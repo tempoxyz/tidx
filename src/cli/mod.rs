@@ -1,4 +1,3 @@
-pub mod compress;
 pub mod query;
 pub mod status;
 pub mod up;
@@ -21,6 +20,4 @@ pub enum Commands {
     Status(status::Args),
     /// Run a SQL query (use --signature to decode event logs)
     Query(query::Args),
-    /// Compress chunks and refresh aggregates
-    Compress(compress::Args),
 }
