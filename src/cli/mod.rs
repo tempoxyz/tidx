@@ -1,5 +1,6 @@
 pub mod compress;
 pub mod query;
+pub mod query_logs;
 pub mod status;
 pub mod sync;
 pub mod up;
@@ -24,6 +25,8 @@ pub enum Commands {
     Sync(sync::Args),
     /// Run a SQL query
     Query(query::Args),
+    /// Query logs by event signature (e.g., "Transfer(address,address,uint256)")
+    QueryLogs(query_logs::Args),
     /// Compress chunks and refresh aggregates
     Compress(compress::Args),
 }
