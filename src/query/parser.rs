@@ -46,6 +46,11 @@ impl EventSignature {
         hex::encode(self.topic0)
     }
 
+    /// Returns the first 4 bytes of topic0 as hex (the event selector)
+    pub fn selector_hex(&self) -> String {
+        hex::encode(&self.topic0[..4])
+    }
+
     fn canonical_signature(name: &str, params: &[AbiParam]) -> String {
         let param_types: Vec<String> = params.iter().map(|p| p.ty.canonical()).collect();
         format!("{}({})", name, param_types.join(","))
