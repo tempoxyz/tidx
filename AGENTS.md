@@ -39,7 +39,21 @@ docker run --rm --network host ghcr.io/tempoxyz/tempo-bench:latest \
   --faucet
 ```
 
-### Run
+### Run (Docker)
+```bash
+# Production deployment with TimescaleDB, Prometheus, Grafana
+RPC_URL=https://rpc.testnet.tempo.xyz docker compose up -d
+
+# View logs
+docker compose logs -f ak47
+
+# Access services:
+# - HTTP API: http://localhost:8080
+# - Prometheus: http://localhost:9091
+# - Grafana: http://localhost:3000 (admin/admin)
+```
+
+### Run (Local)
 ```bash
 # Start continuous head-following sync + HTTP API on port 8080 (requires DB)
 cargo run -- up --rpc https://rpc.testnet.tempo.xyz --db postgres://ak47:ak47@localhost:5432/ak47

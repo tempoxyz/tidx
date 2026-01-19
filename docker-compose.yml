@@ -1,0 +1,70 @@
+services:
+  timescaledb:
+    image: timescale/timescaledb:latest-pg16
+    environment:
+      POSTGRES_USER: ak47
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-ak47}
+      POSTGRES_DB: ak47
+    ports:
+      - "5432:5432"
+    volumes:
+      - timescaledb_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ak47 -d ak47"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    restart: unless-stopped
+
+  ak47:
+    image: ghcr.io/tempoxyz/ak47:latest
+    # Or build locally:
+    # build: .
+    command:
+      - up
+      - --rpc
+      - "${RPC_URL:-https://rpc.testnet.tempo.xyz}"
+      - --db
+      - "postgres://ak47:${POSTGRES_PASSWORD:-ak47}@timescaledb:5432/ak47"
+      - --port
+      - "8080"
+      - --metrics-port
+      - "9090"
+    ports:
+      - "8080:8080"   # HTTP API
+      - "9090:9090"   # Prometheus metrics
+    depends_on:
+      timescaledb:
+        condition: service_healthy
+    environment:
+      RUST_LOG: ${RUST_LOG:-ak47=info}
+    restart: unless-stopped
+
+  prometheus:
+    image: prom/prometheus:latest
+    ports:
+      - "9091:9090"
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus_data:/prometheus
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      - --storage.tsdb.retention.time=30d
+    restart: unless-stopped
+
+  grafana:
+    image: grafana/grafana:latest
+    ports:
+      - "3000:3000"
+    volumes:
+      - grafana_data:/var/lib/grafana
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_PASSWORD:-admin}
+      GF_USERS_ALLOW_SIGN_UP: "false"
+    restart: unless-stopped
+
+volumes:
+  timescaledb_data:
+  prometheus_data:
+  grafana_data:
