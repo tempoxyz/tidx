@@ -26,7 +26,6 @@ async fn main() -> Result<()> {
         Commands::Status(args) => cli::status::run(args).await,
         Commands::Sync(args) => cli::sync::run(args).await,
         Commands::Query(args) => cli::query::run(args).await,
-        Commands::QueryLogs(args) => cli::query_logs::run(args).await,
         Commands::Compress(args) => cli::compress::run(args).await,
     }
 }

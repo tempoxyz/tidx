@@ -1,6 +1,7 @@
 use anyhow::{anyhow, Result};
 use clap::Args as ClapArgs;
 
+use ak47::query::EventSignature;
 use crate::db;
 
 #[derive(ClapArgs)]
@@ -9,8 +10,12 @@ pub struct Args {
     #[arg(long, env = "AK47_DATABASE_URL")]
     pub db: String,
 
-    /// SQL query (SELECT only)
+    /// SQL query (SELECT only). Use event name from --signature as table.
     pub sql: String,
+
+    /// Event signature to create a CTE (e.g., "Transfer(address indexed from, address indexed to, uint256 value)")
+    #[arg(long, short)]
+    pub signature: Option<String>,
 
     /// Output format (table, json, csv)
     #[arg(long, default_value = "table")]
@@ -20,7 +25,7 @@ pub struct Args {
 pub async fn run(args: Args) -> Result<()> {
     let normalized = args.sql.trim().to_uppercase();
 
-    if !normalized.starts_with("SELECT") {
+    if !normalized.starts_with("SELECT") && !normalized.starts_with("WITH") {
         return Err(anyhow!("Only SELECT queries are allowed"));
     }
 
@@ -33,10 +38,19 @@ pub async fn run(args: Args) -> Result<()> {
         }
     }
 
+    // Build final SQL with optional signature CTE
+    let sql = if let Some(ref sig_str) = args.signature {
+        let sig = EventSignature::parse(sig_str)?;
+        let cte = sig.to_cte_sql();
+        format!("WITH {} {}", cte, args.sql)
+    } else {
+        args.sql.clone()
+    };
+
     let pool = db::create_pool(&args.db).await?;
     let conn = pool.get().await?;
 
-    let rows = conn.query(&args.sql, &[]).await?;
+    let rows = conn.query(&sql, &[]).await?;
 
     if rows.is_empty() {
         println!("No results");
