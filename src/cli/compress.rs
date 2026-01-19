@@ -1,14 +1,20 @@
 use anyhow::Result;
 use clap::Args as ClapArgs;
+use std::path::PathBuf;
 use tracing::info;
 
+use ak47::config::Config;
 use ak47::db;
 
 #[derive(ClapArgs)]
 pub struct Args {
-    /// Database URL
-    #[arg(long, env = "AK47_DATABASE_URL")]
-    pub db: String,
+    /// Path to config file
+    #[arg(short, long, default_value = "config.toml")]
+    pub config: PathBuf,
+
+    /// Filter by chain ID (future: when multi-chain tables exist)
+    #[arg(long)]
+    pub chain_id: Option<u64>,
 
     /// Only show what would be compressed (dry run)
     #[arg(long)]
@@ -20,7 +26,8 @@ pub struct Args {
 }
 
 pub async fn run(args: Args) -> Result<()> {
-    let pool = db::create_pool(&args.db).await?;
+    let config = Config::load(&args.config)?;
+    let pool = db::create_pool(&config.database_url).await?;
     let conn = pool.get().await?;
 
     // Check if TimescaleDB is available and tables are hypertables

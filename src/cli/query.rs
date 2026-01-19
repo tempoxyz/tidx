@@ -1,14 +1,16 @@
 use anyhow::Result;
 use clap::Args as ClapArgs;
+use std::path::PathBuf;
 
+use ak47::config::Config;
 use ak47::db;
 use ak47::service::{self, QueryOptions};
 
 #[derive(ClapArgs)]
 pub struct Args {
-    /// Database URL
-    #[arg(long, env = "AK47_DATABASE_URL")]
-    pub db: String,
+    /// Path to config file
+    #[arg(short, long, default_value = "config.toml")]
+    pub config: PathBuf,
 
     /// SQL query (SELECT only). Use event name from --signature as table.
     pub sql: String,
@@ -16,6 +18,10 @@ pub struct Args {
     /// Event signature to create a CTE (e.g., "Transfer(address indexed from, address indexed to, uint256 value)")
     #[arg(long, short)]
     pub signature: Option<String>,
+
+    /// Filter by chain ID (future: when multi-chain tables exist)
+    #[arg(long)]
+    pub chain_id: Option<u64>,
 
     /// Output format (table, json, csv)
     #[arg(long, default_value = "table")]
@@ -31,7 +37,8 @@ pub struct Args {
 }
 
 pub async fn run(args: Args) -> Result<()> {
-    let pool = db::create_pool(&args.db).await?;
+    let config = Config::load(&args.config)?;
+    let pool = db::create_pool(&config.database_url).await?;
 
     let options = QueryOptions {
         timeout_ms: args.timeout,
