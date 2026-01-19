@@ -2,7 +2,7 @@ use anyhow::Result;
 use clap::Args as ClapArgs;
 use tracing::info;
 
-use crate::db;
+use ak47::db;
 
 #[derive(ClapArgs)]
 pub struct Args {

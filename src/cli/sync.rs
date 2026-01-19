@@ -4,10 +4,10 @@ use clap::{Args as ClapArgs, Subcommand};
 use std::collections::HashMap;
 use tracing::info;
 
-use crate::db::{self, PartitionManager};
-use crate::sync::decoder::{decode_block, decode_log, decode_transaction};
-use crate::sync::fetcher::RpcClient;
-use crate::sync::writer::{write_block, write_logs, write_txs};
+use ak47::db::{self, PartitionManager};
+use ak47::sync::decoder::{decode_block, decode_log, decode_transaction};
+use ak47::sync::fetcher::RpcClient;
+use ak47::sync::writer::{write_block, write_logs, write_txs};
 
 #[derive(ClapArgs)]
 pub struct Args {

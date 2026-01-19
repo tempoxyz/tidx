@@ -1,8 +1,9 @@
 use anyhow::Result;
-use chrono::{DateTime, Utc};
+use chrono::Utc;
 use clap::Args as ClapArgs;
 
-use crate::db;
+use ak47::db;
+use ak47::service;
 
 #[derive(ClapArgs)]
 pub struct Args {
@@ -13,57 +14,45 @@ pub struct Args {
     /// Watch mode - continuously update status
     #[arg(long, short)]
     pub watch: bool,
+
+    /// Output as JSON
+    #[arg(long)]
+    pub json: bool,
 }
 
 pub async fn run(args: Args) -> Result<()> {
     let pool = db::create_pool(&args.db).await?;
 
     loop {
-        let conn = pool.get().await?;
-
-        let state = conn
-            .query_opt(
-                "SELECT chain_id, head_num, synced_num, updated_at FROM sync_state WHERE id = 1",
-                &[],
-            )
-            .await?;
+        let status = service::get_status(&pool).await?;
 
         if args.watch {
             print!("\x1B[2J\x1B[1;1H");
         }
 
-        println!("AK47 Status");
-        println!("═══════════════════════════════════════");
+        if args.json {
+            println!("{}", serde_json::to_string_pretty(&status)?);
+        } else {
+            println!("AK47 Status");
+            println!("═══════════════════════════════════════");
 
-        match state {
-            Some(row) => {
-                let chain_id: i64 = row.get(0);
-                let head: i64 = row.get(1);
-                let synced: i64 = row.get(2);
-                let updated: DateTime<Utc> = row.get(3);
+            match status {
+                Some(s) => {
+                    let age = Utc::now().signed_duration_since(s.updated_at);
 
-                let chain_name = match chain_id {
-                    4217 => "Presto",
-                    42429 => "Andantino",
-                    42431 => "Moderato",
-                    _ => "Unknown",
-                };
-
-                let lag = head - synced;
-                let age = Utc::now().signed_duration_since(updated);
-
-                println!("Network:    {} ({})", chain_name, chain_id);
-                println!("Head:       {}", head);
-                println!("Synced:     {}", synced);
-                println!("Lag:        {} blocks", lag);
-                println!(
-                    "Updated:    {} ({} ago)",
-                    updated.format("%H:%M:%S"),
-                    format_duration(age)
-                );
-            }
-            None => {
-                println!("No sync state found. Run 'ak47 up' to start syncing.");
+                    println!("Network:    {} ({})", s.chain_name, s.chain_id);
+                    println!("Head:       {}", s.head_num);
+                    println!("Synced:     {}", s.synced_num);
+                    println!("Lag:        {} blocks", s.lag);
+                    println!(
+                        "Updated:    {} ({} ago)",
+                        s.updated_at.format("%H:%M:%S"),
+                        format_duration(age)
+                    );
+                }
+                None => {
+                    println!("No sync state found. Run 'ak47 up' to start syncing.");
+                }
             }
         }
 
