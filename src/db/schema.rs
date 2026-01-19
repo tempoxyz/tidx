@@ -24,6 +24,12 @@ pub async fn run_migrations(pool: &Pool) -> Result<()> {
     ))
     .await?;
 
+    info!("Running receipts migration");
+    conn.batch_execute(include_str!(
+        "../../migrations/009_receipts.sql"
+    ))
+    .await?;
+
     Ok(())
 }
 
