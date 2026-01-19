@@ -93,8 +93,7 @@ pub async fn execute_query(
 
     let conn = pool.get().await?;
 
-    // Force read-only transaction at database level (defense in depth)
-    conn.execute("SET TRANSACTION READ ONLY", &[]).await?;
+    // Set statement timeout for this session
     conn.execute(
         &format!("SET statement_timeout = {}", options.timeout_ms),
         &[],

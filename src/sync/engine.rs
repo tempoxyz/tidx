@@ -79,7 +79,7 @@ impl SyncEngine {
         };
 
         if synced >= remote_head {
-            tokio::time::sleep(Duration::from_millis(500)).await;
+            tokio::time::sleep(Duration::from_millis(100)).await;
             return Ok(());
         }
 

@@ -149,9 +149,8 @@ async fn handle_query_live(
 
     let stream = async_stream::stream! {
         let mut last_block_num: u64 = 0;
-        let mut pending_blocks: std::collections::VecDeque<u64> = std::collections::VecDeque::new();
 
-        // Execute initial query to get current state
+        // Execute initial query to get current state and determine starting block
         match crate::service::execute_query(&pool, &sql, signature.as_deref(), &options).await {
             Ok(result) => {
                 yield Ok(SseEvent::default()
@@ -168,69 +167,53 @@ async fn handle_query_live(
             }
         }
 
+        // Get current head block to set baseline
+        if let Ok(status) = crate::service::get_status(&pool).await {
+            if let Some(s) = status {
+                last_block_num = s.synced_num as u64;
+            }
+        }
+
         // Stream updates on each new block
         loop {
-            // First, drain any pending broadcasts into our queue
-            loop {
-                match rx.try_recv() {
-                    Ok(update) => {
-                        if update.block_num > last_block_num {
-                            pending_blocks.push_back(update.block_num);
+            match rx.recv().await {
+                Ok(update) => {
+                    if update.block_num <= last_block_num {
+                        continue;
+                    }
+
+                    // Interpolate: emit events for each block from last+1 to current
+                    let start = last_block_num + 1;
+                    let end = update.block_num;
+
+                    for block_num in start..=end {
+                        let filtered_sql = inject_block_filter(&sql, block_num);
+                        match crate::service::execute_query(&pool, &filtered_sql, signature.as_deref(), &options).await {
+                            Ok(result) => {
+                                yield Ok(SseEvent::default()
+                                    .event("result")
+                                    .json_data(QueryResponse { result, ok: true })
+                                    .unwrap());
+                            }
+                            Err(e) => {
+                                yield Ok(SseEvent::default()
+                                    .event("error")
+                                    .json_data(serde_json::json!({ "ok": false, "error": e.to_string() }))
+                                    .unwrap());
+                            }
                         }
                     }
-                    Err(tokio::sync::broadcast::error::TryRecvError::Empty) => break,
-                    Err(tokio::sync::broadcast::error::TryRecvError::Lagged(n)) => {
-                        yield Ok(SseEvent::default()
-                            .event("lagged")
-                            .json_data(serde_json::json!({ "skipped": n }))
-                            .unwrap());
-                    }
-                    Err(tokio::sync::broadcast::error::TryRecvError::Closed) => {
-                        return;
-                    }
-                }
-            }
 
-            // Process pending blocks one at a time in order
-            if let Some(block_num) = pending_blocks.pop_front() {
-                if block_num <= last_block_num {
-                    continue;
+                    last_block_num = end;
                 }
-                last_block_num = block_num;
-
-                // Query with block_num filter to get THIS specific block's data
-                let filtered_sql = inject_block_filter(&sql, block_num);
-                match crate::service::execute_query(&pool, &filtered_sql, signature.as_deref(), &options).await {
-                    Ok(result) => {
-                        yield Ok(SseEvent::default()
-                            .event("result")
-                            .json_data(QueryResponse { result, ok: true })
-                            .unwrap());
-                    }
-                    Err(e) => {
-                        yield Ok(SseEvent::default()
-                            .event("error")
-                            .json_data(serde_json::json!({ "ok": false, "error": e.to_string() }))
-                            .unwrap());
-                    }
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                    yield Ok(SseEvent::default()
+                        .event("lagged")
+                        .json_data(serde_json::json!({ "skipped": n }))
+                        .unwrap());
                 }
-            } else {
-                // No pending blocks, wait for next broadcast
-                match rx.recv().await {
-                    Ok(update) => {
-                        if update.block_num > last_block_num {
-                            pending_blocks.push_back(update.block_num);
-                        }
-                    }
-                    Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
-                        yield Ok(SseEvent::default()
-                            .event("lagged")
-                            .json_data(serde_json::json!({ "skipped": n }))
-                            .unwrap());
-                    }
-                    Err(tokio::sync::broadcast::error::RecvError::Closed) => {
-                        break;
-                    }
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                    break;
                 }
             }
         }
