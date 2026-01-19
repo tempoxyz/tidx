@@ -41,11 +41,20 @@ docker run --rm --network host ghcr.io/tempoxyz/tempo-bench:latest \
 
 ### Run
 ```bash
-# Start syncing (requires DB)
+# Start continuous head-following sync (requires DB)
 cargo run -- up --rpc https://rpc.testnet.tempo.xyz --db postgres://ak47:ak47@localhost:5432/ak47
 
-# Check status
+# Check sync status (shows forward progress, backfill progress, gaps)
 cargo run -- status --db postgres://ak47:ak47@localhost:5432/ak47
+
+# Backfill from current position toward genesis (resumes if interrupted)
+cargo run -- sync --rpc https://rpc.testnet.tempo.xyz --db postgres://ak47:ak47@localhost:5432/ak47 backfill --to 0
+
+# Backfill from specific block
+cargo run -- sync --rpc https://rpc.testnet.tempo.xyz --db postgres://ak47:ak47@localhost:5432/ak47 backfill --from 10000 --to 0
+
+# Show sync status via sync command
+cargo run -- sync --rpc https://rpc.testnet.tempo.xyz --db postgres://ak47:ak47@localhost:5432/ak47 status
 ```
 
 ### Benchmarks
