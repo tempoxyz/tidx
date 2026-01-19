@@ -148,14 +148,16 @@ async fn handle_query_live(
     };
 
     let stream = async_stream::stream! {
-        let mut last_block_num: u64 = 0;
+        let mut last_result_hash: Option<String> = None;
 
         // Execute initial query
         match crate::service::execute_query(&pool, &sql, signature.as_deref(), &options).await {
             Ok(result) => {
+                let response = QueryResponse { result, ok: true };
+                last_result_hash = Some(format!("{:?}", response.result.rows));
                 yield Ok(SseEvent::default()
                     .event("result")
-                    .json_data(QueryResponse { result, ok: true })
+                    .json_data(response)
                     .unwrap());
             }
             Err(e) => {
@@ -170,18 +172,21 @@ async fn handle_query_live(
         // Stream updates on each new block
         loop {
             match rx.recv().await {
-                Ok(update) => {
-                    // Skip if we've already processed this block or earlier
-                    if update.block_num <= last_block_num {
-                        continue;
-                    }
-                    last_block_num = update.block_num;
-
+                Ok(_update) => {
                     match crate::service::execute_query(&pool, &sql, signature.as_deref(), &options).await {
                         Ok(result) => {
+                            let response = QueryResponse { result, ok: true };
+                            let result_hash = format!("{:?}", response.result.rows);
+                            
+                            // Skip if result is identical to last sent
+                            if Some(&result_hash) == last_result_hash.as_ref() {
+                                continue;
+                            }
+                            last_result_hash = Some(result_hash);
+
                             yield Ok(SseEvent::default()
                                 .event("result")
-                                .json_data(QueryResponse { result, ok: true })
+                                .json_data(response)
                                 .unwrap());
                         }
                         Err(e) => {

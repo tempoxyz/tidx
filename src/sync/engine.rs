@@ -140,16 +140,16 @@ impl SyncEngine {
             metrics::record_logs_indexed(self.chain_id, log_count);
             progress.report_forward(current_to, remote_head, block_count);
 
-            // Broadcast once per batch (last block in batch)
+            // Broadcast for each block (SSE handler deduplicates)
             if let Some(ref broadcaster) = self.broadcaster {
-                if let Some(last_block) = blocks.last() {
+                for block in &blocks {
                     broadcaster.send(BlockUpdate {
                         chain_id: self.chain_id,
-                        block_num: last_block.number_u64(),
-                        block_hash: format!("0x{}", hex::encode(last_block.hash.0)),
-                        tx_count: tx_count,
-                        log_count: log_count,
-                        timestamp: last_block.timestamp_u64() as i64,
+                        block_num: block.number_u64(),
+                        block_hash: format!("0x{}", hex::encode(block.hash.0)),
+                        tx_count: block.transactions().count() as u64,
+                        log_count: 0, // Per-block log count not available here
+                        timestamp: block.timestamp_u64() as i64,
                     });
                 }
             }
