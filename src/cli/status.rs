@@ -4,12 +4,17 @@ use clap::Args as ClapArgs;
 
 use ak47::db;
 use ak47::service;
+use ak47::sync::fetcher::RpcClient;
 
 #[derive(ClapArgs)]
 pub struct Args {
     /// Database URL
     #[arg(long, env = "AK47_DATABASE_URL")]
     pub db: String,
+
+    /// RPC endpoint URL (for live head)
+    #[arg(long, env = "AK47_RPC_URL")]
+    pub rpc: Option<String>,
 
     /// Watch mode - continuously update status
     #[arg(long, short)]
@@ -22,9 +27,15 @@ pub struct Args {
 
 pub async fn run(args: Args) -> Result<()> {
     let pool = db::create_pool(&args.db).await?;
+    let rpc = args.rpc.as_ref().map(|url| RpcClient::new(url));
 
     loop {
         let status = service::get_status(&pool).await?;
+        let live_head = if let Some(ref rpc) = rpc {
+            rpc.latest_block_number().await.ok()
+        } else {
+            None
+        };
 
         if args.watch {
             print!("\x1B[2J\x1B[1;1H");
@@ -39,11 +50,13 @@ pub async fn run(args: Args) -> Result<()> {
             match status {
                 Some(s) => {
                     let age = Utc::now().signed_duration_since(s.updated_at);
+                    let head = live_head.unwrap_or(s.head_num as u64);
+                    let lag = head.saturating_sub(s.synced_num as u64);
 
                     println!("Network:    {} ({})", s.chain_name, s.chain_id);
-                    println!("Head:       {}", s.head_num);
+                    println!("Head:       {}{}", head, if live_head.is_some() { " (live)" } else { "" });
                     println!("Synced:     {}", s.synced_num);
-                    println!("Lag:        {} blocks", s.lag);
+                    println!("Lag:        {} blocks", lag);
                     println!(
                         "Updated:    {} ({} ago)",
                         s.updated_at.format("%H:%M:%S"),

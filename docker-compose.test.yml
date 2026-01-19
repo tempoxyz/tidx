@@ -39,6 +39,7 @@ services:
       - "8545:8545"
     tmpfs:
       - /data
+      
   ak47:
     build: .
     command:

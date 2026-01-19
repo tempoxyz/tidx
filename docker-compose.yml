@@ -17,13 +17,11 @@ services:
     restart: unless-stopped
 
   ak47:
-    image: ghcr.io/tempoxyz/ak47:latest
-    # Or build locally:
-    # build: .
+    build: .
     command:
       - up
       - --rpc
-      - "${RPC_URL:-https://rpc.testnet.tempo.xyz}"
+      - "${RPC_URL:-https://rpc.moderato.tempo.xyz}"
       - --db
       - "postgres://ak47:${POSTGRES_PASSWORD:-ak47}@timescaledb:5432/ak47"
       - --port
