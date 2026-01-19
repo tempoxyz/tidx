@@ -1,14 +1,13 @@
 mod common;
 
 use std::sync::Arc;
-use std::time::Duration;
 
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use tower::ServiceExt;
 
-use ak47::api;
-use ak47::broadcast::{BlockUpdate, Broadcaster};
+use ak47::api::{self, inject_block_filter};
+use ak47::broadcast::Broadcaster;
 use common::testdb::TestDb;
 
 #[tokio::test]
@@ -45,20 +44,6 @@ async fn test_query_get_returns_sse() {
     let db = TestDb::empty().await;
     let broadcaster = Arc::new(Broadcaster::new());
     let app = api::router(db.pool.clone(), broadcaster.clone());
-
-    // Spawn task to send a block update after a delay
-    let broadcaster_clone = broadcaster.clone();
-    tokio::spawn(async move {
-        tokio::time::sleep(Duration::from_millis(50)).await;
-        broadcaster_clone.send(BlockUpdate {
-            chain_id: 4217,
-            block_num: 1,
-            block_hash: "0xabc".to_string(),
-            tx_count: 0,
-            log_count: 0,
-            timestamp: 0,
-        });
-    });
 
     let response = app
         .oneshot(
@@ -165,4 +150,45 @@ async fn test_status_endpoint() {
 
     // ok should be present (true or false depending on sync state)
     assert!(json.get("ok").is_some());
+}
+
+#[test]
+fn test_inject_block_filter_blocks_table() {
+    // Blocks table uses 'num' column
+    let sql = "SELECT num, hash FROM blocks ORDER BY num DESC LIMIT 1";
+    let filtered = inject_block_filter(sql, 100);
+    assert!(filtered.contains("num = 100"), "got: {}", filtered);
+    assert!(filtered.contains("ORDER BY"), "should preserve ORDER BY");
+}
+
+#[test]
+fn test_inject_block_filter_txs_table() {
+    // Txs table uses 'block_num' column
+    let sql = "SELECT * FROM txs ORDER BY block_num DESC LIMIT 10";
+    let filtered = inject_block_filter(sql, 200);
+    assert!(filtered.contains("block_num = 200"), "got: {}", filtered);
+}
+
+#[test]
+fn test_inject_block_filter_logs_table() {
+    // Logs table uses 'block_num' column
+    let sql = "SELECT * FROM logs WHERE address = '0x123' ORDER BY block_num DESC";
+    let filtered = inject_block_filter(sql, 300);
+    assert!(filtered.contains("block_num = 300"), "got: {}", filtered);
+    assert!(filtered.contains("address = '0x123'"), "should preserve existing WHERE");
+}
+
+#[test]
+fn test_inject_block_filter_with_existing_where() {
+    let sql = "SELECT * FROM txs WHERE gas_used > 21000 ORDER BY block_num DESC";
+    let filtered = inject_block_filter(sql, 400);
+    assert!(filtered.contains("block_num = 400"), "got: {}", filtered);
+    assert!(filtered.contains("gas_used > 21000"), "should preserve existing condition");
+}
+
+#[test]
+fn test_inject_block_filter_no_order_by() {
+    let sql = "SELECT COUNT(*) FROM blocks LIMIT 1";
+    let filtered = inject_block_filter(sql, 500);
+    assert!(filtered.contains("num = 500"), "got: {}", filtered);
 }

@@ -363,7 +363,8 @@ fn parse_time_filter(after: &str) -> Result<String, ApiError> {
 /// Inject a block number filter into SQL query for live streaming.
 /// Transforms queries to only return data for the specific block.
 /// Uses 'num' for blocks table, 'block_num' for txs/logs tables.
-fn inject_block_filter(sql: &str, block_num: u64) -> String {
+#[doc(hidden)]
+pub fn inject_block_filter(sql: &str, block_num: u64) -> String {
     let sql_upper = sql.to_uppercase();
     
     // Determine column name based on table being queried
