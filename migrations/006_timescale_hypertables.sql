@@ -23,21 +23,30 @@ CREATE TABLE IF NOT EXISTS blocks (
     PRIMARY KEY (num)
 );
 
--- Convert to hypertable with 2M block chunks
-SELECT create_hypertable('blocks', by_range('num', 2000000), if_not_exists => TRUE);
+-- Convert to hypertable with 2M block chunks (only if not already a hypertable)
+DO $$
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM timescaledb_information.hypertables WHERE hypertable_name = 'blocks') 
+       AND NOT EXISTS (SELECT 1 FROM pg_class c JOIN pg_partitioned_table pt ON c.oid = pt.partrelid WHERE c.relname = 'blocks') THEN
+        PERFORM create_hypertable('blocks', by_range('num', 2000000));
+    END IF;
+END $$;
 
 -- Block indexes
 CREATE INDEX IF NOT EXISTS idx_blocks_hash ON blocks (hash);
 CREATE INDEX IF NOT EXISTS idx_blocks_timestamp ON blocks (timestamp DESC);
 
--- Enable compression
-ALTER TABLE blocks SET (
-    timescaledb.compress,
-    timescaledb.compress_orderby = 'num DESC'
-);
-
--- Auto-compress chunks older than 2M blocks (one chunk)
-SELECT add_compression_policy('blocks', 2000000, if_not_exists => TRUE);
+-- Enable compression (idempotent - ALTER TABLE SET is safe to re-run)
+DO $$
+BEGIN
+    IF EXISTS (SELECT 1 FROM timescaledb_information.hypertables WHERE hypertable_name = 'blocks') THEN
+        ALTER TABLE blocks SET (
+            timescaledb.compress,
+            timescaledb.compress_orderby = 'num DESC'
+        );
+        PERFORM add_compression_policy('blocks', 2000000, if_not_exists => TRUE);
+    END IF;
+END $$;
 
 -- ============================================================================
 -- TRANSACTIONS HYPERTABLE
@@ -69,22 +78,32 @@ CREATE TABLE IF NOT EXISTS txs (
     PRIMARY KEY (block_num, idx)
 );
 
--- Convert to hypertable
-SELECT create_hypertable('txs', by_range('block_num', 2000000), if_not_exists => TRUE);
+-- Convert to hypertable (only if not already a hypertable or partitioned)
+DO $$
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM timescaledb_information.hypertables WHERE hypertable_name = 'txs') 
+       AND NOT EXISTS (SELECT 1 FROM pg_class c JOIN pg_partitioned_table pt ON c.oid = pt.partrelid WHERE c.relname = 'txs') THEN
+        PERFORM create_hypertable('txs', by_range('block_num', 2000000));
+    END IF;
+END $$;
 
 -- Transaction indexes
 CREATE INDEX IF NOT EXISTS idx_txs_hash ON txs (hash);
 CREATE INDEX IF NOT EXISTS idx_txs_from ON txs ("from", block_timestamp DESC);
 CREATE INDEX IF NOT EXISTS idx_txs_to ON txs ("to", block_timestamp DESC);
 
--- Enable compression (segment by type for better ratio)
-ALTER TABLE txs SET (
-    timescaledb.compress,
-    timescaledb.compress_segmentby = 'type',
-    timescaledb.compress_orderby = 'block_num DESC, idx'
-);
-
-SELECT add_compression_policy('txs', 2000000, if_not_exists => TRUE);
+-- Enable compression (only if hypertable)
+DO $$
+BEGIN
+    IF EXISTS (SELECT 1 FROM timescaledb_information.hypertables WHERE hypertable_name = 'txs') THEN
+        ALTER TABLE txs SET (
+            timescaledb.compress,
+            timescaledb.compress_segmentby = 'type',
+            timescaledb.compress_orderby = 'block_num DESC, idx'
+        );
+        PERFORM add_compression_policy('txs', 2000000, if_not_exists => TRUE);
+    END IF;
+END $$;
 
 -- ============================================================================
 -- LOGS HYPERTABLE
@@ -103,21 +122,31 @@ CREATE TABLE IF NOT EXISTS logs (
     PRIMARY KEY (block_num, log_idx)
 );
 
--- Convert to hypertable
-SELECT create_hypertable('logs', by_range('block_num', 2000000), if_not_exists => TRUE);
+-- Convert to hypertable (only if not already a hypertable or partitioned)
+DO $$
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM timescaledb_information.hypertables WHERE hypertable_name = 'logs') 
+       AND NOT EXISTS (SELECT 1 FROM pg_class c JOIN pg_partitioned_table pt ON c.oid = pt.partrelid WHERE c.relname = 'logs') THEN
+        PERFORM create_hypertable('logs', by_range('block_num', 2000000));
+    END IF;
+END $$;
 
 -- Log indexes
 CREATE INDEX IF NOT EXISTS idx_logs_selector ON logs (selector, block_timestamp DESC);
 CREATE INDEX IF NOT EXISTS idx_logs_address ON logs (address, block_timestamp DESC);
 
 -- Enable compression (segment by selector for event queries)
-ALTER TABLE logs SET (
-    timescaledb.compress,
-    timescaledb.compress_segmentby = 'selector',
-    timescaledb.compress_orderby = 'block_num DESC, log_idx'
-);
-
-SELECT add_compression_policy('logs', 2000000, if_not_exists => TRUE);
+DO $$
+BEGIN
+    IF EXISTS (SELECT 1 FROM timescaledb_information.hypertables WHERE hypertable_name = 'logs') THEN
+        ALTER TABLE logs SET (
+            timescaledb.compress,
+            timescaledb.compress_segmentby = 'selector',
+            timescaledb.compress_orderby = 'block_num DESC, log_idx'
+        );
+        PERFORM add_compression_policy('logs', 2000000, if_not_exists => TRUE);
+    END IF;
+END $$;
 
 -- ============================================================================
 -- SYNC STATE
