@@ -6,7 +6,7 @@ use tokio::sync::broadcast;
 use tracing::{debug, error, info};
 
 use crate::db::Pool;
-use crate::metrics;
+use crate::metrics::{self, SyncProgress};
 use crate::types::SyncState;
 
 use super::decoder::{decode_block, decode_log, decode_transaction};
@@ -37,13 +37,16 @@ impl SyncEngine {
     }
 
     pub async fn run(&mut self, mut shutdown: broadcast::Receiver<()>) -> Result<()> {
+        let state = load_sync_state(&self.pool).await?.unwrap_or_default();
+        let mut progress = SyncProgress::new(self.chain_id, state.synced_num);
+
         loop {
             tokio::select! {
                 _ = shutdown.recv() => {
                     info!("Shutting down sync engine");
                     break;
                 }
-                result = self.tick_pipelined() => {
+                result = self.tick_pipelined(&mut progress) => {
                     if let Err(e) = result {
                         error!(error = %e, "Sync tick failed");
                         tokio::time::sleep(Duration::from_secs(1)).await;
@@ -56,7 +59,7 @@ impl SyncEngine {
 
     /// Pipelined sync: fetch next batch while writing current batch
     /// This overlaps network I/O with database I/O for better throughput
-    async fn tick_pipelined(&mut self) -> Result<()> {
+    async fn tick_pipelined(&mut self, progress: &mut SyncProgress) -> Result<()> {
         let state = load_sync_state(&self.pool).await?.unwrap_or_default();
         let remote_head = self.rpc.latest_block_number().await?;
 
@@ -122,11 +125,10 @@ impl SyncEngine {
             let tx_count = all_txs.len() as u64;
             let log_count = all_logs.len() as u64;
 
-            metrics::record_blocks_indexed(block_count);
-            metrics::record_txs_indexed(tx_count);
-            metrics::record_logs_indexed(log_count);
-            metrics::set_sync_head(current_to);
-            metrics::set_sync_lag(remote_head.saturating_sub(current_to));
+            metrics::record_blocks_indexed(self.chain_id, block_count);
+            metrics::record_txs_indexed(self.chain_id, tx_count);
+            metrics::record_logs_indexed(self.chain_id, log_count);
+            progress.report_forward(current_to, remote_head, block_count);
 
             debug!(
                 from = current_from,
@@ -434,6 +436,7 @@ impl SyncEngine {
 
         let mut synced = 0u64;
         let mut current_end = start_block;
+        let mut progress = SyncProgress::new(self.chain_id, start_block);
 
         while current_end >= to {
             // Check for shutdown
@@ -457,16 +460,8 @@ impl SyncEngine {
             }
             save_sync_state(&self.pool, &state).await?;
 
-            metrics::record_blocks_indexed(batch_blocks);
-            metrics::set_backfill_progress(current_start);
-
-            info!(
-                from = current_start,
-                to = current_end,
-                synced = synced,
-                remaining = current_start.saturating_sub(to),
-                "Backfilled batch"
-            );
+            metrics::record_blocks_indexed(self.chain_id, batch_blocks);
+            progress.report_backfill(current_start, to, batch_blocks);
 
             if current_start == to {
                 break;

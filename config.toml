@@ -12,9 +12,9 @@ metrics_port = 9090
 
 # Chains to index
 [[chains]]
-name = "andantino"
+name = "moderato"
 chain_id = 42429
-rpc_url = "https://rpc.testnet.tempo.xyz"
+rpc_url = "https://rpc.moderato.tempo.xyz"
 backfill = true
 batch_size = 100
 
