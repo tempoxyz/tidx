@@ -103,12 +103,12 @@ impl EventSignature {
         };
 
         format!(
-            r#""{name}" AS (
+            r#"{name} AS (
     SELECT block_num, block_timestamp, log_idx, tx_idx, tx_hash, address{select_clause}
     FROM logs
     WHERE selector = '\x{topic0}'
 )"#,
-            name = self.name,
+            name = self.name.to_lowercase(),
             select_clause = select_clause,
             topic0 = self.topic0_hex(),
         )
@@ -145,12 +145,12 @@ impl EventSignature {
         };
 
         format!(
-            r#""{name}" AS (
+            r#"{name} AS (
     SELECT block_num, block_timestamp, log_idx, tx_idx, tx_hash, address{select_clause}
     FROM logs
     WHERE selector = '0x{topic0}'
 )"#,
-            name = self.name,
+            name = self.name.to_lowercase(),
             select_clause = select_clause,
             topic0 = self.topic0_hex(),
         )
