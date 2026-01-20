@@ -43,32 +43,43 @@
 
 ## Quickstart
 
-### Docker Compose (Recommended)
+### Requirements
+
+- [TimescaleDB](https://docs.timescale.com/self-hosted/latest/install/) (Postgres with time-series extensions)
+
+### Install
 
 ```bash
-# Clone and start
-git clone https://github.com/tempoxyz/ak47
-cd ak47
-docker compose up -d
+curl -L https://ak47.tempo.xyz/install.sh | bash
+```
+
+### Run
+
+```bash
+# Create config
+cat > config.toml << EOF
+[[chains]]
+name = "mainnet"
+chain_id = 4217
+rpc_url = "https://rpc.tempo.xyz"
+database_url = "postgres://user:pass@localhost:5432/ak47"
+EOF
+
+# Start indexing
+ak47 up
 
 # Check status
-curl http://localhost:8080/status
+ak47 status
+```
+
+### Docker Compose
+
+```bash
+git clone https://github.com/tempoxyz/ak47 && cd ak47
+docker compose up -d
 
 # Query data
 curl "http://localhost:8080/query?sql=SELECT * FROM blocks ORDER BY num DESC LIMIT 5"
-```
-
-### Local Binary
-
-```bash
-# Build
-cargo build --release
-
-# Run (requires TimescaleDB)
-./target/release/ak47 up --config config.toml
-
-# Check status
-./target/release/ak47 status
 ```
 
 ## How It Works
@@ -86,23 +97,42 @@ Chain:    [0]----[1]----[2]----...----[HEAD-1]----[HEAD]----[HEAD+1]
 
 Both syncs persist progress to `sync_state`, so interrupted syncs resume automatically.
 
+### Hybrid Storage
+
+Recent data stays in row format for fast writes and point queries. Older chunks auto-compress to columnar format for analytics:
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                                                                             │
+│   HOT DATA (row format)              COLD DATA (columnar, compressed)       │
+│  ┌─────┬─────┬─────┬─────┐          ┌─────────────────────────────────┐     │
+│  │ now │ -1h │ -2h │ ... │   ───►   │  -30d  │  -60d  │  -90d  │ ...  │     │
+│  └─────┴─────┴─────┴─────┘          └─────────────────────────────────┘     │
+│     Fast writes + OLTP                  10-20x smaller + fast OLAP          │
+│                                                                             │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
 ### Why TimescaleDB?
 
-- **Hybrid OLTP + OLAP** — Fast point lookups (row) AND fast analytics (columnar compression)
 - **Hypertables** — Auto-partitioned by timestamp for efficient time-range queries
 - **Compression** — Columnar storage reduces size 10-20x, speeds up aggregations
-- **Continuous Aggregates** — Pre-computed rollups refresh automatically
+- **Continuous Aggregates** — Materialized views that auto-refresh on schedule
 - **Full SQL** — No custom query language, just Postgres
 
 ## Installation
 
-### Docker (Recommended)
+### One-liner
+
+```bash
+curl -L https://ak47.tempo.xyz/install.sh | bash
+```
+
+### Docker
 
 ```bash
 docker pull ghcr.io/tempoxyz/ak47:latest
-
-# Run with config
-docker run -v $(pwd)/config.toml:/config.toml ghcr.io/tempoxyz/ak47 up --config /config.toml
+docker run -v $(pwd)/config.toml:/config.toml ghcr.io/tempoxyz/ak47 up
 ```
 
 ### From Source
@@ -111,13 +141,9 @@ docker run -v $(pwd)/config.toml:/config.toml ghcr.io/tempoxyz/ak47 up --config 
 git clone https://github.com/tempoxyz/ak47
 cd ak47
 cargo build --release
-
-# Binary at ./target/release/ak47
 ```
 
-**Requirements:**
-- Rust 1.75+ (2024 edition)
-- TimescaleDB 2.x (auto-creates tables on first run)
+**Requirements:** TimescaleDB 2.x
 
 ## Configuration
 

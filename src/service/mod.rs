@@ -122,6 +122,9 @@ pub async fn execute_query(
         sql.to_string()
     };
 
+    // Convert '0x...' hex strings to '\x...' bytea literals
+    let sql = sql.replace("'0x", "'\\x");
+
     let sql = if !normalized.contains("LIMIT") {
         format!("{} LIMIT {}", sql, options.limit)
     } else {
@@ -149,7 +152,7 @@ pub async fn execute_query(
             metrics::record_query_duration(start.elapsed());
             rows
         }
-        Ok(Err(e)) => return Err(anyhow!("Query error: {e}")),
+        Ok(Err(e)) => return Err(anyhow!("Query error: {e:?}")),
         Err(_) => return Err(anyhow!("Query timeout")),
     };
 
