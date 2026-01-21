@@ -501,67 +501,67 @@ All tables use composite primary keys with timestamps for efficient range querie
 
 | Column | Type | Description |
 |--------|------|-------------|
-| `num` | INT8 | Block number |
-| `hash` | BYTEA | Block hash |
-| `parent_hash` | BYTEA | Parent block hash |
-| `timestamp` | TIMESTAMPTZ | Block timestamp |
-| `gas_limit` | INT8 | Gas limit |
-| `gas_used` | INT8 | Gas used |
-| `miner` | BYTEA | Block producer |
+| `num` | `INT8` | Block number |
+| `hash` | `BYTEA` | Block hash |
+| `parent_hash` | `BYTEA` | Parent block hash |
+| `timestamp` | `TIMESTAMPTZ` | Block timestamp |
+| `gas_limit` | `INT8` | Gas limit |
+| `gas_used` | `INT8` | Gas used |
+| `miner` | `BYTEA` | Block producer |
 
 ### txs
 
 | Column | Type | Description |
 |--------|------|-------------|
-| `block_num` | INT8 | Block number |
-| `block_timestamp` | TIMESTAMPTZ | Block timestamp |
-| `idx` | INT4 | Transaction index |
-| `hash` | BYTEA | Transaction hash |
-| `type` | INT2 | Transaction type |
-| `from` | BYTEA | Sender address |
-| `to` | BYTEA | Recipient address |
-| `value` | TEXT | Transfer value (wei) |
-| `input` | BYTEA | Calldata |
-| `gas_used` | INT8 | Gas consumed |
+| `block_num` | `INT8` | Block number |
+| `block_timestamp` | `TIMESTAMPTZ` | Block timestamp |
+| `idx` | `INT4` | Transaction index |
+| `hash` | `BYTEA` | Transaction hash |
+| `type` | `INT2` | Transaction type |
+| `from` | `BYTEA` | Sender address |
+| `to` | `BYTEA` | Recipient address |
+| `value` | `TEXT` | Transfer value (wei) |
+| `input` | `BYTEA` | Calldata |
+| `gas_used` | `INT8` | Gas consumed |
 
 ### logs
 
 | Column | Type | Description |
 |--------|------|-------------|
-| `block_num` | INT8 | Block number |
-| `block_timestamp` | TIMESTAMPTZ | Block timestamp |
-| `log_idx` | INT4 | Log index |
-| `tx_hash` | BYTEA | Transaction hash |
-| `address` | BYTEA | Emitting contract |
-| `selector` | BYTEA | Event selector (topic0) |
-| `topics` | BYTEA[] | All topics |
-| `data` | BYTEA | Event data |
+| `block_num` | `INT8` | Block number |
+| `block_timestamp` | `TIMESTAMPTZ` | Block timestamp |
+| `log_idx` | `INT4` | Log index |
+| `tx_hash` | `BYTEA` | Transaction hash |
+| `address` | `BYTEA` | Emitting contract |
+| `selector` | `BYTEA` | Event selector (topic0) |
+| `topics` | `BYTEA[]` | All topics |
+| `data` | `BYTEA` | Event data |
 
 ### receipts
 
 | Column | Type | Description |
 |--------|------|-------------|
-| `block_num` | INT8 | Block number |
-| `block_timestamp` | TIMESTAMPTZ | Block timestamp |
-| `tx_idx` | INT4 | Transaction index |
-| `tx_hash` | BYTEA | Transaction hash |
-| `from` | BYTEA | Sender address |
-| `to` | BYTEA | Recipient address |
-| `contract_address` | BYTEA | Created contract (if deploy) |
-| `gas_used` | INT8 | Gas consumed |
-| `cumulative_gas_used` | INT8 | Cumulative gas in block |
-| `effective_gas_price` | TEXT | Actual gas price paid |
-| `status` | INT2 | Success (1) or failure (0) |
-| `fee_payer` | BYTEA | Tempo fee payer (if sponsored) |
+| `block_num` | `INT8` | Block number |
+| `block_timestamp` | `TIMESTAMPTZ` | Block timestamp |
+| `tx_idx` | `INT4` | Transaction index |
+| `tx_hash` | `BYTEA` | Transaction hash |
+| `from` | `BYTEA` | Sender address |
+| `to` | `BYTEA` | Recipient address |
+| `contract_address` | `BYTEA` | Created contract (if deploy) |
+| `gas_used` | `INT8` | Gas consumed |
+| `cumulative_gas_used` | `INT8` | Cumulative gas in block |
+| `effective_gas_price` | `TEXT` | Actual gas price paid |
+| `status` | `INT2` | Success (1) or failure (0) |
+| `fee_payer` | `BYTEA` | Tempo fee payer (if sponsored) |
 
 ### sync_state
 
 | Column | Type | Description |
 |--------|------|-------------|
-| `chain_id` | INT8 | Chain identifier |
-| `head_num` | INT8 | Remote chain head |
-| `synced_num` | INT8 | Highest synced block |
-| `backfill_num` | INT8 | Lowest synced block |
+| `chain_id` | `INT8` | Chain identifier |
+| `head_num` | `INT8` | Remote chain head |
+| `synced_num` | `INT8` | Highest synced block |
+| `backfill_num` | `INT8` | Lowest synced block |
 
 ## Development
 
