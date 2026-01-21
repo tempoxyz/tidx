@@ -47,3 +47,10 @@ jobs:
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git tag -a "v${{ steps.version.outputs.current }}" -m "Release v${{ steps.version.outputs.current }}"
           git push origin "v${{ steps.version.outputs.current }}"
+
+      - name: Trigger release
+        if: steps.version.outputs.changed == 'true'
+        run: |
+          gh workflow run release.yml -f tag="v${{ steps.version.outputs.current }}"
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
