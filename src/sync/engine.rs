@@ -1,3 +1,4 @@
+use alloy::network::ReceiptResponse;
 use anyhow::Result;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -168,11 +169,11 @@ impl SyncEngine {
                 for block in &blocks {
                     broadcaster.send(BlockUpdate {
                         chain_id: self.chain_id,
-                        block_num: block.number_u64(),
-                        block_hash: format!("0x{}", hex::encode(block.hash.0)),
-                        tx_count: block.transactions().count() as u64,
+                        block_num: block.header.number,
+                        block_hash: format!("0x{}", hex::encode(block.header.hash)),
+                        tx_count: block.transactions.len() as u64,
                         log_count: 0, // Per-block log count not available here
-                        timestamp: block.timestamp_u64() as i64,
+                        timestamp: block.header.timestamp as i64,
                     });
                 }
             }
@@ -202,13 +203,13 @@ impl SyncEngine {
 
     /// Validate parent hash chain for a batch of blocks
     /// Returns Ok(()) if chain is valid, Err with details if not
-    async fn validate_parent_chain(&self, blocks: &[crate::tempo::TempoBlock]) -> Result<()> {
+    async fn validate_parent_chain(&self, blocks: &[crate::tempo::Block]) -> Result<()> {
         if blocks.is_empty() {
             return Ok(());
         }
 
         let first_block = &blocks[0];
-        let first_num = first_block.number_u64();
+        let first_num = first_block.header.number;
 
         // Check parent hash against stored block (if not genesis)
         if first_num > 0
@@ -217,24 +218,24 @@ impl SyncEngine {
             let expected_parent: [u8; 32] = stored_hash
                 .try_into()
                 .map_err(|_| anyhow::anyhow!("Invalid stored hash length"))?;
-            if first_block.parent_hash.0 != expected_parent {
+            if first_block.header.parent_hash.0 != expected_parent {
                 return Err(anyhow::anyhow!(
                     "Parent hash mismatch at block {}: expected {:?}, got {:?}",
                     first_num,
                     hex::encode(expected_parent),
-                    hex::encode(first_block.parent_hash.0)
+                    hex::encode(first_block.header.parent_hash.0)
                 ));
             }
         }
 
         // Validate internal chain continuity
         for window in blocks.windows(2) {
-            if window[1].parent_hash != window[0].hash {
+            if window[1].header.parent_hash != window[0].header.hash {
                 return Err(anyhow::anyhow!(
                     "Internal chain break at block {}: parent_hash {:?} != prev hash {:?}",
-                    window[1].number_u64(),
-                    hex::encode(window[1].parent_hash.0),
-                    hex::encode(window[0].hash.0)
+                    window[1].header.number,
+                    hex::encode(window[1].header.parent_hash.0),
+                    hex::encode(window[0].header.hash.0)
                 ));
             }
         }
@@ -262,7 +263,7 @@ impl SyncEngine {
         from: u64,
         to: u64,
     ) -> Result<(
-        Vec<crate::tempo::TempoBlock>,
+        Vec<crate::tempo::Block>,
         Vec<crate::types::BlockRow>,
         Vec<crate::types::TxRow>,
         Vec<crate::types::LogRow>,
@@ -278,7 +279,7 @@ impl SyncEngine {
 
         let block_timestamps: HashMap<u64, _> = blocks
             .iter()
-            .map(|b| (b.number_u64(), timestamp_from_secs(b.timestamp_u64())))
+            .map(|b| (b.header.number, timestamp_from_secs(b.header.timestamp)))
             .collect();
 
         let block_rows: Vec<_> = blocks.iter().map(decode_block).collect();
@@ -287,7 +288,8 @@ impl SyncEngine {
             .iter()
             .flat_map(|block| {
                 block
-                    .transactions()
+                    .transactions
+                    .txns()
                     .enumerate()
                     .map(|(i, tx)| decode_transaction(tx, block, i as u32))
             })
@@ -297,10 +299,10 @@ impl SyncEngine {
             .iter()
             .flatten()
             .flat_map(|receipt| {
-                let block_num = receipt.block_number.to::<u64>();
+                let block_num = receipt.block_number().unwrap_or(0);
                 block_timestamps
                     .get(&block_num)
-                    .map(|&ts| receipt.logs.iter().map(move |log| decode_log(log, ts)))
+                    .map(|&ts| receipt.inner.logs().iter().map(move |log| decode_log(log, ts)))
                     .into_iter()
                     .flatten()
             })
@@ -310,7 +312,7 @@ impl SyncEngine {
             .iter()
             .flatten()
             .filter_map(|receipt| {
-                let block_num = receipt.block_number.to::<u64>();
+                let block_num = receipt.block_number().unwrap_or(0);
                 block_timestamps.get(&block_num).map(|&ts| decode_receipt(receipt, ts))
             })
             .collect();
@@ -327,7 +329,7 @@ impl SyncEngine {
 
         let block_timestamps: HashMap<u64, _> = blocks
             .iter()
-            .map(|b| (b.number_u64(), timestamp_from_secs(b.timestamp_u64())))
+            .map(|b| (b.header.number, timestamp_from_secs(b.header.timestamp)))
             .collect();
 
         // Decode all blocks, transactions, and logs upfront
@@ -337,7 +339,8 @@ impl SyncEngine {
             .iter()
             .flat_map(|block| {
                 block
-                    .transactions()
+                    .transactions
+                    .txns()
                     .enumerate()
                     .map(|(i, tx)| decode_transaction(tx, block, i as u32))
             })
@@ -347,10 +350,10 @@ impl SyncEngine {
             .iter()
             .flatten()
             .flat_map(|receipt| {
-                let block_num = receipt.block_number.to::<u64>();
+                let block_num = receipt.block_number().unwrap_or(0);
                 block_timestamps
                     .get(&block_num)
-                    .map(|&ts| receipt.logs.iter().map(move |log| decode_log(log, ts)))
+                    .map(|&ts| receipt.inner.logs().iter().map(move |log| decode_log(log, ts)))
                     .into_iter()
                     .flatten()
             })
@@ -360,7 +363,7 @@ impl SyncEngine {
             .iter()
             .flatten()
             .filter_map(|receipt| {
-                let block_num = receipt.block_number.to::<u64>();
+                let block_num = receipt.block_number().unwrap_or(0);
                 block_timestamps.get(&block_num).map(|&ts| decode_receipt(receipt, ts))
             })
             .collect();
@@ -381,11 +384,12 @@ impl SyncEngine {
         )?;
 
         let block_row = decode_block(&block);
-        let block_ts = timestamp_from_secs(block.timestamp_u64());
+        let block_ts = timestamp_from_secs(block.header.timestamp);
         write_block(&self.pool, &block_row).await?;
 
         let txs: Vec<_> = block
-            .transactions()
+            .transactions
+            .txns()
             .enumerate()
             .map(|(i, tx)| decode_transaction(tx, &block, i as u32))
             .collect();
@@ -395,7 +399,7 @@ impl SyncEngine {
         // Extract logs from receipts
         let log_rows: Vec<_> = receipts
             .iter()
-            .flat_map(|r| r.logs.iter().map(|log| decode_log(log, block_ts)))
+            .flat_map(|r| r.inner.logs().iter().map(|log| decode_log(log, block_ts)))
             .collect();
         write_logs(&self.pool, &log_rows).await?;
 

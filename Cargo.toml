@@ -34,6 +34,7 @@ duckdb = { version = "1.2", features = ["bundled", "vscalar"] }
 
 # Ethereum/Tempo primitives
 alloy = { version = "1", features = ["full"] }
+tempo-alloy = { git = "https://github.com/tempoxyz/tempo", default-features = false }
 
 # Serialization
 serde = { version = "1", features = ["derive"] }
