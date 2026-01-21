@@ -60,7 +60,7 @@ curl -L https://ak47.wevm.dev/install | bash
 ### Run
 
 ```bash
-# Initialize config (interactive)
+# Initialize config
 ak47 init
 
 # Start indexing
@@ -68,16 +68,6 @@ ak47 up
 
 # Check status
 ak47 status
-```
-
-### Docker Compose
-
-```bash
-git clone https://github.com/tempoxyz/ak47 && cd ak47
-make up
-
-# Query data
-curl "http://localhost:8080/query?sql=SELECT * FROM blocks ORDER BY num DESC LIMIT 5"
 ```
 
 ## Overview
@@ -171,51 +161,30 @@ duckdb_path = "/data/moderato.duckdb"
 
 ### Reference
 
-#### `[http]`
+```
+[http]                                             HTTP server configuration
+├── enabled                 bool      = true         Enable HTTP API server
+├── port                    u16       = 8080         HTTP server port
+├── bind                    string    = "0.0.0.0"    Bind address
+├── api_keys                string[]  = []           API keys that bypass rate limiting
+└── [rate_limit]                                     Rate limiting for unauthenticated requests
+    ├── enabled             bool      = true         Enable rate limiting
+    ├── requests_per_window u32       = 100          Max requests per window
+    ├── window_secs         u64       = 60           Window in seconds
+    └── max_sse_connections u32       = 5            Max concurrent SSE connections per IP
 
-HTTP server configuration
+[prometheus]                                       Prometheus metrics server
+├── enabled                 bool      = true         Enable metrics endpoint
+└── port                    u16       = 9090         Metrics server port
 
-| Field | Type | Default | Description |
-|-------|------|---------|-------------|
-| `enabled` | bool | `true` | Enable HTTP API server |
-| `port` | u16 | `8080` | HTTP server port |
-| `bind` | string | `"0.0.0.0"` | Bind address |
-| `api_keys` | string[] | `[]` | API keys that bypass rate limiting |
-
-#### `[http.rate_limit]`
-
-Rate limiting configuration for unauthenticated requests
-
-| Field | Type | Default | Description |
-|-------|------|---------|-------------|
-| `enabled` | bool | `true` | Enable rate limiting |
-| `requests_per_window` | u32 | `100` | Max requests per window |
-| `window_secs` | u64 | `60` | Rate limit window in seconds |
-| `max_sse_connections` | u32 | `5` | Max concurrent SSE connections per IP |
-
-**Authentication:** Pass API key via `Authorization: Bearer <key>` header.
-
-#### `[prometheus]`
-
-Prometheus metrics server configuration
-
-| Field | Type | Default | Description |
-|-------|------|---------|-------------|
-| `enabled` | bool | `true` | Enable Prometheus metrics endpoint |
-| `port` | u16 | `9090` | Metrics server port |
-
-#### `[[chains]]`
-
-Chain configuration
-
-| Field | Type | Required | Default | Description |
-|-------|------|----------|---------|-------------|
-| `name` | string | ✓ | - | Display name for logging |
-| `chain_id` | u64 | ✓ | - | Chain ID |
-| `rpc_url` | string | ✓ | - | JSON-RPC endpoint URL |
-| `pg_url` | string | ✓ | - | PostgreSQL connection string |
-| `duckdb_path` | string | - | - | Path to DuckDB file (enables OLAP). Omit to disable DuckDB for this chain |
-| `batch_size` | u64 | - | `100` | Blocks per RPC batch request |
+[[chains]]                                         Chain configuration 
+├── name                    string    (required)     Display name for logging
+├── chain_id                u64       (required)     Chain ID
+├── rpc_url                 string    (required)     JSON-RPC endpoint URL
+├── pg_url                  string    (required)     PostgreSQL connection string
+├── duckdb_path             string                   Path to DuckDB file (enables OLAP)
+└── batch_size              u64       = 100          Blocks per RPC batch request
+```
 
 ## CLI
 
@@ -312,25 +281,7 @@ ak47 query \
 
 ## HTTP API
 
-### Endpoints
-
-| Endpoint | Method | Description |
-|----------|--------|-------------|
-| `/health` | GET | Health check |
-| `/status` | GET | Sync status for all chains + DuckDB |
-| `/query` | GET | Execute SQL query (auto-routed) |
-| `/metrics` | GET | Prometheus metrics |
-
-### Query Parameters
-
-| Field | Type | Required | Default | Description |
-|-------|------|----------|---------|-------------|
-| `sql` | string | ✓ | - | SQL query (SELECT only) |
-| `chainId` | number | ✓ | - | Chain ID to query |
-| `signature` | string | | - | Event signature for CTE generation |
-| `engine` | string | | (auto) | Force engine: `postgres` or `duckdb` |
-| `timeout_ms` | number | | `5000` | Query timeout in milliseconds |
-| `limit` | number | | `10000` | Maximum rows to return |
+ak47 exposes a HTTP API for querying the indexer.
 
 ### Examples
 
@@ -346,6 +297,20 @@ curl "http://localhost:8080/query?chainId=4217&sql=SELECT type, COUNT(*) FROM tx
 # Status
 curl http://localhost:8080/status
 > {"ok":true,"chains":[{"chain_id":4217,"synced_num":567890,"head_num":567890,"lag":0,"duckdb_synced_num":567840,"duckdb_lag":50}]}
+```
+
+### Reference
+
+```
+GET /health                                              Health check
+GET /status                                              Sync status for all chains + DuckDB
+GET /query                                               Execute SQL query (auto-routed)
+    ?sql                    string    (required)         SQL query (SELECT only)
+    ?chainId                number    (required)         Chain ID to query
+    ?signature              string                       Event signature for CTE generation
+    ?engine                 string    = (auto)           Force engine: postgres or duckdb
+    ?live                   bool      = false            Enable SSE streaming on new blocks
+GET /metrics                                             Prometheus metrics
 ```
 
 ## Schemas
