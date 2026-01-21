@@ -82,17 +82,11 @@ async fn print_status(config: &Config) -> Result<()> {
             println!("│  └─ Lag:       {realtime_lag} blocks");
             println!("│");
 
-            // Gap-fill status - only show TRUE gaps (discontinuities within synced range)
-            // Filter out ranges that are just pending backfill work
+            // Gap-fill status - show all gaps up to tip_num
             let all_gaps = detect_gaps(&pool).await.unwrap_or_default();
-            let backfill_floor = state.backfill_num.unwrap_or(state.tip_num);
             let gaps: Vec<_> = all_gaps
                 .into_iter()
-                .filter(|(start, end)| {
-                    // Only show gaps that are WITHIN the synced range
-                    // (between backfill_num and tip_num)
-                    *start >= backfill_floor && *end <= state.tip_num
-                })
+                .filter(|(_start, end)| *end <= state.tip_num)
                 .collect();
 
             if !gaps.is_empty() {
@@ -180,12 +174,10 @@ async fn print_json_status(config: &Config) -> Result<()> {
         let (state, gaps) = if let Ok(pool) = db::create_pool(&chain.pg_url).await {
             let state = load_sync_state(&pool, chain.chain_id).await.ok().flatten();
             let all_gaps = detect_gaps(&pool).await.unwrap_or_default();
-            // Filter to only TRUE gaps (within synced range, not pending backfill)
-            let backfill_floor = state.as_ref().map(|s| s.backfill_num.unwrap_or(s.tip_num)).unwrap_or(0);
             let tip = state.as_ref().map(|s| s.tip_num).unwrap_or(0);
             let gaps: Vec<_> = all_gaps
                 .into_iter()
-                .filter(|(start, end)| *start >= backfill_floor && *end <= tip)
+                .filter(|(_start, end)| *end <= tip)
                 .collect();
             (state, gaps)
         } else {
