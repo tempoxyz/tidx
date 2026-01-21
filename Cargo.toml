@@ -1,6 +1,6 @@
 [package]
 name = "ak47"
-version = "0.0.2"
+version = "0.0.3"
 edition = "2024"
 license = "MIT"
 repository = "https://github.com/wevm/ak47"
