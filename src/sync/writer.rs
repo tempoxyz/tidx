@@ -304,7 +304,7 @@ pub async fn load_sync_state(pool: &Pool, chain_id: u64) -> Result<Option<SyncSt
 
     let row = conn
         .query_opt(
-            "SELECT chain_id, head_num, synced_num, backfill_num, started_at FROM sync_state WHERE chain_id = $1",
+            "SELECT chain_id, head_num, synced_num, tip_num, backfill_num, started_at FROM sync_state WHERE chain_id = $1",
             &[&(chain_id as i64)],
         )
         .await?;
@@ -313,8 +313,9 @@ pub async fn load_sync_state(pool: &Pool, chain_id: u64) -> Result<Option<SyncSt
         chain_id: r.get::<_, i64>(0) as u64,
         head_num: r.get::<_, i64>(1) as u64,
         synced_num: r.get::<_, i64>(2) as u64,
-        backfill_num: r.get::<_, Option<i64>>(3).map(|n| n as u64),
-        started_at: r.get(4),
+        tip_num: r.get::<_, i64>(3) as u64,
+        backfill_num: r.get::<_, Option<i64>>(4).map(|n| n as u64),
+        started_at: r.get(5),
     }))
 }
 
@@ -324,7 +325,7 @@ pub async fn load_all_sync_states(pool: &Pool) -> Result<Vec<SyncState>> {
 
     let rows = conn
         .query(
-            "SELECT chain_id, head_num, synced_num, backfill_num, started_at FROM sync_state ORDER BY chain_id",
+            "SELECT chain_id, head_num, synced_num, tip_num, backfill_num, started_at FROM sync_state ORDER BY chain_id",
             &[],
         )
         .await?;
@@ -335,8 +336,9 @@ pub async fn load_all_sync_states(pool: &Pool) -> Result<Vec<SyncState>> {
             chain_id: r.get::<_, i64>(0) as u64,
             head_num: r.get::<_, i64>(1) as u64,
             synced_num: r.get::<_, i64>(2) as u64,
-            backfill_num: r.get::<_, Option<i64>>(3).map(|n| n as u64),
-            started_at: r.get(4),
+            tip_num: r.get::<_, i64>(3) as u64,
+            backfill_num: r.get::<_, Option<i64>>(4).map(|n| n as u64),
+            started_at: r.get(5),
         })
         .collect())
 }
@@ -346,11 +348,12 @@ pub async fn save_sync_state(pool: &Pool, state: &SyncState) -> Result<()> {
 
     conn.execute(
         r#"
-        INSERT INTO sync_state (chain_id, head_num, synced_num, backfill_num, started_at, updated_at)
-        VALUES ($1, $2, $3, $4, COALESCE($5, NOW()), NOW())
+        INSERT INTO sync_state (chain_id, head_num, synced_num, tip_num, backfill_num, started_at, updated_at)
+        VALUES ($1, $2, $3, $4, $5, COALESCE($6, NOW()), NOW())
         ON CONFLICT (chain_id) DO UPDATE SET
             head_num = GREATEST(sync_state.head_num, EXCLUDED.head_num),
             synced_num = GREATEST(sync_state.synced_num, EXCLUDED.synced_num),
+            tip_num = GREATEST(sync_state.tip_num, EXCLUDED.tip_num),
             backfill_num = COALESCE(EXCLUDED.backfill_num, sync_state.backfill_num),
             started_at = COALESCE(sync_state.started_at, EXCLUDED.started_at),
             updated_at = NOW()
@@ -359,9 +362,48 @@ pub async fn save_sync_state(pool: &Pool, state: &SyncState) -> Result<()> {
             &(state.chain_id as i64),
             &(state.head_num as i64),
             &(state.synced_num as i64),
+            &(state.tip_num as i64),
             &state.backfill_num.map(|n| n as i64),
             &state.started_at,
         ],
+    )
+    .await?;
+
+    Ok(())
+}
+
+/// Update only tip_num (for realtime sync - avoids clobbering synced_num)
+pub async fn update_tip_num(pool: &Pool, chain_id: u64, tip_num: u64, head_num: u64) -> Result<()> {
+    let conn = pool.get().await?;
+
+    conn.execute(
+        r#"
+        INSERT INTO sync_state (chain_id, head_num, tip_num, synced_num, started_at, updated_at)
+        VALUES ($1, $2, $3, 0, NOW(), NOW())
+        ON CONFLICT (chain_id) DO UPDATE SET
+            head_num = GREATEST(sync_state.head_num, EXCLUDED.head_num),
+            tip_num = GREATEST(sync_state.tip_num, EXCLUDED.tip_num),
+            updated_at = NOW()
+        "#,
+        &[&(chain_id as i64), &(head_num as i64), &(tip_num as i64)],
+    )
+    .await?;
+
+    Ok(())
+}
+
+/// Update only synced_num (for gap-fill sync - avoids clobbering tip_num)
+pub async fn update_synced_num(pool: &Pool, chain_id: u64, synced_num: u64) -> Result<()> {
+    let conn = pool.get().await?;
+
+    conn.execute(
+        r#"
+        UPDATE sync_state
+        SET synced_num = GREATEST(synced_num, $1),
+            updated_at = NOW()
+        WHERE chain_id = $2
+        "#,
+        &[&(synced_num as i64), &(chain_id as i64)],
     )
     .await?;
 

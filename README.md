@@ -41,6 +41,7 @@
 - [HTTP API](#http-api)
 - [Query Cookbook](#query-cookbook)
 - [Database Schema](#database-schema)
+- [Sync Architecture](#sync-architecture)
 - [Development](#development)
 - [License](#license)
 
@@ -429,11 +430,112 @@ All tables use composite primary keys with timestamps for efficient range querie
 | Column | Type | Description |
 |--------|------|-------------|
 | `chain_id` | `INT8` | Chain identifier |
-| `head_num` | `INT8` | Remote chain head |
-| `synced_num` | `INT8` | Highest synced block |
-| `backfill_num` | `INT8` | Lowest synced block |
+| `head_num` | `INT8` | Remote chain head from RPC |
+| `synced_num` | `INT8` | Highest contiguous block (no gaps from backfill_num to here) |
+| `tip_num` | `INT8` | Highest block near chain head (realtime follows this) |
+| `backfill_num` | `INT8` | Lowest synced block going backwards (NULL=not started, 0=complete) |
 | `started_at` | `TIMESTAMPTZ` | Sync start time |
 | `updated_at` | `TIMESTAMPTZ` | Last update time |
+
+## Sync Architecture
+
+ak47 uses three concurrent sync operations to maximize throughput while ensuring realtime data availability:
+
+```
+Block Numbers:  0                                                              HEAD
+                │                                                                │
+                ▼                                                                ▼
+    ════════════╪════════════════════════════════════════════════════════════════╪═══▶ time
+                │                                                                │
+    INDEXED:    ░░░░░░░░░░░████████████████░░░░░░░░░░░░░░░░░░░░░░░░░░░░██████████
+                │         │               │                            │        │
+                ▼         ▼               ▼                            ▼        ▼
+              genesis  backfill_num   synced_num                   tip_num   head_num
+               (0)       (500)          (800)                       (1900)    (2000)
+                │         │               │                            │        │
+                └─────────┘               └────────────────────────────┘        │
+                 BACKFILL                         GAP-FILL                      │
+              (toward genesis)              (fills skipped blocks)              │
+                                                                       └────────┘
+                                                                        REALTIME
+                                                                     (following head)
+
+Legend:
+  ████  = indexed blocks
+  ░░░░  = not yet indexed
+```
+
+### Sync Cursors
+
+| Cursor | Description |
+|--------|-------------|
+| `head_num` | Current chain head from RPC |
+| `tip_num` | Highest block indexed (realtime keeps this near head) |
+| `synced_num` | Highest contiguous block (no gaps from backfill_num to here) |
+| `backfill_num` | Lowest block indexed going backwards toward genesis |
+
+### Metrics
+
+| Metric | Formula | Description |
+|--------|---------|-------------|
+| **Realtime lag** | `head_num - tip_num` | Should be ~0, realtime keeps up with new blocks |
+| **Gap** | `tip_num - synced_num` | Blocks realtime skipped, gap-fill backfills these |
+| **Backfill remaining** | `backfill_num` | Blocks left to index toward genesis |
+
+### Concurrent Operations
+
+1. **REALTIME** — Jumps to chain head immediately, follows new blocks with minimal lag (~0 blocks)
+2. **GAP-FILL** — Fills the gap between `synced_num` and `tip_num` in background
+3. **BACKFILL** — Syncs historical blocks from `backfill_num` toward genesis
+
+### When Gaps Occur
+
+Gaps between `synced_num` and `tip_num` happen when:
+
+| Scenario | What Happens |
+|----------|--------------|
+| **Indexer restart after downtime** | Chain moved ahead while stopped. Realtime jumps to head, gap-fill backfills the missed blocks. |
+| **Slow RPC or network issues** | Realtime temporarily falls behind, then jumps ahead when connection recovers. |
+| **Initial sync** | Realtime starts near head immediately, gap-fill works backwards to meet backfill. |
+| **Rate-limited RPC** | Realtime prioritizes head, gap-fill catches up at sustainable rate. |
+
+### Multiple Gaps (Repeated Restarts)
+
+If the indexer stops and restarts multiple times, multiple non-contiguous gaps can form:
+
+```
+Scenario: Indexer stops twice while chain advances
+
+  Run 1: Sync 0-100, stop
+  Run 2: Chain at 250, jump to 240-250, stop  
+  Run 3: Chain at 400, jump to 390-400
+
+Block Numbers:  0          100    240  250          390  400
+                │           │      │    │            │    │
+                ▼           ▼      ▼    ▼            ▼    ▼
+    ════════════╪═══════════╪══════╪════╪════════════╪════╪═══▶ time
+                │           │      │    │            │    │
+    INDEXED:    ████████████       █████             ██████
+                │           │      │    │            │    │
+                ▼           ▼      ▼    ▼            ▼    ▼
+              genesis    synced  gap1  gap1        gap2  tip/head
+               (0)        (100)  start  end        start  (400)
+                                 (101) (239)       (251)
+
+Gaps detected: [(101, 239), (251, 389)]
+```
+
+The gap-fill loop uses SQL to detect **all** gaps in the `blocks` table:
+
+```sql
+SELECT prev_num + 1 as gap_start, num - 1 as gap_end
+FROM (SELECT num, LAG(num) OVER (ORDER BY num) as prev_num FROM blocks)
+WHERE num - prev_num > 1
+```
+
+This returns all gaps regardless of how many exist. Gap-fill processes them sequentially until `synced_num` catches up to `tip_num`.
+
+This architecture ensures **new blocks are always indexed immediately**, even if historical sync is incomplete.
 
 ## Development
 

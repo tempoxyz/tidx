@@ -74,8 +74,10 @@ pub struct SyncState {
     pub chain_id: u64,
     /// Remote chain head block number
     pub head_num: u64,
-    /// Highest block synced (forward direction)
+    /// Highest contiguous block synced (no gaps from backfill_num to here)
     pub synced_num: u64,
+    /// Highest block synced near chain head (may have gaps below)
+    pub tip_num: u64,
     /// Lowest block synced going backwards (None = not started, Some(0) = complete)
     pub backfill_num: Option<u64>,
     /// When sync started (for ETA calculations)

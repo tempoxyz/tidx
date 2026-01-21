@@ -13,7 +13,12 @@ pub struct SyncStatus {
     pub chain_id: i64,
     pub head_num: i64,
     pub synced_num: i64,
+    pub tip_num: i64,
     pub lag: i64,
+    pub gap_blocks: i64,
+    /// Detected gaps in the blocks table: [(start, end), ...]
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub gaps: Vec<(i64, i64)>,
     pub backfill_num: Option<i64>,
     pub backfill_remaining: i64,
     pub sync_rate: Option<f64>,
@@ -30,17 +35,22 @@ pub async fn get_all_status(pool: &Pool) -> Result<Vec<SyncStatus>> {
 
     let rows = conn
         .query(
-            "SELECT chain_id, head_num, synced_num, backfill_num, started_at, updated_at FROM sync_state ORDER BY chain_id",
+            "SELECT chain_id, head_num, synced_num, tip_num, backfill_num, started_at, updated_at FROM sync_state ORDER BY chain_id",
             &[],
         )
         .await?;
+
+    // Detect actual gaps in the blocks table
+    let gaps = crate::sync::writer::detect_gaps(pool).await.unwrap_or_default();
+    let gaps_i64: Vec<(i64, i64)> = gaps.iter().map(|(s, e)| (*s as i64, *e as i64)).collect();
 
     Ok(rows
         .iter()
         .map(|row| {
             let synced_num: i64 = row.get(2);
-            let backfill_num: Option<i64> = row.get(3);
-            let started_at: Option<DateTime<Utc>> = row.get(4);
+            let tip_num: i64 = row.get(3);
+            let backfill_num: Option<i64> = row.get(4);
+            let started_at: Option<DateTime<Utc>> = row.get(5);
 
             let backfill_remaining = match backfill_num {
                 None => synced_num.saturating_sub(1),
@@ -62,16 +72,22 @@ pub async fn get_all_status(pool: &Pool) -> Result<Vec<SyncStatus>> {
                 if rate > 0.0 { Some(backfill_remaining as f64 / rate) } else { None }
             });
 
+            // Gap = blocks between synced_num and tip_num that may be missing
+            let gap_blocks = tip_num.saturating_sub(synced_num);
+
             SyncStatus {
                 chain_id: row.get(0),
                 head_num: row.get(1),
                 synced_num,
-                lag: row.get::<_, i64>(1) - synced_num,
+                tip_num,
+                lag: row.get::<_, i64>(1) - tip_num, // lag from head to tip (realtime)
+                gap_blocks,
+                gaps: gaps_i64.clone(),
                 backfill_num,
                 backfill_remaining,
                 sync_rate,
                 eta_secs,
-                updated_at: row.get(5),
+                updated_at: row.get(6),
                 duckdb_synced_num: None,
                 duckdb_lag: None,
             }

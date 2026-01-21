@@ -5,7 +5,8 @@ use common::testdb::TestDb;
 
 use ak47::query::EventSignature;
 use ak47::sync::engine::SyncEngine;
-use ak47::sync::writer::{detect_gaps, get_block_hash};
+use ak47::sync::writer::{detect_gaps, get_block_hash, load_sync_state, save_sync_state, update_synced_num, update_tip_num};
+use ak47::types::SyncState;
 use serial_test::serial;
 
 #[tokio::test]
@@ -437,6 +438,278 @@ async fn test_gap_detection_empty_table() {
     let gaps = detect_gaps(&db.pool).await.expect("Failed to detect gaps");
 
     assert!(gaps.is_empty(), "Empty table should have no gaps");
+}
+
+// ============================================================================
+// Sync state tests (tip_num, synced_num, realtime/gap-fill architecture)
+// ============================================================================
+
+#[tokio::test]
+#[serial(db)]
+async fn test_sync_state_tip_num_and_synced_num() {
+    let db = TestDb::empty().await;
+    db.truncate_all().await;
+
+    let chain_id = 12345u64;
+
+    // Initially no state
+    let state = load_sync_state(&db.pool, chain_id).await.expect("Failed to load");
+    assert!(state.is_none(), "Should have no state initially");
+
+    // Update tip_num (simulates realtime sync)
+    update_tip_num(&db.pool, chain_id, 100, 105).await.expect("Failed to update tip_num");
+
+    let state = load_sync_state(&db.pool, chain_id).await.expect("Failed to load").unwrap();
+    assert_eq!(state.tip_num, 100, "tip_num should be 100");
+    assert_eq!(state.head_num, 105, "head_num should be 105");
+    assert_eq!(state.synced_num, 0, "synced_num should start at 0");
+
+    // Update synced_num (simulates gap-fill catching up)
+    update_synced_num(&db.pool, chain_id, 50).await.expect("Failed to update synced_num");
+
+    let state = load_sync_state(&db.pool, chain_id).await.expect("Failed to load").unwrap();
+    assert_eq!(state.tip_num, 100, "tip_num should still be 100");
+    assert_eq!(state.synced_num, 50, "synced_num should be 50");
+
+    // Update tip_num again (realtime advances)
+    update_tip_num(&db.pool, chain_id, 150, 155).await.expect("Failed to update tip_num");
+
+    let state = load_sync_state(&db.pool, chain_id).await.expect("Failed to load").unwrap();
+    assert_eq!(state.tip_num, 150, "tip_num should advance to 150");
+    assert_eq!(state.synced_num, 50, "synced_num should still be 50");
+
+    // Gap-fill catches up completely
+    update_synced_num(&db.pool, chain_id, 150).await.expect("Failed to update synced_num");
+
+    let state = load_sync_state(&db.pool, chain_id).await.expect("Failed to load").unwrap();
+    assert_eq!(state.tip_num, 150, "tip_num should be 150");
+    assert_eq!(state.synced_num, 150, "synced_num should catch up to 150");
+}
+
+#[tokio::test]
+#[serial(db)]
+async fn test_sync_state_only_increases() {
+    let db = TestDb::empty().await;
+    db.truncate_all().await;
+
+    let chain_id = 99999u64;
+
+    // Set initial state
+    update_tip_num(&db.pool, chain_id, 100, 100).await.expect("Failed");
+    update_synced_num(&db.pool, chain_id, 50).await.expect("Failed");
+
+    // Try to set lower values - should be ignored (GREATEST in SQL)
+    update_tip_num(&db.pool, chain_id, 80, 80).await.expect("Failed");
+    update_synced_num(&db.pool, chain_id, 30).await.expect("Failed");
+
+    let state = load_sync_state(&db.pool, chain_id).await.expect("Failed to load").unwrap();
+    assert_eq!(state.tip_num, 100, "tip_num should not decrease");
+    assert_eq!(state.synced_num, 50, "synced_num should not decrease");
+    assert_eq!(state.head_num, 100, "head_num should not decrease");
+}
+
+#[tokio::test]
+#[serial(db)]
+async fn test_sync_state_save_and_load() {
+    let db = TestDb::empty().await;
+    db.truncate_all().await;
+
+    let chain_id = 77777u64;
+
+    let state = SyncState {
+        chain_id,
+        head_num: 1000,
+        synced_num: 800,
+        tip_num: 950,
+        backfill_num: Some(100),
+        started_at: Some(chrono::Utc::now()),
+    };
+
+    save_sync_state(&db.pool, &state).await.expect("Failed to save");
+
+    let loaded = load_sync_state(&db.pool, chain_id).await.expect("Failed to load").unwrap();
+    assert_eq!(loaded.chain_id, chain_id);
+    assert_eq!(loaded.head_num, 1000);
+    assert_eq!(loaded.synced_num, 800);
+    assert_eq!(loaded.tip_num, 950);
+    assert_eq!(loaded.backfill_num, Some(100));
+}
+
+#[tokio::test]
+#[serial(db)]
+async fn test_sync_state_methods() {
+    let state = SyncState {
+        chain_id: 1,
+        head_num: 1000,
+        synced_num: 800,
+        tip_num: 950,
+        backfill_num: Some(100),
+        started_at: None,
+    };
+
+    // Test backfill methods
+    assert!(!state.backfill_complete(), "Backfill not complete when backfill_num > 0");
+    assert!(state.backfill_started(), "Backfill started when backfill_num is Some");
+    assert_eq!(state.backfill_remaining(), 100, "100 blocks remaining");
+
+    // Test indexed range
+    let (low, high) = state.indexed_range();
+    assert_eq!(low, 100, "Low should be backfill_num");
+    assert_eq!(high, 800, "High should be synced_num");
+
+    // Test total indexed
+    assert_eq!(state.total_indexed(), 701, "Total indexed = 800 - 100 + 1");
+
+    // Complete backfill
+    let complete = SyncState {
+        backfill_num: Some(0),
+        ..state.clone()
+    };
+    assert!(complete.backfill_complete(), "Backfill complete when backfill_num = 0");
+    assert_eq!(complete.backfill_remaining(), 0);
+}
+
+#[tokio::test]
+#[serial(db)]
+async fn test_gap_fill_scenario_multiple_restarts() {
+    let db = TestDb::empty().await;
+    db.truncate_all().await;
+
+    let conn = db.pool.get().await.expect("Failed to get connection");
+
+    // Simulate: indexer ran 3 times, each time jumping to near head
+    // Run 1: synced blocks 1-100
+    // Run 2: chain at 300, jumped to 290-300
+    // Run 3: chain at 500, jumped to 490-500
+    
+    // Insert blocks for run 1: 1-100
+    for num in 1i64..=100 {
+        conn.execute(
+            r#"INSERT INTO blocks (num, hash, parent_hash, timestamp, timestamp_ms, gas_limit, gas_used, miner)
+               VALUES ($1, $2, $3, NOW(), $4, 1000000, 100000, $5)"#,
+            &[
+                &num,
+                &vec![num as u8; 32],
+                &vec![(num.saturating_sub(1)) as u8; 32],
+                &(num * 1000),
+                &vec![0u8; 20],
+            ],
+        )
+        .await
+        .expect("Failed to insert block");
+    }
+
+    // Insert blocks for run 2: 290-300
+    for num in 290i64..=300 {
+        conn.execute(
+            r#"INSERT INTO blocks (num, hash, parent_hash, timestamp, timestamp_ms, gas_limit, gas_used, miner)
+               VALUES ($1, $2, $3, NOW(), $4, 1000000, 100000, $5)"#,
+            &[
+                &num,
+                &vec![num as u8; 32],
+                &vec![(num - 1) as u8; 32],
+                &(num * 1000),
+                &vec![0u8; 20],
+            ],
+        )
+        .await
+        .expect("Failed to insert block");
+    }
+
+    // Insert blocks for run 3: 490-500
+    for num in 490i64..=500 {
+        conn.execute(
+            r#"INSERT INTO blocks (num, hash, parent_hash, timestamp, timestamp_ms, gas_limit, gas_used, miner)
+               VALUES ($1, $2, $3, NOW(), $4, 1000000, 100000, $5)"#,
+            &[
+                &num,
+                &vec![num as u8; 32],
+                &vec![(num - 1) as u8; 32],
+                &(num * 1000),
+                &vec![0u8; 20],
+            ],
+        )
+        .await
+        .expect("Failed to insert block");
+    }
+
+    // Detect all gaps
+    let gaps = detect_gaps(&db.pool).await.expect("Failed to detect gaps");
+
+    // Should have 2 gaps:
+    // Gap 1: 101-289 (between run 1 and run 2)
+    // Gap 2: 301-489 (between run 2 and run 3)
+    assert_eq!(gaps.len(), 2, "Should detect two gaps from multiple restarts");
+    assert_eq!(gaps[0], (101, 289), "First gap should be 101-289");
+    assert_eq!(gaps[1], (301, 489), "Second gap should be 301-489");
+
+    // Calculate total gap blocks
+    let total_gap_blocks: u64 = gaps.iter().map(|(s, e)| e - s + 1).sum();
+    assert_eq!(total_gap_blocks, 189 + 189, "Total gap should be 378 blocks");
+}
+
+#[tokio::test]
+#[serial(db)]
+async fn test_gap_detection_single_block_gaps() {
+    let db = TestDb::empty().await;
+    db.truncate_all().await;
+
+    let conn = db.pool.get().await.expect("Failed to get connection");
+
+    // Insert blocks with single-block gaps: 1, 3, 5, 7, 9 (missing 2, 4, 6, 8)
+    for num in [1i64, 3, 5, 7, 9] {
+        conn.execute(
+            r#"INSERT INTO blocks (num, hash, parent_hash, timestamp, timestamp_ms, gas_limit, gas_used, miner)
+               VALUES ($1, $2, $3, NOW(), $4, 1000000, 100000, $5)"#,
+            &[
+                &num,
+                &vec![num as u8; 32],
+                &vec![(num - 1) as u8; 32],
+                &(num * 1000),
+                &vec![0u8; 20],
+            ],
+        )
+        .await
+        .expect("Failed to insert block");
+    }
+
+    let gaps = detect_gaps(&db.pool).await.expect("Failed to detect gaps");
+
+    assert_eq!(gaps.len(), 4, "Should detect four single-block gaps");
+    assert_eq!(gaps[0], (2, 2), "Gap at block 2");
+    assert_eq!(gaps[1], (4, 4), "Gap at block 4");
+    assert_eq!(gaps[2], (6, 6), "Gap at block 6");
+    assert_eq!(gaps[3], (8, 8), "Gap at block 8");
+}
+
+#[tokio::test]
+#[serial(db)]
+async fn test_gap_detection_contiguous_blocks() {
+    let db = TestDb::empty().await;
+    db.truncate_all().await;
+
+    let conn = db.pool.get().await.expect("Failed to get connection");
+
+    // Insert contiguous blocks 1-10
+    for num in 1i64..=10 {
+        conn.execute(
+            r#"INSERT INTO blocks (num, hash, parent_hash, timestamp, timestamp_ms, gas_limit, gas_used, miner)
+               VALUES ($1, $2, $3, NOW(), $4, 1000000, 100000, $5)"#,
+            &[
+                &num,
+                &vec![num as u8; 32],
+                &vec![(num.saturating_sub(1)) as u8; 32],
+                &(num * 1000),
+                &vec![0u8; 20],
+            ],
+        )
+        .await
+        .expect("Failed to insert block");
+    }
+
+    let gaps = detect_gaps(&db.pool).await.expect("Failed to detect gaps");
+
+    assert!(gaps.is_empty(), "Contiguous blocks should have no gaps");
 }
 
 // ============================================================================

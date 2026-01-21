@@ -5,7 +5,7 @@ use std::path::PathBuf;
 use ak47::config::Config;
 use ak47::db;
 use ak47::sync::fetcher::RpcClient;
-use ak47::sync::writer::load_sync_state;
+use ak47::sync::writer::{detect_gaps, load_sync_state};
 
 #[derive(ClapArgs)]
 pub struct Args {
@@ -73,13 +73,30 @@ async fn print_status(config: &Config) -> Result<()> {
 
         if let Some(state) = load_sync_state(&pool, chain.chain_id).await? {
             let head = live_head.unwrap_or(state.head_num);
-            let lag = head.saturating_sub(state.synced_num);
+            let realtime_lag = head.saturating_sub(state.tip_num);
 
-            // Forward sync status
-            println!("│  Forward Sync");
+            // Realtime sync status
+            println!("│  Realtime Sync");
             println!("│  ├─ Head:      {} {}", head, if live_head.is_some() { "(live)" } else { "" });
+            println!("│  ├─ Tip:       {}", state.tip_num);
+            println!("│  └─ Lag:       {realtime_lag} blocks");
+            println!("│");
+
+            // Gap-fill status
+            let gaps = detect_gaps(&pool).await.unwrap_or_default();
+            println!("│  Gap-Fill");
             println!("│  ├─ Synced:    {}", state.synced_num);
-            println!("│  └─ Lag:       {lag} blocks");
+            if gaps.is_empty() {
+                println!("│  └─ Gaps:      ✓ No gaps");
+            } else {
+                let total_gap_blocks: u64 = gaps.iter().map(|(s, e)| e - s + 1).sum();
+                println!("│  ├─ Gaps:      {} ({} blocks total)", gaps.len(), format_number(total_gap_blocks));
+                for (i, (start, end)) in gaps.iter().enumerate() {
+                    let size = end - start + 1;
+                    let prefix = if i == gaps.len() - 1 { "└" } else { "├" };
+                    println!("│  │  {prefix}─ {} → {} ({} blocks)", format_number(*start), format_number(*end), format_number(size));
+                }
+            }
             println!("│");
 
             // Backfill status
@@ -146,11 +163,16 @@ async fn print_json_status(config: &Config) -> Result<()> {
         let rpc = RpcClient::new(&chain.rpc_url);
         let live_head = rpc.latest_block_number().await.ok();
 
-        let state = if let Ok(pool) = db::create_pool(&chain.pg_url).await {
-            load_sync_state(&pool, chain.chain_id).await.ok().flatten()
+        let (state, gaps) = if let Ok(pool) = db::create_pool(&chain.pg_url).await {
+            let state = load_sync_state(&pool, chain.chain_id).await.ok().flatten();
+            let gaps = detect_gaps(&pool).await.unwrap_or_default();
+            (state, gaps)
         } else {
-            None
+            (None, vec![])
         };
+
+        let gaps_json: Vec<_> = gaps.iter().map(|(s, e)| serde_json::json!({"start": s, "end": e, "size": e - s + 1})).collect();
+        let total_gap_blocks: u64 = gaps.iter().map(|(s, e)| e - s + 1).sum();
 
         let chain_status = serde_json::json!({
             "name": chain.name,
@@ -158,8 +180,12 @@ async fn print_json_status(config: &Config) -> Result<()> {
             "rpc_url": chain.rpc_url,
             "pg_url": chain.pg_url,
             "head": live_head,
-            "synced": state.as_ref().map(|s| s.synced_num),
-            "lag": state.as_ref().and_then(|s| live_head.map(|h| h.saturating_sub(s.synced_num))),
+            "tip_num": state.as_ref().map(|s| s.tip_num),
+            "synced_num": state.as_ref().map(|s| s.synced_num),
+            "realtime_lag": state.as_ref().and_then(|s| live_head.map(|h| h.saturating_sub(s.tip_num))),
+            "gap_count": gaps.len(),
+            "gap_blocks": total_gap_blocks,
+            "gaps": gaps_json,
             "backfill_block": state.as_ref().and_then(|s| s.backfill_num),
             "backfill_complete": state.as_ref().map(|s| s.backfill_complete()).unwrap_or(false),
             "sync_rate": state.as_ref().and_then(|s| s.sync_rate()),
