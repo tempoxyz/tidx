@@ -53,7 +53,7 @@
 ### Install
 
 ```bash
-curl -L https://raw.githubusercontent.com/tempoxyz/ak47/main/scripts/install.sh | bash
+curl -L https://ak47.wevm.dev/install | bash
 ```
 
 ### Run
@@ -115,7 +115,7 @@ ak47 uses a hybrid PostgreSQL + DuckDB architecture that automatically routes qu
 ### Quick Install
 
 ```bash
-curl -L https://raw.githubusercontent.com/tempoxyz/ak47/main/scripts/install.sh | bash
+curl -L https://ak47.wevm.dev/install | bash
 ```
 
 ### Docker

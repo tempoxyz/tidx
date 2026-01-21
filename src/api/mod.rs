@@ -5,6 +5,8 @@ use std::convert::Infallible;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
+use tokio::sync::RwLock;
+
 use axum::{
     extract::{ConnectInfo, Query, State},
     http::{header, Method, StatusCode},
@@ -22,34 +24,37 @@ use tower_http::cors::CorsLayer;
 use tower_http::trace::TraceLayer;
 
 use crate::broadcast::Broadcaster;
-use crate::config::HttpConfig;
+use crate::config::{HttpConfig, SharedHttpConfig};
 use crate::db::{DuckDbPool, Pool};
 use crate::service::{QueryOptions, QueryResult, SyncStatus};
 
 pub use rate_limit::{RateLimiter, SseConnectionGuard};
 
+pub type SharedPools = Arc<RwLock<HashMap<u64, Pool>>>;
+pub type SharedDuckDbPools = Arc<RwLock<HashMap<u64, Arc<DuckDbPool>>>>;
+
 #[derive(Clone)]
 pub struct AppState {
-    /// Map of chain_id -> pool
-    pub pools: HashMap<u64, Pool>,
+    /// Map of chain_id -> pool (hot-reloadable)
+    pub pools: SharedPools,
     /// Default chain_id (first chain)
     pub default_chain_id: u64,
     pub broadcaster: Arc<Broadcaster>,
-    /// Per-chain DuckDB pools for analytical queries
-    pub duckdb_pools: HashMap<u64, Arc<DuckDbPool>>,
+    /// Per-chain DuckDB pools for analytical queries (hot-reloadable)
+    pub duckdb_pools: SharedDuckDbPools,
     /// Rate limiter for request throttling
     pub rate_limiter: RateLimiter,
 }
 
 impl AppState {
-    fn get_pool(&self, chain_id: Option<u64>) -> Option<&Pool> {
+    async fn get_pool(&self, chain_id: Option<u64>) -> Option<Pool> {
         let id = chain_id.unwrap_or(self.default_chain_id);
-        self.pools.get(&id)
+        self.pools.read().await.get(&id).cloned()
     }
 
-    fn get_duckdb_pool(&self, chain_id: Option<u64>) -> Option<&Arc<DuckDbPool>> {
+    async fn get_duckdb_pool(&self, chain_id: Option<u64>) -> Option<Arc<DuckDbPool>> {
         let id = chain_id.unwrap_or(self.default_chain_id);
-        self.duckdb_pools.get(&id)
+        self.duckdb_pools.read().await.get(&id).cloned()
     }
 }
 
@@ -69,7 +74,28 @@ pub fn router_with_options(
         http_config.api_keys.clone(),
     );
 
-    // Spawn background cleanup task for rate limiter
+    rate_limit::spawn_cleanup_task(rate_limiter.clone());
+
+    let state = AppState {
+        pools: Arc::new(RwLock::new(pools)),
+        default_chain_id,
+        broadcaster,
+        duckdb_pools: Arc::new(RwLock::new(duckdb_pools)),
+        rate_limiter: rate_limiter.clone(),
+    };
+
+    build_router(state, rate_limiter)
+}
+
+pub fn router_shared(
+    pools: SharedPools,
+    default_chain_id: u64,
+    broadcaster: Arc<Broadcaster>,
+    duckdb_pools: SharedDuckDbPools,
+    http_config: SharedHttpConfig,
+) -> Router<()> {
+    let rate_limiter = RateLimiter::new_shared(http_config);
+
     rate_limit::spawn_cleanup_task(rate_limiter.clone());
 
     let state = AppState {
@@ -80,11 +106,14 @@ pub fn router_with_options(
         rate_limiter: rate_limiter.clone(),
     };
 
-    // Configure CORS - restrictive by default, allow configured origins
+    build_router(state, rate_limiter)
+}
+
+fn build_router(state: AppState, rate_limiter: RateLimiter) -> Router<()> {
     let cors = CorsLayer::new()
         .allow_methods([Method::GET, Method::OPTIONS])
         .allow_headers([header::CONTENT_TYPE, header::AUTHORIZATION])
-        .allow_origin(tower_http::cors::Any); // TODO: make configurable
+        .allow_origin(tower_http::cors::Any);
 
     Router::new()
         .route("/health", get(handle_health))
@@ -110,18 +139,19 @@ struct StatusResponse {
 }
 
 async fn handle_status(State(state): State<AppState>) -> Result<Json<StatusResponse>, ApiError> {
-    // Aggregate status from all chains
     let mut all_chains = Vec::new();
-    for pool in state.pools.values() {
+    let pools = state.pools.read().await;
+    for pool in pools.values() {
         if let Ok(chains) = crate::service::get_all_status(pool).await {
             all_chains.extend(chains);
         }
     }
+    drop(pools);
 
-    // Populate DuckDB status for each chain
+    let duckdb_pools = state.duckdb_pools.read().await;
     for chain in &mut all_chains {
         let chain_id = chain.chain_id as u64;
-        if let Some(duckdb_pool) = state.duckdb_pools.get(&chain_id) {
+        if let Some(duckdb_pool) = duckdb_pools.get(&chain_id) {
             if let Ok(duck_status) = crate::sync::get_sync_status(duckdb_pool).await {
                 chain.duckdb_synced_num = Some(duck_status.latest_block);
                 chain.duckdb_lag = Some(chain.synced_num - duck_status.latest_block);
@@ -193,10 +223,10 @@ async fn handle_query_once(
 ) -> Result<Json<QueryResponse>, ApiError> {
     let pool = state
         .get_pool(Some(params.chain_id))
+        .await
         .ok_or_else(|| ApiError::BadRequest(format!(
-            "Unknown chain_id: {}. Available: {:?}",
+            "Unknown chain_id: {}",
             params.chain_id,
-            state.pools.keys().collect::<Vec<_>>()
         )))?;
 
     let options = QueryOptions {
@@ -204,9 +234,10 @@ async fn handle_query_once(
         limit: params.limit.clamp(1, 100000),
     };
 
+    let duckdb_pool = state.get_duckdb_pool(Some(params.chain_id)).await;
     let result = crate::service::execute_query_with_engine(
-        pool,
-        state.get_duckdb_pool(Some(params.chain_id)),
+        &pool,
+        duckdb_pool.as_ref(),
         &params.sql,
         params.signature.as_deref(),
         &options,
@@ -238,12 +269,10 @@ async fn handle_query_live(
     addr: SocketAddr,
     headers: axum::http::HeaderMap,
 ) -> Sse<KeepAliveStream<SseStream>> {
-    // Check SSE connection limit (API key holders bypass this)
     let ip = rate_limit::extract_client_ip(&headers, Some(&addr));
-    let has_api_key = state.rate_limiter.has_valid_api_key(&headers);
+    let has_api_key = state.rate_limiter.has_valid_api_key(&headers).await;
 
     let connection_guard = if has_api_key {
-        // API key holders always get a connection
         Some(SseConnectionGuard::new_unlimited())
     } else {
         match state.rate_limiter.acquire_sse_connection(ip).await {
@@ -263,8 +292,8 @@ async fn handle_query_live(
         }
     };
 
-    let pool = match state.get_pool(Some(params.chain_id)) {
-        Some(p) => p.clone(),
+    let pool = match state.get_pool(Some(params.chain_id)).await {
+        Some(p) => p,
         None => {
             let stream: SseStream = Box::pin(async_stream::stream! {
                 yield Ok(SseEvent::default()

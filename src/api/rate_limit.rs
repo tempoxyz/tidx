@@ -12,7 +12,7 @@ use axum::{
 };
 use tokio::sync::RwLock;
 
-use crate::config::RateLimitConfig;
+use crate::config::{HttpConfig, RateLimitConfig, SharedHttpConfig};
 
 /// Rate limiter state shared across requests.
 #[derive(Clone)]
@@ -21,10 +21,10 @@ pub struct RateLimiter {
     buckets: Arc<RwLock<HashMap<IpAddr, TokenBucket>>>,
     /// Per-IP SSE connection counts
     sse_connections: Arc<RwLock<HashMap<IpAddr, u32>>>,
-    /// Valid API keys (requests with these bypass rate limiting)
-    api_keys: Arc<Vec<String>>,
-    /// Configuration
-    config: RateLimitConfig,
+    /// Shared HTTP config (hot-reloadable)
+    http_config: SharedHttpConfig,
+    /// Fallback config for non-shared mode
+    static_config: Option<HttpConfig>,
 }
 
 struct TokenBucket {
@@ -34,48 +34,72 @@ struct TokenBucket {
 
 impl RateLimiter {
     pub fn new(config: RateLimitConfig, api_keys: Vec<String>) -> Self {
+        let http_config = HttpConfig {
+            api_keys,
+            rate_limit: config,
+            ..HttpConfig::default()
+        };
         Self {
             buckets: Arc::new(RwLock::new(HashMap::new())),
             sse_connections: Arc::new(RwLock::new(HashMap::new())),
-            api_keys: Arc::new(api_keys),
-            config,
+            http_config: Arc::new(RwLock::new(http_config.clone())),
+            static_config: Some(http_config),
+        }
+    }
+
+    pub fn new_shared(http_config: SharedHttpConfig) -> Self {
+        Self {
+            buckets: Arc::new(RwLock::new(HashMap::new())),
+            sse_connections: Arc::new(RwLock::new(HashMap::new())),
+            http_config,
+            static_config: None,
         }
     }
 
     /// Check if request has a valid API key via Authorization: Bearer header.
-    pub fn has_valid_api_key(&self, headers: &HeaderMap) -> bool {
-        if self.api_keys.is_empty() {
+    pub async fn has_valid_api_key(&self, headers: &HeaderMap) -> bool {
+        let api_keys = &self.get_http_config().await.api_keys;
+        if api_keys.is_empty() {
             return false;
         }
 
         if let Some(auth) = headers.get("authorization").and_then(|v| v.to_str().ok()) {
             if let Some(key) = auth.strip_prefix("Bearer ") {
-                return self.api_keys.contains(&key.to_string());
+                return api_keys.contains(&key.to_string());
             }
         }
 
         false
     }
 
+    async fn get_http_config(&self) -> HttpConfig {
+        if let Some(ref static_cfg) = self.static_config {
+            static_cfg.clone()
+        } else {
+            self.http_config.read().await.clone()
+        }
+    }
+
     /// Check and consume a token for the given IP.
     /// Returns Ok(remaining) if allowed, Err(retry_after_secs) if rate limited.
     pub async fn check_rate_limit(&self, ip: IpAddr) -> Result<u32, u64> {
-        if !self.config.enabled {
+        let config = self.get_http_config().await.rate_limit;
+
+        if !config.enabled {
             return Ok(u32::MAX);
         }
 
         let mut buckets = self.buckets.write().await;
         let now = Instant::now();
-        let window = Duration::from_secs(self.config.window_secs);
+        let window = Duration::from_secs(config.window_secs);
 
         let bucket = buckets.entry(ip).or_insert_with(|| TokenBucket {
-            tokens: self.config.requests_per_window,
+            tokens: config.requests_per_window,
             last_refill: now,
         });
 
-        // Refill tokens if window has passed
         if now.duration_since(bucket.last_refill) >= window {
-            bucket.tokens = self.config.requests_per_window;
+            bucket.tokens = config.requests_per_window;
             bucket.last_refill = now;
         }
 
@@ -91,14 +115,16 @@ impl RateLimiter {
 
     /// Try to acquire an SSE connection slot for the given IP.
     pub async fn acquire_sse_connection(&self, ip: IpAddr) -> Result<SseConnectionGuard, ()> {
-        if !self.config.enabled {
+        let config = self.get_http_config().await.rate_limit;
+
+        if !config.enabled {
             return Ok(SseConnectionGuard::new(ip, Arc::clone(&self.sse_connections)));
         }
 
         let mut connections = self.sse_connections.write().await;
         let count = connections.entry(ip).or_insert(0);
 
-        if *count >= self.config.max_sse_connections {
+        if *count >= config.max_sse_connections {
             return Err(());
         }
 
@@ -109,15 +135,16 @@ impl RateLimiter {
     /// Periodically clean up stale entries.
     pub async fn cleanup(&self) {
         let now = Instant::now();
-        let window = Duration::from_secs(self.config.window_secs * 2);
+        let config = self.get_http_config().await.rate_limit;
+        let window = Duration::from_secs(config.window_secs * 2);
 
         let mut buckets = self.buckets.write().await;
         buckets.retain(|_, bucket| now.duration_since(bucket.last_refill) < window);
     }
 
     /// Get current config for rate limit headers.
-    pub fn config(&self) -> &RateLimitConfig {
-        &self.config
+    pub async fn get_rate_limit_config(&self) -> RateLimitConfig {
+        self.get_http_config().await.rate_limit
     }
 }
 
@@ -194,8 +221,7 @@ pub async fn rate_limit_middleware(
 ) -> Response {
     let headers = request.headers();
 
-    // API key holders bypass rate limiting
-    if limiter.has_valid_api_key(headers) {
+    if limiter.has_valid_api_key(headers).await {
         return next.run(request).await;
     }
 
@@ -203,16 +229,15 @@ pub async fn rate_limit_middleware(
 
     match limiter.check_rate_limit(ip).await {
         Ok(remaining) => {
+            let config = limiter.get_rate_limit_config().await;
             let mut response = next.run(request).await;
             let headers = response.headers_mut();
-            headers.insert(
-                "ratelimit-limit",
-                limiter.config().requests_per_window.into(),
-            );
+            headers.insert("ratelimit-limit", config.requests_per_window.into());
             headers.insert("ratelimit-remaining", remaining.into());
             response
         }
         Err(retry_after) => {
+            let config = limiter.get_rate_limit_config().await;
             let body = serde_json::json!({
                 "ok": false,
                 "error": "Rate limit exceeded",
@@ -222,7 +247,7 @@ pub async fn rate_limit_middleware(
                 StatusCode::TOO_MANY_REQUESTS,
                 [
                     ("retry-after", retry_after.to_string()),
-                    ("ratelimit-limit", limiter.config().requests_per_window.to_string()),
+                    ("ratelimit-limit", config.requests_per_window.to_string()),
                     ("ratelimit-remaining", "0".to_string()),
                 ],
                 Json(body),

@@ -66,6 +66,9 @@ rust_decimal = { version = "1.40.0", features = ["db-tokio-postgres"] }
 # Random
 rand = "0.9"
 url = "2.5.8"
+
+# File watching
+notify = "8"
 sqlparser = { version = "0.60.0", features = ["visitor"] }
 regex-lite = "0.1.8"
 

@@ -1,3 +1,7 @@
+mod watcher;
+
+pub use watcher::{ConfigWatcher, NewChainEvent, SharedHttpConfig};
+
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
@@ -51,7 +55,7 @@ impl Default for HttpConfig {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RateLimitConfig {
     /// Enable rate limiting (default: true)
     #[serde(default = "default_true")]
