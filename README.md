@@ -146,6 +146,13 @@ ak47 uses a `config.toml` file to configure the indexer.
 enabled = true
 port = 8080
 bind = "0.0.0.0"
+api_keys = ["your-secret-api-key"]  # Optional: keys that bypass rate limiting
+
+[http.rate_limit]
+enabled = true
+requests_per_window = 100  
+window_secs = 60           
+max_sse_connections = 5    
 
 [prometheus]
 enabled = true
@@ -179,6 +186,20 @@ HTTP server configuration
 | `enabled` | bool | `true` | Enable HTTP API server |
 | `port` | u16 | `8080` | HTTP server port |
 | `bind` | string | `"0.0.0.0"` | Bind address |
+| `api_keys` | string[] | `[]` | API keys that bypass rate limiting |
+
+#### `[http.rate_limit]`
+
+Rate limiting configuration for unauthenticated requests
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `enabled` | bool | `true` | Enable rate limiting |
+| `requests_per_window` | u32 | `100` | Max requests per window |
+| `window_secs` | u64 | `60` | Rate limit window in seconds |
+| `max_sse_connections` | u32 | `5` | Max concurrent SSE connections per IP |
+
+**Authentication:** Pass API key via `Authorization: Bearer <key>` header.
 
 #### `[prometheus]`
 

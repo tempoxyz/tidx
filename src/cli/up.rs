@@ -108,8 +108,13 @@ pub async fn run(args: Args) -> Result<()> {
     if config.http.enabled {
         if !pools_map.is_empty() {
             let addr: SocketAddr = format!("{}:{}", config.http.bind, config.http.port).parse()?;
-            let router =
-                api::router_with_options(pools_map, default_chain_id, broadcaster.clone(), duckdb_pools_map);
+            let router = api::router_with_options(
+                pools_map,
+                default_chain_id,
+                broadcaster.clone(),
+                duckdb_pools_map,
+                &config.http,
+            );
 
             info!(addr = %addr, "Starting HTTP API server");
 
@@ -117,12 +122,15 @@ pub async fn run(args: Args) -> Result<()> {
             let mut shutdown_rx_api = shutdown_tx.subscribe();
 
             tokio::spawn(async move {
-                axum::serve(listener, router)
-                    .with_graceful_shutdown(async move {
-                        let _ = shutdown_rx_api.recv().await;
-                    })
-                    .await
-                    .ok();
+                axum::serve(
+                    listener,
+                    router.into_make_service_with_connect_info::<SocketAddr>(),
+                )
+                .with_graceful_shutdown(async move {
+                    let _ = shutdown_rx_api.recv().await;
+                })
+                .await
+                .ok();
             });
         }
     }

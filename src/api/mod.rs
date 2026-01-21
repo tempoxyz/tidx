@@ -1,10 +1,14 @@
+mod rate_limit;
+
 use std::collections::HashMap;
 use std::convert::Infallible;
+use std::net::SocketAddr;
 use std::sync::Arc;
 
 use axum::{
-    extract::{Query, State},
-    http::StatusCode,
+    extract::{ConnectInfo, Query, State},
+    http::{header, Method, StatusCode},
+    middleware,
     response::{
         sse::{Event as SseEvent, KeepAlive, KeepAliveStream},
         IntoResponse, Response, Sse,
@@ -18,8 +22,11 @@ use tower_http::cors::CorsLayer;
 use tower_http::trace::TraceLayer;
 
 use crate::broadcast::Broadcaster;
+use crate::config::HttpConfig;
 use crate::db::{DuckDbPool, Pool};
 use crate::service::{QueryOptions, QueryResult, SyncStatus};
+
+pub use rate_limit::{RateLimiter, SseConnectionGuard};
 
 #[derive(Clone)]
 pub struct AppState {
@@ -30,6 +37,8 @@ pub struct AppState {
     pub broadcaster: Arc<Broadcaster>,
     /// Per-chain DuckDB pools for analytical queries
     pub duckdb_pools: HashMap<u64, Arc<DuckDbPool>>,
+    /// Rate limiter for request throttling
+    pub rate_limiter: RateLimiter,
 }
 
 impl AppState {
@@ -44,8 +53,8 @@ impl AppState {
     }
 }
 
-pub fn router(pools: HashMap<u64, Pool>, default_chain_id: u64, broadcaster: Arc<Broadcaster>) -> Router {
-    router_with_options(pools, default_chain_id, broadcaster, HashMap::new())
+pub fn router(pools: HashMap<u64, Pool>, default_chain_id: u64, broadcaster: Arc<Broadcaster>) -> Router<()> {
+    router_with_options(pools, default_chain_id, broadcaster, HashMap::new(), &HttpConfig::default())
 }
 
 pub fn router_with_options(
@@ -53,14 +62,39 @@ pub fn router_with_options(
     default_chain_id: u64,
     broadcaster: Arc<Broadcaster>,
     duckdb_pools: HashMap<u64, Arc<DuckDbPool>>,
-) -> Router {
-    let state = AppState { pools, default_chain_id, broadcaster, duckdb_pools };
+    http_config: &HttpConfig,
+) -> Router<()> {
+    let rate_limiter = RateLimiter::new(
+        http_config.rate_limit.clone(),
+        http_config.api_keys.clone(),
+    );
+
+    // Spawn background cleanup task for rate limiter
+    rate_limit::spawn_cleanup_task(rate_limiter.clone());
+
+    let state = AppState {
+        pools,
+        default_chain_id,
+        broadcaster,
+        duckdb_pools,
+        rate_limiter: rate_limiter.clone(),
+    };
+
+    // Configure CORS - restrictive by default, allow configured origins
+    let cors = CorsLayer::new()
+        .allow_methods([Method::GET, Method::OPTIONS])
+        .allow_headers([header::CONTENT_TYPE, header::AUTHORIZATION])
+        .allow_origin(tower_http::cors::Any); // TODO: make configurable
 
     Router::new()
         .route("/health", get(handle_health))
         .route("/status", get(handle_status))
         .route("/query", get(handle_query))
-        .layer(CorsLayer::permissive())
+        .layer(middleware::from_fn_with_state(
+            rate_limiter,
+            rate_limit::rate_limit_middleware,
+        ))
+        .layer(cors)
         .layer(TraceLayer::new_for_http())
         .with_state(state)
 }
@@ -142,10 +176,12 @@ struct QueryResponse {
 
 async fn handle_query(
     State(state): State<AppState>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    headers: axum::http::HeaderMap,
     Query(params): Query<QueryParams>,
 ) -> Response {
     if params.live {
-        handle_query_live(state, params).await.into_response()
+        handle_query_live(state, params, addr, headers).await.into_response()
     } else {
         handle_query_once(state, params).await.into_response()
     }
@@ -193,10 +229,40 @@ async fn handle_query_once(
 
 type SseStream = std::pin::Pin<Box<dyn Stream<Item = Result<SseEvent, Infallible>> + Send>>;
 
+/// Maximum blocks to catch up in a single update (prevents query multiplication attack)
+const MAX_CATCHUP_BLOCKS: u64 = 10;
+
 async fn handle_query_live(
     state: AppState,
     params: QueryParams,
+    addr: SocketAddr,
+    headers: axum::http::HeaderMap,
 ) -> Sse<KeepAliveStream<SseStream>> {
+    // Check SSE connection limit (API key holders bypass this)
+    let ip = rate_limit::extract_client_ip(&headers, Some(&addr));
+    let has_api_key = state.rate_limiter.has_valid_api_key(&headers);
+
+    let connection_guard = if has_api_key {
+        // API key holders always get a connection
+        Some(SseConnectionGuard::new_unlimited())
+    } else {
+        match state.rate_limiter.acquire_sse_connection(ip).await {
+            Ok(guard) => Some(guard),
+            Err(()) => {
+                let stream: SseStream = Box::pin(async_stream::stream! {
+                    yield Ok(SseEvent::default()
+                        .event("error")
+                        .json_data(serde_json::json!({
+                            "ok": false,
+                            "error": "Too many SSE connections from this IP"
+                        }))
+                        .unwrap());
+                });
+                return Sse::new(stream).keep_alive(KeepAlive::default());
+            }
+        }
+    };
+
     let pool = match state.get_pool(Some(params.chain_id)) {
         Some(p) => p.clone(),
         None => {
@@ -219,6 +285,8 @@ async fn handle_query_live(
     };
 
     let stream = async_stream::stream! {
+        // Keep guard alive for the lifetime of the stream
+        let _guard = connection_guard;
         let mut last_block_num: u64 = 0;
 
         // Execute initial query (DuckDB not used in live queries - need fresh data)
@@ -256,7 +324,21 @@ async fn handle_query_live(
                     let start = last_block_num + 1;
                     let end = update.block_num;
 
-                    for block_num in start..=end {
+                    // Limit catch-up to prevent query multiplication DoS
+                    let blocks_behind = end - start + 1;
+                    if blocks_behind > MAX_CATCHUP_BLOCKS {
+                        yield Ok(SseEvent::default()
+                            .event("lagged")
+                            .json_data(serde_json::json!({
+                                "skipped": blocks_behind - MAX_CATCHUP_BLOCKS,
+                                "reason": "catch-up limit exceeded"
+                            }))
+                            .unwrap());
+                        last_block_num = end - MAX_CATCHUP_BLOCKS;
+                    }
+
+                    let catch_up_start = last_block_num + 1;
+                    for block_num in catch_up_start..=end {
                         let filtered_sql = inject_block_filter(&sql, block_num);
                         match crate::service::execute_query(&pool, None, &filtered_sql, signature.as_deref(), &options).await {
                             Ok(result) => {
