@@ -522,6 +522,7 @@ async fn test_sync_state_save_and_load() {
         synced_num: 800,
         tip_num: 950,
         backfill_num: Some(100),
+        sync_rate: None,
         started_at: Some(chrono::Utc::now()),
     };
 
@@ -544,6 +545,7 @@ async fn test_sync_state_methods() {
         synced_num: 800,
         tip_num: 950,
         backfill_num: Some(100),
+        sync_rate: None,
         started_at: None,
     };
 

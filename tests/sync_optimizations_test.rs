@@ -246,17 +246,17 @@ async fn test_copy_large_batch_logs() {
 
 #[tokio::test]
 #[serial(db)]
-async fn test_copy_idempotent() {
+async fn test_delete_copy_idempotent() {
     let db = TestDb::empty().await;
     db.truncate_all().await;
 
-    // Test that duplicate inserts are handled (ON CONFLICT DO NOTHING via staging)
+    // Test that rewriting the same block range is idempotent (DELETE + COPY)
     let blocks = generate_blocks(1, 70_000_000);
     write_blocks(&db.pool, &blocks).await.unwrap();
 
     let txs = generate_txs(100, 70_000_000);
     write_txs(&db.pool, &txs).await.unwrap();
-    write_txs(&db.pool, &txs).await.unwrap(); // Second insert should be no-op
+    write_txs(&db.pool, &txs).await.unwrap(); // Second write should delete and reinsert
 
     let conn = db.pool.get().await.unwrap();
     let count: i64 = conn
@@ -265,7 +265,101 @@ async fn test_copy_idempotent() {
         .unwrap()
         .get(0);
 
-    assert_eq!(count, 100, "Duplicate inserts should be ignored");
+    assert_eq!(count, 100, "Rewrite should have exactly 100 txs");
+}
+
+#[tokio::test]
+#[serial(db)]
+async fn test_delete_copy_overwrites_existing_data() {
+    let db = TestDb::empty().await;
+    db.truncate_all().await;
+
+    let blocks = generate_blocks(1, 71_000_000);
+    write_blocks(&db.pool, &blocks).await.unwrap();
+
+    // Write initial logs with specific selector
+    let mut logs = generate_logs(50, 71_000_000);
+    for log in &mut logs {
+        log.selector = Some(vec![0xaa, 0xbb, 0xcc, 0xdd]);
+    }
+    write_logs(&db.pool, &logs).await.unwrap();
+
+    // Verify initial selector
+    let conn = db.pool.get().await.unwrap();
+    let initial: Vec<u8> = conn
+        .query_one("SELECT selector FROM logs WHERE block_num = 71000000 LIMIT 1", &[])
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(initial, vec![0xaa, 0xbb, 0xcc, 0xdd]);
+
+    // Rewrite with different selector - should DELETE old and INSERT new
+    for log in &mut logs {
+        log.selector = Some(vec![0x11, 0x22, 0x33, 0x44]);
+    }
+    write_logs(&db.pool, &logs).await.unwrap();
+
+    // Verify data was replaced
+    let updated: Vec<u8> = conn
+        .query_one("SELECT selector FROM logs WHERE block_num = 71000000 LIMIT 1", &[])
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(updated, vec![0x11, 0x22, 0x33, 0x44], "Data should be overwritten");
+
+    let count: i64 = conn
+        .query_one("SELECT COUNT(*) FROM logs WHERE block_num = 71000000", &[])
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(count, 50, "Should still have exactly 50 logs");
+}
+
+#[tokio::test]
+#[serial(db)]
+async fn test_delete_copy_handles_block_range() {
+    let db = TestDb::empty().await;
+    db.truncate_all().await;
+
+    // Write blocks 72_000_000 to 72_000_009
+    let blocks = generate_blocks(10, 72_000_000);
+    write_blocks(&db.pool, &blocks).await.unwrap();
+
+    // Write txs for blocks 0-4
+    let txs_first: Vec<_> = (0..5)
+        .flat_map(|i| generate_txs(10, 72_000_000 + i))
+        .collect();
+    write_txs(&db.pool, &txs_first).await.unwrap();
+
+    // Write txs for blocks 3-7 (overlapping range)
+    let txs_second: Vec<_> = (3..8)
+        .flat_map(|i| generate_txs(20, 72_000_000 + i))
+        .collect();
+    write_txs(&db.pool, &txs_second).await.unwrap();
+
+    let conn = db.pool.get().await.unwrap();
+
+    // Blocks 0-2 should still have 10 txs each (untouched)
+    let count_0_2: i64 = conn
+        .query_one(
+            "SELECT COUNT(*) FROM txs WHERE block_num >= 72000000 AND block_num <= 72000002",
+            &[],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(count_0_2, 30, "Blocks 0-2 should have 10 txs each");
+
+    // Blocks 3-7 should have 20 txs each (overwritten)
+    let count_3_7: i64 = conn
+        .query_one(
+            "SELECT COUNT(*) FROM txs WHERE block_num >= 72000003 AND block_num <= 72000007",
+            &[],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(count_3_7, 100, "Blocks 3-7 should have 20 txs each");
 }
 
 #[tokio::test]
