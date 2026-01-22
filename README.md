@@ -1,7 +1,3 @@
-<p align="center">
-  <img src=".github/banner.png" alt="ak47" width="100%" />
-</p>
-
 <h1 align="center">ak47</h1>
 
 <p align="center">
