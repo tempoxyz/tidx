@@ -1,9 +1,6 @@
-name: Release
+name: Create Release
 
 on:
-  push:
-    tags:
-      - "v*"
   workflow_dispatch:
     inputs:
       version:
@@ -14,68 +11,17 @@ on:
           - minor
           - major
 
-env:
-  CARGO_TERM_COLOR: always
-
 jobs:
-  docker:
-    name: Build Docker
+  calculate-version:
+    name: Calculate Version
     runs-on: ubuntu-latest
-    permissions:
-      contents: read
-      packages: write
-
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
-
-      - name: Log in to GHCR
-        uses: docker/login-action@v3
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Extract metadata
-        id: meta
-        uses: docker/metadata-action@v5
-        with:
-          images: ghcr.io/${{ github.repository }}
-          tags: |
-            type=semver,pattern={{version}}
-            type=semver,pattern={{major}}.{{minor}}
-            type=semver,pattern={{major}}
-            type=sha,prefix=
-            type=raw,value=latest,enable={{is_default_branch}}
-
-      - name: Build and push
-        uses: docker/build-push-action@v6
-        with:
-          context: .
-          platforms: linux/amd64
-          push: true
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
-
-  release:
-    name: Create Release
-    needs: [docker]
-    runs-on: ubuntu-latest
-    permissions:
-      contents: write
     outputs:
       version: ${{ steps.version.outputs.version }}
-
     steps:
       - uses: actions/checkout@v4
 
-      - name: Bump version
+      - name: Calculate version
         id: version
-        if: github.event_name == 'workflow_dispatch'
         run: |
           CURRENT=$(grep '^version = ' Cargo.toml | head -1 | sed 's/version = "\(.*\)"/\1/')
           MAJOR=$(echo $CURRENT | cut -d. -f1)
@@ -88,23 +34,47 @@ jobs:
             patch) NEW="$MAJOR.$MINOR.$((PATCH + 1))" ;;
           esac
           
-          echo "Bumping $CURRENT -> $NEW"
-          sed -i "s/^version = \"$CURRENT\"/version = \"$NEW\"/" Cargo.toml
+          echo "New version: $NEW"
           echo "version=$NEW" >> $GITHUB_OUTPUT
 
-      - name: Commit and tag
-        if: github.event_name == 'workflow_dispatch'
+  publish-docker:
+    needs: [calculate-version]
+    uses: ./.github/workflows/docker.yml
+    permissions:
+      contents: read
+      packages: write
+    with:
+      version: v${{ needs.calculate-version.outputs.version }}
+
+  release:
+    name: Create Release
+    needs: [calculate-version, publish-docker]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Bump version
         run: |
+          VERSION="${{ needs.calculate-version.outputs.version }}"
+          CURRENT=$(grep '^version = ' Cargo.toml | head -1 | sed 's/version = "\(.*\)"/\1/')
+          sed -i "s/^version = \"$CURRENT\"/version = \"$VERSION\"/" Cargo.toml
+
+      - name: Commit and tag
+        run: |
+          VERSION="${{ needs.calculate-version.outputs.version }}"
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add Cargo.toml
-          git commit -m "chore: release v${{ steps.version.outputs.version }}"
-          git tag -a "v${{ steps.version.outputs.version }}" -m "Release v${{ steps.version.outputs.version }}"
+          git commit -m "chore: release v$VERSION"
+          git tag -a "v$VERSION" -m "Release v$VERSION"
           git push
-          git push origin "v${{ steps.version.outputs.version }}"
+          git push origin "v$VERSION"
 
       - name: Create Release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ steps.version.outputs.version && format('v{0}', steps.version.outputs.version) || github.ref_name }}
+          tag_name: v${{ needs.calculate-version.outputs.version }}
           generate_release_notes: true
