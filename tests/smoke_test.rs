@@ -3,10 +3,10 @@ mod common;
 use common::tempo::TempoNode;
 use common::testdb::TestDb;
 
-use ak47::query::EventSignature;
-use ak47::sync::engine::SyncEngine;
-use ak47::sync::writer::{detect_gaps, get_block_hash, load_sync_state, save_sync_state, update_synced_num, update_tip_num};
-use ak47::types::SyncState;
+use tidx::query::EventSignature;
+use tidx::sync::engine::SyncEngine;
+use tidx::sync::writer::{detect_gaps, get_block_hash, load_sync_state, save_sync_state, update_synced_num, update_tip_num};
+use tidx::types::SyncState;
 use serial_test::serial;
 
 #[tokio::test]
@@ -857,8 +857,8 @@ async fn test_seeded_receipt_stats() {
 // ============================================================================
 
 use std::sync::Arc;
-use ak47::db::DuckDbPool;
-use ak47::service::{execute_query_with_engine, QueryOptions};
+use tidx::db::DuckDbPool;
+use tidx::service::{execute_query_with_engine, QueryOptions};
 
 fn default_options() -> QueryOptions {
     QueryOptions { timeout_ms: 5000, limit: 1000 }

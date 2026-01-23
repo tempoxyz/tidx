@@ -1,4 +1,4 @@
-<h1 align="center">ak47</h1>
+<h1 align="center">tidx</h1>
 
 <p align="center">
   <strong>Indexer for Tempo</strong>
@@ -15,7 +15,7 @@
 
 ---
 
-**ak47** indexes [Tempo](https://tempo.xyz) chain data into a hybrid PostgreSQL + DuckDB architecture for fast point lookups (OLTP) and lightning-fast analytics (OLAP). 
+**tidx** indexes [Tempo](https://tempo.xyz) chain data into a hybrid PostgreSQL + DuckDB architecture for fast point lookups (OLTP) and lightning-fast analytics (OLAP). 
 
 ## Features
 
@@ -49,29 +49,29 @@
 ### Install
 
 ```bash
-curl -L https://ak47.tempo.xyz/install | bash
+curl -L https://tidx.tempo.xyz/install | bash
 ```
 
 ### Run
 
 ```bash
 # Initialize config
-ak47 init
+tidx init
 
 # Start indexing
-ak47 up
+tidx up
 
 # Check status
-ak47 status
+tidx status
 ```
 
 ## Overview
 
-ak47 uses a hybrid PostgreSQL + DuckDB architecture that automatically routes queries to the optimal engine:
+tidx uses a hybrid PostgreSQL + DuckDB architecture that automatically routes queries to the optimal engine:
 
 ```
                            ┌─────────────────┐
-                           │   ak47 Router   │
+                           │   tidx Router   │
                            └────────┬────────┘
                                     │
          ┌──────────────────────────┴──────────────────────────┐
@@ -95,27 +95,27 @@ ak47 uses a hybrid PostgreSQL + DuckDB architecture that automatically routes qu
 ### Quick Install
 
 ```bash
-curl -L https://ak47.tempo.xyz/install | bash
+curl -L https://tidx.tempo.xyz/install | bash
 ```
 
 ### Docker
 
 ```bash
-docker pull ghcr.io/tempoxyz/ak47:latest
-docker run -v $(pwd)/config.toml:/config.toml ghcr.io/tempoxyz/ak47 up
+docker pull ghcr.io/tempoxyz/tidx:latest
+docker run -v $(pwd)/config.toml:/config.toml ghcr.io/tempoxyz/tidx up
 ```
 
 ### From Source
 
 ```bash
-git clone https://github.com/tempoxyz/ak47
-cd ak47
+git clone https://github.com/tempoxyz/tidx
+cd tidx
 cargo build --release
 ```
 
 ## Configuration
 
-ak47 uses a `config.toml` file to configure the indexer.
+tidx uses a `config.toml` file to configure the indexer.
 
 ### Example
 
@@ -142,7 +142,7 @@ port = 9090
 name = "mainnet"
 chain_id = 4217
 rpc_url = "https://rpc.tempo.xyz"
-pg_url = "postgres://user:pass@localhost:5432/ak47_mainnet"
+pg_url = "postgres://user:pass@localhost:5432/tidx_mainnet"
 duckdb_path = "/data/mainnet.duckdb"  # Optional: enables OLAP queries
 batch_size = 100
 
@@ -150,7 +150,7 @@ batch_size = 100
 name = "moderato"
 chain_id = 42431
 rpc_url = "https://rpc.moderato.tempo.xyz"
-pg_url = "postgres://user:pass@localhost:5432/ak47_moderato"
+pg_url = "postgres://user:pass@localhost:5432/tidx_moderato"
 duckdb_path = "/data/moderato.duckdb"
 ```
 
@@ -184,7 +184,7 @@ duckdb_path = "/data/moderato.duckdb"
 ## CLI
 
 ```
-Usage: ak47 <COMMAND>
+Usage: tidx <COMMAND>
 
 Commands:
   init         Initialize a new config.toml
@@ -197,12 +197,12 @@ Options:
   -h, --help  Print help
 ```
 
-### `ak47 init`
+### `tidx init`
 
 ```
 Initialize a new config.toml
 
-Usage: ak47 init [OPTIONS]
+Usage: tidx init [OPTIONS]
 
 Options:
   -o, --output <OUTPUT>  Output path for config file [default: config.toml]
@@ -210,24 +210,24 @@ Options:
   -h, --help             Print help
 ```
 
-### `ak47 up`
+### `tidx up`
 
 ```
 Start syncing blocks from the chain (continuous) and serve HTTP API
 
-Usage: ak47 up [OPTIONS]
+Usage: tidx up [OPTIONS]
 
 Options:
   -c, --config <CONFIG>  Path to config file [default: config.toml]
   -h, --help             Print help
 ```
 
-### `ak47 status`
+### `tidx status`
 
 ```
 Show sync status
 
-Usage: ak47 status [OPTIONS]
+Usage: tidx status [OPTIONS]
 
 Options:
   -c, --config <CONFIG>  Path to config file [default: config.toml]
@@ -236,12 +236,12 @@ Options:
   -h, --help             Print help
 ```
 
-### `ak47 query`
+### `tidx query`
 
 ```
 Run a SQL query (use --signature to decode event logs)
 
-Usage: ak47 query [OPTIONS] <SQL>
+Usage: tidx query [OPTIONS] <SQL>
 
 Arguments:
   <SQL>  SQL query (SELECT only). Use event name from --signature as table
@@ -260,23 +260,23 @@ Options:
 
 ```bash
 # Start with config
-ak47 up --config config.toml
+tidx up --config config.toml
 
 # Watch sync status (updates every second)
-ak47 status --watch
+tidx status --watch
 
 # Run SQL query
-ak47 query "SELECT COUNT(*) FROM txs"
+tidx query "SELECT COUNT(*) FROM txs"
 
 # Query with event decoding
-ak47 query \
+tidx query \
   --signature "Transfer(address indexed from, address indexed to, uint256 value)" \
   "SELECT * FROM Transfer LIMIT 10"
 ```
 
 ## HTTP API
 
-ak47 exposes a HTTP API for querying the indexer.
+tidx exposes a HTTP API for querying the indexer.
 
 ### Examples
 
@@ -397,7 +397,7 @@ All tables use composite primary keys with timestamps for efficient range querie
 
 ## Sync Architecture
 
-ak47 uses two concurrent sync operations: **Realtime** follows the chain head, while **Gap Sync** fills all missing blocks from most recent to earliest.
+tidx uses two concurrent sync operations: **Realtime** follows the chain head, while **Gap Sync** fills all missing blocks from most recent to earliest.
 
 ```
 Block Numbers:  0                                                              HEAD

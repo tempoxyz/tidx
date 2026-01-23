@@ -1,9 +1,9 @@
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 use tokio::runtime::Runtime;
 
-use ak47::db::{create_pool, run_migrations};
-use ak47::sync::writer::{write_blocks, write_logs, write_txs};
-use ak47::types::{BlockRow, LogRow, TxRow};
+use tidx::db::{create_pool, run_migrations};
+use tidx::sync::writer::{write_blocks, write_logs, write_txs};
+use tidx::types::{BlockRow, LogRow, TxRow};
 
 fn generate_blocks(count: usize, offset: usize) -> Vec<BlockRow> {
     (0..count)

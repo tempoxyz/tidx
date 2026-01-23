@@ -1,17 +1,17 @@
 [package]
-name = "ak47"
+name = "tidx"
 version = "0.0.11"
 edition = "2024"
 license = "MIT"
-repository = "https://github.com/tempoxyz/ak47"
+repository = "https://github.com/tempoxyz/tidx"
 description = "High-throughput Tempo blockchain indexer"
 
 [[bin]]
-name = "ak47"
+name = "tidx"
 path = "src/main.rs"
 
 [lib]
-name = "ak47"
+name = "tidx"
 path = "src/lib.rs"
 
 [dependencies]

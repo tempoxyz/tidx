@@ -25,7 +25,7 @@ RUN apt-get update && apt-get install -y \
     libstdc++6 \
     && rm -rf /var/lib/apt/lists/*
 
-COPY --from=builder /app/target/release/ak47 /usr/local/bin/
+COPY --from=builder /app/target/release/tidx /usr/local/bin/
 COPY --from=builder /app/db /db
 
-ENTRYPOINT ["ak47"]
+ENTRYPOINT ["tidx"]

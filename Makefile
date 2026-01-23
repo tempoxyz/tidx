@@ -24,7 +24,7 @@ up:
 	@$(COMPOSE) up -d
 ifeq ($(LOCALNET),1)
 	@echo "Waiting for PostgreSQL..."
-	@until $(COMPOSE) exec -T postgres pg_isready -U ak47 -d ak47 > /dev/null 2>&1; do sleep 1; done
+	@until $(COMPOSE) exec -T postgres pg_isready -U tidx -d tidx > /dev/null 2>&1; do sleep 1; done
 	@echo "✓ Ready."
 endif
 
@@ -34,7 +34,7 @@ down:
 
 # Tail indexer logs
 logs:
-	@$(COMPOSE) logs -f ak47
+	@$(COMPOSE) logs -f tidx
 
 # ============================================================================
 # Data
@@ -74,7 +74,7 @@ seed-heavy:
 
 # Build Docker image
 build:
-	@$(COMPOSE) build ak47
+	@$(COMPOSE) build tidx
 
 # Run clippy lints
 check:
@@ -87,13 +87,13 @@ LOCALNET_COMPOSE := docker compose -f docker/local/docker-compose.yml
 test:
 	@$(LOCALNET_COMPOSE) up -d postgres tempo
 	@echo "Waiting for PostgreSQL..."
-	@until $(LOCALNET_COMPOSE) exec -T postgres pg_isready -U ak47 -d postgres > /dev/null 2>&1; do sleep 1; done
-	@$(LOCALNET_COMPOSE) exec -T postgres psql -U ak47 -d postgres -c "CREATE DATABASE ak47" > /dev/null 2>&1 || true
+	@until $(LOCALNET_COMPOSE) exec -T postgres pg_isready -U tidx -d postgres > /dev/null 2>&1; do sleep 1; done
+	@$(LOCALNET_COMPOSE) exec -T postgres psql -U tidx -d postgres -c "CREATE DATABASE tidx" > /dev/null 2>&1 || true
 	@echo "Waiting for Tempo..."
 	@until curl -s http://localhost:8545 -X POST -H "Content-Type: application/json" \
 		-d '{"jsonrpc":"2.0","method":"eth_blockNumber","params":[],"id":1}' | grep -q result; do sleep 1; done
 	@echo "Running tests..."
-	@DATABASE_URL=postgres://ak47:ak47@localhost:5433/ak47 RPC_URL=http://localhost:8545 \
+	@DATABASE_URL=postgres://tidx:tidx@localhost:5433/tidx RPC_URL=http://localhost:8545 \
 		cargo test -- --test-threads=1 --nocapture
 
 # Benchmark parameters
@@ -102,7 +102,7 @@ BENCH_ARTIFACT ?= .bench_seed.dump
 
 # Check if benchmark data exists, restore from artifact or generate fresh
 define check_bench_data
-	@TX_COUNT=$$($(LOCALNET_COMPOSE) exec -T postgres psql -U ak47 -d ak47 -tAc "SELECT COUNT(*) FROM txs" 2>/dev/null || echo "0"); \
+	@TX_COUNT=$$($(LOCALNET_COMPOSE) exec -T postgres psql -U tidx -d tidx -tAc "SELECT COUNT(*) FROM txs" 2>/dev/null || echo "0"); \
 	if [ "$$TX_COUNT" -ge 1000000 ]; then \
 		echo "Using existing data ($$TX_COUNT txs)"; \
 	elif [ -f "$(BENCH_ARTIFACT)" ]; then \
@@ -120,14 +120,14 @@ bench-gen:
 	@START_TIME=$$(date +%s); \
 	$(LOCALNET_COMPOSE) up -d postgres; \
 	echo "Waiting for PostgreSQL..."; \
-	until $(LOCALNET_COMPOSE) exec -T postgres pg_isready -U ak47 -d postgres > /dev/null 2>&1; do sleep 1; done; \
-	$(LOCALNET_COMPOSE) exec -T postgres psql -U ak47 -d postgres -c "DROP DATABASE IF EXISTS ak47_test WITH (FORCE)" > /dev/null 2>&1 || true; \
-	$(LOCALNET_COMPOSE) exec -T postgres psql -U ak47 -d postgres -c "CREATE DATABASE ak47_test" > /dev/null; \
+	until $(LOCALNET_COMPOSE) exec -T postgres pg_isready -U tidx -d postgres > /dev/null 2>&1; do sleep 1; done; \
+	$(LOCALNET_COMPOSE) exec -T postgres psql -U tidx -d postgres -c "DROP DATABASE IF EXISTS tidx_test WITH (FORCE)" > /dev/null 2>&1 || true; \
+	$(LOCALNET_COMPOSE) exec -T postgres psql -U tidx -d postgres -c "CREATE DATABASE tidx_test" > /dev/null; \
 	echo "Seeding $(BENCH_TXS) synthetic transactions..."; \
-	SEED_TXS=$(BENCH_TXS) DATABASE_URL=postgres://ak47:ak47@localhost:5433/ak47_test \
+	SEED_TXS=$(BENCH_TXS) DATABASE_URL=postgres://tidx:tidx@localhost:5433/tidx_test \
 		cargo test --release --test seed_bench -- --ignored --nocapture; \
 	echo "Dumping to artifact..."; \
-	$(LOCALNET_COMPOSE) exec -T postgres pg_dump -U ak47 -Fc ak47_test > $(BENCH_ARTIFACT); \
+	$(LOCALNET_COMPOSE) exec -T postgres pg_dump -U tidx -Fc tidx_test > $(BENCH_ARTIFACT); \
 	END_TIME=$$(date +%s); \
 	ELAPSED=$$((END_TIME - START_TIME)); \
 	MINS=$$((ELAPSED / 60)); \
@@ -135,29 +135,29 @@ bench-gen:
 	echo ""; \
 	echo "=== Completed in $${MINS}m $${SECS}s ==="; \
 	echo "Artifact: $(BENCH_ARTIFACT) ($$(du -h $(BENCH_ARTIFACT) | cut -f1))"; \
-	$(LOCALNET_COMPOSE) exec -T postgres psql -U ak47 -d ak47_test -c "SELECT COUNT(*) as blocks FROM blocks; SELECT COUNT(*) as txs FROM txs; SELECT COUNT(*) as logs FROM logs;"
+	$(LOCALNET_COMPOSE) exec -T postgres psql -U tidx -d tidx_test -c "SELECT COUNT(*) as blocks FROM blocks; SELECT COUNT(*) as txs FROM txs; SELECT COUNT(*) as logs FROM logs;"
 
 # Internal: restore from artifact (fast)
 _bench_restore:
 	@$(LOCALNET_COMPOSE) up -d postgres
-	@until $(LOCALNET_COMPOSE) exec -T postgres pg_isready -U ak47 -d postgres > /dev/null 2>&1; do sleep 1; done
-	@$(LOCALNET_COMPOSE) exec -T postgres psql -U ak47 -d postgres -c "DROP DATABASE IF EXISTS ak47 WITH (FORCE)" > /dev/null 2>&1 || true
-	@$(LOCALNET_COMPOSE) exec -T postgres psql -U ak47 -d postgres -c "CREATE DATABASE ak47" > /dev/null
-	@cat $(BENCH_ARTIFACT) | $(LOCALNET_COMPOSE) exec -T postgres pg_restore -U ak47 -d ak47 --no-owner --no-acl 2>/dev/null || true
-	@TX_COUNT=$$($(LOCALNET_COMPOSE) exec -T postgres psql -U ak47 -d ak47 -tAc "SELECT COUNT(*) FROM txs"); \
+	@until $(LOCALNET_COMPOSE) exec -T postgres pg_isready -U tidx -d postgres > /dev/null 2>&1; do sleep 1; done
+	@$(LOCALNET_COMPOSE) exec -T postgres psql -U tidx -d postgres -c "DROP DATABASE IF EXISTS tidx WITH (FORCE)" > /dev/null 2>&1 || true
+	@$(LOCALNET_COMPOSE) exec -T postgres psql -U tidx -d postgres -c "CREATE DATABASE tidx" > /dev/null
+	@cat $(BENCH_ARTIFACT) | $(LOCALNET_COMPOSE) exec -T postgres pg_restore -U tidx -d tidx --no-owner --no-acl 2>/dev/null || true
+	@TX_COUNT=$$($(LOCALNET_COMPOSE) exec -T postgres psql -U tidx -d tidx -tAc "SELECT COUNT(*) FROM txs"); \
 	echo "Restored $$TX_COUNT txs from artifact"
 
 # Internal: seed fresh (slow, used when no artifact exists)
 _bench_seed:
 	@$(LOCALNET_COMPOSE) up -d postgres
 	@echo "Waiting for PostgreSQL..."
-	@until $(LOCALNET_COMPOSE) exec -T postgres pg_isready -U ak47 -d postgres > /dev/null 2>&1; do sleep 1; done
-	@$(LOCALNET_COMPOSE) exec -T postgres psql -U ak47 -d postgres -c "DROP DATABASE IF EXISTS ak47 WITH (FORCE)" > /dev/null 2>&1 || true
-	@$(LOCALNET_COMPOSE) exec -T postgres psql -U ak47 -d postgres -c "CREATE DATABASE ak47" > /dev/null
+	@until $(LOCALNET_COMPOSE) exec -T postgres pg_isready -U tidx -d postgres > /dev/null 2>&1; do sleep 1; done
+	@$(LOCALNET_COMPOSE) exec -T postgres psql -U tidx -d postgres -c "DROP DATABASE IF EXISTS tidx WITH (FORCE)" > /dev/null 2>&1 || true
+	@$(LOCALNET_COMPOSE) exec -T postgres psql -U tidx -d postgres -c "CREATE DATABASE tidx" > /dev/null
 	@echo "Seeding $(BENCH_TXS) synthetic transactions..."
-	@SEED_TXS=$(BENCH_TXS) DATABASE_URL=postgres://ak47:ak47@localhost:5433/ak47 \
+	@SEED_TXS=$(BENCH_TXS) DATABASE_URL=postgres://tidx:tidx@localhost:5433/tidx \
 		cargo test --release --test seed_bench -- --ignored --nocapture
-	@$(LOCALNET_COMPOSE) exec -T postgres psql -U ak47 -d ak47 -c "SELECT COUNT(*) as blocks FROM blocks; SELECT COUNT(*) as txs FROM txs; SELECT COUNT(*) as logs FROM logs;"
+	@$(LOCALNET_COMPOSE) exec -T postgres psql -U tidx -d tidx -c "SELECT COUNT(*) as blocks FROM blocks; SELECT COUNT(*) as txs FROM txs; SELECT COUNT(*) as logs FROM logs;"
 
 # Run benchmarks (seeds 2M txs if data doesn't exist)
 bench:
@@ -165,14 +165,14 @@ bench:
 	@sleep 2
 	$(call check_bench_data)
 	@echo "=== Running Query Benchmarks ==="
-	@DATABASE_URL=postgres://ak47:ak47@localhost:5433/ak47 cargo bench --bench query_bench
+	@DATABASE_URL=postgres://tidx:tidx@localhost:5433/tidx cargo bench --bench query_bench
 	@echo "Report: target/criterion/report/index.html"
 
 # Run benchmarks and open report
 bench-open: bench
 	@open target/criterion/report/index.html 2>/dev/null || xdg-open target/criterion/report/index.html 2>/dev/null || echo "Open target/criterion/report/index.html"
 
-# Compare ak47 vs golden-axe sync performance
+# Compare tidx vs golden-axe sync performance
 # Both index from the same live tempo chain
 # Requires: golden-axe repo at ~/git/golden-axe
 GOLDEN_AXE_DIR ?= $(HOME)/git/golden-axe
@@ -181,7 +181,7 @@ COMPARE_TPS ?= 3000
 
 bench-vs-golden-axe:
 	@echo "============================================"
-	@echo "=== ak47 vs golden-axe Sync Comparison ==="
+	@echo "=== tidx vs golden-axe Sync Comparison ==="
 	@echo "============================================"
 	@echo ""
 	@echo "=== Step 1: Starting Tempo node ==="
@@ -203,8 +203,8 @@ bench-vs-golden-axe:
 	echo "Chain seeded to block $$CHAIN_HEAD"
 	@echo ""
 	@echo "=== Step 3: Reset databases ==="
-	@$(LOCALNET_COMPOSE) exec -T postgres psql -U ak47 -c "DROP DATABASE IF EXISTS ak47" > /dev/null 2>&1 || true
-	@$(LOCALNET_COMPOSE) exec -T postgres psql -U ak47 -c "CREATE DATABASE ak47" > /dev/null
+	@$(LOCALNET_COMPOSE) exec -T postgres psql -U tidx -c "DROP DATABASE IF EXISTS tidx" > /dev/null 2>&1 || true
+	@$(LOCALNET_COMPOSE) exec -T postgres psql -U tidx -c "CREATE DATABASE tidx" > /dev/null
 	@dropdb --if-exists ga_bench 2>/dev/null || true
 	@createdb ga_bench 2>/dev/null || true
 	@psql ga_bench -f $(GOLDEN_AXE_DIR)/be/src/sql/schema.sql > /dev/null 2>&1
@@ -214,20 +214,20 @@ bench-vs-golden-axe:
 		VALUES (31337, 'http://localhost:8545', true, 100, 4, 0)" > /dev/null 2>&1
 	@echo "Databases reset"
 	@echo ""
-	@echo "=== Step 4: Benchmark ak47 sync ==="
+	@echo "=== Step 4: Benchmark tidx sync ==="
 	@cargo build --release
-	@echo "Starting ak47..."
+	@echo "Starting tidx..."
 	@START=$$(date +%s); \
-	timeout 600 ./target/release/ak47 up \
+	timeout 600 ./target/release/tidx up \
 		--rpc http://localhost:8545 \
-		--db postgres://ak47:ak47@localhost:5433/ak47 2>&1 | head -100 || true; \
+		--db postgres://tidx:tidx@localhost:5433/tidx 2>&1 | head -100 || true; \
 	END=$$(date +%s); \
-	AK47_TIME=$$((END - START)); \
-	AK47_TXS=$$($(LOCALNET_COMPOSE) exec -T postgres psql -U ak47 -d ak47 -tAc "SELECT COUNT(*) FROM txs" 2>/dev/null || echo "0"); \
-	AK47_BLOCKS=$$($(LOCALNET_COMPOSE) exec -T postgres psql -U ak47 -d ak47 -tAc "SELECT COUNT(*) FROM blocks" 2>/dev/null || echo "0"); \
-	echo "ak47: $$AK47_TXS txs, $$AK47_BLOCKS blocks in $${AK47_TIME}s"; \
-	echo "ak47: $$(echo "scale=0; $$AK47_TXS / $$AK47_TIME" | bc) txs/sec"; \
-	echo "$$AK47_TIME $$AK47_TXS $$AK47_BLOCKS" > /tmp/ak47_result.txt
+	TIDX_TIME=$$((END - START)); \
+	TIDX_TXS=$$($(LOCALNET_COMPOSE) exec -T postgres psql -U tidx -d tidx -tAc "SELECT COUNT(*) FROM txs" 2>/dev/null || echo "0"); \
+	TIDX_BLOCKS=$$($(LOCALNET_COMPOSE) exec -T postgres psql -U tidx -d tidx -tAc "SELECT COUNT(*) FROM blocks" 2>/dev/null || echo "0"); \
+	echo "tidx: $$TIDX_TXS txs, $$TIDX_BLOCKS blocks in $${TIDX_TIME}s"; \
+	echo "tidx: $$(echo "scale=0; $$TIDX_TXS / $$TIDX_TIME" | bc) txs/sec"; \
+	echo "$$TIDX_TIME $$TIDX_TXS $$TIDX_BLOCKS" > /tmp/tidx_result.txt
 	@echo ""
 	@echo "=== Step 5: Benchmark golden-axe sync ==="
 	@cd $(GOLDEN_AXE_DIR) && cargo build --release -p be
@@ -246,17 +246,17 @@ bench-vs-golden-axe:
 	@echo "============================================"
 	@echo "=== Results ==="
 	@echo "============================================"
-	@AK47=$$(cat /tmp/ak47_result.txt); GA=$$(cat /tmp/ga_result.txt); \
-	AK47_TIME=$$(echo $$AK47 | cut -d' ' -f1); AK47_TXS=$$(echo $$AK47 | cut -d' ' -f2); \
+	@TIDX=$$(cat /tmp/tidx_result.txt); GA=$$(cat /tmp/ga_result.txt); \
+	TIDX_TIME=$$(echo $$TIDX | cut -d' ' -f1); TIDX_TXS=$$(echo $$TIDX | cut -d' ' -f2); \
 	GA_TIME=$$(echo $$GA | cut -d' ' -f1); GA_TXS=$$(echo $$GA | cut -d' ' -f2); \
-	echo "ak47:       $$AK47_TXS txs in $${AK47_TIME}s ($$(echo "scale=0; $$AK47_TXS / $$AK47_TIME" | bc) txs/sec)"; \
+	echo "tidx:       $$TIDX_TXS txs in $${TIDX_TIME}s ($$(echo "scale=0; $$TIDX_TXS / $$TIDX_TIME" | bc) txs/sec)"; \
 	echo "golden-axe: $$GA_TXS txs in $${GA_TIME}s ($$(echo "scale=0; $$GA_TXS / $$GA_TIME" | bc) txs/sec)"; \
-	if [ $$AK47_TIME -lt $$GA_TIME ]; then \
-		SPEEDUP=$$(echo "scale=1; $$GA_TIME / $$AK47_TIME" | bc); \
+	if [ $$TIDX_TIME -lt $$GA_TIME ]; then \
+		SPEEDUP=$$(echo "scale=1; $$GA_TIME / $$TIDX_TIME" | bc); \
 		echo ""; \
-		echo "ak47 is $${SPEEDUP}x faster"; \
+		echo "tidx is $${SPEEDUP}x faster"; \
 	else \
-		SPEEDUP=$$(echo "scale=1; $$AK47_TIME / $$GA_TIME" | bc); \
+		SPEEDUP=$$(echo "scale=1; $$TIDX_TIME / $$GA_TIME" | bc); \
 		echo ""; \
 		echo "golden-axe is $${SPEEDUP}x faster"; \
 	fi
@@ -271,7 +271,7 @@ clean:
 # ============================================================================
 
 help:
-	@echo "ak47 Development"
+	@echo "tidx Development"
 	@echo ""
 	@echo "  LOCALNET=1 make <cmd>  Use localnet compose (index local Tempo node)"
 	@echo ""

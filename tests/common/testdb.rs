@@ -1,5 +1,5 @@
-use ak47::db::{create_pool, run_migrations, Pool};
-use ak47::sync::engine::SyncEngine;
+use tidx::db::{create_pool, run_migrations, Pool};
+use tidx::sync::engine::SyncEngine;
 use tokio::sync::{Mutex, MutexGuard, OnceCell};
 
 use super::tempo::TempoNode;

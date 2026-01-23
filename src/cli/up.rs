@@ -9,12 +9,12 @@ use metrics_exporter_prometheus::PrometheusBuilder;
 use tokio::sync::RwLock;
 use tracing::{error, info};
 
-use ak47::api::{self, SharedDuckDbPools, SharedPools};
-use ak47::broadcast::Broadcaster;
-use ak47::config::{ChainConfig, Config, ConfigWatcher, NewChainEvent};
-use ak47::db::{self, DuckDbPool, Pool};
-use ak47::sync::engine::SyncEngine;
-use ak47::sync::{backfill_from_postgres, Replicator, ReplicatorHandle};
+use tidx::api::{self, SharedDuckDbPools, SharedPools};
+use tidx::broadcast::Broadcaster;
+use tidx::config::{ChainConfig, Config, ConfigWatcher, NewChainEvent};
+use tidx::db::{self, DuckDbPool, Pool};
+use tidx::sync::engine::SyncEngine;
+use tidx::sync::{backfill_from_postgres, Replicator, ReplicatorHandle};
 
 #[derive(ClapArgs)]
 pub struct Args {

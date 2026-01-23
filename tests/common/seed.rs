@@ -3,9 +3,9 @@ use rand::Rng;
 use std::time::Instant;
 use tracing::info;
 
-use ak47::db::Pool;
-use ak47::sync::writer::{write_blocks, write_logs, write_txs};
-use ak47::types::{BlockRow, LogRow, TxRow};
+use tidx::db::Pool;
+use tidx::sync::writer::{write_blocks, write_logs, write_txs};
+use tidx::types::{BlockRow, LogRow, TxRow};
 
 /// Seed configuration
 pub struct SeedConfig {

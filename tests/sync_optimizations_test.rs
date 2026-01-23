@@ -3,9 +3,9 @@ mod common;
 use common::tempo::TempoNode;
 use common::testdb::TestDb;
 
-use ak47::sync::engine::SyncEngine;
-use ak47::sync::writer::{write_blocks, write_logs, write_txs};
-use ak47::types::{BlockRow, LogRow, TxRow};
+use tidx::sync::engine::SyncEngine;
+use tidx::sync::writer::{write_blocks, write_logs, write_txs};
+use tidx::types::{BlockRow, LogRow, TxRow};
 use serial_test::serial;
 
 fn generate_blocks(count: usize, offset: i64) -> Vec<BlockRow> {

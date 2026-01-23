@@ -6,7 +6,7 @@ pub mod up;
 use clap::{Parser, Subcommand};
 
 #[derive(Parser)]
-#[command(name = "ak47")]
+#[command(name = "tidx")]
 #[command(about = "High-throughput Tempo blockchain indexer")]
 pub struct Cli {
     #[command(subcommand)]

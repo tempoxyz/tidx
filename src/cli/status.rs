@@ -2,10 +2,10 @@ use anyhow::Result;
 use clap::Args as ClapArgs;
 use std::path::PathBuf;
 
-use ak47::config::Config;
-use ak47::db;
-use ak47::sync::fetcher::RpcClient;
-use ak47::sync::writer::{detect_all_gaps, load_sync_state};
+use tidx::config::Config;
+use tidx::db;
+use tidx::sync::fetcher::RpcClient;
+use tidx::sync::writer::{detect_all_gaps, load_sync_state};
 
 #[derive(ClapArgs)]
 pub struct Args {
@@ -48,7 +48,7 @@ pub async fn run(args: Args) -> Result<()> {
 
 async fn print_status(config: &Config) -> Result<()> {
     println!("╔═══════════════════════════════════════════════════════════╗");
-    println!("║                     AK47 Indexer Status                   ║");
+    println!("║                     TIDX Indexer Status                   ║");
     println!("╚═══════════════════════════════════════════════════════════╝");
     println!();
 
