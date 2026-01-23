@@ -42,10 +42,8 @@
 
 ## Quickstart
 
-### Quickstart
-
 ```bash
-curl -L https://tidx.tempo.xyz/docker | bash
+curl -L https://tidx.vercel.app/docker | bash
 ```
 
 ## Overview
