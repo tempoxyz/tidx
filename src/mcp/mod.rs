@@ -12,7 +12,7 @@ use tokio::sync::RwLock;
 use crate::config::Config;
 use crate::db::{self, DuckDbPool, Pool};
 
-pub use tools::TidxMcp;
+pub use tools::{TidxMcp, TidxMcpHttp};
 
 /// Shared state for MCP tools
 #[derive(Clone)]
@@ -73,10 +73,20 @@ impl McpState {
     }
 }
 
-/// Run the MCP server over stdio
+/// Run the MCP server over stdio (direct DB access)
 pub async fn serve_stdio(config: &Config) -> Result<()> {
     let state = McpState::from_config(config).await?;
     let service = TidxMcp::new(state);
+
+    let server = service.serve(stdio()).await?;
+    server.waiting().await?;
+
+    Ok(())
+}
+
+/// Run the MCP server over stdio (HTTP proxy mode)
+pub async fn serve_stdio_http(base_url: &str) -> Result<()> {
+    let service = TidxMcpHttp::new(base_url.trim_end_matches('/').to_string());
 
     let server = service.serve(stdio()).await?;
     server.waiting().await?;

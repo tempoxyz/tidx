@@ -4,6 +4,10 @@ use serde::{Deserialize, Serialize};
 use super::McpState;
 use crate::service::{self, QueryOptions};
 
+// ============================================================================
+// Direct DB Access Implementation
+// ============================================================================
+
 /// TIDX MCP Server - exposes blockchain indexer query and status tools
 #[derive(Clone)]
 pub struct TidxMcp {
@@ -213,6 +217,183 @@ impl ServerHandler for TidxMcp {
         ServerInfo {
             instructions: Some(
                 "TIDX is a Tempo blockchain indexer. Use tidx_query to run SQL queries on blocks, transactions, and logs. Use tidx_status to check sync progress. Use tempo_docs to search documentation.".into()
+            ),
+            capabilities: ServerCapabilities::builder()
+                .enable_tools()
+                .build(),
+            ..Default::default()
+        }
+    }
+}
+
+// ============================================================================
+// HTTP Proxy Implementation
+// ============================================================================
+
+/// TIDX MCP Server that proxies to a remote TIDX HTTP API
+#[derive(Clone)]
+pub struct TidxMcpHttp {
+    base_url: String,
+    client: reqwest::Client,
+}
+
+impl TidxMcpHttp {
+    pub fn new(base_url: String) -> Self {
+        Self {
+            base_url,
+            client: reqwest::Client::new(),
+        }
+    }
+}
+
+#[tool(tool_box)]
+impl TidxMcpHttp {
+    /// Query indexed blockchain data using SQL. Available tables: blocks, txs, logs.
+    #[tool(
+        name = "tidx_query",
+        description = "Execute a SQL query on indexed Tempo blockchain data. Tables available: blocks (num, hash, timestamp, tx_count, gas_used), txs (hash, block_num, from_addr, to_addr, value, gas_used, status), logs (block_num, tx_hash, address, topic0-3, data). Use signature param to decode logs."
+    )]
+    async fn query(&self, #[tool(aggr)] params: QueryParams) -> Result<CallToolResult, McpError> {
+        let chain_id = params
+            .chain
+            .as_ref()
+            .and_then(|c| c.parse::<u64>().ok())
+            .unwrap_or(4217); // Default to Presto mainnet
+
+        let mut url = reqwest::Url::parse(&format!("{}/query", self.base_url))
+            .map_err(|e| McpError::internal_error(format!("Invalid URL: {e}"), None))?;
+
+        url.query_pairs_mut()
+            .append_pair("sql", &params.sql)
+            .append_pair("chainId", &chain_id.to_string())
+            .append_pair("timeout_ms", &params.timeout_ms.unwrap_or(5000).to_string())
+            .append_pair("limit", &params.limit.unwrap_or(1000).to_string());
+
+        if let Some(sig) = &params.signature {
+            url.query_pairs_mut().append_pair("signature", sig);
+        }
+        if let Some(engine) = &params.engine {
+            url.query_pairs_mut().append_pair("engine", engine);
+        }
+
+        let resp = self
+            .client
+            .get(url)
+            .send()
+            .await
+            .map_err(|e| McpError::internal_error(format!("HTTP request failed: {e}"), None))?;
+
+        let status = resp.status();
+        let body: serde_json::Value = resp
+            .json()
+            .await
+            .map_err(|e| McpError::internal_error(format!("Failed to parse response: {e}"), None))?;
+
+        if !status.is_success() {
+            let error = body["error"].as_str().unwrap_or("Unknown error");
+            return Err(McpError::internal_error(error.to_string(), None));
+        }
+
+        Ok(CallToolResult::success(vec![Content::json(&body)?]))
+    }
+
+    /// Get sync status for all indexed chains.
+    #[tool(
+        name = "tidx_status",
+        description = "Get sync status for indexed Tempo chains. Returns current block height, sync lag, backfill progress, and ETA."
+    )]
+    async fn status(&self, #[tool(aggr)] _params: StatusParams) -> Result<CallToolResult, McpError> {
+        let url = format!("{}/status", self.base_url);
+
+        let resp = self
+            .client
+            .get(&url)
+            .send()
+            .await
+            .map_err(|e| McpError::internal_error(format!("HTTP request failed: {e}"), None))?;
+
+        let status = resp.status();
+        let body: serde_json::Value = resp
+            .json()
+            .await
+            .map_err(|e| McpError::internal_error(format!("Failed to parse response: {e}"), None))?;
+
+        if !status.is_success() {
+            let error = body["error"].as_str().unwrap_or("Unknown error");
+            return Err(McpError::internal_error(error.to_string(), None));
+        }
+
+        Ok(CallToolResult::success(vec![Content::json(&body)?]))
+    }
+
+    /// Search Tempo documentation for protocol specs, integration guides, and API reference.
+    #[tool(
+        name = "tempo_docs",
+        description = "Search Tempo blockchain documentation. Covers protocol specs (TIP-20 tokens, fees, transactions), integration guides, and SDK reference."
+    )]
+    async fn docs(&self, #[tool(aggr)] params: DocsParams) -> Result<CallToolResult, McpError> {
+        // Same implementation as TidxMcp - forward to docs.tempo.xyz
+        let sse_resp = self
+            .client
+            .get("https://docs.tempo.xyz/api/mcp")
+            .header("Accept", "text/event-stream")
+            .send()
+            .await
+            .map_err(|e| McpError::internal_error(format!("Failed to connect to docs: {e}"), None))?;
+
+        let text = sse_resp
+            .text()
+            .await
+            .map_err(|e| McpError::internal_error(format!("Failed to read SSE: {e}"), None))?;
+
+        let session_id = text
+            .lines()
+            .find(|l| l.starts_with("data:"))
+            .and_then(|l| l.split("sessionId=").nth(1))
+            .map(|s| s.trim())
+            .ok_or_else(|| McpError::internal_error("Failed to get session ID", None))?;
+
+        let request = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {
+                "name": "searchDocs",
+                "arguments": {
+                    "query": params.query
+                }
+            }
+        });
+
+        let resp = self
+            .client
+            .post(format!("https://docs.tempo.xyz/api/mcp/messages?sessionId={session_id}"))
+            .json(&request)
+            .send()
+            .await
+            .map_err(|e| McpError::internal_error(format!("Docs request failed: {e}"), None))?;
+
+        let result: serde_json::Value = resp
+            .json()
+            .await
+            .map_err(|e| McpError::internal_error(format!("Failed to parse response: {e}"), None))?;
+
+        if let Some(content) = result.get("result").and_then(|r| r.get("content")) {
+            Ok(CallToolResult::success(vec![Content::json(content)?]))
+        } else if let Some(error) = result.get("error") {
+            Err(McpError::internal_error(error.to_string(), None))
+        } else {
+            Ok(CallToolResult::success(vec![Content::json(&result)?]))
+        }
+    }
+}
+
+#[tool(tool_box)]
+impl ServerHandler for TidxMcpHttp {
+    fn get_info(&self) -> ServerInfo {
+        ServerInfo {
+            instructions: Some(
+                "TIDX is a Tempo blockchain indexer (HTTP proxy mode). Use tidx_query to run SQL queries on blocks, transactions, and logs. Use tidx_status to check sync progress. Use tempo_docs to search documentation.".into()
             ),
             capabilities: ServerCapabilities::builder()
                 .enable_tools()
