@@ -12,7 +12,11 @@ on:
           - major
 
 jobs:
+  verify:
+    uses: ./.github/workflows/verify.yml
+
   calculate-version:
+    needs: [verify]
     name: Calculate Version
     runs-on: ubuntu-latest
     outputs:
