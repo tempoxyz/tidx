@@ -42,27 +42,10 @@
 
 ## Quickstart
 
-### Requirements
-
-- [PostgreSQL](https://www.postgresql.org/download/)
-
-### Install
+### Quickstart
 
 ```bash
-curl -L https://tidx.tempo.xyz/install | bash
-```
-
-### Run
-
-```bash
-# Initialize config
-tidx init
-
-# Start indexing
-tidx up
-
-# Check status
-tidx status
+curl -L https://tidx.tempo.xyz/docker | bash
 ```
 
 ## Overview
@@ -91,12 +74,6 @@ tidx uses a hybrid PostgreSQL + DuckDB architecture that automatically routes qu
 | **DuckDB** | Aggregations, scans, analytics | `GROUP BY`, `COUNT(*)`, `SUM()` |
 
 ## Installation
-
-### Quick Install
-
-```bash
-curl -L https://tidx.tempo.xyz/install | bash
-```
 
 ### Docker
 
