@@ -1,23 +1,14 @@
 {
-  "rewrites": [
+  "redirects": [
     {
-      "source": "/install",
-      "destination": "/scripts/install.sh"
-    },
-    {
-      "source": "/install.sh",
-      "destination": "/scripts/install.sh"
+      "source": "/docker",
+      "destination": "/scripts/docker.sh",
+      "statusCode": 302
     }
   ],
   "headers": [
     {
-      "source": "/install",
-      "headers": [
-        { "key": "Content-Type", "value": "text/plain; charset=utf-8" }
-      ]
-    },
-    {
-      "source": "/install.sh",
+      "source": "/scripts/:path*",
       "headers": [
         { "key": "Content-Type", "value": "text/plain; charset=utf-8" }
       ]
