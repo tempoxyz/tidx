@@ -1,11 +1,14 @@
 mod common;
 
 use std::collections::HashMap;
+use std::net::SocketAddr;
 use std::sync::Arc;
 
 use axum::body::Body;
+use axum::extract::connect_info::IntoMakeServiceWithConnectInfo;
 use axum::http::{Request, StatusCode};
-use tower::ServiceExt;
+use axum::Router;
+use tower::Service;
 
 use tidx::api::{self, inject_block_filter};
 use tidx::broadcast::Broadcaster;
@@ -19,16 +22,30 @@ fn make_pools(pool: tidx::db::Pool) -> (HashMap<u64, tidx::db::Pool>, u64) {
     (pools, chain_id)
 }
 
+/// Create a test service that includes ConnectInfo (required by rate limit middleware).
+async fn make_test_service(
+    pools: HashMap<u64, ak47::db::Pool>,
+    chain_id: u64,
+    broadcaster: Arc<Broadcaster>,
+) -> impl Service<Request<Body>, Response = axum::response::Response, Error = std::convert::Infallible>
+{
+    let mut svc: IntoMakeServiceWithConnectInfo<Router, SocketAddr> = api::router(pools, chain_id, broadcaster)
+        .into_make_service_with_connect_info::<SocketAddr>();
+    svc.call(SocketAddr::from(([127, 0, 0, 1], 0)))
+        .await
+        .unwrap()
+}
+
 #[tokio::test]
 #[serial(db)]
 async fn test_health_endpoint() {
     let db = TestDb::empty().await;
     let broadcaster = Arc::new(Broadcaster::new());
     let (pools, chain_id) = make_pools(db.pool.clone());
-    let app = api::router(pools, chain_id, broadcaster);
+    let mut app = make_test_service(pools, chain_id, broadcaster).await;
 
     let response = app
-        .oneshot(
+        .call(
             Request::builder()
                 .uri("/health")
                 .body(Body::empty())
@@ -51,10 +68,10 @@ async fn test_status_endpoint() {
     let db = TestDb::new().await;
     let broadcaster = Arc::new(Broadcaster::new());
     let (pools, chain_id) = make_pools(db.pool.clone());
-    let app = api::router(pools, chain_id, broadcaster);
+    let mut app = make_test_service(pools, chain_id, broadcaster).await;
 
     let response = app
-        .oneshot(
+        .call(
             Request::builder()
                 .uri("/status")
                 .body(Body::empty())
@@ -80,10 +97,10 @@ async fn test_query_select_blocks() {
     let db = TestDb::new().await;
     let broadcaster = Arc::new(Broadcaster::new());
     let (pools, chain_id) = make_pools(db.pool.clone());
-    let app = api::router(pools, chain_id, broadcaster);
+    let mut app = make_test_service(pools, chain_id, broadcaster).await;
 
     let response = app
-        .oneshot(
+        .call(
             Request::builder()
                 .method("GET")
                 .uri("/query?sql=SELECT%20num,%20hash%20FROM%20blocks%20ORDER%20BY%20num%20DESC%20LIMIT%205&chainId=1")
@@ -111,10 +128,10 @@ async fn test_query_select_txs() {
     let db = TestDb::new().await;
     let broadcaster = Arc::new(Broadcaster::new());
     let (pools, chain_id) = make_pools(db.pool.clone());
-    let app = api::router(pools, chain_id, broadcaster);
+    let mut app = make_test_service(pools, chain_id, broadcaster).await;
 
     let response = app
-        .oneshot(
+        .call(
             Request::builder()
                 .method("GET")
                 .uri("/query?sql=SELECT%20block_num,%20hash,%20%22from%22%20FROM%20txs%20LIMIT%2010&chainId=1")
@@ -141,10 +158,10 @@ async fn test_query_select_logs() {
     let db = TestDb::new().await;
     let broadcaster = Arc::new(Broadcaster::new());
     let (pools, chain_id) = make_pools(db.pool.clone());
-    let app = api::router(pools, chain_id, broadcaster);
+    let mut app = make_test_service(pools, chain_id, broadcaster).await;
 
     let response = app
-        .oneshot(
+        .call(
             Request::builder()
                 .method("GET")
                 .uri("/query?sql=SELECT%20block_num,%20address,%20selector%20FROM%20logs%20LIMIT%2010&chainId=1")
@@ -175,14 +192,14 @@ async fn test_query_with_signature_cte() {
     let db = TestDb::new().await;
     let broadcaster = Arc::new(Broadcaster::new());
     let (pools, chain_id) = make_pools(db.pool.clone());
-    let app = api::router(pools, chain_id, broadcaster);
+    let mut app = make_test_service(pools, chain_id, broadcaster).await;
 
     // URL encode: spaces=%20, commas=%2C, parens=%28/%29
     let sig = "Transfer(address%20indexed%20from%2Caddress%20indexed%20to%2Cuint256%20value)";
     let uri = format!("/query?sql=SELECT%20*%20FROM%20Transfer%20LIMIT%205&chainId=1&signature={sig}");
 
     let response = app
-        .oneshot(
+        .call(
             Request::builder()
                 .method("GET")
                 .uri(&uri)
@@ -224,10 +241,10 @@ async fn test_query_rejects_non_select() {
     let db = TestDb::empty().await;
     let broadcaster = Arc::new(Broadcaster::new());
     let (pools, chain_id) = make_pools(db.pool.clone());
-    let app = api::router(pools, chain_id, broadcaster);
+    let mut app = make_test_service(pools, chain_id, broadcaster).await;
 
     let response = app
-        .oneshot(
+        .call(
             Request::builder()
                 .method("GET")
                 .uri("/query?sql=DELETE%20FROM%20blocks&chainId=1")
@@ -254,11 +271,11 @@ async fn test_query_chain_id_param() {
     let db = TestDb::new().await;
     let broadcaster = Arc::new(Broadcaster::new());
     let (pools, chain_id) = make_pools(db.pool.clone());
-    let app = api::router(pools, chain_id, broadcaster);
+    let mut app = make_test_service(pools, chain_id, broadcaster).await;
 
     // Query with explicit chainId
     let response = app
-        .oneshot(
+        .call(
             Request::builder()
                 .method("GET")
                 .uri("/query?sql=SELECT%20COUNT(*)%20FROM%20blocks&chainId=1")
@@ -284,10 +301,10 @@ async fn test_query_invalid_chain_id() {
     let db = TestDb::new().await;
     let broadcaster = Arc::new(Broadcaster::new());
     let (pools, chain_id) = make_pools(db.pool.clone());
-    let app = api::router(pools, chain_id, broadcaster);
+    let mut app = make_test_service(pools, chain_id, broadcaster).await;
 
     let response = app
-        .oneshot(
+        .call(
             Request::builder()
                 .method("GET")
                 .uri("/query?sql=SELECT%201&chainId=99999")
@@ -314,10 +331,10 @@ async fn test_query_live_returns_sse() {
     let db = TestDb::new().await;
     let broadcaster = Arc::new(Broadcaster::new());
     let (pools, chain_id) = make_pools(db.pool.clone());
-    let app = api::router(pools, chain_id, broadcaster);
+    let mut app = make_test_service(pools, chain_id, broadcaster).await;
 
     let response = app
-        .oneshot(
+        .call(
             Request::builder()
                 .method("GET")
                 .uri("/query?sql=SELECT%20num%20FROM%20blocks%20LIMIT%201&chainId=1&live=true")

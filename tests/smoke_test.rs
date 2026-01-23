@@ -557,10 +557,10 @@ async fn test_sync_state_methods() {
     // Test indexed range
     let (low, high) = state.indexed_range();
     assert_eq!(low, 100, "Low should be backfill_num");
-    assert_eq!(high, 800, "High should be synced_num");
+    assert_eq!(high, 950, "High should be tip_num");
 
     // Test total indexed
-    assert_eq!(state.total_indexed(), 701, "Total indexed = 800 - 100 + 1");
+    assert_eq!(state.total_indexed(), 851, "Total indexed = 950 - 100 + 1");
 
     // Complete backfill
     let complete = SyncState {
@@ -1077,7 +1077,8 @@ async fn test_query_rejects_forbidden_keywords() {
     .await;
 
     assert!(result.is_err());
-    assert!(result.unwrap_err().to_string().contains("DROP"));
+    // Multiple statements are rejected before checking for specific keywords
+    assert!(result.unwrap_err().to_string().contains("Multiple statements"));
 }
 
 #[tokio::test]

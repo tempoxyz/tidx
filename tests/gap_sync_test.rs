@@ -15,11 +15,11 @@ async fn test_detect_all_gaps_empty_table() {
     let db = TestDb::empty().await;
     db.truncate_all().await;
 
-    // Empty table with tip_num > 0 should report entire range as gap
+    // Empty table with tip_num > 0 should report entire range as gap (starting from block 1)
     let gaps = detect_all_gaps(&db.pool, 100).await.expect("Failed to detect gaps");
 
     assert_eq!(gaps.len(), 1, "Should detect one gap for entire range");
-    assert_eq!(gaps[0], (0, 100), "Gap should be 0 -> 100");
+    assert_eq!(gaps[0], (1, 100), "Gap should be 1 -> 100 (block 0 is genesis)");
 }
 
 #[tokio::test]
@@ -61,8 +61,8 @@ async fn test_detect_all_gaps_genesis_missing() {
 
     let gaps = detect_all_gaps(&db.pool, 10).await.expect("Failed to detect gaps");
 
-    assert_eq!(gaps.len(), 1, "Should detect one gap from genesis");
-    assert_eq!(gaps[0], (0, 4), "Gap should be 0 -> 4");
+    assert_eq!(gaps.len(), 1, "Should detect one gap from block 1");
+    assert_eq!(gaps[0], (1, 4), "Gap should be 1 -> 4 (block 0 is genesis)");
 }
 
 #[tokio::test]
@@ -128,7 +128,7 @@ async fn test_detect_all_gaps_multiple_gaps_sorted_by_recency() {
     // Gaps should be sorted by end block descending (most recent first)
     assert_eq!(gaps[0], (12, 14), "First gap should be most recent: 12-14");
     assert_eq!(gaps[1], (7, 9), "Second gap should be 7-9");
-    assert_eq!(gaps[2], (0, 4), "Third gap should be from genesis: 0-4");
+    assert_eq!(gaps[2], (1, 4), "Third gap should be from block 1: 1-4 (block 0 is genesis)");
 }
 
 #[tokio::test]
@@ -230,9 +230,9 @@ async fn test_detect_all_gaps_filters_beyond_tip() {
 
     // Gap 7-19 extends beyond tip, but we filter to gaps where end <= tip
     // Since the gap 7-19 has end=19 > tip=10, it should be filtered out
-    // Only the genesis gap (0-4) should remain
+    // Only the gap from block 1 (1-4) should remain
     assert_eq!(gaps.len(), 1, "Should only show gaps within tip range");
-    assert_eq!(gaps[0], (0, 4), "Only genesis gap should be reported");
+    assert_eq!(gaps[0], (1, 4), "Only gap from block 1 should be reported (block 0 is genesis)");
 }
 
 #[tokio::test]
@@ -300,12 +300,12 @@ async fn test_detect_gaps_vs_detect_all_gaps() {
     assert_eq!(gaps.len(), 1, "detect_gaps only finds middle gaps");
     assert_eq!(gaps[0], (7, 9), "detect_gaps should find 7-9");
 
-    // detect_all_gaps also includes genesis gap
+    // detect_all_gaps also includes gap from block 1
     let all_gaps = detect_all_gaps(&db.pool, 11).await.expect("Failed");
-    assert_eq!(all_gaps.len(), 2, "detect_all_gaps finds genesis + middle gaps");
+    assert_eq!(all_gaps.len(), 2, "detect_all_gaps finds block 1 gap + middle gaps");
     // Sorted by end descending
     assert_eq!(all_gaps[0], (7, 9), "Most recent gap first");
-    assert_eq!(all_gaps[1], (0, 4), "Genesis gap last");
+    assert_eq!(all_gaps[1], (1, 4), "Gap from block 1 last (block 0 is genesis)");
 }
 
 // ============================================================================
@@ -449,13 +449,13 @@ async fn test_gap_size_calculation() {
     assert_eq!(gaps.len(), 3, "Should detect three gaps");
 
     // Calculate total gap blocks
-    // Gap 0-9: 10 blocks, Gap 11-19: 9 blocks, Gap 21-29: 9 blocks = 28 total
+    // Gap 1-9: 9 blocks (block 0 is genesis), Gap 11-19: 9 blocks, Gap 21-29: 9 blocks = 27 total
     let total_gap_blocks: u64 = gaps.iter().map(|(s, e)| e - s + 1).sum();
-    assert_eq!(total_gap_blocks, 28, "Total gap should be 28 blocks (10+9+9)");
+    assert_eq!(total_gap_blocks, 27, "Total gap should be 27 blocks (9+9+9)");
 
     // Verify individual gap sizes (sorted by end descending)
     let sizes: Vec<u64> = gaps.iter().map(|(s, e)| e - s + 1).collect();
-    assert_eq!(sizes, vec![9, 9, 10], "Gap sizes should be 9, 9, 10 (most recent first)");
+    assert_eq!(sizes, vec![9, 9, 9], "Gap sizes should be 9, 9, 9 (most recent first)");
 }
 
 #[tokio::test]
