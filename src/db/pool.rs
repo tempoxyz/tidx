@@ -30,7 +30,7 @@ pub async fn create_pool_with_size(database_url: &str, max_size: usize) -> Resul
 async fn ensure_database_exists(database_url: &str) -> Result<()> {
     let mut url = Url::parse(database_url).context("Invalid database URL")?;
     
-    // Extract the target database name from the path (e.g., "/ak47_moderato" -> "ak47_moderato")
+    // Extract the target database name from the path (e.g., "/tidx_moderato" -> "tidx_moderato")
     let db_name = url.path().trim_start_matches('/').to_string();
     
     if db_name.is_empty() || db_name == "postgres" {

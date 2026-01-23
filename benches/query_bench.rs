@@ -1,7 +1,7 @@
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
 use tokio::runtime::Runtime;
 
-use ak47::db::{create_pool, run_migrations};
+use tidx::db::{create_pool, run_migrations};
 
 fn bench_oltp_queries(c: &mut Criterion) {
     let rt = Runtime::new().unwrap();

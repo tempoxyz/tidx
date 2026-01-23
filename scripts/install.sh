@@ -1,14 +1,14 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# ak47 installer
-# Usage: curl -L https://ak47.tempo.xyz/install | bash
+# tidx installer
+# Usage: curl -L https://tidx.tempo.xyz/install | bash
 
-REPO="tempoxyz/ak47"
-INSTALL_DIR="${AK47_INSTALL_DIR:-$HOME/.ak47/bin}"
+REPO="tempoxyz/tidx"
+INSTALL_DIR="${TIDX_INSTALL_DIR:-$HOME/.tidx/bin}"
 
 main() {
-    echo "Installing ak47..."
+    echo "Installing tidx..."
 
     # Detect OS and architecture
     OS=$(uname -s | tr '[:upper:]' '[:lower:]')
@@ -37,7 +37,7 @@ main() {
     echo "Latest version: $LATEST"
 
     # Build download URL
-    FILENAME="ak47-${OS}-${ARCH}.tar.gz"
+    FILENAME="tidx-${OS}-${ARCH}.tar.gz"
     URL="https://github.com/$REPO/releases/download/$LATEST/$FILENAME"
 
     # Create install directory
@@ -48,10 +48,10 @@ main() {
     curl -L "$URL" | tar xz -C "$INSTALL_DIR"
 
     # Make executable
-    chmod +x "$INSTALL_DIR/ak47"
+    chmod +x "$INSTALL_DIR/tidx"
 
     echo ""
-    echo "ak47 installed to $INSTALL_DIR/ak47"
+    echo "tidx installed to $INSTALL_DIR/tidx"
     echo ""
 
     # Add to PATH instructions
@@ -76,7 +76,7 @@ main() {
     esac
 
     if [[ ":$PATH:" != *":$INSTALL_DIR:"* ]]; then
-        echo "Add ak47 to your PATH by running:"
+        echo "Add tidx to your PATH by running:"
         echo ""
         if [ "$SHELL_NAME" = "fish" ]; then
             echo "  echo 'set -gx PATH $INSTALL_DIR \$PATH' >> $PROFILE"
@@ -89,7 +89,7 @@ main() {
     fi
 
     echo ""
-    echo "Run 'ak47 --help' to get started"
+    echo "Run 'tidx --help' to get started"
 }
 
 main

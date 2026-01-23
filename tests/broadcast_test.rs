@@ -3,7 +3,7 @@ mod common;
 use std::sync::Arc;
 use std::time::Duration;
 
-use ak47::broadcast::{BlockUpdate, Broadcaster};
+use tidx::broadcast::{BlockUpdate, Broadcaster};
 
 #[tokio::test]
 async fn test_broadcaster_send_receive() {

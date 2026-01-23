@@ -9,7 +9,7 @@ use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
 use std::sync::Arc;
 use tokio::runtime::Runtime;
 
-use ak47::db::{create_pool, DuckDbPool};
+use tidx::db::{create_pool, DuckDbPool};
 
 /// Setup shared test infrastructure.
 fn setup() -> (Runtime, deadpool_postgres::Pool, Arc<DuckDbPool>) {

@@ -5,47 +5,47 @@ use std::time::Instant;
 
 pub fn record_blocks_indexed(chain_id: u64, count: u64) {
     let labels = [("chain_id", chain_id.to_string())];
-    counter!("ak47_blocks_indexed_total", &labels).increment(count);
+    counter!("tidx_blocks_indexed_total", &labels).increment(count);
 }
 
 pub fn record_txs_indexed(chain_id: u64, count: u64) {
     let labels = [("chain_id", chain_id.to_string())];
-    counter!("ak47_txs_indexed_total", &labels).increment(count);
+    counter!("tidx_txs_indexed_total", &labels).increment(count);
 }
 
 pub fn record_logs_indexed(chain_id: u64, count: u64) {
     let labels = [("chain_id", chain_id.to_string())];
-    counter!("ak47_logs_indexed_total", &labels).increment(count);
+    counter!("tidx_logs_indexed_total", &labels).increment(count);
 }
 
 pub fn set_sync_head(chain_id: u64, block_num: u64) {
     let labels = [("chain_id", chain_id.to_string())];
-    gauge!("ak47_sync_head_block", &labels).set(block_num as f64);
+    gauge!("tidx_sync_head_block", &labels).set(block_num as f64);
 }
 
 pub fn set_synced_block(chain_id: u64, block_num: u64) {
     let labels = [("chain_id", chain_id.to_string())];
-    gauge!("ak47_synced_block", &labels).set(block_num as f64);
+    gauge!("tidx_synced_block", &labels).set(block_num as f64);
 }
 
 pub fn set_sync_lag(chain_id: u64, lag: u64) {
     let labels = [("chain_id", chain_id.to_string())];
-    gauge!("ak47_sync_lag_blocks", &labels).set(lag as f64);
+    gauge!("tidx_sync_lag_blocks", &labels).set(lag as f64);
 }
 
 pub fn set_backfill_block(chain_id: u64, block_num: u64) {
     let labels = [("chain_id", chain_id.to_string())];
-    gauge!("ak47_backfill_block", &labels).set(block_num as f64);
+    gauge!("tidx_backfill_block", &labels).set(block_num as f64);
 }
 
 pub fn set_backfill_remaining(chain_id: u64, remaining: u64) {
     let labels = [("chain_id", chain_id.to_string())];
-    gauge!("ak47_backfill_remaining_blocks", &labels).set(remaining as f64);
+    gauge!("tidx_backfill_remaining_blocks", &labels).set(remaining as f64);
 }
 
 pub fn set_sync_rate(chain_id: u64, blocks_per_sec: f64) {
     let labels = [("chain_id", chain_id.to_string())];
-    gauge!("ak47_sync_blocks_per_second", &labels).set(blocks_per_sec);
+    gauge!("tidx_sync_blocks_per_second", &labels).set(blocks_per_sec);
 }
 
 pub fn record_rpc_request(method: &str, duration: std::time::Duration, success: bool) {
@@ -53,16 +53,16 @@ pub fn record_rpc_request(method: &str, duration: std::time::Duration, success: 
         ("method", method.to_string()),
         ("success", success.to_string()),
     ];
-    counter!("ak47_rpc_requests_total", &labels).increment(1);
-    histogram!("ak47_rpc_request_duration_seconds", &labels).record(duration.as_secs_f64());
+    counter!("tidx_rpc_requests_total", &labels).increment(1);
+    histogram!("tidx_rpc_request_duration_seconds", &labels).record(duration.as_secs_f64());
 }
 
 pub fn record_query_duration(duration: std::time::Duration) {
-    histogram!("ak47_query_duration_seconds").record(duration.as_secs_f64());
+    histogram!("tidx_query_duration_seconds").record(duration.as_secs_f64());
 }
 
 pub fn record_query_rows(count: u64) {
-    histogram!("ak47_query_rows").record(count as f64);
+    histogram!("tidx_query_rows").record(count as f64);
 }
 
 /// Tracks sync progress and calculates rate/ETA

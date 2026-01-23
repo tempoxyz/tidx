@@ -2,7 +2,7 @@ mod common;
 
 use common::testdb::TestDb;
 
-use ak47::sync::writer::{detect_all_gaps, detect_gaps};
+use tidx::sync::writer::{detect_all_gaps, detect_gaps};
 use serial_test::serial;
 
 // ============================================================================

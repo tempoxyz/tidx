@@ -2,9 +2,9 @@ use anyhow::Result;
 use clap::Args as ClapArgs;
 use std::path::PathBuf;
 
-use ak47::config::Config;
-use ak47::db;
-use ak47::service::{self, execute_query_with_engine, QueryOptions};
+use tidx::config::Config;
+use tidx::db;
+use tidx::service::{self, execute_query_with_engine, QueryOptions};
 
 #[derive(ClapArgs)]
 pub struct Args {

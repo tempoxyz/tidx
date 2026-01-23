@@ -7,12 +7,12 @@ use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use tower::ServiceExt;
 
-use ak47::api::{self, inject_block_filter};
-use ak47::broadcast::Broadcaster;
+use tidx::api::{self, inject_block_filter};
+use tidx::broadcast::Broadcaster;
 use common::testdb::TestDb;
 use serial_test::serial;
 
-fn make_pools(pool: ak47::db::Pool) -> (HashMap<u64, ak47::db::Pool>, u64) {
+fn make_pools(pool: tidx::db::Pool) -> (HashMap<u64, tidx::db::Pool>, u64) {
     let mut pools = HashMap::new();
     let chain_id = 1u64;
     pools.insert(chain_id, pool);

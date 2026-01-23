@@ -1,4 +1,4 @@
-# AK47 Agent Instructions
+# TIDX Agent Instructions
 
 ## Project Overview
 High-throughput Tempo blockchain indexer in Rust, inspired by golden-axe.
@@ -46,7 +46,7 @@ docker run --rm --network host ghcr.io/tempoxyz/tempo-bench:latest \
 docker compose up -d
 
 # View logs
-docker compose logs -f ak47
+docker compose logs -f tidx
 
 # Access services:
 # - HTTP API: http://localhost:8080

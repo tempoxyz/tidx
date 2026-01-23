@@ -1,8 +1,8 @@
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 use tokio::runtime::Runtime;
 
-use ak47::db::{create_pool, run_migrations};
-use ak47::types::BlockRow;
+use tidx::db::{create_pool, run_migrations};
+use tidx::types::BlockRow;
 
 fn generate_blocks(count: usize) -> Vec<BlockRow> {
     (0..count)
@@ -42,7 +42,7 @@ fn bench_block_insert(c: &mut Criterion) {
                 let blocks = generate_blocks(size);
                 b.to_async(&rt).iter(|| async {
                     for block in &blocks {
-                        ak47::sync::writer::write_block(&pool, block)
+                        tidx::sync::writer::write_block(&pool, block)
                             .await
                             .unwrap();
                     }

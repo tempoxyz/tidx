@@ -13,7 +13,7 @@ use std::sync::Arc;
 use std::time::Instant;
 use tokio::runtime::Runtime;
 
-use ak47::db::{create_pool, run_migrations, DuckDbPool, Pool};
+use tidx::db::{create_pool, run_migrations, DuckDbPool, Pool};
 
 /// Extrapolation target size
 const TARGET_ROWS: usize = 100_000_000;
@@ -30,7 +30,7 @@ const EXTRAPOLATE_SIZES: [usize; 4] = [1_000_000, 2_000_000, 4_000_000, 8_000_00
 /// Uses a temp file for compression (more realistic than in-memory).
 fn setup_duckdb(log_count: usize) -> Arc<DuckDbPool> {
     // Use temp file for compression benefits (mirrors production behavior)
-    let temp_path = format!("/tmp/ak47_bench_{}.duckdb", log_count);
+    let temp_path = format!("/tmp/tidx_bench_{}.duckdb", log_count);
     let _ = std::fs::remove_file(&temp_path); // Clean up any existing file
     let pool = DuckDbPool::new(&temp_path).expect("Failed to create DuckDB pool");
 
@@ -360,7 +360,7 @@ fn bench_extrapolate(c: &mut Criterion) {
 
     // Default Postgres URL from docker-compose
     let pg_url = std::env::var("DATABASE_URL")
-        .unwrap_or_else(|_| "postgres://ak47:ak47@localhost:5433/ak47".to_string());
+        .unwrap_or_else(|_| "postgres://tidx:tidx@localhost:5433/tidx".to_string());
 
     // Try to connect to Postgres
     let pg_pool = rt.block_on(async {
