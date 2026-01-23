@@ -2,6 +2,7 @@ pub mod api;
 pub mod broadcast;
 pub mod config;
 pub mod db;
+pub mod mcp;
 pub mod metrics;
 pub mod query;
 pub mod service;

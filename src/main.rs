@@ -21,5 +21,6 @@ async fn main() -> Result<()> {
         Commands::Up(args) => cli::up::run(args).await,
         Commands::Status(args) => cli::status::run(args).await,
         Commands::Query(args) => cli::query::run(args).await,
+        Commands::Mcp(args) => cli::mcp::run(args).await,
     }
 }
