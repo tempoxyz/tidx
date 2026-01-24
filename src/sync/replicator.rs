@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::Result;
 use tokio::sync::mpsc;
@@ -19,8 +20,10 @@ pub enum ReplicaBatch {
 ///
 /// Uses a channel-based approach where the indexer sends batches
 /// and the replicator flushes them to DuckDB in micro-batches.
+/// Also runs periodic gap-fill to catch up on any dropped batches.
 pub struct Replicator {
     duckdb: Arc<DuckDbPool>,
+    pg_pool: Pool,
     rx: mpsc::Receiver<ReplicaBatch>,
 }
 
@@ -31,69 +34,115 @@ pub struct ReplicatorHandle {
 }
 
 impl ReplicatorHandle {
-    /// Sends a batch of blocks to be replicated.
-    pub async fn send_blocks(&self, blocks: Vec<BlockRow>) -> Result<()> {
+    /// Sends a batch of blocks to be replicated (non-blocking).
+    /// If the channel is full, data is dropped and DuckDB gap-fill will catch up.
+    pub fn send_blocks(&self, blocks: Vec<BlockRow>) {
         if blocks.is_empty() {
-            return Ok(());
+            return;
         }
-        self.tx
-            .send(ReplicaBatch::Blocks(blocks))
-            .await
-            .map_err(|_| anyhow::anyhow!("Replicator channel closed"))
+        if let Err(mpsc::error::TrySendError::Full(_)) = self.tx.try_send(ReplicaBatch::Blocks(blocks)) {
+            tracing::debug!("DuckDB replicator channel full, dropping blocks batch");
+        }
     }
 
-    /// Sends a batch of transactions to be replicated.
-    pub async fn send_txs(&self, txs: Vec<TxRow>) -> Result<()> {
+    /// Sends a batch of transactions to be replicated (non-blocking).
+    pub fn send_txs(&self, txs: Vec<TxRow>) {
         if txs.is_empty() {
-            return Ok(());
+            return;
         }
-        self.tx
-            .send(ReplicaBatch::Txs(txs))
-            .await
-            .map_err(|_| anyhow::anyhow!("Replicator channel closed"))
+        if let Err(mpsc::error::TrySendError::Full(_)) = self.tx.try_send(ReplicaBatch::Txs(txs)) {
+            tracing::debug!("DuckDB replicator channel full, dropping txs batch");
+        }
     }
 
-    /// Sends a batch of logs to be replicated.
-    pub async fn send_logs(&self, logs: Vec<LogRow>) -> Result<()> {
+    /// Sends a batch of logs to be replicated (non-blocking).
+    pub fn send_logs(&self, logs: Vec<LogRow>) {
         if logs.is_empty() {
-            return Ok(());
+            return;
         }
-        self.tx
-            .send(ReplicaBatch::Logs(logs))
-            .await
-            .map_err(|_| anyhow::anyhow!("Replicator channel closed"))
+        if let Err(mpsc::error::TrySendError::Full(_)) = self.tx.try_send(ReplicaBatch::Logs(logs)) {
+            tracing::debug!("DuckDB replicator channel full, dropping logs batch");
+        }
     }
 
-    /// Sends a batch of receipts to be replicated.
-    pub async fn send_receipts(&self, receipts: Vec<ReceiptRow>) -> Result<()> {
+    /// Sends a batch of receipts to be replicated (non-blocking).
+    pub fn send_receipts(&self, receipts: Vec<ReceiptRow>) {
         if receipts.is_empty() {
-            return Ok(());
+            return;
         }
-        self.tx
-            .send(ReplicaBatch::Receipts(receipts))
-            .await
-            .map_err(|_| anyhow::anyhow!("Replicator channel closed"))
+        if let Err(mpsc::error::TrySendError::Full(_)) = self.tx.try_send(ReplicaBatch::Receipts(receipts)) {
+            tracing::debug!("DuckDB replicator channel full, dropping receipts batch");
+        }
     }
 }
 
 impl Replicator {
     /// Creates a new replicator with a channel for receiving batches.
-    pub fn new(duckdb: Arc<DuckDbPool>, buffer_size: usize) -> (Self, ReplicatorHandle) {
+    pub fn new(duckdb: Arc<DuckDbPool>, pg_pool: Pool, buffer_size: usize) -> (Self, ReplicatorHandle) {
         let (tx, rx) = mpsc::channel(buffer_size);
-        (Self { duckdb, rx }, ReplicatorHandle { tx })
+        (Self { duckdb, pg_pool, rx }, ReplicatorHandle { tx })
     }
 
     /// Runs the replicator, processing batches as they arrive.
+    /// Also runs periodic gap-fill every 30s to catch up on dropped batches.
     pub async fn run(mut self) -> Result<()> {
         tracing::info!("DuckDB replicator started");
 
-        while let Some(batch) = self.rx.recv().await {
-            if let Err(e) = self.process_batch(batch).await {
-                tracing::error!(error = %e, "Failed to replicate batch to DuckDB");
+        let mut gap_fill_interval = tokio::time::interval(Duration::from_secs(30));
+        gap_fill_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+        loop {
+            tokio::select! {
+                batch = self.rx.recv() => {
+                    match batch {
+                        Some(b) => {
+                            if let Err(e) = self.process_batch(b).await {
+                                tracing::error!(error = %e, "Failed to replicate batch to DuckDB");
+                            }
+                        }
+                        None => {
+                            tracing::info!("DuckDB replicator channel closed");
+                            break;
+                        }
+                    }
+                }
+                _ = gap_fill_interval.tick() => {
+                    if let Err(e) = self.run_gap_fill().await {
+                        tracing::error!(error = %e, "DuckDB gap-fill failed");
+                    }
+                }
             }
         }
 
         tracing::info!("DuckDB replicator stopped");
+        Ok(())
+    }
+
+    /// Detect and fill any gaps in DuckDB from PostgreSQL.
+    async fn run_gap_fill(&self) -> Result<()> {
+        let pg_latest = {
+            let conn = self.pg_pool.get().await?;
+            let row = conn.query_one("SELECT COALESCE(MAX(num), 0) FROM blocks", &[]).await?;
+            row.get::<_, i64>(0)
+        };
+
+        if pg_latest == 0 {
+            return Ok(());
+        }
+
+        let gaps = detect_all_gaps_duckdb(&self.duckdb, pg_latest).await?;
+        if gaps.is_empty() {
+            return Ok(());
+        }
+
+        let total_blocks: i64 = gaps.iter().map(|(s, e)| e - s + 1).sum();
+        tracing::info!(
+            gaps = gaps.len(),
+            total_blocks,
+            "DuckDB gap-fill: filling gaps from PostgreSQL"
+        );
+
+        fill_gaps_from_postgres(&self.pg_pool, &self.duckdb, &gaps, 500).await?;
         Ok(())
     }
 
@@ -162,33 +211,49 @@ impl Replicator {
                 let count = logs.len();
                 if count > 0 {
                     conn.execute("BEGIN TRANSACTION", [])?;
-                    for log in &logs {
-                        let topics_str = format!(
-                            "[{}]",
-                            log.topics
-                                .iter()
-                                .map(|t| format!("'{}'", format!("0x{}", hex::encode(t))))
-                                .collect::<Vec<_>>()
-                                .join(", ")
-                        );
+                    
+                    // Batch logs into chunks for fewer INSERT statements
+                    for chunk in logs.chunks(100) {
+                        let values: Vec<String> = chunk
+                            .iter()
+                            .map(|log| {
+                                let topics_str = format!(
+                                    "[{}]",
+                                    log.topics
+                                        .iter()
+                                        .map(|t| format!("'0x{}'", hex::encode(t)))
+                                        .collect::<Vec<_>>()
+                                        .join(", ")
+                                );
+                                let selector = log
+                                    .selector
+                                    .as_ref()
+                                    .map(|s| format!("'0x{}'", hex::encode(s)))
+                                    .unwrap_or_else(|| "NULL".to_string());
+                                format!(
+                                    "({}, '{}', {}, {}, '0x{}', '0x{}', {}, {}, '0x{}')",
+                                    log.block_num,
+                                    log.block_timestamp.to_rfc3339(),
+                                    log.log_idx,
+                                    log.tx_idx,
+                                    hex::encode(&log.tx_hash),
+                                    hex::encode(&log.address),
+                                    selector,
+                                    topics_str,
+                                    hex::encode(&log.data),
+                                )
+                            })
+                            .collect();
+                        
                         conn.execute(
                             &format!(
-                                "INSERT INTO logs (block_num, block_timestamp, log_idx, tx_idx, tx_hash, address, selector, topics, data)
-                                 VALUES (?, ?, ?, ?, ?, ?, ?, {}, ?)",
-                                topics_str
+                                "INSERT INTO logs (block_num, block_timestamp, log_idx, tx_idx, tx_hash, address, selector, topics, data) VALUES {}",
+                                values.join(", ")
                             ),
-                            duckdb::params![
-                                log.block_num,
-                                log.block_timestamp.to_rfc3339(),
-                                log.log_idx,
-                                log.tx_idx,
-                                format!("0x{}", hex::encode(&log.tx_hash)),
-                                format!("0x{}", hex::encode(&log.address)),
-                                log.selector.as_ref().map(|s| format!("0x{}", hex::encode(s))),
-                                format!("0x{}", hex::encode(&log.data)),
-                            ],
+                            [],
                         )?;
                     }
+                    
                     conn.execute("COMMIT", [])?;
                 }
                 Self::update_watermark(&conn)?;
@@ -819,15 +884,23 @@ mod tests {
     use chrono::Utc;
     use std::time::Duration;
 
+    fn create_test_pg_pool() -> Pool {
+        use deadpool_postgres::{Config, Runtime};
+        let mut cfg = Config::new();
+        cfg.host = Some("localhost".to_string());
+        cfg.dbname = Some("test".to_string());
+        cfg.pool = Some(deadpool_postgres::PoolConfig::new(1));
+        cfg.create_pool(Some(Runtime::Tokio1), tokio_postgres::NoTls).unwrap()
+    }
+
     #[tokio::test]
     async fn test_replicator_blocks() {
         let duckdb = Arc::new(DuckDbPool::in_memory().unwrap());
-        let (replicator, handle) = Replicator::new(duckdb.clone(), 100);
+        let pg_pool = create_test_pg_pool();
+        let (replicator, handle) = Replicator::new(duckdb.clone(), pg_pool, 100);
 
-        // Spawn replicator
         let replicator_task = tokio::spawn(replicator.run());
 
-        // Send a block
         let block = BlockRow {
             num: 1,
             hash: vec![0xab; 32],
@@ -840,18 +913,14 @@ mod tests {
             extra_data: None,
         };
 
-        handle.send_blocks(vec![block]).await.unwrap();
-
-        // Give it time to process
+        handle.send_blocks(vec![block]);
         tokio::time::sleep(Duration::from_millis(50)).await;
 
-        // Verify block was inserted
         let conn = duckdb.conn().await;
         let mut stmt = conn.prepare("SELECT num FROM blocks WHERE num = 1").unwrap();
         let result: i64 = stmt.query_row([], |row| row.get(0)).unwrap();
         assert_eq!(result, 1);
 
-        // Drop handle to close channel and stop replicator
         drop(handle);
         let _ = replicator_task.await;
     }
@@ -859,7 +928,8 @@ mod tests {
     #[tokio::test]
     async fn test_replicator_txs() {
         let duckdb = Arc::new(DuckDbPool::in_memory().unwrap());
-        let (replicator, handle) = Replicator::new(duckdb.clone(), 100);
+        let pg_pool = create_test_pg_pool();
+        let (replicator, handle) = Replicator::new(duckdb.clone(), pg_pool, 100);
         let replicator_task = tokio::spawn(replicator.run());
 
         let tx = TxRow {
@@ -887,7 +957,7 @@ mod tests {
             signature_type: Some(0),
         };
 
-        handle.send_txs(vec![tx]).await.unwrap();
+        handle.send_txs(vec![tx]);
         tokio::time::sleep(Duration::from_millis(50)).await;
 
         let conn = duckdb.conn().await;
@@ -904,7 +974,8 @@ mod tests {
     #[tokio::test]
     async fn test_replicator_logs() {
         let duckdb = Arc::new(DuckDbPool::in_memory().unwrap());
-        let (replicator, handle) = Replicator::new(duckdb.clone(), 100);
+        let pg_pool = create_test_pg_pool();
+        let (replicator, handle) = Replicator::new(duckdb.clone(), pg_pool, 100);
         let replicator_task = tokio::spawn(replicator.run());
 
         let log = LogRow {
@@ -919,7 +990,7 @@ mod tests {
             data: vec![0x00; 32],
         };
 
-        handle.send_logs(vec![log]).await.unwrap();
+        handle.send_logs(vec![log]);
         tokio::time::sleep(Duration::from_millis(50)).await;
 
         let conn = duckdb.conn().await;
@@ -934,9 +1005,44 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_replicator_logs_batched() {
+        let duckdb = Arc::new(DuckDbPool::in_memory().unwrap());
+        let pg_pool = create_test_pg_pool();
+        let (replicator, handle) = Replicator::new(duckdb.clone(), pg_pool, 100);
+        let replicator_task = tokio::spawn(replicator.run());
+
+        // Send 250 logs to test batching (should be 3 batches of 100, 100, 50)
+        let logs: Vec<LogRow> = (0..250)
+            .map(|i| LogRow {
+                block_num: 1,
+                block_timestamp: Utc::now(),
+                log_idx: i,
+                tx_idx: 0,
+                tx_hash: vec![0xab; 32],
+                address: vec![0xca; 20],
+                selector: Some(vec![0xdd, 0xf2, 0x52, 0xad]),
+                topics: vec![vec![0xdd; 32], vec![0xee; 32]],
+                data: vec![0x00; 32],
+            })
+            .collect();
+
+        handle.send_logs(logs);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let conn = duckdb.conn().await;
+        let mut stmt = conn.prepare("SELECT COUNT(*) FROM logs").unwrap();
+        let count: i64 = stmt.query_row([], |row| row.get(0)).unwrap();
+        assert_eq!(count, 250);
+
+        drop(handle);
+        let _ = replicator_task.await;
+    }
+
+    #[tokio::test]
     async fn test_replicator_receipts() {
         let duckdb = Arc::new(DuckDbPool::in_memory().unwrap());
-        let (replicator, handle) = Replicator::new(duckdb.clone(), 100);
+        let pg_pool = create_test_pg_pool();
+        let (replicator, handle) = Replicator::new(duckdb.clone(), pg_pool, 100);
         let replicator_task = tokio::spawn(replicator.run());
 
         let receipt = ReceiptRow {
@@ -954,7 +1060,7 @@ mod tests {
             fee_payer: None,
         };
 
-        handle.send_receipts(vec![receipt]).await.unwrap();
+        handle.send_receipts(vec![receipt]);
         tokio::time::sleep(Duration::from_millis(50)).await;
 
         let conn = duckdb.conn().await;
@@ -968,6 +1074,36 @@ mod tests {
 
         drop(handle);
         let _ = replicator_task.await;
+    }
+
+    #[tokio::test]
+    async fn test_non_blocking_send_when_channel_full() {
+        let duckdb = Arc::new(DuckDbPool::in_memory().unwrap());
+        let pg_pool = create_test_pg_pool();
+        // Create a tiny buffer of 2
+        let (replicator, handle) = Replicator::new(duckdb.clone(), pg_pool, 2);
+
+        // Don't start the replicator - channel will fill up
+        let _replicator = replicator;
+
+        // Send 10 batches - should not block even though buffer is 2
+        for i in 0..10 {
+            let block = BlockRow {
+                num: i,
+                hash: vec![i as u8; 32],
+                parent_hash: vec![0x00; 32],
+                timestamp: Utc::now(),
+                timestamp_ms: 1704067200000,
+                gas_limit: 30_000_000,
+                gas_used: 21000,
+                miner: vec![0xde; 20],
+                extra_data: None,
+            };
+            handle.send_blocks(vec![block]);
+        }
+
+        // If we got here without blocking, the test passes
+        // (old async API would have blocked on the 3rd send)
     }
 
     #[tokio::test]

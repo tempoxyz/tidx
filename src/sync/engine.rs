@@ -192,10 +192,10 @@ impl SyncEngine {
                 write_receipts(&self.pool, &all_receipts).await?;
 
                 if let Some(ref rep) = replicator {
-                    rep.send_blocks(block_rows_clone).await.ok();
-                    rep.send_txs(all_txs_clone).await.ok();
-                    rep.send_logs(all_logs_clone).await.ok();
-                    rep.send_receipts(all_receipts_clone).await.ok();
+                    rep.send_blocks(block_rows_clone);
+                    rep.send_txs(all_txs_clone);
+                    rep.send_logs(all_logs_clone);
+                    rep.send_receipts(all_receipts_clone);
                 }
 
                 Ok::<_, anyhow::Error>(())
@@ -840,10 +840,10 @@ async fn sync_range_standalone(
     write_receipts(pool, &all_receipts).await?;
 
     if let Some(rep) = replicator {
-        rep.send_blocks(block_rows).await.ok();
-        rep.send_txs(all_txs).await.ok();
-        rep.send_logs(all_logs).await.ok();
-        rep.send_receipts(all_receipts).await.ok();
+        rep.send_blocks(block_rows);
+        rep.send_txs(all_txs);
+        rep.send_logs(all_logs);
+        rep.send_receipts(all_receipts);
     }
 
     Ok(())

@@ -191,7 +191,7 @@ async fn initialize_chain(
         info!(chain = %chain.name, path = %duckdb_path, "Initializing DuckDB");
         let duckdb_pool = Arc::new(DuckDbPool::new(duckdb_path)?);
 
-        let (replicator, handle) = Replicator::new(duckdb_pool.clone(), 1000);
+        let (replicator, handle) = Replicator::new(duckdb_pool.clone(), pool.clone(), 10_000);
         tokio::spawn(replicator.run());
 
         duckdb_pools.write().await.insert(chain.chain_id, duckdb_pool);
