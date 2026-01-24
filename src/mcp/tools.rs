@@ -11,6 +11,7 @@ use crate::service::{self, QueryOptions};
 /// Actual SQL schema from db/*.sql files
 const SCHEMA_BLOCKS: &str = include_str!("../../db/blocks.sql");
 const SCHEMA_TXS: &str = include_str!("../../db/txs.sql");
+const SCHEMA_RECEIPTS: &str = include_str!("../../db/receipts.sql");
 const SCHEMA_LOGS: &str = include_str!("../../db/logs.sql");
 
 fn schema_docs() -> String {
@@ -29,6 +30,11 @@ The following tables are available for querying indexed Tempo blockchain data.
 {SCHEMA_TXS}
 ```
 
+## receipts (transaction receipts)
+```sql
+{SCHEMA_RECEIPTS}
+```
+
 ## logs (event logs)
 ```sql
 {SCHEMA_LOGS}
@@ -41,6 +47,7 @@ The following tables are available for querying indexed Tempo blockchain data.
 - `selector` is the first 4 bytes of topic0 (event signature hash)
 - Chain IDs: Presto (mainnet) = 4217, Andantino (testnet) = 42429
 - Values are in wei (1 TEMPO = 10^18 wei)
+- Use `receipts` for gas_used, status, and contract_address (for deployments)
 "#
     )
 }
