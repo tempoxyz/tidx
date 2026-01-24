@@ -11,13 +11,13 @@ use tokio::sync::Mutex;
 
 /// DuckDB connection pool for analytical queries.
 ///
-/// Uses a single connection protected by mutex since DuckDB is single-writer
-/// and in-memory databases can't be shared across connections.
+/// Uses a single write connection protected by mutex (DuckDB is single-writer).
+/// Read queries open fresh connections to avoid blocking on writes.
 pub struct DuckDbPool {
     /// Path to the DuckDB database file
     path: String,
-    /// Single connection protected by mutex
-    conn: Mutex<Connection>,
+    /// Write connection protected by mutex
+    write_conn: Mutex<Connection>,
 }
 
 impl DuckDbPool {
@@ -35,7 +35,7 @@ impl DuckDbPool {
 
         Ok(Self {
             path: path.to_string(),
-            conn: Mutex::new(conn),
+            write_conn: Mutex::new(conn),
         })
     }
 
@@ -44,9 +44,25 @@ impl DuckDbPool {
         Self::new(":memory:")
     }
 
-    /// Gets the connection for queries or writes.
+    /// Gets the write connection (mutex-protected, blocks other writers).
     pub async fn conn(&self) -> tokio::sync::MutexGuard<'_, Connection> {
-        self.conn.lock().await
+        self.write_conn.lock().await
+    }
+
+    /// Opens a fresh read-only connection (doesn't block on writes).
+    /// For in-memory databases, falls back to the write connection.
+    fn open_read_conn(&self) -> Result<Connection> {
+        if self.path == ":memory:" {
+            anyhow::bail!("In-memory database cannot use separate read connections");
+        }
+        let conn = Connection::open_with_flags(&self.path, duckdb::Config::default().access_mode(duckdb::AccessMode::ReadOnly)?)?;
+        register_udfs(&conn)?;
+        Ok(conn)
+    }
+
+    /// Returns true if this is an in-memory database.
+    pub fn is_in_memory(&self) -> bool {
+        self.path == ":memory:"
     }
 
     /// Returns the database path.
@@ -63,23 +79,37 @@ impl DuckDbPool {
     }
 
     /// Executes a query and returns results as JSON.
+    /// Opens a fresh read-only connection to avoid blocking on writes.
+    /// Falls back to write connection for in-memory databases.
     pub async fn query(&self, sql: &str) -> Result<(Vec<String>, Vec<Vec<serde_json::Value>>)> {
-        let conn = self.conn().await;
-        execute_query(&conn, sql)
+        if self.is_in_memory() {
+            let conn = self.conn().await;
+            execute_query(&conn, sql)
+        } else {
+            let conn = self.open_read_conn()?;
+            execute_query(&conn, sql)
+        }
     }
 
     /// Executes a streaming query and sends batches through a channel.
     ///
     /// Returns column names immediately, then sends row batches through the channel.
     /// This allows SSE streaming of large result sets.
+    /// Opens a fresh read-only connection to avoid blocking on writes.
+    /// Falls back to write connection for in-memory databases.
     pub async fn query_streaming(
         &self,
         sql: &str,
         batch_size: usize,
         tx: tokio::sync::mpsc::Sender<Result<Vec<Vec<serde_json::Value>>>>,
     ) -> Result<Vec<String>> {
-        let conn = self.conn().await;
-        execute_query_streaming(&conn, sql, batch_size, tx)
+        if self.is_in_memory() {
+            let conn = self.conn().await;
+            execute_query_streaming(&conn, sql, batch_size, tx)
+        } else {
+            let conn = self.open_read_conn()?;
+            execute_query_streaming(&conn, sql, batch_size, tx)
+        }
     }
 }
 
