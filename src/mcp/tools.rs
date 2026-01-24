@@ -46,38 +46,113 @@ The following tables are available for querying indexed Tempo blockchain data.
 }
 
 const QUERY_PATTERNS: &str = r#"
-# Common Query Patterns
+# Tempo Query Patterns
 
-## Filtering by address
-Always use hex format with '0x' prefix:
+## Key Constants
+- Transfer event: `0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef`
+- DEX precompile: `0xdec0000000000000000000000000000000000000`
+- Tempo tx type: `118` (0x76)
+- Chain IDs: Presto=4217, Andantino=42429, Moderato=42431
+
+## TIP-20 Token Transfers
 ```sql
-WHERE address = '0x1234...'
+-- Recent transfers for a token
+SELECT 
+  b.timestamp,
+  l.block_num,
+  l.tx_hash,
+  ('0x' || right(lower(l.topics[2]::text), 40)) AS from_addr,
+  ('0x' || right(lower(l.topics[3]::text), 40)) AS to_addr,
+  l.data
+FROM logs l
+JOIN blocks b ON b.num = l.block_num
+WHERE lower(l.address::text) = lower('0x...')  -- token address
+  AND lower(l.selector::text) = lower('0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef')
+ORDER BY b.timestamp DESC
+LIMIT 100
 ```
 
-## Time-based queries
-Use timestamp column on blocks table:
+## DEX Activity
 ```sql
-SELECT * FROM blocks WHERE timestamp > NOW() - INTERVAL '1 hour'
+-- Transactions calling the DEX precompile
+SELECT b.timestamp, t.hash, t."from", t."to", 
+       left(lower(t.input::text), 10) AS func_selector,
+       t.gas_used
+FROM txs t
+JOIN blocks b ON b.num = t.block_num
+WHERE lower(t."to"::text) = '0xdec0000000000000000000000000000000000000'
+ORDER BY b.timestamp DESC
+LIMIT 100
 ```
 
-## Joining logs with transactions
 ```sql
-SELECT l.*, t.from_addr, t.status 
-FROM logs l 
-JOIN txs t ON l.tx_hash = t.hash 
-WHERE l.topic0 = '0xddf252ad...'  -- Transfer event
+-- DEX events emitted
+SELECT b.timestamp, l.block_num, l.tx_hash, l.selector, l.topics, l.data
+FROM logs l
+JOIN blocks b ON b.num = l.block_num
+WHERE lower(l.address::text) = '0xdec0000000000000000000000000000000000000'
+ORDER BY b.timestamp DESC
+LIMIT 100
 ```
 
-## Decoding events with signature parameter
-Pass the event signature to automatically decode logs:
-- signature: "Transfer(address indexed from, address indexed to, uint256 value)"
-- This creates a CTE named after the event that decodes topic1/topic2/data
-
-## Aggregations (uses DuckDB for better performance)
+## Tempo Transactions (type 0x76)
 ```sql
-SELECT DATE_TRUNC('day', timestamp) as day, COUNT(*) as tx_count
-FROM blocks b JOIN txs t ON b.num = t.block_num
+-- Tempo vs regular transaction volume by day
+SELECT 
+  DATE_TRUNC('day', b.timestamp) AS day,
+  SUM(CASE WHEN t.type = 118 THEN 1 ELSE 0 END) AS tempo_txs,
+  SUM(CASE WHEN t.type != 118 THEN 1 ELSE 0 END) AS other_txs
+FROM txs t
+JOIN blocks b ON b.num = t.block_num
+WHERE b.timestamp > NOW() - INTERVAL '7 days'
 GROUP BY day ORDER BY day DESC
+```
+
+```sql
+-- Fee token usage breakdown
+SELECT t.fee_token, COUNT(*) AS tx_count
+FROM txs t
+JOIN blocks b ON b.num = t.block_num
+WHERE t.fee_token IS NOT NULL
+  AND b.timestamp > NOW() - INTERVAL '24 hours'
+GROUP BY t.fee_token
+ORDER BY tx_count DESC
+```
+
+## General EVM Queries
+```sql
+-- Top gas consumers
+SELECT lower(t."from"::text) AS sender, SUM(t.gas_used) AS total_gas, COUNT(*) AS tx_count
+FROM txs t
+JOIN blocks b ON b.num = t.block_num
+WHERE b.timestamp > NOW() - INTERVAL '24 hours'
+GROUP BY sender ORDER BY total_gas DESC LIMIT 20
+```
+
+```sql
+-- Most called contracts
+SELECT lower(t."to"::text) AS contract, COUNT(*) AS call_count
+FROM txs t
+JOIN blocks b ON b.num = t.block_num
+WHERE t."to" IS NOT NULL AND b.timestamp > NOW() - INTERVAL '24 hours'
+GROUP BY contract ORDER BY call_count DESC LIMIT 20
+```
+
+```sql
+-- Events by contract (discover what a contract does)
+SELECT lower(l.address::text) AS contract, lower(l.selector::text) AS event_sig, COUNT(*) AS n
+FROM logs l
+JOIN blocks b ON b.num = l.block_num
+WHERE b.timestamp > NOW() - INTERVAL '24 hours'
+GROUP BY contract, event_sig ORDER BY n DESC LIMIT 50
+```
+
+## Using the signature parameter
+Pass `signature` to decode event logs automatically:
+- signature: `Transfer(address indexed from, address indexed to, uint256 value)`
+- Creates a CTE named `Transfer` with decoded columns: `from`, `to`, `value`
+```sql
+SELECT block_num, "from", "to", value FROM Transfer ORDER BY block_num DESC LIMIT 100
 ```
 "#;
 
