@@ -48,6 +48,16 @@ The following tables are available for querying indexed Tempo blockchain data.
 const QUERY_PATTERNS: &str = r#"
 # Tempo Query Patterns
 
+## Need More Context?
+Use the `tempo_docs` tool to search Tempo documentation for:
+- TIP-20 token standard details and events
+- Stablecoin DEX mechanics (limit/flip/market orders)
+- Tempo transaction features (batching, fee sponsorship, passkeys)
+- TIP-403 policy registry and compliance
+- Fee system and payment lanes
+
+Example: `tempo_docs("How do TIP-20 transfer memos work?")`
+
 ## Key Constants
 - Transfer event: `0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef`
 - DEX precompile: `0xdec0000000000000000000000000000000000000`
