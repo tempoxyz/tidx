@@ -14,7 +14,7 @@ use tidx::broadcast::Broadcaster;
 use tidx::config::{ChainConfig, Config, ConfigWatcher, NewChainEvent};
 use tidx::db::{self, DuckDbPool, Pool};
 use tidx::sync::engine::SyncEngine;
-use tidx::sync::{backfill_from_postgres, Replicator, ReplicatorHandle};
+use tidx::sync::{Replicator, ReplicatorHandle};
 
 #[derive(ClapArgs)]
 pub struct Args {
@@ -63,7 +63,7 @@ pub async fn run(args: Args) -> Result<()> {
     let mut default_chain_id = 0u64;
 
     for chain in &config.chains {
-        let (pool, replicator_handle, duckdb) = initialize_chain(
+        let (pool, replicator_handle) = initialize_chain(
             chain,
             Arc::clone(&duckdb_pools),
         ).await?;
@@ -78,7 +78,6 @@ pub async fn run(args: Args) -> Result<()> {
             chain.clone(),
             pool,
             replicator_handle,
-            duckdb,
             broadcaster.clone(),
             shutdown_tx.subscribe(),
         );
@@ -127,14 +126,13 @@ pub async fn run(args: Args) -> Result<()> {
         tokio::spawn(async move {
             while let Some(event) = chain_rx.recv().await {
                 match initialize_chain(&event.chain, Arc::clone(&duckdb_pools_for_watcher)).await {
-                    Ok((pool, replicator_handle, duckdb)) => {
+                    Ok((pool, replicator_handle)) => {
                         pools_for_watcher.write().await.insert(event.chain.chain_id, pool.clone());
 
                         spawn_sync_engine(
                             event.chain,
                             pool,
                             replicator_handle,
-                            duckdb,
                             broadcaster_for_watcher.clone(),
                             shutdown_tx_for_watcher.subscribe(),
                         );
@@ -182,48 +180,33 @@ pub async fn run(args: Args) -> Result<()> {
 async fn initialize_chain(
     chain: &ChainConfig,
     duckdb_pools: SharedDuckDbPools,
-) -> Result<(Pool, Option<ReplicatorHandle>, Option<Arc<DuckDbPool>>)> {
+) -> Result<(Pool, Option<ReplicatorHandle>)> {
     info!(chain = %chain.name, db = %chain.pg_url, "Connecting to database...");
     let pool = db::create_pool(&chain.pg_url).await?;
 
     info!(chain = %chain.name, "Running migrations...");
     db::run_migrations(&pool).await?;
 
-    let (replicator_handle, duckdb_pool) = if let Some(ref duckdb_path) = chain.duckdb_path {
+    let replicator_handle = if let Some(ref duckdb_path) = chain.duckdb_path {
         info!(chain = %chain.name, path = %duckdb_path, "Initializing DuckDB");
         let duckdb_pool = Arc::new(DuckDbPool::new(duckdb_path)?);
-
-        let pg_pool = pool.clone();
-        let duck_pool = duckdb_pool.clone();
-        tokio::spawn(async move {
-            match backfill_from_postgres(&pg_pool, &duck_pool, 1000).await {
-                Ok(synced) if synced > 0 => {
-                    info!(synced, "DuckDB backfill complete");
-                }
-                Ok(_) => {}
-                Err(e) => {
-                    error!(error = %e, "DuckDB backfill failed");
-                }
-            }
-        });
 
         let (replicator, handle) = Replicator::new(duckdb_pool.clone(), 1000);
         tokio::spawn(replicator.run());
 
-        duckdb_pools.write().await.insert(chain.chain_id, duckdb_pool.clone());
-        (Some(handle), Some(duckdb_pool))
+        duckdb_pools.write().await.insert(chain.chain_id, duckdb_pool);
+        Some(handle)
     } else {
-        (None, None)
+        None
     };
 
-    Ok((pool, replicator_handle, duckdb_pool))
+    Ok((pool, replicator_handle))
 }
 
 fn spawn_sync_engine(
     chain: ChainConfig,
     pool: Pool,
     replicator_handle: Option<ReplicatorHandle>,
-    duckdb: Option<Arc<DuckDbPool>>,
     broadcaster: Arc<Broadcaster>,
     shutdown_rx: tokio::sync::broadcast::Receiver<()>,
 ) {
@@ -231,7 +214,7 @@ fn spawn_sync_engine(
         chain = %chain.name,
         chain_id = chain.chain_id,
         rpc = %chain.rpc_url,
-        duckdb = chain.duckdb_path.is_some(),
+        duckdb = replicator_handle.is_some(),
         "Starting sync for chain"
     );
 
@@ -250,10 +233,6 @@ fn spawn_sync_engine(
 
         if let Some(handle) = replicator_handle {
             engine = engine.with_replicator(handle);
-        }
-
-        if let Some(duck) = duckdb {
-            engine = engine.with_duckdb(duck);
         }
 
         // Run the sync engine - handles both realtime sync and gap sync
