@@ -66,10 +66,9 @@ Use the `tempo_docs` tool to search Tempo documentation for:
 Example: `tempo_docs("How do TIP-20 transfer memos work?")`
 
 ## Key Constants
-- Transfer event: `0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef`
-- DEX precompile: `0xdec0000000000000000000000000000000000000`
 - Tempo tx type: `118` (0x76)
 - Chain IDs: Presto=4217, Andantino=42429, Moderato=42431
+- Use `tempo_docs` to find contract addresses and event signatures
 
 ## TIP-20 Token Transfers
 ```sql
