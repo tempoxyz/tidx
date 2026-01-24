@@ -70,43 +70,47 @@ Example: `tempo_docs("How do TIP-20 transfer memos work?")`
 - Chain IDs: Presto=4217, Andantino=42429, Moderato=42431
 - Use `tempo_docs` to find contract addresses and event signatures
 
-## TIP-20 Token Transfers
+## Event Table CTEs (Recommended)
+The `signature` parameter auto-decodes event logs into a virtual table.
+Pass an event signature to create a CTE with decoded columns.
+
+**How it works:**
+- signature: `Transfer(address indexed from, address indexed to, uint256 value)`
+- Creates a CTE named `Transfer` with columns: `block_num`, `tx_hash`, `address`, `from`, `to`, `value`
+- Indexed params come from topics, non-indexed from data
+- Much simpler than manual topic/data decoding
+
 ```sql
--- Recent transfers for a token
-SELECT 
-  b.timestamp,
-  l.block_num,
-  l.tx_hash,
-  ('0x' || right(lower(l.topics[2]::text), 40)) AS from_addr,
-  ('0x' || right(lower(l.topics[3]::text), 40)) AS to_addr,
-  l.data
-FROM logs l
-JOIN blocks b ON b.num = l.block_num
-WHERE lower(l.address::text) = lower('0x...')  -- token address
-  AND lower(l.selector::text) = lower('0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef')
-ORDER BY b.timestamp DESC
+-- TIP-20 transfers (use with signature param)
+SELECT block_num, address, "from", "to", value 
+FROM Transfer 
+WHERE address = '0x...'  -- token address
+ORDER BY block_num DESC 
 LIMIT 100
 ```
 
-## DEX Activity
 ```sql
--- Transactions calling the DEX precompile
-SELECT b.timestamp, t.hash, t."from", t."to", 
-       left(lower(t.input::text), 10) AS func_selector,
-       t.gas_used
+-- Approval events (use with signature: "Approval(address indexed owner, address indexed spender, uint256 value)")
+SELECT block_num, owner, spender, value FROM Approval ORDER BY block_num DESC LIMIT 100
+```
+
+## Querying Contracts
+```sql
+-- Find transactions to a specific contract
+SELECT b.timestamp, t.hash, t."from", t.gas_used
 FROM txs t
 JOIN blocks b ON b.num = t.block_num
-WHERE lower(t."to"::text) = '0xdec0000000000000000000000000000000000000'
+WHERE t."to" = '0x...'  -- contract address
 ORDER BY b.timestamp DESC
 LIMIT 100
 ```
 
 ```sql
--- DEX events emitted
-SELECT b.timestamp, l.block_num, l.tx_hash, l.selector, l.topics, l.data
+-- Find events emitted by a contract
+SELECT b.timestamp, l.tx_hash, l.selector, l.topics, l.data
 FROM logs l
 JOIN blocks b ON b.num = l.block_num
-WHERE lower(l.address::text) = '0xdec0000000000000000000000000000000000000'
+WHERE l.address = '0x...'  -- contract address
 ORDER BY b.timestamp DESC
 LIMIT 100
 ```
@@ -163,13 +167,11 @@ WHERE b.timestamp > NOW() - INTERVAL '24 hours'
 GROUP BY contract, event_sig ORDER BY n DESC LIMIT 50
 ```
 
-## Using the signature parameter
-Pass `signature` to decode event logs automatically:
-- signature: `Transfer(address indexed from, address indexed to, uint256 value)`
-- Creates a CTE named `Transfer` with decoded columns: `from`, `to`, `value`
-```sql
-SELECT block_num, "from", "to", value FROM Transfer ORDER BY block_num DESC LIMIT 100
-```
+## Common Event Signatures
+Use these with the `signature` parameter:
+- `Transfer(address indexed from, address indexed to, uint256 value)` - ERC20/TIP-20 transfers
+- `Approval(address indexed owner, address indexed spender, uint256 value)` - ERC20/TIP-20 approvals
+- Use `tempo_docs` to find Tempo-specific event signatures (DEX, rewards, etc.)
 "#;
 
 // ============================================================================
