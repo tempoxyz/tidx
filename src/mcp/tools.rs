@@ -8,86 +8,42 @@ use crate::service::{self, QueryOptions};
 // Schema Documentation (used as context for query generation)
 // ============================================================================
 
-const SCHEMA_DOCS: &str = r#"
-# TIDX Database Schema
+/// Actual SQL schema from db/*.sql files
+const SCHEMA_BLOCKS: &str = include_str!("../../db/blocks.sql");
+const SCHEMA_TXS: &str = include_str!("../../db/txs.sql");
+const SCHEMA_LOGS: &str = include_str!("../../db/logs.sql");
 
-## Tables
+fn schema_docs() -> String {
+    format!(
+        r#"# TIDX Database Schema
 
-### blocks
-Indexed blockchain blocks.
-| Column | Type | Description |
-|--------|------|-------------|
-| num | bigint | Block number (primary key) |
-| hash | bytea | Block hash (0x-prefixed hex) |
-| parent_hash | bytea | Parent block hash |
-| timestamp | timestamptz | Block timestamp |
-| tx_count | int | Number of transactions |
-| gas_used | bigint | Total gas used |
-| gas_limit | bigint | Block gas limit |
-| base_fee | bigint | Base fee per gas (wei) |
+The following tables are available for querying indexed Tempo blockchain data.
 
-### txs
-Indexed transactions.
-| Column | Type | Description |
-|--------|------|-------------|
-| hash | bytea | Transaction hash (primary key) |
-| block_num | bigint | Block number |
-| tx_index | int | Transaction index in block |
-| from_addr | bytea | Sender address |
-| to_addr | bytea | Recipient address (null for contract creation) |
-| value | numeric | Value transferred (wei) |
-| gas_used | bigint | Gas used |
-| gas_price | bigint | Gas price (wei) |
-| status | smallint | 1 = success, 0 = failure |
-| input | bytea | Transaction input data |
-
-### logs
-Indexed event logs.
-| Column | Type | Description |
-|--------|------|-------------|
-| block_num | bigint | Block number |
-| tx_hash | bytea | Transaction hash |
-| log_index | int | Log index in transaction |
-| address | bytea | Contract address that emitted the event |
-| topic0 | bytea | Event signature hash |
-| topic1 | bytea | Indexed parameter 1 |
-| topic2 | bytea | Indexed parameter 2 |
-| topic3 | bytea | Indexed parameter 3 |
-| data | bytea | Non-indexed event data (ABI-encoded) |
-
-## Query Examples
-
-### Get recent blocks
+## blocks
 ```sql
-SELECT num, timestamp, tx_count, gas_used FROM blocks ORDER BY num DESC LIMIT 10
+{SCHEMA_BLOCKS}
 ```
 
-### Get transactions for an address
+## txs (transactions)
 ```sql
-SELECT hash, block_num, value, status FROM txs 
-WHERE from_addr = '0x...' OR to_addr = '0x...'
-ORDER BY block_num DESC LIMIT 100
+{SCHEMA_TXS}
 ```
 
-### Decode Transfer events (use signature parameter)
-With signature: `Transfer(address indexed from, address indexed to, uint256 value)`
+## logs (event logs)
 ```sql
-SELECT block_num, "from", "to", value FROM Transfer ORDER BY block_num DESC LIMIT 100
+{SCHEMA_LOGS}
 ```
 
-### Count events by contract
-```sql
-SELECT address, COUNT(*) as event_count FROM logs 
-GROUP BY address ORDER BY event_count DESC LIMIT 20
-```
+## Notes
 
-## Tempo-Specific Notes
-
+- Addresses are BYTEA, query with '0x' prefix: `WHERE "from" = '0x...'`
+- `topics` is an array: access as `topics[1]`, `topics[2]`, etc. (1-indexed)
+- `selector` is the first 4 bytes of topic0 (event signature hash)
 - Chain IDs: Presto (mainnet) = 4217, Andantino (testnet) = 42429
-- TIP-20 tokens use standard ERC20 events (Transfer, Approval)
-- Addresses are 20 bytes, stored as bytea, query with '0x...' prefix
 - Values are in wei (1 TEMPO = 10^18 wei)
-"#;
+"#
+    )
+}
 
 const QUERY_PATTERNS: &str = r#"
 # Common Query Patterns
@@ -337,7 +293,8 @@ impl ServerHandler for TidxMcp {
     fn get_info(&self) -> ServerInfo {
         ServerInfo {
             instructions: Some(format!(
-                "TIDX is a Tempo blockchain indexer. Use tidx_query to run SQL queries on blocks, transactions, and logs. Use tidx_status to check sync progress. Use tempo_docs to search Tempo protocol documentation.\n\n{SCHEMA_DOCS}\n\n{QUERY_PATTERNS}"
+                "TIDX is a Tempo blockchain indexer. Use tidx_query to run SQL queries on blocks, transactions, and logs. Use tidx_status to check sync progress. Use tempo_docs to search Tempo protocol documentation.\n\n{}\n\n{QUERY_PATTERNS}",
+                schema_docs()
             )),
             capabilities: ServerCapabilities::builder()
                 .enable_tools()
@@ -380,9 +337,9 @@ impl ServerHandler for TidxMcp {
         request: ReadResourceRequestParam,
         _context: RequestContext<RoleServer>,
     ) -> Result<ReadResourceResult, McpError> {
-        let content = match request.uri.as_str() {
-            "tidx://schema" => SCHEMA_DOCS,
-            "tidx://patterns" => QUERY_PATTERNS,
+        let content: String = match request.uri.as_str() {
+            "tidx://schema" => schema_docs(),
+            "tidx://patterns" => QUERY_PATTERNS.to_string(),
             _ => return Err(McpError::resource_not_found(
                 format!("Unknown resource: {}", request.uri),
                 None,
@@ -393,7 +350,7 @@ impl ServerHandler for TidxMcp {
             contents: vec![ResourceContents::TextResourceContents {
                 uri: request.uri,
                 mime_type: Some("text/markdown".to_string()),
-                text: content.to_string(),
+                text: content,
             }],
         })
     }
@@ -566,7 +523,8 @@ impl ServerHandler for TidxMcpHttp {
     fn get_info(&self) -> ServerInfo {
         ServerInfo {
             instructions: Some(format!(
-                "TIDX is a Tempo blockchain indexer (HTTP proxy mode). Use tidx_query to run SQL queries on blocks, transactions, and logs. Use tidx_status to check sync progress. Use tempo_docs to search Tempo protocol documentation.\n\n{SCHEMA_DOCS}\n\n{QUERY_PATTERNS}"
+                "TIDX is a Tempo blockchain indexer (HTTP proxy mode). Use tidx_query to run SQL queries on blocks, transactions, and logs. Use tidx_status to check sync progress. Use tempo_docs to search Tempo protocol documentation.\n\n{}\n\n{QUERY_PATTERNS}",
+                schema_docs()
             )),
             capabilities: ServerCapabilities::builder()
                 .enable_tools()
@@ -609,9 +567,9 @@ impl ServerHandler for TidxMcpHttp {
         request: ReadResourceRequestParam,
         _context: RequestContext<RoleServer>,
     ) -> Result<ReadResourceResult, McpError> {
-        let content = match request.uri.as_str() {
-            "tidx://schema" => SCHEMA_DOCS,
-            "tidx://patterns" => QUERY_PATTERNS,
+        let content: String = match request.uri.as_str() {
+            "tidx://schema" => schema_docs(),
+            "tidx://patterns" => QUERY_PATTERNS.to_string(),
             _ => return Err(McpError::resource_not_found(
                 format!("Unknown resource: {}", request.uri),
                 None,
@@ -622,7 +580,7 @@ impl ServerHandler for TidxMcpHttp {
             contents: vec![ResourceContents::TextResourceContents {
                 uri: request.uri,
                 mime_type: Some("text/markdown".to_string()),
-                text: content.to_string(),
+                text: content,
             }],
         })
     }
