@@ -62,8 +62,11 @@ fn generate_logs(count: usize, block_num: i64) -> Vec<LogRow> {
             tx_idx: (i % 100) as i32,
             tx_hash: vec![i as u8; 32],
             address: vec![3u8; 20],
-            selector: Some(vec![0xdd, 0xf2, 0x52, 0xad]), // Transfer selector
-            topics: vec![vec![0xddu8; 32], vec![1u8; 32], vec![2u8; 32]],
+            selector: Some(vec![0xddu8; 32]), // Transfer selector (full 32-byte topic0)
+            topic0: Some(vec![0xddu8; 32]),
+            topic1: Some(vec![1u8; 32]),
+            topic2: Some(vec![2u8; 32]),
+            topic3: None,
             data: vec![0u8; 64],
         })
         .collect()
