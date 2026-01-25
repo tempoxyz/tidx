@@ -260,10 +260,29 @@ async fn print_status(config: &Config) -> Result<()> {
                             let tip_lag = (state.tip_num as i64) - duck_max;
                             let backfill_remaining = (duck_min - pg_min).max(0);
                             
+                            // Get DuckDB block count for rate estimation
+                            let duck_count: i64 = duckdb.query("SELECT COUNT(*) FROM blocks").await
+                                .ok()
+                                .and_then(|(_, rows)| rows.first().and_then(|r| r.first().and_then(|v| v.as_i64())))
+                                .unwrap_or(0);
+                            
                             println!("│  ├─ Range:    {} → {}", format_number(duck_min as u64), format_number(duck_max as u64));
+                            println!("│  ├─ Synced:   {} blocks", format_number(duck_count as u64));
                             println!("│  ├─ Tip lag:  {} blocks", tip_lag);
+                            
                             if backfill_remaining > 0 {
-                                println!("│  └─ Backfill: {} blocks remaining", format_number(backfill_remaining as u64));
+                                // Estimate rate from PG backfill rate (DuckDB follows PG)
+                                let eta_str = if let Some(rate) = state.sync_rate {
+                                    if rate > 0.0 {
+                                        format_eta(backfill_remaining as f64 / rate)
+                                    } else {
+                                        "calculating...".to_string()
+                                    }
+                                } else {
+                                    "calculating...".to_string()
+                                };
+                                println!("│  ├─ Backfill: {} blocks remaining", format_number(backfill_remaining as u64));
+                                println!("│  └─ ETA:      {}", eta_str);
                             } else {
                                 println!("│  └─ Backfill: ✓ Complete");
                             }
