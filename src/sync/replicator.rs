@@ -446,29 +446,26 @@ impl Replicator {
             // Tail sync: copy forward from duck_tip to pg_tip
             let lag = pg_tip - duck_tip;
 
-            tracing::debug!(
-                chain_id = self.chain_id,
-                duck_tip,
-                pg_tip,
-                lag,
-                "DuckDB tail check"
-            );
-
-            if lag <= 0 {
+            // Always log tail check to debug sync issues
+            if lag > 0 {
+                tracing::info!(
+                    chain_id = self.chain_id,
+                    duck_tip,
+                    pg_tip,
+                    lag,
+                    "DuckDB tail sync starting"
+                );
+            } else {
+                tracing::debug!(
+                    chain_id = self.chain_id,
+                    duck_tip,
+                    pg_tip,
+                    "DuckDB tail caught up"
+                );
                 return Ok(());
             }
 
             let sync_end = duck_tip + lag.min(MAX_BLOCKS_PER_TICK);
-
-            tracing::info!(
-                chain_id = self.chain_id,
-                duck_tip,
-                pg_tip,
-                lag,
-                sync_end,
-                "DuckDB tailing Postgres"
-            );
-
             let start = Instant::now();
             let mut synced = 0i64;
             let mut current = duck_tip + 1;
