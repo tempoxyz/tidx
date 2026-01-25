@@ -724,6 +724,9 @@ pub async fn fill_gaps_from_postgres(
     let total_blocks: i64 = gaps.iter().map(|(s, e)| e - s + 1).sum();
     tracing::info!(gap_count = gaps.len(), total_blocks, "Starting DuckDB gap fill from PostgreSQL");
 
+    // Use a separate write connection for gap-fill to avoid blocking realtime replication
+    let duck_conn = duckdb.open_write_conn()?;
+
     let pg_conn = pg_pool.get().await?;
     let mut synced = 0u64;
 
@@ -742,7 +745,6 @@ pub async fn fill_gaps_from_postgres(
                 .await?;
 
             if !block_rows.is_empty() {
-                let duck_conn = duckdb.conn().await;
                 let mut appender = duck_conn.appender("blocks")?;
                 for row in &block_rows {
                     let num: i64 = row.get(0);
@@ -782,7 +784,6 @@ pub async fn fill_gaps_from_postgres(
                 .await?;
 
             if !tx_rows.is_empty() {
-                let duck_conn = duckdb.conn().await;
                 let mut appender = duck_conn.appender("txs")?;
                 for row in &tx_rows {
                     let block_num: i64 = row.get(0);
@@ -846,7 +847,6 @@ pub async fn fill_gaps_from_postgres(
                 .await?;
 
             if !log_rows.is_empty() {
-                let duck_conn = duckdb.conn().await;
                 for chunk in log_rows.chunks(100) {
                     let values: Vec<String> = chunk
                         .iter()
@@ -912,7 +912,6 @@ pub async fn fill_gaps_from_postgres(
                 .await?;
 
             if !receipt_rows.is_empty() {
-                let duck_conn = duckdb.conn().await;
                 let mut appender = duck_conn.appender("receipts")?;
                 for row in &receipt_rows {
                     let block_num: i64 = row.get(0);
