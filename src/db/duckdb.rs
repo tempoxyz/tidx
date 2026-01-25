@@ -70,26 +70,6 @@ impl DuckDbPool {
         Ok(conn)
     }
 
-    /// Opens a fresh write connection for bulk operations like gap-fill.
-    /// This allows gap-fill to run independently without blocking realtime replication.
-    /// DuckDB handles internal locking between multiple write connections.
-    pub fn open_write_conn(&self) -> Result<Connection> {
-        if self.path == ":memory:" {
-            anyhow::bail!("In-memory database cannot use separate write connections");
-        }
-        let conn = Connection::open(&self.path)?;
-        conn.execute_batch(
-            r#"
-            SET memory_limit = '16GB';
-            SET threads = 4;
-            SET checkpoint_threshold = '1GB';
-            SET preserve_insertion_order = false;
-            "#,
-        )?;
-        register_udfs(&conn)?;
-        Ok(conn)
-    }
-
     /// Returns true if this is an in-memory database.
     pub fn is_in_memory(&self) -> bool {
         self.path == ":memory:"
