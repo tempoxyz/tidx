@@ -1,6 +1,6 @@
 [package]
 name = "tidx"
-version = ""
+version = "0.0.29"
 edition = "2024"
 license = "MIT"
 repository = "https://github.com/tempoxyz/tidx"
