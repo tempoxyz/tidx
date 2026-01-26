@@ -318,51 +318,17 @@ impl Replicator {
                 let batch_start = (current - BATCH_SIZE + 1).max(gap_start);
                 let batch_size = current - batch_start + 1;
 
-                // Fetch from PG
-                let block_rows = pg_conn
-                    .query(
-                        "SELECT num, hash, parent_hash, timestamp, timestamp_ms, gas_limit, gas_used, miner, extra_data 
-                         FROM blocks WHERE num >= $1 AND num <= $2 ORDER BY num",
-                        &[&batch_start, &current],
-                    )
-                    .await?;
+                // Copy all tables (blocks, txs, logs, receipts) for this range
+                let batch_synced =
+                    copy_range_to_duckdb(&pg_conn, duckdb, batch_start, current).await?;
 
-                if block_rows.is_empty() {
+                if batch_synced == 0 {
                     // PG doesn't have these blocks yet
                     current = batch_start - 1;
                     continue;
                 }
 
-                // Write to DuckDB
-                let duck_conn = duckdb.conn().await;
-                for row in &block_rows {
-                    let num: i64 = row.get(0);
-                    let hash: Vec<u8> = row.get(1);
-                    let parent_hash: Vec<u8> = row.get(2);
-                    let timestamp: chrono::DateTime<chrono::Utc> = row.get(3);
-                    let timestamp_ms: i64 = row.get(4);
-                    let gas_limit: i64 = row.get(5);
-                    let gas_used: i64 = row.get(6);
-                    let miner: Vec<u8> = row.get(7);
-                    let extra_data: Option<Vec<u8>> = row.get(8);
-
-                    let sql = format!(
-                        "INSERT OR IGNORE INTO blocks (num, hash, parent_hash, timestamp, timestamp_ms, gas_limit, gas_used, miner, extra_data) VALUES ({}, '0x{}', '0x{}', '{}', {}, {}, {}, '0x{}', {})",
-                        num,
-                        hex::encode(&hash),
-                        hex::encode(&parent_hash),
-                        timestamp.to_rfc3339(),
-                        timestamp_ms,
-                        gas_limit,
-                        gas_used,
-                        hex::encode(&miner),
-                        extra_data.as_ref().map(|d| format!("'0x{}'", hex::encode(d))).unwrap_or_else(|| "NULL".to_string()),
-                    );
-                    let _ = duck_conn.execute(&sql, []);
-                }
-                drop(duck_conn);
-
-                synced += block_rows.len() as i64;
+                synced += batch_synced;
                 remaining -= batch_size;
                 current = batch_start - 1;
             }
@@ -507,227 +473,10 @@ impl Replicator {
         start: i64,
         end: i64,
     ) -> Result<()> {
-        // Fetch all data from Postgres first (outside DuckDB lock)
-        let block_rows = pg_conn
-            .query(
-                "SELECT num, hash, parent_hash, timestamp, timestamp_ms, gas_limit, gas_used, miner, extra_data 
-                 FROM blocks WHERE num >= $1 AND num <= $2 ORDER BY num",
-                &[&start, &end],
-            )
-            .await?;
-
-        let tx_rows = pg_conn
-            .query(
-                "SELECT block_num, block_timestamp, idx, hash, type, \"from\", \"to\", value, input,
-                        gas_limit, max_fee_per_gas, max_priority_fee_per_gas, gas_used, nonce_key, nonce,
-                        fee_token, fee_payer, calls::text, call_count, valid_before, valid_after, signature_type
-                 FROM txs WHERE block_num >= $1 AND block_num <= $2 ORDER BY block_num, idx",
-                &[&start, &end],
-            )
-            .await?;
-
-        let log_rows = pg_conn
-            .query(
-                "SELECT block_num, block_timestamp, log_idx, tx_idx, tx_hash, address, selector, topic0, topic1, topic2, topic3, data
-                 FROM logs WHERE block_num >= $1 AND block_num <= $2 ORDER BY block_num, log_idx",
-                &[&start, &end],
-            )
-            .await?;
-
-        let receipt_rows = pg_conn
-            .query(
-                "SELECT block_num, block_timestamp, tx_idx, tx_hash, \"from\", \"to\", contract_address,
-                        gas_used, cumulative_gas_used, effective_gas_price, status, fee_payer
-                 FROM receipts WHERE block_num >= $1 AND block_num <= $2 ORDER BY block_num, tx_idx",
-                &[&start, &end],
-            )
-            .await?;
-
-        // Now write all tables to DuckDB (holding lock for minimal time)
-        let duck_conn = self.duckdb.conn().await;
-
-        // Write blocks
-        for row in &block_rows {
-            let num: i64 = row.get(0);
-            let hash: Vec<u8> = row.get(1);
-            let parent_hash: Vec<u8> = row.get(2);
-            let timestamp: chrono::DateTime<chrono::Utc> = row.get(3);
-            let timestamp_ms: i64 = row.get(4);
-            let gas_limit: i64 = row.get(5);
-            let gas_used: i64 = row.get(6);
-            let miner: Vec<u8> = row.get(7);
-            let extra_data: Option<Vec<u8>> = row.get(8);
-
-            let sql = format!(
-                "INSERT OR IGNORE INTO blocks (num, hash, parent_hash, timestamp, timestamp_ms, gas_limit, gas_used, miner, extra_data) VALUES ({}, '0x{}', '0x{}', '{}', {}, {}, {}, '0x{}', {})",
-                num,
-                hex::encode(&hash),
-                hex::encode(&parent_hash),
-                timestamp.to_rfc3339(),
-                timestamp_ms,
-                gas_limit,
-                gas_used,
-                hex::encode(&miner),
-                extra_data.as_ref().map(|d| format!("'0x{}'", hex::encode(d))).unwrap_or_else(|| "NULL".to_string()),
-            );
-            if let Err(e) = duck_conn.execute(&sql, []) {
-                tracing::warn!(error = %e, block_num = num, "Failed to insert block, skipping");
-            }
-        }
-
-        // Write transactions
-        if !tx_rows.is_empty() {
-            for chunk in tx_rows.chunks(100) {
-                let values: Vec<String> = chunk.iter().map(|row| {
-                    let block_num: i64 = row.get(0);
-                    let block_timestamp: chrono::DateTime<chrono::Utc> = row.get(1);
-                    let idx: i32 = row.get(2);
-                    let hash: Vec<u8> = row.get(3);
-                    let tx_type: i16 = row.get(4);
-                    let from: Vec<u8> = row.get(5);
-                    let to: Option<Vec<u8>> = row.get(6);
-                    let value: String = row.get(7);
-                    let input: Vec<u8> = row.get(8);
-                    let gas_limit: i64 = row.get(9);
-                    let max_fee: String = row.get(10);
-                    let max_priority: String = row.get(11);
-                    let gas_used: Option<i64> = row.get(12);
-                    let nonce_key: Vec<u8> = row.get(13);
-                    let nonce: i64 = row.get(14);
-                    let fee_token: Option<Vec<u8>> = row.get(15);
-                    let fee_payer: Option<Vec<u8>> = row.get(16);
-                    let calls: Option<String> = row.get(17);
-                    let call_count: i16 = row.get(18);
-                    let valid_before: Option<i64> = row.get(19);
-                    let valid_after: Option<i64> = row.get(20);
-                    let signature_type: Option<i16> = row.get(21);
-
-                    format!(
-                        "({}, '{}', {}, '0x{}', {}, '0x{}', {}, '{}', '0x{}', {}, '{}', '{}', {}, '0x{}', {}, {}, {}, {}, {}, {}, {}, {})",
-                        block_num,
-                        block_timestamp.to_rfc3339(),
-                        idx,
-                        hex::encode(&hash),
-                        tx_type,
-                        hex::encode(&from),
-                        to.as_ref().map(|t| format!("'0x{}'", hex::encode(t))).unwrap_or_else(|| "NULL".to_string()),
-                        value,
-                        hex::encode(&input),
-                        gas_limit,
-                        max_fee,
-                        max_priority,
-                        gas_used.map(|g| g.to_string()).unwrap_or_else(|| "NULL".to_string()),
-                        hex::encode(&nonce_key),
-                        nonce,
-                        fee_token.as_ref().map(|t| format!("'0x{}'", hex::encode(t))).unwrap_or_else(|| "NULL".to_string()),
-                        fee_payer.as_ref().map(|p| format!("'0x{}'", hex::encode(p))).unwrap_or_else(|| "NULL".to_string()),
-                        calls.as_ref().map(|c| format!("'{}'", c.replace('\'', "''"))).unwrap_or_else(|| "NULL".to_string()),
-                        call_count,
-                        valid_before.map(|v| v.to_string()).unwrap_or_else(|| "NULL".to_string()),
-                        valid_after.map(|v| v.to_string()).unwrap_or_else(|| "NULL".to_string()),
-                        signature_type.map(|s| s.to_string()).unwrap_or_else(|| "NULL".to_string()),
-                    )
-                }).collect();
-
-                let sql = format!(
-                    "INSERT OR IGNORE INTO txs (block_num, block_timestamp, idx, hash, type, \"from\", \"to\", value, input, gas_limit, max_fee_per_gas, max_priority_fee_per_gas, gas_used, nonce_key, nonce, fee_token, fee_payer, calls, call_count, valid_before, valid_after, signature_type) VALUES {}",
-                    values.join(", ")
-                );
-                if let Err(e) = duck_conn.execute(&sql, []) {
-                    tracing::warn!(error = %e, "Failed to insert tx batch, skipping");
-                }
-            }
-        }
-
-        // Write logs
-        if !log_rows.is_empty() {
-            for chunk in log_rows.chunks(100) {
-                let values: Vec<String> = chunk.iter().map(|row| {
-                    let block_num: i64 = row.get(0);
-                    let block_timestamp: chrono::DateTime<chrono::Utc> = row.get(1);
-                    let log_idx: i32 = row.get(2);
-                    let tx_idx: i32 = row.get(3);
-                    let tx_hash: Vec<u8> = row.get(4);
-                    let address: Vec<u8> = row.get(5);
-                    let selector: Option<Vec<u8>> = row.get(6);
-                    let topic0: Option<Vec<u8>> = row.get(7);
-                    let topic1: Option<Vec<u8>> = row.get(8);
-                    let topic2: Option<Vec<u8>> = row.get(9);
-                    let topic3: Option<Vec<u8>> = row.get(10);
-                    let data: Vec<u8> = row.get(11);
-
-                    format!(
-                        "({}, '{}', {}, {}, '0x{}', '0x{}', {}, {}, {}, {}, {}, '0x{}')",
-                        block_num,
-                        block_timestamp.to_rfc3339(),
-                        log_idx,
-                        tx_idx,
-                        hex::encode(&tx_hash),
-                        hex::encode(&address),
-                        selector.as_ref().map(|s| format!("'0x{}'", hex::encode(s))).unwrap_or_else(|| "NULL".to_string()),
-                        topic0.as_ref().map(|t| format!("'0x{}'", hex::encode(t))).unwrap_or_else(|| "NULL".to_string()),
-                        topic1.as_ref().map(|t| format!("'0x{}'", hex::encode(t))).unwrap_or_else(|| "NULL".to_string()),
-                        topic2.as_ref().map(|t| format!("'0x{}'", hex::encode(t))).unwrap_or_else(|| "NULL".to_string()),
-                        topic3.as_ref().map(|t| format!("'0x{}'", hex::encode(t))).unwrap_or_else(|| "NULL".to_string()),
-                        hex::encode(&data),
-                    )
-                }).collect();
-
-                let sql = format!(
-                    "INSERT OR IGNORE INTO logs (block_num, block_timestamp, log_idx, tx_idx, tx_hash, address, selector, topic0, topic1, topic2, topic3, data) VALUES {}",
-                    values.join(", ")
-                );
-                if let Err(e) = duck_conn.execute(&sql, []) {
-                    tracing::warn!(error = %e, "Failed to insert log batch, skipping");
-                }
-            }
-        }
-
-        // Write receipts
-        if !receipt_rows.is_empty() {
-            for chunk in receipt_rows.chunks(100) {
-                let values: Vec<String> = chunk.iter().map(|row| {
-                    let block_num: i64 = row.get(0);
-                    let block_timestamp: chrono::DateTime<chrono::Utc> = row.get(1);
-                    let tx_idx: i32 = row.get(2);
-                    let tx_hash: Vec<u8> = row.get(3);
-                    let from: Vec<u8> = row.get(4);
-                    let to: Option<Vec<u8>> = row.get(5);
-                    let contract_address: Option<Vec<u8>> = row.get(6);
-                    let gas_used: i64 = row.get(7);
-                    let cumulative_gas_used: i64 = row.get(8);
-                    let effective_gas_price: Option<String> = row.get(9);
-                    let status: Option<i16> = row.get(10);
-                    let fee_payer: Option<Vec<u8>> = row.get(11);
-
-                    format!(
-                        "({}, '{}', {}, '0x{}', '0x{}', {}, {}, {}, {}, {}, {}, {})",
-                        block_num,
-                        block_timestamp.to_rfc3339(),
-                        tx_idx,
-                        hex::encode(&tx_hash),
-                        hex::encode(&from),
-                        to.as_ref().map(|t| format!("'0x{}'", hex::encode(t))).unwrap_or_else(|| "NULL".to_string()),
-                        contract_address.as_ref().map(|c| format!("'0x{}'", hex::encode(c))).unwrap_or_else(|| "NULL".to_string()),
-                        gas_used,
-                        cumulative_gas_used,
-                        effective_gas_price.as_ref().map(|p| format!("'{}'", p)).unwrap_or_else(|| "NULL".to_string()),
-                        status.map(|s| s.to_string()).unwrap_or_else(|| "NULL".to_string()),
-                        fee_payer.as_ref().map(|p| format!("'0x{}'", hex::encode(p))).unwrap_or_else(|| "NULL".to_string()),
-                    )
-                }).collect();
-
-                let sql = format!(
-                    "INSERT OR IGNORE INTO receipts (block_num, block_timestamp, tx_idx, tx_hash, \"from\", \"to\", contract_address, gas_used, cumulative_gas_used, effective_gas_price, status, fee_payer) VALUES {}",
-                    values.join(", ")
-                );
-                if let Err(e) = duck_conn.execute(&sql, []) {
-                    tracing::warn!(error = %e, "Failed to insert receipt batch, skipping");
-                }
-            }
-        }
+        copy_range_to_duckdb(pg_conn, &self.duckdb, start, end).await?;
 
         // Update watermark
+        let duck_conn = self.duckdb.conn().await;
         duck_conn.execute(
             "UPDATE duckdb_sync_state SET latest_block = $1, updated_at = CURRENT_TIMESTAMP WHERE id = 1",
             duckdb::params![end],
@@ -802,6 +551,243 @@ impl Replicator {
 
         Ok(())
     }
+}
+
+/// Copies all tables (blocks, txs, logs, receipts) for a block range from Postgres to DuckDB.
+/// Returns the number of blocks synced (0 if no blocks in range).
+async fn copy_range_to_duckdb(
+    pg_conn: &deadpool_postgres::Object,
+    duckdb: &Arc<DuckDbPool>,
+    start: i64,
+    end: i64,
+) -> Result<i64> {
+    // Fetch all data from Postgres first (outside DuckDB lock)
+    let block_rows = pg_conn
+        .query(
+            "SELECT num, hash, parent_hash, timestamp, timestamp_ms, gas_limit, gas_used, miner, extra_data 
+             FROM blocks WHERE num >= $1 AND num <= $2 ORDER BY num",
+            &[&start, &end],
+        )
+        .await?;
+
+    if block_rows.is_empty() {
+        return Ok(0);
+    }
+
+    let tx_rows = pg_conn
+        .query(
+            "SELECT block_num, block_timestamp, idx, hash, type, \"from\", \"to\", value, input,
+                    gas_limit, max_fee_per_gas, max_priority_fee_per_gas, gas_used, nonce_key, nonce,
+                    fee_token, fee_payer, calls::text, call_count, valid_before, valid_after, signature_type
+             FROM txs WHERE block_num >= $1 AND block_num <= $2 ORDER BY block_num, idx",
+            &[&start, &end],
+        )
+        .await?;
+
+    let log_rows = pg_conn
+        .query(
+            "SELECT block_num, block_timestamp, log_idx, tx_idx, tx_hash, address, selector, topic0, topic1, topic2, topic3, data
+             FROM logs WHERE block_num >= $1 AND block_num <= $2 ORDER BY block_num, log_idx",
+            &[&start, &end],
+        )
+        .await?;
+
+    let receipt_rows = pg_conn
+        .query(
+            "SELECT block_num, block_timestamp, tx_idx, tx_hash, \"from\", \"to\", contract_address,
+                    gas_used, cumulative_gas_used, effective_gas_price, status, fee_payer
+             FROM receipts WHERE block_num >= $1 AND block_num <= $2 ORDER BY block_num, tx_idx",
+            &[&start, &end],
+        )
+        .await?;
+
+    let blocks_synced = block_rows.len() as i64;
+
+    // Now write all tables to DuckDB (holding lock for minimal time)
+    let duck_conn = duckdb.conn().await;
+
+    // Write blocks
+    for row in &block_rows {
+        let num: i64 = row.get(0);
+        let hash: Vec<u8> = row.get(1);
+        let parent_hash: Vec<u8> = row.get(2);
+        let timestamp: chrono::DateTime<chrono::Utc> = row.get(3);
+        let timestamp_ms: i64 = row.get(4);
+        let gas_limit: i64 = row.get(5);
+        let gas_used: i64 = row.get(6);
+        let miner: Vec<u8> = row.get(7);
+        let extra_data: Option<Vec<u8>> = row.get(8);
+
+        let sql = format!(
+            "INSERT OR IGNORE INTO blocks (num, hash, parent_hash, timestamp, timestamp_ms, gas_limit, gas_used, miner, extra_data) VALUES ({}, '0x{}', '0x{}', '{}', {}, {}, {}, '0x{}', {})",
+            num,
+            hex::encode(&hash),
+            hex::encode(&parent_hash),
+            timestamp.to_rfc3339(),
+            timestamp_ms,
+            gas_limit,
+            gas_used,
+            hex::encode(&miner),
+            extra_data.as_ref().map(|d| format!("'0x{}'", hex::encode(d))).unwrap_or_else(|| "NULL".to_string()),
+        );
+        if let Err(e) = duck_conn.execute(&sql, []) {
+            tracing::warn!(error = %e, block_num = num, "Failed to insert block, skipping");
+        }
+    }
+
+    // Write transactions
+    if !tx_rows.is_empty() {
+        for chunk in tx_rows.chunks(100) {
+            let values: Vec<String> = chunk.iter().map(|row| {
+                let block_num: i64 = row.get(0);
+                let block_timestamp: chrono::DateTime<chrono::Utc> = row.get(1);
+                let idx: i32 = row.get(2);
+                let hash: Vec<u8> = row.get(3);
+                let tx_type: i16 = row.get(4);
+                let from: Vec<u8> = row.get(5);
+                let to: Option<Vec<u8>> = row.get(6);
+                let value: String = row.get(7);
+                let input: Vec<u8> = row.get(8);
+                let gas_limit: i64 = row.get(9);
+                let max_fee_per_gas: Option<String> = row.get(10);
+                let max_priority_fee_per_gas: Option<String> = row.get(11);
+                let gas_used: Option<i64> = row.get(12);
+                let nonce_key: Option<Vec<u8>> = row.get(13);
+                let nonce: i64 = row.get(14);
+                let fee_token: Option<Vec<u8>> = row.get(15);
+                let fee_payer: Option<Vec<u8>> = row.get(16);
+                let calls: Option<String> = row.get(17);
+                let call_count: Option<i32> = row.get(18);
+                let valid_before: Option<i64> = row.get(19);
+                let valid_after: Option<i64> = row.get(20);
+                let signature_type: Option<i16> = row.get(21);
+
+                format!(
+                    "({}, '{}', {}, '0x{}', {}, '0x{}', {}, '{}', '0x{}', {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {})",
+                    block_num,
+                    block_timestamp.to_rfc3339(),
+                    idx,
+                    hex::encode(&hash),
+                    tx_type,
+                    hex::encode(&from),
+                    to.as_ref().map(|t| format!("'0x{}'", hex::encode(t))).unwrap_or_else(|| "NULL".to_string()),
+                    value,
+                    hex::encode(&input),
+                    gas_limit,
+                    max_fee_per_gas.as_ref().map(|f| format!("'{}'", f)).unwrap_or_else(|| "NULL".to_string()),
+                    max_priority_fee_per_gas.as_ref().map(|f| format!("'{}'", f)).unwrap_or_else(|| "NULL".to_string()),
+                    gas_used.map(|g| g.to_string()).unwrap_or_else(|| "NULL".to_string()),
+                    nonce_key.as_ref().map(|k| format!("'0x{}'", hex::encode(k))).unwrap_or_else(|| "NULL".to_string()),
+                    nonce,
+                    fee_token.as_ref().map(|t| format!("'0x{}'", hex::encode(t))).unwrap_or_else(|| "NULL".to_string()),
+                    fee_payer.as_ref().map(|p| format!("'0x{}'", hex::encode(p))).unwrap_or_else(|| "NULL".to_string()),
+                    calls.as_ref().map(|c| format!("'{}'", c.replace('\'', "''"))).unwrap_or_else(|| "NULL".to_string()),
+                    call_count.map(|c| c.to_string()).unwrap_or_else(|| "NULL".to_string()),
+                    valid_before.map(|v| v.to_string()).unwrap_or_else(|| "NULL".to_string()),
+                    valid_after.map(|v| v.to_string()).unwrap_or_else(|| "NULL".to_string()),
+                    signature_type.map(|s| s.to_string()).unwrap_or_else(|| "NULL".to_string()),
+                )
+            }).collect();
+
+            let sql = format!(
+                "INSERT OR IGNORE INTO txs (block_num, block_timestamp, idx, hash, type, \"from\", \"to\", value, input, gas_limit, max_fee_per_gas, max_priority_fee_per_gas, gas_used, nonce_key, nonce, fee_token, fee_payer, calls, call_count, valid_before, valid_after, signature_type) VALUES {}",
+                values.join(", ")
+            );
+            if let Err(e) = duck_conn.execute(&sql, []) {
+                tracing::warn!(error = %e, "Failed to insert tx batch, skipping");
+            }
+        }
+    }
+
+    // Write logs
+    if !log_rows.is_empty() {
+        for chunk in log_rows.chunks(100) {
+            let values: Vec<String> = chunk.iter().map(|row| {
+                let block_num: i64 = row.get(0);
+                let block_timestamp: chrono::DateTime<chrono::Utc> = row.get(1);
+                let log_idx: i32 = row.get(2);
+                let tx_idx: i32 = row.get(3);
+                let tx_hash: Vec<u8> = row.get(4);
+                let address: Vec<u8> = row.get(5);
+                let selector: Option<Vec<u8>> = row.get(6);
+                let topic0: Option<Vec<u8>> = row.get(7);
+                let topic1: Option<Vec<u8>> = row.get(8);
+                let topic2: Option<Vec<u8>> = row.get(9);
+                let topic3: Option<Vec<u8>> = row.get(10);
+                let data: Vec<u8> = row.get(11);
+
+                format!(
+                    "({}, '{}', {}, {}, '0x{}', '0x{}', {}, {}, {}, {}, {}, '0x{}')",
+                    block_num,
+                    block_timestamp.to_rfc3339(),
+                    log_idx,
+                    tx_idx,
+                    hex::encode(&tx_hash),
+                    hex::encode(&address),
+                    selector.as_ref().map(|s| format!("'0x{}'", hex::encode(s))).unwrap_or_else(|| "NULL".to_string()),
+                    topic0.as_ref().map(|t| format!("'0x{}'", hex::encode(t))).unwrap_or_else(|| "NULL".to_string()),
+                    topic1.as_ref().map(|t| format!("'0x{}'", hex::encode(t))).unwrap_or_else(|| "NULL".to_string()),
+                    topic2.as_ref().map(|t| format!("'0x{}'", hex::encode(t))).unwrap_or_else(|| "NULL".to_string()),
+                    topic3.as_ref().map(|t| format!("'0x{}'", hex::encode(t))).unwrap_or_else(|| "NULL".to_string()),
+                    hex::encode(&data),
+                )
+            }).collect();
+
+            let sql = format!(
+                "INSERT OR IGNORE INTO logs (block_num, block_timestamp, log_idx, tx_idx, tx_hash, address, selector, topic0, topic1, topic2, topic3, data) VALUES {}",
+                values.join(", ")
+            );
+            if let Err(e) = duck_conn.execute(&sql, []) {
+                tracing::warn!(error = %e, "Failed to insert log batch, skipping");
+            }
+        }
+    }
+
+    // Write receipts
+    if !receipt_rows.is_empty() {
+        for chunk in receipt_rows.chunks(100) {
+            let values: Vec<String> = chunk.iter().map(|row| {
+                let block_num: i64 = row.get(0);
+                let block_timestamp: chrono::DateTime<chrono::Utc> = row.get(1);
+                let tx_idx: i32 = row.get(2);
+                let tx_hash: Vec<u8> = row.get(3);
+                let from: Vec<u8> = row.get(4);
+                let to: Option<Vec<u8>> = row.get(5);
+                let contract_address: Option<Vec<u8>> = row.get(6);
+                let gas_used: i64 = row.get(7);
+                let cumulative_gas_used: i64 = row.get(8);
+                let effective_gas_price: Option<String> = row.get(9);
+                let status: Option<i16> = row.get(10);
+                let fee_payer: Option<Vec<u8>> = row.get(11);
+
+                format!(
+                    "({}, '{}', {}, '0x{}', '0x{}', {}, {}, {}, {}, {}, {}, {})",
+                    block_num,
+                    block_timestamp.to_rfc3339(),
+                    tx_idx,
+                    hex::encode(&tx_hash),
+                    hex::encode(&from),
+                    to.as_ref().map(|t| format!("'0x{}'", hex::encode(t))).unwrap_or_else(|| "NULL".to_string()),
+                    contract_address.as_ref().map(|c| format!("'0x{}'", hex::encode(c))).unwrap_or_else(|| "NULL".to_string()),
+                    gas_used,
+                    cumulative_gas_used,
+                    effective_gas_price.as_ref().map(|p| format!("'{}'", p)).unwrap_or_else(|| "NULL".to_string()),
+                    status.map(|s| s.to_string()).unwrap_or_else(|| "NULL".to_string()),
+                    fee_payer.as_ref().map(|p| format!("'0x{}'", hex::encode(p))).unwrap_or_else(|| "NULL".to_string()),
+                )
+            }).collect();
+
+            let sql = format!(
+                "INSERT OR IGNORE INTO receipts (block_num, block_timestamp, tx_idx, tx_hash, \"from\", \"to\", contract_address, gas_used, cumulative_gas_used, effective_gas_price, status, fee_payer) VALUES {}",
+                values.join(", ")
+            );
+            if let Err(e) = duck_conn.execute(&sql, []) {
+                tracing::warn!(error = %e, "Failed to insert receipt batch, skipping");
+            }
+        }
+    }
+
+    Ok(blocks_synced)
 }
 
 /// Backfills DuckDB from PostgreSQL for blocks, txs, logs, and receipts.
