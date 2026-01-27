@@ -305,7 +305,12 @@ async fn print_status(config: &Config) -> Result<()> {
                         }
                     }
                     Err(e) => {
-                        println!("│  └─ Error:    {}", e);
+                        let msg = e.to_string();
+                        if msg.contains("Conflicting lock") || msg.contains("lock on file") {
+                            println!("│  └─ Status:   Locked (indexer running)");
+                        } else {
+                            println!("│  └─ Error:    {}", e);
+                        }
                     }
                 }
             }

@@ -186,6 +186,9 @@ impl DuckDbPool {
         let path_owned = path.to_string();
         let path_for_thread = path.to_string();
 
+        // Use a channel to get the init result back from the spawned thread
+        let (init_tx, init_rx) = std::sync::mpsc::channel::<Result<()>>();
+
         thread::Builder::new()
             .name(format!("duckdb-ro-{}", path))
             .spawn(move || {
@@ -195,15 +198,18 @@ impl DuckDbPool {
                 ) {
                     Ok(c) => c,
                     Err(e) => {
-                        tracing::error!(error = %e, "Failed to open read-only DuckDB connection");
+                        let _ = init_tx.send(Err(anyhow::anyhow!("{}", e)));
                         return;
                     }
                 };
 
                 if let Err(e) = register_udfs(&conn) {
-                    tracing::error!(error = %e, "Failed to register DuckDB UDFs");
+                    let _ = init_tx.send(Err(anyhow::anyhow!("Failed to register UDFs: {}", e)));
                     return;
                 }
+
+                // Signal successful init
+                let _ = init_tx.send(Ok(()));
 
                 while let Ok(op) = op_rx.recv() {
                     match op {
@@ -242,6 +248,10 @@ impl DuckDbPool {
                     }
                 }
             })?;
+
+        // Wait for init result from the spawned thread
+        init_rx.recv()
+            .map_err(|_| anyhow::anyhow!("DuckDB thread died during init"))??;
 
         Ok(Self {
             path: path_owned,
