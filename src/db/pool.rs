@@ -12,8 +12,16 @@ pub async fn create_pool(database_url: &str) -> Result<Pool> {
 pub async fn create_pool_with_size(database_url: &str, max_size: usize) -> Result<Pool> {
     ensure_database_exists(database_url).await?;
 
+    // Append idle_in_transaction_session_timeout to kill stale connections (e.g., crash mid-COPY)
+    // This prevents lock contention on restart
+    let url_with_timeout = if database_url.contains('?') {
+        format!("{}&options=-c%20idle_in_transaction_session_timeout%3D60000", database_url)
+    } else {
+        format!("{}?options=-c%20idle_in_transaction_session_timeout%3D60000", database_url)
+    };
+
     let mut config = Config::new();
-    config.url = Some(database_url.to_string());
+    config.url = Some(url_with_timeout);
     config.pool = Some(deadpool_postgres::PoolConfig {
         max_size,
         ..Default::default()
