@@ -41,7 +41,7 @@ impl DuckDbPgEngine {
                     if i == 0 {
                         extension_available = true;
                         tracing::info!(
-                            pg_url = %pg_url.split('@').last().unwrap_or(pg_url),
+                            pg_url = %pg_url.split('@').next_back().unwrap_or(pg_url),
                             pool_size,
                             "DuckDB postgres extension initialized"
                         );
@@ -224,7 +224,7 @@ impl DuckDbPgEngine {
         }
 
         let conn = self.checkout().await?;
-        let result = execute_query(&*conn, sql);
+        let result = execute_query(&conn, sql);
         drop(conn); // Return to pool
         result
     }
@@ -241,7 +241,7 @@ impl DuckDbPgEngine {
         }
 
         let conn = self.checkout().await?;
-        let result = execute_query_streaming(&*conn, sql, batch_size, tx);
+        let result = execute_query_streaming(&conn, sql, batch_size, tx);
         drop(conn); // Return to pool
         result
     }
