@@ -74,7 +74,7 @@ pub async fn run(args: Args) -> Result<()> {
 
     let result = execute_query_with_engine(
         &pool,
-        None, // CLI doesn't use DuckDB engine
+        None, // DuckDB pool not available in CLI yet
         &args.sql,
         args.signature.as_deref(),
         &options,

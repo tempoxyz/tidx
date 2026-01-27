@@ -23,7 +23,17 @@ RUN apt-get update && apt-get install -y \
     ca-certificates \
     libssl3 \
     libstdc++6 \
+    curl \
+    unzip \
     && rm -rf /var/lib/apt/lists/*
+
+# Pre-install DuckDB CLI to download postgres extension for offline use
+# This allows the postgres extension to work without internet access at runtime
+RUN curl -fsSL https://github.com/duckdb/duckdb/releases/download/v1.2.2/duckdb_cli-linux-amd64.zip -o /tmp/duckdb.zip \
+    && unzip /tmp/duckdb.zip -d /tmp \
+    && /tmp/duckdb -c "INSTALL postgres; LOAD postgres;" \
+    && rm -rf /tmp/duckdb.zip /tmp/duckdb \
+    && mkdir -p /root/.duckdb
 
 COPY --from=builder /app/target/release/tidx /usr/local/bin/
 COPY --from=builder /app/db /db

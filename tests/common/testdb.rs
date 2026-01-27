@@ -12,7 +12,6 @@ static TEST_LOCK: OnceCell<Mutex<()>> = OnceCell::const_new();
 /// Tests that need isolation should use `truncate_all()` or unique data ranges.
 pub struct TestDb {
     pub pool: Pool,
-    pub database_url: String,
     _guard: MutexGuard<'static, ()>,
 }
 
@@ -45,7 +44,7 @@ impl TestDb {
             })
             .await;
 
-        Self { pool, database_url: url, _guard: guard }
+        Self { pool, _guard: guard }
     }
 
     async fn ensure_seeded(&self) {
