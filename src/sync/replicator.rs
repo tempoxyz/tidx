@@ -472,6 +472,10 @@ impl Replicator {
                 let synced = Self::copy_range_with_scanner(&conn, &pg_alias, batch_start, current)?;
                 total_synced += synced;
                 
+                // Checkpoint to flush WAL before releasing connection
+                // This ensures read connections can open without WAL replay issues
+                let _ = conn.execute("CHECKPOINT", []);
+                
                 // Release connection immediately after batch
                 drop(conn);
                 

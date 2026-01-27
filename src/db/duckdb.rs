@@ -43,7 +43,7 @@ impl DuckDbPool {
             r#"
             SET memory_limit = '16GB';
             SET threads = 4;
-            SET checkpoint_threshold = '1GB';
+            SET checkpoint_threshold = '100MB';
             SET preserve_insertion_order = false;
             "#,
         )?;
