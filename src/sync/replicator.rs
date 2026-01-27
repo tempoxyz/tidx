@@ -404,12 +404,14 @@ impl Replicator {
         conn.execute(&attach_sql, [])?;
 
         // Get PG block range via attached database
-        let mut stmt = conn.prepare(&format!(
-            "SELECT COALESCE(MIN(num), 0) as pg_min, COALESCE(MAX(num), 0) as pg_max \
-             FROM {}.public.blocks",
-            pg_alias
-        ))?;
-        let (pg_min, pg_max): (i64, i64) = stmt.query_row([], |row| Ok((row.get(0)?, row.get(1)?)))?;
+        let (pg_min, pg_max): (i64, i64) = {
+            let mut stmt = conn.prepare(&format!(
+                "SELECT COALESCE(MIN(num), 0) as pg_min, COALESCE(MAX(num), 0) as pg_max \
+                 FROM {}.public.blocks",
+                pg_alias
+            ))?;
+            stmt.query_row([], |row| Ok((row.get(0)?, row.get(1)?)))?
+        };
 
         if pg_max == 0 {
             return Ok(0);
@@ -441,25 +443,44 @@ impl Replicator {
         // Sort by start descending (most recent first)
         gaps.sort_by(|a, b| b.0.cmp(&a.0));
 
-        // Process gaps in larger batches (postgres_scanner handles parallelism internally)
-        const BATCH_SIZE: i64 = 10_000;
+        // Process gaps in smaller batches, releasing connection between batches
+        // to allow tail task and queries to proceed
+        const BATCH_SIZE: i64 = 1_000;
         let mut total_synced = 0i64;
         let start_time = Instant::now();
 
+        // Release connection before loop - we'll re-acquire per batch
+        drop(conn);
+
         for (gap_start, gap_end) in gaps {
-            // Process gap in chunks
             let mut current = gap_end;
             while current >= gap_start {
                 let batch_start = (current - BATCH_SIZE + 1).max(gap_start);
                 
+                // Acquire connection for this batch only
+                let conn = duckdb.conn().await;
+                
+                // Re-attach postgres (may already be attached from previous batch)
+                let attach_sql = format!(
+                    "ATTACH IF NOT EXISTS '{}' AS {} (TYPE postgres, READ_ONLY)",
+                    pg_url.replace('\'', "''"),
+                    pg_alias
+                );
+                conn.execute("LOAD postgres", [])?;
+                conn.execute(&attach_sql, [])?;
+                
                 let synced = Self::copy_range_with_scanner(&conn, &pg_alias, batch_start, current)?;
                 total_synced += synced;
                 
+                // Release connection immediately after batch
+                drop(conn);
+                
                 current = batch_start - 1;
+                
+                // Brief yield to let other tasks run
+                tokio::task::yield_now().await;
             }
         }
-
-        drop(conn); // Release lock before logging
 
         if total_synced > 0 {
             let elapsed = start_time.elapsed();
