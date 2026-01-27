@@ -395,14 +395,12 @@ impl Replicator {
         // Use chain-specific alias to avoid conflicts when multiple chains share a connection
         let pg_alias = format!("pg_{}", chain_id);
         
-        // Attach Postgres database with chain-specific alias
+        // Attach Postgres database with chain-specific alias (skip if already attached)
         let attach_sql = format!(
-            "ATTACH '{}' AS {} (TYPE postgres, READ_ONLY)",
+            "ATTACH IF NOT EXISTS '{}' AS {} (TYPE postgres, READ_ONLY)",
             pg_url.replace('\'', "''"),
             pg_alias
         );
-        // Detach first in case already attached from a previous call
-        let _ = conn.execute(&format!("DETACH IF EXISTS {}", pg_alias), []);
         conn.execute(&attach_sql, [])?;
 
         // Get PG block range via attached database

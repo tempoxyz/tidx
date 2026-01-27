@@ -5777,7 +5777,7 @@ dependencies = [
 
 [[package]]
 name = "tidx"
-version = "0.0.33"
+version = "0.0.35"
 dependencies = [
  "alloy",
  "anyhow",
