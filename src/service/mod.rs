@@ -73,19 +73,24 @@ pub async fn get_all_status(pool: &Pool) -> Result<Vec<SyncStatus>> {
                 Some(n) => n,
             };
 
-            let sync_rate = started_at.and_then(|started| {
-                let elapsed = Utc::now().signed_duration_since(started);
-                let secs = elapsed.num_seconds() as f64;
-                let total_indexed = match backfill_num {
-                    Some(n) => synced_num - n + 1,
-                    None => 1,
-                };
-                if secs > 0.0 { Some(total_indexed as f64 / secs) } else { None }
-            });
-
-            let eta_secs = sync_rate.and_then(|rate| {
-                if rate > 0.0 { Some(backfill_remaining as f64 / rate) } else { None }
-            });
+            // Only calculate rate/ETA if actively backfilling
+            let (sync_rate, eta_secs) = if backfill_remaining > 0 {
+                let rate = started_at.and_then(|started| {
+                    let elapsed = Utc::now().signed_duration_since(started);
+                    let secs = elapsed.num_seconds() as f64;
+                    let total_indexed = match backfill_num {
+                        Some(n) => synced_num - n + 1,
+                        None => 1,
+                    };
+                    if secs > 0.0 && total_indexed > 0 { Some(total_indexed as f64 / secs) } else { None }
+                });
+                let eta = rate.and_then(|r| {
+                    if r > 0.0 { Some(backfill_remaining as f64 / r) } else { None }
+                });
+                (rate, eta)
+            } else {
+                (None, None)
+            };
 
             // Gap = blocks between synced_num and tip_num that may be missing
             let gap_blocks = tip_num.saturating_sub(synced_num);
