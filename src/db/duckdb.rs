@@ -8,7 +8,7 @@ use duckdb::vscalar::{ScalarFunctionSignature, VScalar};
 use duckdb::vtab::arrow::WritableVector;
 use duckdb::Connection;
 use std::sync::RwLock;
-use tokio::sync::Mutex;
+use std::thread;
 
 /// Cached sync status for fast status endpoint queries.
 #[derive(Debug, Clone, Default)]
@@ -20,43 +20,156 @@ pub struct CachedSyncStatus {
 
 /// DuckDB connection pool for analytical queries.
 ///
-/// Uses a single write connection protected by mutex (DuckDB is single-writer).
-/// Read queries open fresh connections to avoid blocking on writes.
+/// DuckDB's Connection is !Sync (contains RefCell), so we run all operations
+/// on a dedicated thread to avoid file descriptor corruption. The connection
+/// is protected by a std::sync::Mutex and all operations are dispatched via
+/// a channel to the dedicated thread.
 pub struct DuckDbPool {
     /// Path to the DuckDB database file
     path: String,
-    /// Write connection protected by mutex
-    write_conn: Mutex<Connection>,
+    /// Sender to dispatch operations to the dedicated DuckDB thread
+    op_tx: std::sync::mpsc::Sender<DuckDbOp>,
     /// Cached sync status (updated by background task)
     cached_status: RwLock<CachedSyncStatus>,
+}
+
+/// Operations that can be executed on the DuckDB thread.
+enum DuckDbOp {
+    /// Execute SQL that doesn't return results
+    Execute {
+        sql: String,
+        result_tx: tokio::sync::oneshot::Sender<Result<usize>>,
+    },
+    /// Execute a query and return results as JSON
+    Query {
+        sql: String,
+        result_tx: tokio::sync::oneshot::Sender<Result<(Vec<String>, Vec<Vec<serde_json::Value>>)>>,
+    },
+    /// Execute a streaming query
+    QueryStreaming {
+        sql: String,
+        batch_size: usize,
+        batch_tx: tokio::sync::mpsc::Sender<Result<Vec<Vec<serde_json::Value>>>>,
+        result_tx: tokio::sync::oneshot::Sender<Result<Vec<String>>>,
+    },
+    /// Get min/max block range
+    BlockRange {
+        result_tx: tokio::sync::oneshot::Sender<Result<(Option<i64>, Option<i64>)>>,
+    },
+    /// Execute a custom closure (for complex operations like gap-fill)
+    WithConnection {
+        func: Box<dyn FnOnce(&Connection) -> Result<()> + Send>,
+        result_tx: tokio::sync::oneshot::Sender<Result<()>>,
+    },
+    /// Execute a closure that returns a serializable result
+    WithConnectionBoxed {
+        func: Box<dyn FnOnce(&Connection) -> Result<Box<dyn std::any::Any + Send>> + Send>,
+        result_tx: tokio::sync::oneshot::Sender<Result<Box<dyn std::any::Any + Send>>>,
+    },
+    /// Checkpoint the database
+    Checkpoint {
+        result_tx: tokio::sync::oneshot::Sender<Result<()>>,
+    },
 }
 
 impl DuckDbPool {
     /// Creates a new DuckDB pool at the specified path.
     ///
     /// Creates the database file and schema if they don't exist.
+    /// Spawns a dedicated thread for all DuckDB operations to avoid
+    /// file descriptor corruption from cross-thread access.
     pub fn new(path: &str) -> Result<Self> {
-        let conn = Connection::open(path).context("Failed to open DuckDB connection")?;
+        let (op_tx, op_rx) = std::sync::mpsc::channel::<DuckDbOp>();
+        let path_owned = path.to_string();
+        let path_for_thread = path.to_string();
 
-        // Performance tuning
-        conn.execute_batch(
-            r#"
-            SET memory_limit = '16GB';
-            SET threads = 4;
-            SET checkpoint_threshold = '100MB';
-            SET preserve_insertion_order = false;
-            "#,
-        )?;
+        // Spawn dedicated thread for DuckDB operations
+        thread::Builder::new()
+            .name(format!("duckdb-{}", path))
+            .spawn(move || {
+                // Open connection on this thread
+                let conn = match Connection::open(&path_for_thread) {
+                    Ok(c) => c,
+                    Err(e) => {
+                        tracing::error!(error = %e, "Failed to open DuckDB connection");
+                        return;
+                    }
+                };
 
-        // Register native UDFs for fast hex parsing
-        register_udfs(&conn)?;
+                // Performance tuning
+                if let Err(e) = conn.execute_batch(
+                    r#"
+                    SET memory_limit = '16GB';
+                    SET threads = 4;
+                    SET checkpoint_threshold = '100MB';
+                    SET preserve_insertion_order = false;
+                    "#,
+                ) {
+                    tracing::error!(error = %e, "Failed to configure DuckDB");
+                    return;
+                }
 
-        // Run schema migrations
-        run_schema(&conn)?;
+                // Register native UDFs for fast hex parsing
+                if let Err(e) = register_udfs(&conn) {
+                    tracing::error!(error = %e, "Failed to register DuckDB UDFs");
+                    return;
+                }
+
+                // Run schema migrations
+                if let Err(e) = run_schema(&conn) {
+                    tracing::error!(error = %e, "Failed to run DuckDB schema");
+                    return;
+                }
+
+                tracing::info!(path = %path_for_thread, "DuckDB thread started");
+
+                // Process operations
+                while let Ok(op) = op_rx.recv() {
+                    match op {
+                        DuckDbOp::Execute { sql, result_tx } => {
+                            let result = conn.execute(&sql, []).map_err(|e| anyhow::anyhow!("{}", e));
+                            let _ = result_tx.send(result);
+                        }
+                        DuckDbOp::Query { sql, result_tx } => {
+                            let result = execute_query(&conn, &sql);
+                            let _ = result_tx.send(result);
+                        }
+                        DuckDbOp::QueryStreaming { sql, batch_size, batch_tx, result_tx } => {
+                            let result = execute_query_streaming(&conn, &sql, batch_size, batch_tx);
+                            let _ = result_tx.send(result);
+                        }
+                        DuckDbOp::BlockRange { result_tx } => {
+                            let min: Option<i64> = conn.prepare("SELECT MIN(num) FROM blocks")
+                                .ok()
+                                .and_then(|mut stmt| stmt.query_row([], |row| row.get(0)).ok());
+                            let max: Option<i64> = conn.prepare("SELECT MAX(num) FROM blocks")
+                                .ok()
+                                .and_then(|mut stmt| stmt.query_row([], |row| row.get(0)).ok());
+                            let _ = result_tx.send(Ok((min, max)));
+                        }
+                        DuckDbOp::WithConnection { func, result_tx } => {
+                            let result = func(&conn);
+                            let _ = result_tx.send(result);
+                        }
+                        DuckDbOp::WithConnectionBoxed { func, result_tx } => {
+                            let result = func(&conn);
+                            let _ = result_tx.send(result);
+                        }
+                        DuckDbOp::Checkpoint { result_tx } => {
+                            let result = conn.execute("CHECKPOINT", [])
+                                .map(|_| ())
+                                .map_err(|e| anyhow::anyhow!("{}", e));
+                            let _ = result_tx.send(result);
+                        }
+                    }
+                }
+
+                tracing::info!(path = %path_for_thread, "DuckDB thread stopped");
+            })?;
 
         Ok(Self {
-            path: path.to_string(),
-            write_conn: Mutex::new(conn),
+            path: path_owned,
+            op_tx,
             cached_status: RwLock::new(CachedSyncStatus::default()),
         })
     }
@@ -69,11 +182,70 @@ impl DuckDbPool {
     /// Opens a read-only connection to an existing DuckDB database.
     /// Use this for status queries when the main indexer may have the file locked.
     pub fn open_readonly(path: &str) -> Result<Self> {
-        let conn = Connection::open_with_flags(path, duckdb::Config::default().access_mode(duckdb::AccessMode::ReadOnly)?)?;
-        register_udfs(&conn)?;
+        let (op_tx, op_rx) = std::sync::mpsc::channel::<DuckDbOp>();
+        let path_owned = path.to_string();
+        let path_for_thread = path.to_string();
+
+        thread::Builder::new()
+            .name(format!("duckdb-ro-{}", path))
+            .spawn(move || {
+                let conn = match Connection::open_with_flags(
+                    &path_for_thread,
+                    duckdb::Config::default().access_mode(duckdb::AccessMode::ReadOnly).unwrap(),
+                ) {
+                    Ok(c) => c,
+                    Err(e) => {
+                        tracing::error!(error = %e, "Failed to open read-only DuckDB connection");
+                        return;
+                    }
+                };
+
+                if let Err(e) = register_udfs(&conn) {
+                    tracing::error!(error = %e, "Failed to register DuckDB UDFs");
+                    return;
+                }
+
+                while let Ok(op) = op_rx.recv() {
+                    match op {
+                        DuckDbOp::Execute { sql, result_tx } => {
+                            let result = conn.execute(&sql, []).map_err(|e| anyhow::anyhow!("{}", e));
+                            let _ = result_tx.send(result);
+                        }
+                        DuckDbOp::Query { sql, result_tx } => {
+                            let result = execute_query(&conn, &sql);
+                            let _ = result_tx.send(result);
+                        }
+                        DuckDbOp::QueryStreaming { sql, batch_size, batch_tx, result_tx } => {
+                            let result = execute_query_streaming(&conn, &sql, batch_size, batch_tx);
+                            let _ = result_tx.send(result);
+                        }
+                        DuckDbOp::BlockRange { result_tx } => {
+                            let min: Option<i64> = conn.prepare("SELECT MIN(num) FROM blocks")
+                                .ok()
+                                .and_then(|mut stmt| stmt.query_row([], |row| row.get(0)).ok());
+                            let max: Option<i64> = conn.prepare("SELECT MAX(num) FROM blocks")
+                                .ok()
+                                .and_then(|mut stmt| stmt.query_row([], |row| row.get(0)).ok());
+                            let _ = result_tx.send(Ok((min, max)));
+                        }
+                        DuckDbOp::WithConnection { func, result_tx } => {
+                            let result = func(&conn);
+                            let _ = result_tx.send(result);
+                        }
+                        DuckDbOp::WithConnectionBoxed { func, result_tx } => {
+                            let result = func(&conn);
+                            let _ = result_tx.send(result);
+                        }
+                        DuckDbOp::Checkpoint { result_tx } => {
+                            let _ = result_tx.send(Ok(()));
+                        }
+                    }
+                }
+            })?;
+
         Ok(Self {
-            path: path.to_string(),
-            write_conn: Mutex::new(conn),
+            path: path_owned,
+            op_tx,
             cached_status: RwLock::new(CachedSyncStatus::default()),
         })
     }
@@ -92,22 +264,6 @@ impl DuckDbPool {
         self.cached_status.read().map(|s| s.clone()).unwrap_or_default()
     }
 
-    /// Gets the write connection (mutex-protected, blocks other writers).
-    pub async fn conn(&self) -> tokio::sync::MutexGuard<'_, Connection> {
-        self.write_conn.lock().await
-    }
-
-    /// Opens a fresh read-only connection (doesn't block on writes).
-    /// For in-memory databases, falls back to the write connection.
-    fn open_read_conn(&self) -> Result<Connection> {
-        if self.path == ":memory:" {
-            anyhow::bail!("In-memory database cannot use separate read connections");
-        }
-        let conn = Connection::open_with_flags(&self.path, duckdb::Config::default().access_mode(duckdb::AccessMode::ReadOnly)?)?;
-        register_udfs(&conn)?;
-        Ok(conn)
-    }
-
     /// Returns true if this is an in-memory database.
     pub fn is_in_memory(&self) -> bool {
         self.path == ":memory:"
@@ -118,89 +274,133 @@ impl DuckDbPool {
         &self.path
     }
 
+    /// Execute SQL that doesn't return results.
+    pub async fn execute(&self, sql: &str) -> Result<usize> {
+        let (result_tx, result_rx) = tokio::sync::oneshot::channel();
+        self.op_tx
+            .send(DuckDbOp::Execute {
+                sql: sql.to_string(),
+                result_tx,
+            })
+            .map_err(|_| anyhow::anyhow!("DuckDB thread stopped"))?;
+        result_rx.await.map_err(|_| anyhow::anyhow!("DuckDB thread stopped"))?
+    }
+
+    /// Execute a closure with direct access to the connection.
+    /// The closure runs on the dedicated DuckDB thread.
+    pub async fn with_connection<F>(&self, func: F) -> Result<()>
+    where
+        F: FnOnce(&Connection) -> Result<()> + Send + 'static,
+    {
+        let (result_tx, result_rx) = tokio::sync::oneshot::channel();
+        self.op_tx
+            .send(DuckDbOp::WithConnection {
+                func: Box::new(func),
+                result_tx,
+            })
+            .map_err(|_| anyhow::anyhow!("DuckDB thread stopped"))?;
+        result_rx.await.map_err(|_| anyhow::anyhow!("DuckDB thread stopped"))?
+    }
+
+    /// Execute a closure with direct access to the connection that returns a value.
+    /// The closure runs on the dedicated DuckDB thread.
+    pub async fn with_connection_result<F, T>(&self, func: F) -> Result<T>
+    where
+        F: FnOnce(&Connection) -> Result<T> + Send + 'static,
+        T: Send + 'static,
+    {
+        let (result_tx, result_rx) = tokio::sync::oneshot::channel();
+        self.op_tx
+            .send(DuckDbOp::WithConnectionBoxed {
+                func: Box::new(move |conn| {
+                    let result = func(conn)?;
+                    Ok(Box::new(result) as Box<dyn std::any::Any + Send>)
+                }),
+                result_tx,
+            })
+            .map_err(|_| anyhow::anyhow!("DuckDB thread stopped"))?;
+        let boxed = result_rx.await.map_err(|_| anyhow::anyhow!("DuckDB thread stopped"))??;
+        boxed
+            .downcast::<T>()
+            .map(|b| *b)
+            .map_err(|_| anyhow::anyhow!("Type mismatch in DuckDB result"))
+    }
+
+    /// Checkpoint the database to flush WAL.
+    pub async fn checkpoint(&self) -> Result<()> {
+        let (result_tx, result_rx) = tokio::sync::oneshot::channel();
+        self.op_tx
+            .send(DuckDbOp::Checkpoint { result_tx })
+            .map_err(|_| anyhow::anyhow!("DuckDB thread stopped"))?;
+        result_rx.await.map_err(|_| anyhow::anyhow!("DuckDB thread stopped"))?
+    }
+
+    /// Execute multiple SQL statements in a batch.
+    /// All statements run on the dedicated DuckDB thread.
+    pub async fn execute_batch(&self, statements: Vec<String>) -> Result<()> {
+        self.with_connection(move |conn| {
+            for sql in statements {
+                conn.execute(&sql, [])?;
+            }
+            Ok(())
+        }).await
+    }
+
     /// Gets the latest synced block number from DuckDB.
-    /// Uses a read-only connection to avoid blocking on writes.
     pub async fn latest_block(&self) -> Result<Option<i64>> {
-        self.query_scalar("SELECT MAX(num) FROM blocks").await
+        let (_min, max) = self.block_range().await?;
+        Ok(max)
     }
 
     /// Gets the earliest synced block number from DuckDB.
-    /// Uses a read-only connection to avoid blocking on writes.
     pub async fn earliest_block(&self) -> Result<Option<i64>> {
-        self.query_scalar("SELECT MIN(num) FROM blocks").await
+        let (min, _max) = self.block_range().await?;
+        Ok(min)
     }
 
     /// Gets both min and max block numbers from DuckDB.
-    /// Uses a read-only connection to avoid blocking on writes.
     pub async fn block_range(&self) -> Result<(Option<i64>, Option<i64>)> {
-        if self.is_in_memory() {
-            let conn = self.conn().await;
-            let min: Option<i64> = conn.prepare("SELECT MIN(num) FROM blocks")
-                .ok()
-                .and_then(|mut stmt| stmt.query_row([], |row| row.get(0)).ok());
-            let max: Option<i64> = conn.prepare("SELECT MAX(num) FROM blocks")
-                .ok()
-                .and_then(|mut stmt| stmt.query_row([], |row| row.get(0)).ok());
-            Ok((min, max))
-        } else {
-            let conn = self.open_read_conn()?;
-            let min: Option<i64> = conn.prepare("SELECT MIN(num) FROM blocks")
-                .ok()
-                .and_then(|mut stmt| stmt.query_row([], |row| row.get(0)).ok());
-            let max: Option<i64> = conn.prepare("SELECT MAX(num) FROM blocks")
-                .ok()
-                .and_then(|mut stmt| stmt.query_row([], |row| row.get(0)).ok());
-            Ok((min, max))
-        }
-    }
-
-    /// Helper to query a single scalar value.
-    async fn query_scalar(&self, sql: &str) -> Result<Option<i64>> {
-        if self.is_in_memory() {
-            let conn = self.conn().await;
-            let mut stmt = conn.prepare(sql)?;
-            let result: Option<i64> = stmt.query_row([], |row| row.get(0)).ok();
-            Ok(result)
-        } else {
-            let conn = self.open_read_conn()?;
-            let mut stmt = conn.prepare(sql)?;
-            let result: Option<i64> = stmt.query_row([], |row| row.get(0)).ok();
-            Ok(result)
-        }
+        let (result_tx, result_rx) = tokio::sync::oneshot::channel();
+        self.op_tx
+            .send(DuckDbOp::BlockRange { result_tx })
+            .map_err(|_| anyhow::anyhow!("DuckDB thread stopped"))?;
+        result_rx.await.map_err(|_| anyhow::anyhow!("DuckDB thread stopped"))?
     }
 
     /// Executes a query and returns results as JSON.
-    /// Opens a fresh read-only connection to avoid blocking on writes.
-    /// Falls back to write connection for in-memory databases.
+    /// Runs on the dedicated DuckDB thread.
     pub async fn query(&self, sql: &str) -> Result<(Vec<String>, Vec<Vec<serde_json::Value>>)> {
-        if self.is_in_memory() {
-            let conn = self.conn().await;
-            execute_query(&conn, sql)
-        } else {
-            let conn = self.open_read_conn()?;
-            execute_query(&conn, sql)
-        }
+        let (result_tx, result_rx) = tokio::sync::oneshot::channel();
+        self.op_tx
+            .send(DuckDbOp::Query {
+                sql: sql.to_string(),
+                result_tx,
+            })
+            .map_err(|_| anyhow::anyhow!("DuckDB thread stopped"))?;
+        result_rx.await.map_err(|_| anyhow::anyhow!("DuckDB thread stopped"))?
     }
 
     /// Executes a streaming query and sends batches through a channel.
     ///
     /// Returns column names immediately, then sends row batches through the channel.
     /// This allows SSE streaming of large result sets.
-    /// Opens a fresh read-only connection to avoid blocking on writes.
-    /// Falls back to write connection for in-memory databases.
+    /// Runs on the dedicated DuckDB thread.
     pub async fn query_streaming(
         &self,
         sql: &str,
         batch_size: usize,
-        tx: tokio::sync::mpsc::Sender<Result<Vec<Vec<serde_json::Value>>>>,
+        batch_tx: tokio::sync::mpsc::Sender<Result<Vec<Vec<serde_json::Value>>>>,
     ) -> Result<Vec<String>> {
-        if self.is_in_memory() {
-            let conn = self.conn().await;
-            execute_query_streaming(&conn, sql, batch_size, tx)
-        } else {
-            let conn = self.open_read_conn()?;
-            execute_query_streaming(&conn, sql, batch_size, tx)
-        }
+        let (result_tx, result_rx) = tokio::sync::oneshot::channel();
+        self.op_tx
+            .send(DuckDbOp::QueryStreaming {
+                sql: sql.to_string(),
+                batch_size,
+                batch_tx,
+                result_tx,
+            })
+            .map_err(|_| anyhow::anyhow!("DuckDB thread stopped"))?;
+        result_rx.await.map_err(|_| anyhow::anyhow!("DuckDB thread stopped"))?
     }
 }
 
@@ -905,14 +1105,11 @@ mod tests {
     #[tokio::test]
     async fn test_schema_creation() {
         let pool = DuckDbPool::in_memory().unwrap();
-        let conn = pool.conn().await;
 
         // Verify tables exist
-        let (_, rows) = execute_query(
-            &conn,
+        let (_, rows) = pool.query(
             "SELECT table_name FROM information_schema.tables WHERE table_schema = 'main'",
-        )
-        .unwrap();
+        ).await.unwrap();
 
         let table_names: Vec<&str> = rows
             .iter()
@@ -929,16 +1126,14 @@ mod tests {
     async fn test_insert_and_query() {
         let pool = DuckDbPool::in_memory().unwrap();
 
-        // Insert a block and query it back
-        let conn = pool.conn().await;
-        conn.execute(
+        // Insert a block
+        pool.execute(
             "INSERT INTO blocks (num, hash, parent_hash, timestamp, timestamp_ms, gas_limit, gas_used, miner)
              VALUES (1, '0xabc', '0x000', '2024-01-01 00:00:00+00', 1704067200000, 30000000, 21000, '0xminer')",
-            [],
-        )
-        .unwrap();
+        ).await.unwrap();
 
-        let (_, rows) = execute_query(&conn, "SELECT num, hash FROM blocks WHERE num = 1").unwrap();
+        // Query it back
+        let (_, rows) = pool.query("SELECT num, hash FROM blocks WHERE num = 1").await.unwrap();
 
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0][0], serde_json::json!(1));
@@ -950,24 +1145,20 @@ mod tests {
         let pool = DuckDbPool::in_memory().unwrap();
 
         // Insert multiple blocks
-        let conn = pool.conn().await;
         for i in 1..=10 {
-            conn.execute(
+            pool.execute(
                 &format!(
                     "INSERT INTO blocks (num, hash, parent_hash, timestamp, timestamp_ms, gas_limit, gas_used, miner)
                      VALUES ({i}, '0x{i:03x}', '0x000', '2024-01-01 00:00:00+00', {}, 30000000, {}, '0xminer')",
                     1_704_067_200_000_i64 + i * 1000,
                     21000 * i
                 ),
-                [],
-            )
-            .unwrap();
+            ).await.unwrap();
         }
 
         // Run aggregation
-        let (cols, rows) =
-            execute_query(&conn, "SELECT COUNT(*) as cnt, SUM(gas_used) as total FROM blocks")
-                .unwrap();
+        let (cols, rows) = pool.query("SELECT COUNT(*) as cnt, SUM(gas_used) as total FROM blocks")
+            .await.unwrap();
 
         assert_eq!(cols, vec!["cnt", "total"]);
         assert_eq!(rows.len(), 1);
@@ -983,25 +1174,43 @@ mod tests {
     mod udf_tests {
         use super::*;
 
+        async fn get_i128_async(pool: &DuckDbPool, sql: &str) -> Option<i128> {
+            let sql = sql.to_string();
+            pool.with_connection_result(move |conn| {
+                let mut stmt = conn.prepare(&sql)?;
+                let result: Option<i128> = stmt.query_row([], |row| row.get::<_, i128>(0)).ok();
+                Ok(result)
+            }).await.ok().flatten()
+        }
+
         fn get_i128(pool: &DuckDbPool, sql: &str) -> Option<i128> {
-            let conn = futures::executor::block_on(pool.conn());
-            let mut stmt = conn.prepare(sql).unwrap();
-            stmt.query_row([], |row| row.get::<_, i128>(0)).ok()
+            futures::executor::block_on(get_i128_async(pool, sql))
+        }
+
+        async fn get_string_async(pool: &DuckDbPool, sql: &str) -> Option<String> {
+            let sql = sql.to_string();
+            pool.with_connection_result(move |conn| {
+                let mut stmt = conn.prepare(&sql)?;
+                let result: Option<String> = stmt.query_row([], |row| row.get::<_, String>(0)).ok();
+                Ok(result)
+            }).await.ok().flatten()
         }
 
         fn get_string(pool: &DuckDbPool, sql: &str) -> Option<String> {
-            let conn = futures::executor::block_on(pool.conn());
-            let mut stmt = conn.prepare(sql).unwrap();
-            stmt.query_row([], |row| row.get::<_, String>(0)).ok()
+            futures::executor::block_on(get_string_async(pool, sql))
+        }
+
+        async fn is_null_async(pool: &DuckDbPool, sql: &str) -> bool {
+            let sql = sql.to_string();
+            pool.with_connection_result(move |conn| {
+                let mut stmt = conn.prepare(&sql)?;
+                let result: Option<Option<String>> = stmt.query_row([], |row| row.get::<_, Option<String>>(0)).ok();
+                Ok(result.flatten().is_none())
+            }).await.unwrap_or(true)
         }
 
         fn is_null(pool: &DuckDbPool, sql: &str) -> bool {
-            let conn = futures::executor::block_on(pool.conn());
-            let mut stmt = conn.prepare(sql).unwrap();
-            stmt.query_row([], |row| row.get::<_, Option<String>>(0))
-                .ok()
-                .flatten()
-                .is_none()
+            futures::executor::block_on(is_null_async(pool, sql))
         }
 
         // --------------------------------------------------------------------
@@ -1365,67 +1574,55 @@ mod tests {
         #[test]
         fn test_batch_processing() {
             let pool = DuckDbPool::in_memory().unwrap();
-            let conn = futures::executor::block_on(pool.conn());
             
             // Create a table with multiple rows to test batch processing
-            conn.execute(
-                "CREATE TEMP TABLE test_topics (id INT, topic VARCHAR)",
-                [],
-            ).unwrap();
-            
-            // Insert multiple topics
-            for i in 1..=100 {
-                let topic = format!(
-                    "0x{:064x}",
-                    i
-                );
-                conn.execute(
-                    &format!("INSERT INTO test_topics VALUES ({i}, '{topic}')"),
-                    [],
-                ).unwrap();
-            }
-            
-            // Query all at once
-            let (_, rows) = execute_query(
-                &conn,
-                "SELECT id, topic_uint_native(topic) as value FROM test_topics ORDER BY id",
-            ).unwrap();
-            
-            assert_eq!(rows.len(), 100);
-            for (i, row) in rows.iter().enumerate() {
-                assert_eq!(row[0], serde_json::json!((i + 1) as i64));
-                assert_eq!(row[1], serde_json::json!((i + 1) as i64));
-            }
+            futures::executor::block_on(async {
+                pool.execute("CREATE TEMP TABLE test_topics (id INT, topic VARCHAR)").await.unwrap();
+                
+                // Insert multiple topics
+                for i in 1..=100 {
+                    let topic = format!("0x{:064x}", i);
+                    pool.execute(&format!("INSERT INTO test_topics VALUES ({i}, '{topic}')")).await.unwrap();
+                }
+                
+                // Query all at once
+                let (_, rows) = pool.query(
+                    "SELECT id, topic_uint_native(topic) as value FROM test_topics ORDER BY id",
+                ).await.unwrap();
+                
+                assert_eq!(rows.len(), 100);
+                for (i, row) in rows.iter().enumerate() {
+                    assert_eq!(row[0], serde_json::json!((i + 1) as i64));
+                    assert_eq!(row[1], serde_json::json!((i + 1) as i64));
+                }
+            });
         }
 
         #[test]
         fn test_null_handling_in_batch() {
             let pool = DuckDbPool::in_memory().unwrap();
-            let conn = futures::executor::block_on(pool.conn());
             
-            conn.execute(
-                "CREATE TEMP TABLE test_mixed (id INT, topic VARCHAR)",
-                [],
-            ).unwrap();
-            
-            // Mix of valid and NULL values
-            conn.execute("INSERT INTO test_mixed VALUES (1, '0x0000000000000000000000000000000000000000000000000000000000000001')", []).unwrap();
-            conn.execute("INSERT INTO test_mixed VALUES (2, NULL)", []).unwrap();
-            conn.execute("INSERT INTO test_mixed VALUES (3, '0x0000000000000000000000000000000000000000000000000000000000000003')", []).unwrap();
-            conn.execute("INSERT INTO test_mixed VALUES (4, NULL)", []).unwrap();
-            conn.execute("INSERT INTO test_mixed VALUES (5, '0x0000000000000000000000000000000000000000000000000000000000000005')", []).unwrap();
-            
-            let (_, rows) = execute_query(
-                &conn,
-                "SELECT id, topic_uint_native(topic) as value FROM test_mixed ORDER BY id",
-            ).unwrap();
-            
-            assert_eq!(rows.len(), 5);
-            assert_eq!(rows[0][1], serde_json::json!(1));
-            assert_eq!(rows[1][1], serde_json::Value::Null);
-            assert_eq!(rows[2][1], serde_json::json!(3));
-            assert_eq!(rows[3][1], serde_json::Value::Null);
-            assert_eq!(rows[4][1], serde_json::json!(5));
+            futures::executor::block_on(async {
+                pool.execute("CREATE TEMP TABLE test_mixed (id INT, topic VARCHAR)").await.unwrap();
+                
+                // Mix of valid and NULL values
+                pool.execute("INSERT INTO test_mixed VALUES (1, '0x0000000000000000000000000000000000000000000000000000000000000001')").await.unwrap();
+                pool.execute("INSERT INTO test_mixed VALUES (2, NULL)").await.unwrap();
+                pool.execute("INSERT INTO test_mixed VALUES (3, '0x0000000000000000000000000000000000000000000000000000000000000003')").await.unwrap();
+                pool.execute("INSERT INTO test_mixed VALUES (4, NULL)").await.unwrap();
+                pool.execute("INSERT INTO test_mixed VALUES (5, '0x0000000000000000000000000000000000000000000000000000000000000005')").await.unwrap();
+                
+                let (_, rows) = pool.query(
+                    "SELECT id, topic_uint_native(topic) as value FROM test_mixed ORDER BY id",
+                ).await.unwrap();
+                
+                assert_eq!(rows.len(), 5);
+                assert_eq!(rows[0][1], serde_json::json!(1));
+                assert_eq!(rows[1][1], serde_json::Value::Null);
+                assert_eq!(rows[2][1], serde_json::json!(3));
+                assert_eq!(rows[3][1], serde_json::Value::Null);
+                assert_eq!(rows[4][1], serde_json::json!(5));
+            });
         }
 
         // --------------------------------------------------------------------
@@ -1435,228 +1632,228 @@ mod tests {
         #[test]
         fn test_cte_transfer_event_group_by_to() {
             let pool = DuckDbPool::in_memory().unwrap();
-            let conn = futures::executor::block_on(pool.conn());
 
-            // Insert mock Transfer event logs
-            // Transfer event selector: 0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef
-            let transfer_selector = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef";
-            
-            // Insert 100 Transfer events with varying from/to addresses and values
-            for i in 0..100_u64 {
-                let from_addr = format!("{:040x}", i % 10); // 10 unique senders
-                let to_addr = format!("{:040x}", i % 5);    // 5 unique receivers
-                let value = (i + 1) * 1_000_000_000_u64; // smaller values to avoid overflow
+            futures::executor::block_on(async {
+                // Insert mock Transfer event logs
+                // Transfer event selector: 0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef
+                let transfer_selector = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef";
                 
-                let topic0 = transfer_selector;
-                let topic1 = format!("0x000000000000000000000000{from_addr}");
-                let topic2 = format!("0x000000000000000000000000{to_addr}");
-                let data = format!("0x{:064x}", value);
+                // Insert 100 Transfer events with varying from/to addresses and values
+                for i in 0..100_u64 {
+                    let from_addr = format!("{:040x}", i % 10); // 10 unique senders
+                    let to_addr = format!("{:040x}", i % 5);    // 5 unique receivers
+                    let value = (i + 1) * 1_000_000_000_u64; // smaller values to avoid overflow
+                    
+                    let topic0 = transfer_selector;
+                    let topic1 = format!("0x000000000000000000000000{from_addr}");
+                    let topic2 = format!("0x000000000000000000000000{to_addr}");
+                    let data = format!("0x{:064x}", value);
+                    
+                    pool.execute(
+                        &format!(
+                            "INSERT INTO logs (block_num, block_timestamp, log_idx, tx_idx, tx_hash, address, selector, topic0, topic1, topic2, topic3, data)
+                             VALUES ({i}, '2024-01-01 00:00:00+00', {i}, 0, '0xabc{i:03x}', '0xtoken', '{transfer_selector}', 
+                                     '{topic0}', '{topic1}', '{topic2}', NULL, '{data}')"
+                        ),
+                    ).await.unwrap();
+                }
+
+                // Run the problematic CTE query: GROUP BY "to"
+                let sql = r#"
+                    WITH transfer AS (
+                        SELECT block_num, block_timestamp, log_idx, tx_idx, tx_hash, address,
+                               topic_address_native(topic1) AS "from",
+                               topic_address_native(topic2) AS "to",
+                               abi_uint_native(data, 0) AS "value"
+                        FROM logs
+                        WHERE selector = '0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef'
+                    )
+                    SELECT "to", COUNT(*) as cnt
+                    FROM transfer
+                    GROUP BY "to"
+                    ORDER BY cnt DESC
+                "#;
+
+                let (cols, rows) = pool.query(sql).await.unwrap();
                 
-                conn.execute(
-                    &format!(
-                        "INSERT INTO logs (block_num, block_timestamp, log_idx, tx_idx, tx_hash, address, selector, topic0, topic1, topic2, topic3, data)
-                         VALUES ({i}, '2024-01-01 00:00:00+00', {i}, 0, '0xabc{i:03x}', '0xtoken', '{transfer_selector}', 
-                                 '{topic0}', '{topic1}', '{topic2}', NULL, '{data}')"
-                    ),
-                    [],
-                ).unwrap();
-            }
-
-            // Run the problematic CTE query: GROUP BY "to"
-            let sql = r#"
-                WITH transfer AS (
-                    SELECT block_num, block_timestamp, log_idx, tx_idx, tx_hash, address,
-                           topic_address_native(topic1) AS "from",
-                           topic_address_native(topic2) AS "to",
-                           abi_uint_native(data, 0) AS "value"
-                    FROM logs
-                    WHERE selector = '0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef'
-                )
-                SELECT "to", COUNT(*) as cnt
-                FROM transfer
-                GROUP BY "to"
-                ORDER BY cnt DESC
-            "#;
-
-            let (cols, rows) = execute_query(&conn, sql).unwrap();
-            
-            assert_eq!(cols, vec!["to", "cnt"]);
-            assert_eq!(rows.len(), 5); // 5 unique receivers
-            
-            // Each receiver should have 20 transfers (100 / 5)
-            for row in &rows {
-                assert_eq!(row[1], serde_json::json!(20));
-            }
+                assert_eq!(cols, vec!["to", "cnt"]);
+                assert_eq!(rows.len(), 5); // 5 unique receivers
+                
+                // Each receiver should have 20 transfers (100 / 5)
+                for row in &rows {
+                    assert_eq!(row[1], serde_json::json!(20));
+                }
+            });
         }
 
         #[test]
         fn test_cte_transfer_event_sum_value() {
             let pool = DuckDbPool::in_memory().unwrap();
-            let conn = futures::executor::block_on(pool.conn());
 
-            let transfer_selector = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef";
-            
-            // Insert 10 Transfer events with known values (use smaller values to stay in i64 range)
-            for i in 0..10_u64 {
-                let from_addr = format!("{:040x}", 1);
-                let to_addr = format!("{:040x}", 2);
-                let value = (i + 1) * 1_000_000_000_u64; // 1-10 Gwei (smaller to avoid overflow)
+            futures::executor::block_on(async {
+                let transfer_selector = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef";
                 
-                let topic0 = transfer_selector;
-                let topic1 = format!("0x000000000000000000000000{from_addr}");
-                let topic2 = format!("0x000000000000000000000000{to_addr}");
-                let data = format!("0x{:064x}", value);
+                // Insert 10 Transfer events with known values (use smaller values to stay in i64 range)
+                for i in 0..10_u64 {
+                    let from_addr = format!("{:040x}", 1);
+                    let to_addr = format!("{:040x}", 2);
+                    let value = (i + 1) * 1_000_000_000_u64; // 1-10 Gwei (smaller to avoid overflow)
+                    
+                    let topic0 = transfer_selector;
+                    let topic1 = format!("0x000000000000000000000000{from_addr}");
+                    let topic2 = format!("0x000000000000000000000000{to_addr}");
+                    let data = format!("0x{:064x}", value);
+                    
+                    pool.execute(
+                        &format!(
+                            "INSERT INTO logs (block_num, block_timestamp, log_idx, tx_idx, tx_hash, address, selector, topic0, topic1, topic2, topic3, data)
+                             VALUES ({i}, '2024-01-01 00:00:00+00', {i}, 0, '0xabc{i:03x}', '0xtoken', '{transfer_selector}', 
+                                     '{topic0}', '{topic1}', '{topic2}', NULL, '{data}')"
+                        ),
+                    ).await.unwrap();
+                }
+
+                // Run aggregation with SUM on decoded value
+                let sql = r#"
+                    WITH transfer AS (
+                        SELECT block_num, block_timestamp, log_idx, tx_idx, tx_hash, address,
+                               topic_address_native(topic1) AS "from",
+                               topic_address_native(topic2) AS "to",
+                               abi_uint_native(data, 0) AS "value"
+                        FROM logs
+                        WHERE selector = '0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef'
+                    )
+                    SELECT "to", SUM("value") as total
+                    FROM transfer
+                    GROUP BY "to"
+                "#;
+
+                let (cols, rows) = pool.query(sql).await.unwrap();
                 
-                conn.execute(
-                    &format!(
-                        "INSERT INTO logs (block_num, block_timestamp, log_idx, tx_idx, tx_hash, address, selector, topic0, topic1, topic2, topic3, data)
-                         VALUES ({i}, '2024-01-01 00:00:00+00', {i}, 0, '0xabc{i:03x}', '0xtoken', '{transfer_selector}', 
-                                 '{topic0}', '{topic1}', '{topic2}', NULL, '{data}')"
-                    ),
-                    [],
-                ).unwrap();
-            }
-
-            // Run aggregation with SUM on decoded value
-            let sql = r#"
-                WITH transfer AS (
-                    SELECT block_num, block_timestamp, log_idx, tx_idx, tx_hash, address,
-                           topic_address_native(topic1) AS "from",
-                           topic_address_native(topic2) AS "to",
-                           abi_uint_native(data, 0) AS "value"
-                    FROM logs
-                    WHERE selector = '0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef'
-                )
-                SELECT "to", SUM("value") as total
-                FROM transfer
-                GROUP BY "to"
-            "#;
-
-            let (cols, rows) = execute_query(&conn, sql).unwrap();
-            
-            assert_eq!(cols, vec!["to", "total"]);
-            assert_eq!(rows.len(), 1);
-            
-            // Sum of 1+2+...+10 Gwei = 55 Gwei = 55 * 1e9 wei
-            let expected_total: i64 = 55 * 1_000_000_000;
-            assert_eq!(rows[0][1], serde_json::json!(expected_total));
+                assert_eq!(cols, vec!["to", "total"]);
+                assert_eq!(rows.len(), 1);
+                
+                // Sum of 1+2+...+10 Gwei = 55 Gwei = 55 * 1e9 wei
+                let expected_total: i64 = 55 * 1_000_000_000;
+                assert_eq!(rows[0][1], serde_json::json!(expected_total));
+            });
         }
 
         #[test]
         fn test_cte_transfer_event_filter_by_from() {
             let pool = DuckDbPool::in_memory().unwrap();
-            let conn = futures::executor::block_on(pool.conn());
 
-            let transfer_selector = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef";
-            
-            // Insert transfers from different addresses
-            for i in 0..20 {
-                let from_addr = if i < 10 { 
-                    "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" 
-                } else { 
-                    "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb" 
-                };
-                let to_addr = format!("{:040x}", i);
-                let value = 1_000_000_000_000_000_000_u64; // 1 ETH
+            futures::executor::block_on(async {
+                let transfer_selector = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef";
                 
-                let topic0 = transfer_selector;
-                let topic1 = format!("0x000000000000000000000000{from_addr}");
-                let topic2 = format!("0x000000000000000000000000{to_addr}");
-                let data = format!("0x{:064x}", value);
+                // Insert transfers from different addresses
+                for i in 0..20 {
+                    let from_addr = if i < 10 { 
+                        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" 
+                    } else { 
+                        "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb" 
+                    };
+                    let to_addr = format!("{:040x}", i);
+                    let value = 1_000_000_000_000_000_000_u64; // 1 ETH
+                    
+                    let topic0 = transfer_selector;
+                    let topic1 = format!("0x000000000000000000000000{from_addr}");
+                    let topic2 = format!("0x000000000000000000000000{to_addr}");
+                    let data = format!("0x{:064x}", value);
+                    
+                    pool.execute(
+                        &format!(
+                            "INSERT INTO logs (block_num, block_timestamp, log_idx, tx_idx, tx_hash, address, selector, topic0, topic1, topic2, topic3, data)
+                             VALUES ({i}, '2024-01-01 00:00:00+00', {i}, 0, '0xabc{i:03x}', '0xtoken', '{transfer_selector}', 
+                                     '{topic0}', '{topic1}', '{topic2}', NULL, '{data}')"
+                        ),
+                    ).await.unwrap();
+                }
+
+                // Filter by specific "from" address
+                let sql = r#"
+                    WITH transfer AS (
+                        SELECT block_num, block_timestamp, log_idx, tx_idx, tx_hash, address,
+                               topic_address_native(topic1) AS "from",
+                               topic_address_native(topic2) AS "to",
+                               abi_uint_native(data, 0) AS "value"
+                        FROM logs
+                        WHERE selector = '0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef'
+                    )
+                    SELECT COUNT(*) as cnt
+                    FROM transfer
+                    WHERE "from" = '0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'
+                "#;
+
+                let (_, rows) = pool.query(sql).await.unwrap();
                 
-                conn.execute(
-                    &format!(
-                        "INSERT INTO logs (block_num, block_timestamp, log_idx, tx_idx, tx_hash, address, selector, topic0, topic1, topic2, topic3, data)
-                         VALUES ({i}, '2024-01-01 00:00:00+00', {i}, 0, '0xabc{i:03x}', '0xtoken', '{transfer_selector}', 
-                                 '{topic0}', '{topic1}', '{topic2}', NULL, '{data}')"
-                    ),
-                    [],
-                ).unwrap();
-            }
-
-            // Filter by specific "from" address
-            let sql = r#"
-                WITH transfer AS (
-                    SELECT block_num, block_timestamp, log_idx, tx_idx, tx_hash, address,
-                           topic_address_native(topic1) AS "from",
-                           topic_address_native(topic2) AS "to",
-                           abi_uint_native(data, 0) AS "value"
-                    FROM logs
-                    WHERE selector = '0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef'
-                )
-                SELECT COUNT(*) as cnt
-                FROM transfer
-                WHERE "from" = '0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'
-            "#;
-
-            let (_, rows) = execute_query(&conn, sql).unwrap();
-            
-            assert_eq!(rows.len(), 1);
-            assert_eq!(rows[0][0], serde_json::json!(10)); // 10 transfers from address A
+                assert_eq!(rows.len(), 1);
+                assert_eq!(rows[0][0], serde_json::json!(10)); // 10 transfers from address A
+            });
         }
 
         #[test]
         fn test_cte_large_batch_performance() {
             let pool = DuckDbPool::in_memory().unwrap();
-            let conn = futures::executor::block_on(pool.conn());
 
-            let transfer_selector = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef";
-            
-            // Insert 1000 Transfer events (stress test)
-            let start = std::time::Instant::now();
-            for i in 0..1000 {
-                let from_addr = format!("{:040x}", i % 100);
-                let to_addr = format!("{:040x}", i % 50);
-                let value = (i + 1) as u64 * 1_000_000_000_u64;
+            futures::executor::block_on(async {
+                let transfer_selector = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef";
                 
-                let topic0 = transfer_selector;
-                let topic1 = format!("0x000000000000000000000000{from_addr}");
-                let topic2 = format!("0x000000000000000000000000{to_addr}");
-                let data = format!("0x{:064x}", value);
+                // Insert 1000 Transfer events (stress test)
+                let start = std::time::Instant::now();
+                for i in 0..1000 {
+                    let from_addr = format!("{:040x}", i % 100);
+                    let to_addr = format!("{:040x}", i % 50);
+                    let value = (i + 1) as u64 * 1_000_000_000_u64;
+                    
+                    let topic0 = transfer_selector;
+                    let topic1 = format!("0x000000000000000000000000{from_addr}");
+                    let topic2 = format!("0x000000000000000000000000{to_addr}");
+                    let data = format!("0x{:064x}", value);
+                    
+                    pool.execute(
+                        &format!(
+                            "INSERT INTO logs (block_num, block_timestamp, log_idx, tx_idx, tx_hash, address, selector, topic0, topic1, topic2, topic3, data)
+                             VALUES ({i}, '2024-01-01 00:00:00+00', {i}, 0, '0x{i:064x}', '0xtoken', '{transfer_selector}', 
+                                     '{topic0}', '{topic1}', '{topic2}', NULL, '{data}')"
+                        ),
+                    ).await.unwrap();
+                }
+                let insert_time = start.elapsed();
+
+                // Run the full CTE query with GROUP BY
+                let query_start = std::time::Instant::now();
+                let sql = r#"
+                    WITH transfer AS (
+                        SELECT block_num, block_timestamp, log_idx, tx_idx, tx_hash, address,
+                               topic_address_native(topic1) AS "from",
+                               topic_address_native(topic2) AS "to",
+                               abi_uint_native(data, 0) AS "value"
+                        FROM logs
+                        WHERE selector = '0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef'
+                    )
+                    SELECT "to", COUNT(*) as cnt, SUM("value") as total
+                    FROM transfer
+                    GROUP BY "to"
+                    ORDER BY total DESC
+                    LIMIT 10
+                "#;
+
+                let (cols, rows) = pool.query(sql).await.unwrap();
+                let query_time = query_start.elapsed();
                 
-                conn.execute(
-                    &format!(
-                        "INSERT INTO logs (block_num, block_timestamp, log_idx, tx_idx, tx_hash, address, selector, topic0, topic1, topic2, topic3, data)
-                         VALUES ({i}, '2024-01-01 00:00:00+00', {i}, 0, '0x{i:064x}', '0xtoken', '{transfer_selector}', 
-                                 '{topic0}', '{topic1}', '{topic2}', NULL, '{data}')"
-                    ),
-                    [],
-                ).unwrap();
-            }
-            let insert_time = start.elapsed();
+                assert_eq!(cols, vec!["to", "cnt", "total"]);
+                assert_eq!(rows.len(), 10);
+                
+                // Each of 50 receivers gets 20 transfers (1000 / 50)
+                for row in &rows {
+                    assert_eq!(row[1], serde_json::json!(20));
+                }
 
-            // Run the full CTE query with GROUP BY
-            let query_start = std::time::Instant::now();
-            let sql = r#"
-                WITH transfer AS (
-                    SELECT block_num, block_timestamp, log_idx, tx_idx, tx_hash, address,
-                           topic_address_native(topic1) AS "from",
-                           topic_address_native(topic2) AS "to",
-                           abi_uint_native(data, 0) AS "value"
-                    FROM logs
-                    WHERE selector = '0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef'
-                )
-                SELECT "to", COUNT(*) as cnt, SUM("value") as total
-                FROM transfer
-                GROUP BY "to"
-                ORDER BY total DESC
-                LIMIT 10
-            "#;
-
-            let (cols, rows) = execute_query(&conn, sql).unwrap();
-            let query_time = query_start.elapsed();
-            
-            assert_eq!(cols, vec!["to", "cnt", "total"]);
-            assert_eq!(rows.len(), 10);
-            
-            // Each of 50 receivers gets 20 transfers (1000 / 50)
-            for row in &rows {
-                assert_eq!(row[1], serde_json::json!(20));
-            }
-
-            // Performance assertion: query should complete in under 1 second
-            assert!(query_time.as_millis() < 1000, 
-                "Query took too long: {:?} (insert: {:?})", query_time, insert_time);
+                // Performance assertion: query should complete in under 1 second
+                assert!(query_time.as_millis() < 1000, 
+                    "Query took too long: {:?} (insert: {:?})", query_time, insert_time);
+            });
         }
     }
 }
