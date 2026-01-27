@@ -41,6 +41,19 @@ pub struct HttpConfig {
     /// Rate limiting configuration
     #[serde(default)]
     pub rate_limit: RateLimitConfig,
+
+    /// Enable DuckDB for analytical queries (default: true)
+    /// Uses the postgres extension to query PostgreSQL through DuckDB's vectorized engine
+    #[serde(default = "default_true")]
+    pub duckdb_enabled: bool,
+
+    /// Number of DuckDB connections per chain (default: 4)
+    #[serde(default = "default_duckdb_pool_size")]
+    pub duckdb_pool_size: usize,
+}
+
+fn default_duckdb_pool_size() -> usize {
+    4
 }
 
 impl Default for HttpConfig {
@@ -51,6 +64,8 @@ impl Default for HttpConfig {
             bind: "0.0.0.0".to_string(),
             api_keys: Vec::new(),
             rate_limit: RateLimitConfig::default(),
+            duckdb_enabled: true,
+            duckdb_pool_size: 4,
         }
     }
 }
@@ -146,9 +161,6 @@ pub struct ChainConfig {
 
     /// Database connection URL for this chain
     pub pg_url: String,
-
-    /// DuckDB path for this chain (optional, enables OLAP queries)
-    pub duckdb_path: Option<String>,
 
     /// Enable backfill to genesis (default: true)
     #[serde(default = "default_backfill")]

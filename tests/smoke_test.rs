@@ -857,8 +857,6 @@ async fn test_seeded_receipt_stats() {
 // Query service integration tests - routes through service layer
 // ============================================================================
 
-use std::sync::Arc;
-use tidx::db::DuckDbPool;
 use tidx::service::{execute_query_with_engine, QueryOptions};
 
 fn default_options() -> QueryOptions {
@@ -873,7 +871,7 @@ async fn test_query_blocks_postgres() {
 
     let result = execute_query_with_engine(
         &db.pool,
-        None,
+        None, // No DuckDB engine
         "SELECT num, hash FROM blocks ORDER BY num DESC LIMIT 5",
         None,
         &opts,
@@ -890,28 +888,6 @@ async fn test_query_blocks_postgres() {
 
 #[tokio::test]
 #[serial(db)]
-async fn test_query_blocks_duckdb() {
-    let db = TestDb::new().await;
-    let duckdb = Arc::new(DuckDbPool::new(":memory:").expect("Failed to create DuckDB"));
-    let opts = default_options();
-
-    let result = execute_query_with_engine(
-        &db.pool,
-        Some(&duckdb),
-        "SELECT num, hash FROM blocks ORDER BY num DESC LIMIT 5",
-        None,
-        &opts,
-        Some("duckdb"),
-    )
-    .await
-    .expect("Query failed");
-
-    assert_eq!(result.engine.as_deref(), Some("duckdb"));
-    assert!(result.columns.contains(&"num".to_string()));
-}
-
-#[tokio::test]
-#[serial(db)]
 async fn test_query_txs_point_lookup() {
     let db = TestDb::new().await;
     let opts = default_options();
@@ -922,54 +898,12 @@ async fn test_query_txs_point_lookup() {
         "SELECT block_num, hash, \"from\" FROM txs WHERE block_num = 1 LIMIT 10",
         None,
         &opts,
-        None, // Auto-route: point lookup -> postgres
+        None,
     )
     .await
     .expect("Query failed");
 
     assert_eq!(result.engine.as_deref(), Some("postgres"));
-}
-
-#[tokio::test]
-#[serial(db)]
-async fn test_query_olap_aggregation_routes_to_duckdb() {
-    let db = TestDb::new().await;
-    let duckdb = Arc::new(DuckDbPool::new(":memory:").expect("Failed to create DuckDB"));
-    let opts = default_options();
-
-    let result = execute_query_with_engine(
-        &db.pool,
-        Some(&duckdb),
-        "SELECT miner, COUNT(*) as cnt FROM blocks GROUP BY miner ORDER BY cnt DESC LIMIT 10",
-        None,
-        &opts,
-        None, // Auto-route: GROUP BY -> duckdb
-    )
-    .await
-    .expect("Query failed");
-
-    assert_eq!(result.engine.as_deref(), Some("duckdb"));
-}
-
-#[tokio::test]
-#[serial(db)]
-async fn test_query_olap_sum_routes_to_duckdb() {
-    let db = TestDb::new().await;
-    let duckdb = Arc::new(DuckDbPool::new(":memory:").expect("Failed to create DuckDB"));
-    let opts = default_options();
-
-    let result = execute_query_with_engine(
-        &db.pool,
-        Some(&duckdb),
-        "SELECT SUM(gas_used) FROM blocks",
-        None,
-        &opts,
-        None, // Auto-route: SUM -> duckdb
-    )
-    .await
-    .expect("Query failed");
-
-    assert_eq!(result.engine.as_deref(), Some("duckdb"));
 }
 
 #[tokio::test]
@@ -990,31 +924,6 @@ async fn test_query_logs_with_event_signature() {
     .expect("Query with signature CTE failed");
 
     assert_eq!(result.engine.as_deref(), Some("postgres"));
-    // CTE should decode indexed params
-    assert!(result.columns.contains(&"from".to_string()));
-    assert!(result.columns.contains(&"to".to_string()));
-    assert!(result.columns.contains(&"value".to_string()));
-}
-
-#[tokio::test]
-#[serial(db)]
-async fn test_query_logs_with_event_signature_duckdb() {
-    let db = TestDb::new().await;
-    let duckdb = Arc::new(DuckDbPool::new(":memory:").expect("Failed to create DuckDB"));
-    let opts = default_options();
-
-    let result = execute_query_with_engine(
-        &db.pool,
-        Some(&duckdb),
-        "SELECT * FROM transfer LIMIT 10",
-        Some("Transfer(address indexed from, address indexed to, uint256 value)"),
-        &opts,
-        Some("duckdb"),
-    )
-    .await
-    .expect("Query with signature CTE on DuckDB failed");
-
-    assert_eq!(result.engine.as_deref(), Some("duckdb"));
     assert!(result.columns.contains(&"from".to_string()));
     assert!(result.columns.contains(&"to".to_string()));
     assert!(result.columns.contains(&"value".to_string()));
@@ -1078,7 +987,6 @@ async fn test_query_rejects_forbidden_keywords() {
     .await;
 
     assert!(result.is_err());
-    // Multiple statements are rejected before checking for specific keywords
     assert!(result.unwrap_err().to_string().contains("Multiple statements"));
 }
 
@@ -1086,13 +994,11 @@ async fn test_query_rejects_forbidden_keywords() {
 #[serial(db)]
 async fn test_query_explicit_engine_hint() {
     let db = TestDb::new().await;
-    let duckdb = Arc::new(DuckDbPool::new(":memory:").expect("Failed to create DuckDB"));
     let opts = default_options();
 
-    // Force postgres even for OLAP query
     let result = execute_query_with_engine(
         &db.pool,
-        Some(&duckdb),
+        None,
         "/* engine=postgres */ SELECT COUNT(*) FROM blocks GROUP BY miner",
         None,
         &opts,
@@ -1102,35 +1008,117 @@ async fn test_query_explicit_engine_hint() {
     .expect("Query failed");
 
     assert_eq!(result.engine.as_deref(), Some("postgres"));
+}
 
-    // Force duckdb even for simple query
+// ============================================================================
+// DuckDB Postgres Extension tests
+// ============================================================================
+
+#[tokio::test]
+#[serial(db)]
+async fn test_duckdb_postgres_extension_query() {
+    use tidx::db::DuckDbPgEngine;
+
+    let tempo = TempoNode::from_env();
+    tempo.wait_for_ready().await.expect("Tempo node not ready");
+
+    let db = TestDb::empty().await;
+
+    // Sync some blocks first
+    let target_block = 5u64;
+    tempo.wait_for_block(target_block).await.expect("Block not reached");
+
+    let engine = SyncEngine::new(ThrottledPool::from_pool(db.pool.clone()), &tempo.rpc_url)
+        .await
+        .expect("Failed to create sync engine");
+
+    for block_num in 1..=target_block {
+        engine.sync_block(block_num).await.expect("Failed to sync block");
+    }
+
+    // Now test DuckDB querying Postgres via extension
+    let duckdb = DuckDbPgEngine::new(&db.database_url, 2).expect("Failed to create DuckDB engine");
+
+    if !duckdb.is_available() {
+        // Extension not available (e.g., in CI without network), skip test
+        println!("Skipping test: DuckDB postgres extension not available");
+        return;
+    }
+
+    // Query blocks through DuckDB
+    let (columns, rows) = duckdb.query("SELECT num, hash FROM blocks ORDER BY num LIMIT 5")
+        .await
+        .expect("DuckDB query failed");
+
+    assert!(columns.contains(&"num".to_string()));
+    assert!(columns.contains(&"hash".to_string()));
+    assert!(!rows.is_empty(), "Expected blocks from DuckDB query");
+
+    // Verify hex format (should be 0x-prefixed)
+    let first_row = &rows[0];
+    let hash_col_idx = columns.iter().position(|c| c == "hash").unwrap();
+    if let serde_json::Value::String(hash) = &first_row[hash_col_idx] {
+        assert!(hash.starts_with("0x"), "Hash should be 0x-prefixed: {}", hash);
+        assert_eq!(hash.len(), 66, "Hash should be 66 chars (0x + 64 hex): {}", hash);
+    } else {
+        panic!("Expected hash to be a string");
+    }
+}
+
+#[tokio::test]
+#[serial(db)]
+async fn test_duckdb_analytical_query_routing() {
+    use std::sync::Arc;
+    use tidx::db::DuckDbPgEngine;
+    use tidx::service::{execute_query_with_engine, QueryOptions};
+
+    let tempo = TempoNode::from_env();
+    tempo.wait_for_ready().await.expect("Tempo node not ready");
+
+    let db = TestDb::empty().await;
+
+    // Sync some blocks first
+    let target_block = 5u64;
+    tempo.wait_for_block(target_block).await.expect("Block not reached");
+
+    let engine = SyncEngine::new(ThrottledPool::from_pool(db.pool.clone()), &tempo.rpc_url)
+        .await
+        .expect("Failed to create sync engine");
+
+    for block_num in 1..=target_block {
+        engine.sync_block(block_num).await.expect("Failed to sync block");
+    }
+
+    let duckdb = Arc::new(DuckDbPgEngine::new(&db.database_url, 2).expect("Failed to create DuckDB engine"));
+    let options = QueryOptions::default();
+
+    if !duckdb.is_available() {
+        println!("Skipping test: DuckDB postgres extension not available");
+        return;
+    }
+
+    // Analytical query (GROUP BY) should route to DuckDB
     let result = execute_query_with_engine(
         &db.pool,
         Some(&duckdb),
-        "/* engine=duckdb */ SELECT * FROM blocks LIMIT 1",
+        "SELECT COUNT(*) as cnt FROM blocks",
         None,
-        &opts,
-        None,
+        &options,
+        None, // Auto-route
     )
     .await
     .expect("Query failed");
 
     assert_eq!(result.engine.as_deref(), Some("duckdb"));
-}
+    assert_eq!(result.row_count, 1);
 
-#[tokio::test]
-#[serial(db)]
-async fn test_query_fallback_to_postgres_without_duckdb() {
-    let db = TestDb::new().await;
-    let opts = default_options();
-
-    // OLAP query but no DuckDB pool -> falls back to postgres
+    // Point lookup should route to Postgres
     let result = execute_query_with_engine(
         &db.pool,
-        None, // No DuckDB
-        "SELECT COUNT(*) FROM blocks GROUP BY miner",
+        Some(&duckdb),
+        "SELECT * FROM blocks WHERE num = 1",
         None,
-        &opts,
+        &options,
         None,
     )
     .await
@@ -1153,208 +1141,4 @@ async fn test_event_signature_topic0() {
     assert!(sig.topic0_hex().starts_with("8c5be1e5"));
 }
 
-// ============================================================================
-// DuckDB CTE tests (in-memory, no localnet required)
-// ============================================================================
 
-#[tokio::test]
-#[serial(db)]
-async fn test_duckdb_event_cte() {
-    let duckdb = Arc::new(DuckDbPool::new(":memory:").expect("Failed to create DuckDB"));
-    let conn = duckdb.conn().await;
-
-    // Insert test log matching Transfer signature
-    conn.execute(
-        r#"INSERT INTO logs (block_num, block_timestamp, log_idx, tx_idx, tx_hash, address, selector, topic0, topic1, topic2, data)
-           VALUES (100, '2024-01-01 00:00:00', 0, 0, '0xtxhash', '0xcontract',
-                   '0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef',
-                   '0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef',
-                   '0x000000000000000000000000aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
-                   '0x000000000000000000000000bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb',
-                   '0x0000000000000000000000000000000000000000000000000000000000000064')"#,
-        [],
-    ).expect("Failed to insert test log");
-
-    // Build CTE query
-    let sig = EventSignature::parse("Transfer(address indexed from, address indexed to, uint256 value)").unwrap();
-    let cte = sig.to_cte_sql_duckdb();
-    let sql = format!("WITH {cte} SELECT * FROM transfer LIMIT 1");
-
-    let mut stmt = conn.prepare(&sql).expect("Failed to prepare CTE query");
-    let mut rows = stmt.query([]).expect("Failed to execute CTE query");
-    
-    let row = rows.next().expect("Failed to get row").expect("No rows returned");
-    
-    // Verify decoded values
-    let from: String = row.get(6).expect("Failed to get from");
-    let to: String = row.get(7).expect("Failed to get to");
-    let value: i128 = row.get(8).expect("Failed to get value");
-
-    assert_eq!(from, "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
-    assert_eq!(to, "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
-    // Value is UHUGEINT (128-bit unsigned) - 0x64 = 100
-    assert_eq!(value, 100);
-}
-
-// ============================================================================
-// Postgres Extension tests (requires DATABASE_URL)
-// Uses modern ATTACH syntax (DuckDB 1.4+)
-// ============================================================================
-
-/// Test that postgres extension produces data in the same format as the manual copy.
-/// This validates the hex encoding matches between approaches.
-#[tokio::test]
-#[serial(db)]
-async fn test_postgres_scanner_data_format() {
-    let db = TestDb::new().await;
-
-    // Skip if no data
-    if db.block_count().await == 0 {
-        println!("Skipping postgres extension test - no data in DB");
-        return;
-    }
-
-    let duckdb = DuckDbPool::new(":memory:").expect("Failed to create DuckDB");
-    let conn = duckdb.conn().await;
-
-    // Install and load modern postgres extension (not legacy postgres_scanner)
-    if let Err(e) = conn.execute("INSTALL postgres", []) {
-        println!("Skipping postgres extension test - extension not available: {e}");
-        return;
-    }
-    conn.execute("LOAD postgres", []).expect("Failed to load postgres");
-
-    let pg_url = std::env::var("DATABASE_URL").expect("DATABASE_URL must be set");
-    let escaped_url = pg_url.replace('\'', "''");
-
-    // Attach Postgres database
-    let attach_sql = format!("ATTACH '{escaped_url}' AS pg (TYPE postgres, READ_ONLY)");
-    conn.execute(&attach_sql, []).expect("Failed to attach postgres");
-
-    // Test blocks table - verify hex encoding produces lowercase with 0x prefix
-    let mut stmt = conn.prepare(
-        "SELECT num, '0x' || lower(hex(hash)) as hash, '0x' || lower(hex(miner)) as miner \
-         FROM pg.public.blocks \
-         ORDER BY num LIMIT 1"
-    ).expect("Failed to prepare scanner query");
-    let mut rows = stmt.query([]).expect("Failed to execute scanner query");
-    
-    if let Some(row) = rows.next().expect("Failed to get row") {
-        let num: i64 = row.get(0).expect("Failed to get num");
-        let hash: String = row.get(1).expect("Failed to get hash");
-        let miner: String = row.get(2).expect("Failed to get miner");
-
-        println!("Block {num}: hash={hash}, miner={miner}");
-
-        // Verify format: 0x prefix + lowercase hex
-        assert!(hash.starts_with("0x"), "Hash should start with 0x");
-        assert_eq!(hash.len(), 66, "Block hash should be 66 chars (0x + 64 hex)");
-        assert!(hash[2..].chars().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()), 
-            "Hash should be lowercase hex");
-
-        assert!(miner.starts_with("0x"), "Miner should start with 0x");
-        assert_eq!(miner.len(), 42, "Miner address should be 42 chars (0x + 40 hex)");
-        assert!(miner[2..].chars().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()),
-            "Miner should be lowercase hex");
-    }
-
-    // Test transactions table - verify nullable fields and JSONB handling
-    let mut stmt = conn.prepare(
-        "SELECT block_num, '0x' || lower(hex(hash)) as hash, \
-                CASE WHEN \"to\" IS NOT NULL THEN '0x' || lower(hex(\"to\")) ELSE NULL END as to_addr, \
-                calls \
-         FROM pg.public.txs \
-         ORDER BY block_num, idx LIMIT 5"
-    ).expect("Failed to prepare txs scanner query");
-    let mut rows = stmt.query([]).expect("Failed to execute txs scanner query");
-    
-    let mut tx_count = 0;
-    while let Some(row) = rows.next().expect("Failed to get tx row") {
-        let hash: String = row.get(1).expect("Failed to get tx hash");
-        let to_addr: Option<String> = row.get(2).ok();
-        let calls: Option<String> = row.get(3).ok();
-
-        println!("TX hash={hash}, to={to_addr:?}, calls={calls:?}");
-
-        assert!(hash.starts_with("0x"), "TX hash should start with 0x");
-        assert_eq!(hash.len(), 66, "TX hash should be 66 chars");
-
-        if let Some(to) = to_addr {
-            assert!(to.starts_with("0x"), "To address should start with 0x");
-            assert_eq!(to.len(), 42, "To address should be 42 chars");
-        }
-
-        // JSONB should come through as string (may be null for single-call txs)
-        if let Some(calls_json) = &calls {
-            // Should be valid JSON if present
-            assert!(calls_json.starts_with('[') || calls_json.starts_with('{'),
-                "Calls should be JSON: {calls_json}");
-        }
-
-        tx_count += 1;
-    }
-
-    println!("Validated {tx_count} transactions via postgres extension");
-}
-
-/// Test that postgres extension INSERT produces identical data to manual copy.
-#[tokio::test]
-#[serial(db)]
-async fn test_postgres_scanner_insert_matches_manual() {
-    let db = TestDb::new().await;
-
-    if db.block_count().await == 0 {
-        println!("Skipping postgres extension insert test - no data in DB");
-        return;
-    }
-
-    let duckdb = DuckDbPool::new(":memory:").expect("Failed to create DuckDB");
-    let conn = duckdb.conn().await;
-
-    if let Err(e) = conn.execute("INSTALL postgres", []) {
-        println!("Skipping test - postgres extension not available: {e}");
-        return;
-    }
-    conn.execute("LOAD postgres", []).expect("Failed to load postgres");
-
-    let pg_url = std::env::var("DATABASE_URL").expect("DATABASE_URL must be set");
-    let escaped_url = pg_url.replace('\'', "''");
-
-    // Attach Postgres database
-    let attach_sql = format!("ATTACH '{escaped_url}' AS pg (TYPE postgres, READ_ONLY)");
-    conn.execute(&attach_sql, []).expect("Failed to attach postgres");
-
-    // Copy first 5 blocks using attached postgres database
-    let inserted = conn.execute(
-        "INSERT OR IGNORE INTO blocks \
-         SELECT num, '0x' || lower(hex(hash)), '0x' || lower(hex(parent_hash)), \
-                timestamp, timestamp_ms, gas_limit, gas_used, '0x' || lower(hex(miner)), \
-                CASE WHEN extra_data IS NOT NULL THEN '0x' || lower(hex(extra_data)) ELSE NULL END \
-         FROM pg.public.blocks \
-         WHERE num <= 5",
-        []
-    ).expect("Failed to insert blocks via postgres extension");
-    println!("Inserted {inserted} blocks via postgres extension");
-
-    // Verify data in DuckDB
-    let mut stmt = conn.prepare("SELECT num, hash, miner FROM blocks ORDER BY num LIMIT 5")
-        .expect("Failed to prepare verify query");
-    let mut rows = stmt.query([]).expect("Failed to execute verify query");
-
-    let mut verified = 0;
-    while let Some(row) = rows.next().expect("Failed to get row") {
-        let num: i64 = row.get(0).expect("Failed to get num");
-        let hash: String = row.get(1).expect("Failed to get hash");
-        let miner: String = row.get(2).expect("Failed to get miner");
-
-        // Verify format consistency
-        assert!(hash.starts_with("0x") && hash.len() == 66, "Invalid hash format: {hash}");
-        assert!(miner.starts_with("0x") && miner.len() == 42, "Invalid miner format: {miner}");
-        
-        verified += 1;
-        println!("Verified block {num}");
-    }
-
-    assert!(verified > 0, "Should have verified at least one block");
-    println!("Successfully verified {verified} blocks copied via postgres extension");
-}

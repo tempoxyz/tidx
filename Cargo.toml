@@ -30,7 +30,7 @@ tower-http = { version = "0.6", features = ["cors", "trace"] }
 tokio-postgres = { version = "0.7", features = ["with-chrono-0_4", "with-serde_json-1"] }
 deadpool-postgres = "0.14"
 postgres-types = { version = "0.2", features = ["derive"] }
-duckdb = { version = "1.2", features = ["bundled", "vscalar"] }
+duckdb = { version = "1.2", features = ["bundled"] }
 
 # Ethereum/Tempo primitives
 alloy = { version = "1", features = ["full"] }
