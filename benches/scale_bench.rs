@@ -36,62 +36,54 @@ fn setup_duckdb(log_count: usize) -> Arc<DuckDbPool> {
 
     let rt = Runtime::new().unwrap();
     rt.block_on(async {
-        let conn = pool.conn().await;
-
         // Derive counts: 1 block per 10 logs, 1 tx per 2 logs
         let block_count = log_count / 10;
         let tx_count = log_count / 2;
 
         // Generate blocks
         if block_count > 0 {
-            conn.execute(
-                &format!(
-                    r#"INSERT INTO blocks (num, hash, parent_hash, timestamp, timestamp_ms, gas_limit, gas_used, miner)
-                       SELECT 
-                           i as num,
-                           '0x' || lpad(printf('%x', i), 64, '0') as hash,
-                           '0x' || lpad(printf('%x', i - 1), 64, '0') as parent_hash,
-                           make_timestamptz(2024, 1, 1, 0, 0, 0) + to_seconds(i) as timestamp,
-                           1704067200000 + i * 1000 as timestamp_ms,
-                           30000000 as gas_limit,
-                           15000000 + (i % 10000000) as gas_used,
-                           '0x' || lpad(printf('%x', i % 1000), 40, '0') as miner
-                       FROM generate_series(1, {block_count}) as t(i)"#
-                ),
-                [],
-            )
-            .expect("Failed to insert blocks");
+            let block_sql = format!(
+                r#"INSERT INTO blocks (num, hash, parent_hash, timestamp, timestamp_ms, gas_limit, gas_used, miner)
+                   SELECT 
+                       i as num,
+                       '0x' || lpad(printf('%x', i), 64, '0') as hash,
+                       '0x' || lpad(printf('%x', i - 1), 64, '0') as parent_hash,
+                       make_timestamptz(2024, 1, 1, 0, 0, 0) + to_seconds(i) as timestamp,
+                       1704067200000 + i * 1000 as timestamp_ms,
+                       30000000 as gas_limit,
+                       15000000 + (i % 10000000) as gas_used,
+                       '0x' || lpad(printf('%x', i % 1000), 40, '0') as miner
+                   FROM generate_series(1, {block_count}) as t(i)"#
+            );
+            pool.execute(&block_sql).await.expect("Failed to insert blocks");
         }
 
         // Generate transactions (1 tx per block to avoid PK conflicts)
         if tx_count > 0 {
-            conn.execute(
-                &format!(
-                    r#"INSERT INTO txs (block_num, block_timestamp, idx, hash, type, "from", "to", value, input,
-                                       gas_limit, max_fee_per_gas, max_priority_fee_per_gas, gas_used,
-                                       nonce_key, nonce, call_count)
-                       SELECT 
-                           i as block_num,
-                           make_timestamptz(2024, 1, 1, 0, 0, 0) + to_seconds(i) as block_timestamp,
-                           0 as idx,
-                           '0x' || lpad(printf('%x', i), 64, '0') as hash,
-                           (i % 3)::smallint as type,
-                           '0x' || lpad(printf('%x', i % 10000), 40, '0') as "from",
-                           '0x' || lpad(printf('%x', (i + 1) % 10000), 40, '0') as "to",
-                           (i % 1000000000)::text as value,
-                           '0x' as input,
-                           21000 + (i % 100000) as gas_limit,
-                           '1000000000' as max_fee_per_gas,
-                           '100000000' as max_priority_fee_per_gas,
-                           21000 as gas_used,
-                           '0x' || lpad(printf('%x', i % 10000), 40, '0') as nonce_key,
-                           (i / 10000)::bigint as nonce,
-                           1::smallint as call_count
-                       FROM generate_series(1, {tx_count}) as t(i)"#
-                ),
-                [],
-            )
-            .expect("Failed to insert txs");
+            let tx_sql = format!(
+                r#"INSERT INTO txs (block_num, block_timestamp, idx, hash, type, "from", "to", value, input,
+                                   gas_limit, max_fee_per_gas, max_priority_fee_per_gas, gas_used,
+                                   nonce_key, nonce, call_count)
+                   SELECT 
+                       i as block_num,
+                       make_timestamptz(2024, 1, 1, 0, 0, 0) + to_seconds(i) as block_timestamp,
+                       0 as idx,
+                       '0x' || lpad(printf('%x', i), 64, '0') as hash,
+                       (i % 3)::smallint as type,
+                       '0x' || lpad(printf('%x', i % 10000), 40, '0') as "from",
+                       '0x' || lpad(printf('%x', (i + 1) % 10000), 40, '0') as "to",
+                       (i % 1000000000)::text as value,
+                       '0x' as input,
+                       21000 + (i % 100000) as gas_limit,
+                       '1000000000' as max_fee_per_gas,
+                       '100000000' as max_priority_fee_per_gas,
+                       21000 as gas_used,
+                       '0x' || lpad(printf('%x', i % 10000), 40, '0') as nonce_key,
+                       (i / 10000)::bigint as nonce,
+                       1::smallint as call_count
+                   FROM generate_series(1, {tx_count}) as t(i)"#
+            );
+            pool.execute(&tx_sql).await.expect("Failed to insert txs");
         }
 
         // Generate logs (80% Transfer events from specific contract)
@@ -101,37 +93,34 @@ fn setup_duckdb(log_count: usize) -> Arc<DuckDbPool> {
         let target_contract = "0x20c0000000000000000000000000000000000001";
         let hot_sender = "0x5bc1473610754a5ca10749552b119df90c1a1877";
 
-        conn.execute(
-            &format!(
-                r#"INSERT INTO logs (block_num, block_timestamp, log_idx, tx_idx, tx_hash, address, selector, topic0, topic1, topic2, topic3, data)
-                   SELECT 
-                       i as block_num,
-                       make_timestamptz(2024, 1, 1, 0, 0, 0) + to_seconds(i) as block_timestamp,
-                       0 as log_idx,
-                       0 as tx_idx,
-                       '0x' || lpad(printf('%x', i), 64, '0') as tx_hash,
-                       -- 80% from target contract, 20% random
-                       CASE WHEN i % 5 < 4 THEN '{target_contract}'
-                            ELSE '0x' || lpad(printf('%x', i % 1000), 40, '0')
-                       END as address,
-                       '{transfer_topic0}' as selector,
-                       '{transfer_topic0}' as topic0,
-                       -- 1% from hot sender (for filtered query testing)
-                       CASE WHEN i % 100 = 0 
-                            THEN '0x000000000000000000000000' || substr('{hot_sender}', 3)
-                            ELSE '0x' || lpad(printf('%x', i % 10000), 64, '0')
-                       END as topic1,
-                       '0x' || lpad(printf('%x', (i + 1) % 10000), 64, '0') as topic2,
-                       NULL as topic3,
-                       '0x' || lpad(printf('%x', i % 1000000000000), 64, '0') as data
-                   FROM generate_series(1, {log_count}) as t(i)"#
-            ),
-            [],
-        )
-        .expect("Failed to insert logs");
+        let log_sql = format!(
+            r#"INSERT INTO logs (block_num, block_timestamp, log_idx, tx_idx, tx_hash, address, selector, topic0, topic1, topic2, topic3, data)
+               SELECT 
+                   i as block_num,
+                   make_timestamptz(2024, 1, 1, 0, 0, 0) + to_seconds(i) as block_timestamp,
+                   0 as log_idx,
+                   0 as tx_idx,
+                   '0x' || lpad(printf('%x', i), 64, '0') as tx_hash,
+                   -- 80% from target contract, 20% random
+                   CASE WHEN i % 5 < 4 THEN '{target_contract}'
+                        ELSE '0x' || lpad(printf('%x', i % 1000), 40, '0')
+                   END as address,
+                   '{transfer_topic0}' as selector,
+                   '{transfer_topic0}' as topic0,
+                   -- 1% from hot sender (for filtered query testing)
+                   CASE WHEN i % 100 = 0 
+                        THEN '0x000000000000000000000000' || substr('{hot_sender}', 3)
+                        ELSE '0x' || lpad(printf('%x', i % 10000), 64, '0')
+                   END as topic1,
+                   '0x' || lpad(printf('%x', (i + 1) % 10000), 64, '0') as topic2,
+                   NULL as topic3,
+                   '0x' || lpad(printf('%x', i % 1000000000000), 64, '0') as data
+               FROM generate_series(1, {log_count}) as t(i)"#
+        );
+        pool.execute(&log_sql).await.expect("Failed to insert logs");
 
         // Force checkpoint to compress data (simulates production behavior)
-        conn.execute("CHECKPOINT", []).expect("Failed to checkpoint");
+        pool.checkpoint().await.expect("Failed to checkpoint");
     });
 
     Arc::new(pool)

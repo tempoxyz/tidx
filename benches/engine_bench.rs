@@ -25,7 +25,6 @@ fn setup() -> (Runtime, deadpool_postgres::Pool, Arc<DuckDbPool>) {
 
         // Sync blocks from PostgreSQL to DuckDB
         let pg_conn = pg_pool.get().await.expect("Failed to get pg connection");
-        let duck_conn = pool.conn().await;
 
         // Copy blocks
         let rows = pg_conn
@@ -39,6 +38,8 @@ fn setup() -> (Runtime, deadpool_postgres::Pool, Arc<DuckDbPool>) {
             .await
             .expect("Failed to query blocks");
 
+        // Build SQL statements from fetched rows
+        let mut block_stmts = Vec::new();
         for row in &rows {
             let num: i64 = row.get(0);
             let hash: String = row.get(1);
@@ -50,16 +51,22 @@ fn setup() -> (Runtime, deadpool_postgres::Pool, Arc<DuckDbPool>) {
             let miner: String = row.get(7);
             let extra_data: Option<String> = row.get(8);
 
-            duck_conn
-                .execute(
-                    &format!(
-                        "INSERT INTO blocks (num, hash, parent_hash, timestamp, timestamp_ms, gas_limit, gas_used, miner, extra_data)
-                         VALUES ({num}, '0x{hash}', '0x{parent_hash}', '{timestamp}', {timestamp_ms}, {gas_limit}, {gas_used}, '0x{miner}', {})",
-                        extra_data.map_or("NULL".to_string(), |e| format!("'0x{e}'"))
-                    ),
-                    [],
-                )
-                .ok(); // Ignore duplicate key errors
+            block_stmts.push(format!(
+                "INSERT INTO blocks (num, hash, parent_hash, timestamp, timestamp_ms, gas_limit, gas_used, miner, extra_data)
+                 VALUES ({num}, '0x{hash}', '0x{parent_hash}', '{timestamp}', {timestamp_ms}, {gas_limit}, {gas_used}, '0x{miner}', {})",
+                extra_data.map_or("NULL".to_string(), |e| format!("'0x{e}'"))
+            ));
+        }
+
+        // Execute block inserts
+        if !block_stmts.is_empty() {
+            let sql = block_stmts.join(";\n");
+            pool.with_connection(move |conn| {
+                for stmt in sql.split(";\n") {
+                    let _ = conn.execute(stmt, []);
+                }
+                Ok(())
+            }).await.ok();
         }
 
         // Copy transactions
@@ -77,6 +84,7 @@ fn setup() -> (Runtime, deadpool_postgres::Pool, Arc<DuckDbPool>) {
             .await
             .expect("Failed to query txs");
 
+        let mut tx_stmts = Vec::new();
         for row in &rows {
             let block_num: i64 = row.get(0);
             let block_timestamp: chrono::DateTime<chrono::Utc> = row.get(1);
@@ -101,29 +109,35 @@ fn setup() -> (Runtime, deadpool_postgres::Pool, Arc<DuckDbPool>) {
             let valid_after: Option<i64> = row.get(20);
             let sig_type: Option<i16> = row.get(21);
 
-            duck_conn
-                .execute(
-                    &format!(
-                        r#"INSERT INTO txs (block_num, block_timestamp, idx, hash, type, "from", "to", value, input,
-                                           gas_limit, max_fee_per_gas, max_priority_fee_per_gas, gas_used,
-                                           nonce_key, nonce, fee_token, fee_payer, calls, call_count,
-                                           valid_before, valid_after, signature_type)
-                           VALUES ({block_num}, '{block_timestamp}', {idx}, '0x{hash}', {tx_type}, '0x{from}',
-                                   {to}, '{value}', '0x{input}', {gas_limit}, '{max_fee}', '{max_priority}',
-                                   {gas_used}, '0x{nonce_key}', {nonce}, {fee_token}, {fee_payer}, {calls},
-                                   {call_count}, {valid_before}, {valid_after}, {sig_type})"#,
-                        to = to.map_or("NULL".to_string(), |t| format!("'0x{t}'")),
-                        gas_used = gas_used.map_or("NULL".to_string(), |g| g.to_string()),
-                        fee_token = fee_token.map_or("NULL".to_string(), |f| format!("'0x{f}'")),
-                        fee_payer = fee_payer.map_or("NULL".to_string(), |f| format!("'0x{f}'")),
-                        calls = calls.map_or("NULL".to_string(), |c| format!("'{}'", c.replace('\'', "''"))),
-                        valid_before = valid_before.map_or("NULL".to_string(), |v| v.to_string()),
-                        valid_after = valid_after.map_or("NULL".to_string(), |v| v.to_string()),
-                        sig_type = sig_type.map_or("NULL".to_string(), |s| s.to_string()),
-                    ),
-                    [],
-                )
-                .ok();
+            tx_stmts.push(format!(
+                r#"INSERT INTO txs (block_num, block_timestamp, idx, hash, type, "from", "to", value, input,
+                                   gas_limit, max_fee_per_gas, max_priority_fee_per_gas, gas_used,
+                                   nonce_key, nonce, fee_token, fee_payer, calls, call_count,
+                                   valid_before, valid_after, signature_type)
+                   VALUES ({block_num}, '{block_timestamp}', {idx}, '0x{hash}', {tx_type}, '0x{from}',
+                           {to}, '{value}', '0x{input}', {gas_limit}, '{max_fee}', '{max_priority}',
+                           {gas_used}, '0x{nonce_key}', {nonce}, {fee_token}, {fee_payer}, {calls},
+                           {call_count}, {valid_before}, {valid_after}, {sig_type})"#,
+                to = to.map_or("NULL".to_string(), |t| format!("'0x{t}'")),
+                gas_used = gas_used.map_or("NULL".to_string(), |g| g.to_string()),
+                fee_token = fee_token.map_or("NULL".to_string(), |f| format!("'0x{f}'")),
+                fee_payer = fee_payer.map_or("NULL".to_string(), |f| format!("'0x{f}'")),
+                calls = calls.map_or("NULL".to_string(), |c| format!("'{}'", c.replace('\'', "''"))),
+                valid_before = valid_before.map_or("NULL".to_string(), |v| v.to_string()),
+                valid_after = valid_after.map_or("NULL".to_string(), |v| v.to_string()),
+                sig_type = sig_type.map_or("NULL".to_string(), |s| s.to_string()),
+            ));
+        }
+
+        // Execute tx inserts
+        if !tx_stmts.is_empty() {
+            let sql = tx_stmts.join(";\n");
+            pool.with_connection(move |conn| {
+                for stmt in sql.split(";\n") {
+                    let _ = conn.execute(stmt, []);
+                }
+                Ok(())
+            }).await.ok();
         }
 
         // Copy logs
@@ -139,6 +153,7 @@ fn setup() -> (Runtime, deadpool_postgres::Pool, Arc<DuckDbPool>) {
             .await
             .expect("Failed to query logs");
 
+        let mut log_stmts = Vec::new();
         for row in &rows {
             let block_num: i64 = row.get(0);
             let block_timestamp: chrono::DateTime<chrono::Utc> = row.get(1);
@@ -153,23 +168,28 @@ fn setup() -> (Runtime, deadpool_postgres::Pool, Arc<DuckDbPool>) {
             let topic3: Option<String> = row.get(10);
             let data: String = row.get(11);
 
-            duck_conn
-                .execute(
-                    &format!(
-                        "INSERT INTO logs (block_num, block_timestamp, log_idx, tx_idx, tx_hash, address, selector, topic0, topic1, topic2, topic3, data)
-                         VALUES ({block_num}, '{block_timestamp}', {log_idx}, {tx_idx}, '0x{tx_hash}', '0x{address}', {selector}, {topic0}, {topic1}, {topic2}, {topic3}, '0x{data}')",
-                        selector = selector.map_or("NULL".to_string(), |s| format!("'0x{s}'")),
-                        topic0 = topic0.map_or("NULL".to_string(), |t| format!("'0x{t}'")),
-                        topic1 = topic1.map_or("NULL".to_string(), |t| format!("'0x{t}'")),
-                        topic2 = topic2.map_or("NULL".to_string(), |t| format!("'0x{t}'")),
-                        topic3 = topic3.map_or("NULL".to_string(), |t| format!("'0x{t}'")),
-                    ),
-                    [],
-                )
-                .ok();
+            log_stmts.push(format!(
+                "INSERT INTO logs (block_num, block_timestamp, log_idx, tx_idx, tx_hash, address, selector, topic0, topic1, topic2, topic3, data)
+                 VALUES ({block_num}, '{block_timestamp}', {log_idx}, {tx_idx}, '0x{tx_hash}', '0x{address}', {selector}, {topic0}, {topic1}, {topic2}, {topic3}, '0x{data}')",
+                selector = selector.map_or("NULL".to_string(), |s| format!("'0x{s}'")),
+                topic0 = topic0.map_or("NULL".to_string(), |t| format!("'0x{t}'")),
+                topic1 = topic1.map_or("NULL".to_string(), |t| format!("'0x{t}'")),
+                topic2 = topic2.map_or("NULL".to_string(), |t| format!("'0x{t}'")),
+                topic3 = topic3.map_or("NULL".to_string(), |t| format!("'0x{t}'")),
+            ));
         }
 
-        drop(duck_conn);
+        // Execute log inserts
+        if !log_stmts.is_empty() {
+            let sql = log_stmts.join(";\n");
+            pool.with_connection(move |conn| {
+                for stmt in sql.split(";\n") {
+                    let _ = conn.execute(stmt, []);
+                }
+                Ok(())
+            }).await.ok();
+        }
+
         Arc::new(pool)
     });
 
