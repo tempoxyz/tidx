@@ -130,6 +130,32 @@ fn print_http_status(resp: &serde_json::Value) -> Result<()> {
                 }
             }
         }
+
+        // DuckDB status from HTTP response
+        let duck_max = chain["duckdb_max"].as_i64();
+        let duck_min = chain["duckdb_min"].as_i64();
+        let duck_tip_lag = chain["duckdb_tip_lag"].as_i64().unwrap_or(0);
+        let duck_backfill = chain["duckdb_backfill_remaining"].as_i64().unwrap_or(0);
+        let duck_gaps = chain["duckdb_internal_gaps"].as_i64().unwrap_or(0);
+
+        if duck_max.is_some() {
+            println!("│");
+            println!("│  DuckDB (OLAP)");
+            if let (Some(min), Some(max)) = (duck_min, duck_max) {
+                if max == 0 {
+                    println!("│  └─ Status:   Empty");
+                } else {
+                    println!("│  ├─ Range:    {} - {}", format_number(min as u64), format_number(max as u64));
+                    println!("│  ├─ Tip Lag:  {} blocks", duck_tip_lag);
+                    if duck_backfill > 0 || duck_gaps > 0 {
+                        println!("│  └─ Backfill: {} blocks remaining", format_number(duck_backfill as u64));
+                    } else {
+                        println!("│  └─ Status:   ✓ Synced");
+                    }
+                }
+            }
+        }
+
         println!("└───────────────────────────────────────────────────────────");
         println!();
     }
