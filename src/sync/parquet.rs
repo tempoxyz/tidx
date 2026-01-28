@@ -1,18 +1,18 @@
 //! Parquet-based data transfer from PostgreSQL to DuckDB.
 //!
 //! This module provides streaming data transfer using Parquet as an intermediate format:
-//! 1. Query PostgreSQL for block range data
-//! 2. Write to temporary Parquet file (streaming, memory-bounded)
+//! 1. Stream rows from PostgreSQL using query_raw (cursor-based)
+//! 2. Write to Parquet in chunks (memory-bounded, ~10k rows per batch)
 //! 3. DuckDB ingests via `read_parquet()` (efficient columnar read)
 //! 4. Cleanup temp file
 //!
 //! Benefits over direct approaches:
-//! - Memory-safe: never holds full dataset in memory
+//! - Memory-safe: never holds full dataset in memory (streaming)
 //! - No OOM from postgres extension (scanner mode issue)
 //! - Faster than SQL string building
 //! - Columnar format matches DuckDB's storage
 
-use std::fs;
+use std::fs::{self, File};
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -20,11 +20,19 @@ use anyhow::{Context, Result};
 use arrow::array::{Int16Array, Int32Array, Int64Array, StringBuilder};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
+use futures::StreamExt;
 use parquet::arrow::ArrowWriter;
 use parquet::basic::Compression;
 use parquet::file::properties::WriterProperties;
+use tokio_postgres::types::ToSql;
 
 use crate::db::DuckDbPool;
+
+/// Chunk sizes for streaming - smaller for logs (wider rows)
+const CHUNK_SIZE_BLOCKS: usize = 10_000;
+const CHUNK_SIZE_TXS: usize = 5_000;
+const CHUNK_SIZE_LOGS: usize = 2_000;
+const CHUNK_SIZE_RECEIPTS: usize = 5_000;
 
 /// Temporary directory for Parquet files
 fn temp_dir() -> PathBuf {
@@ -41,8 +49,8 @@ fn ensure_temp_dir() -> Result<PathBuf> {
 /// Copy a range of blocks from Postgres to DuckDB via Parquet.
 ///
 /// This is the unified approach for both tail sync and gap-fill:
-/// - Streams data through Parquet files
-/// - Memory-bounded (no OOM on large ranges)
+/// - **Streams** data from PostgreSQL using query_raw (cursor-based)
+/// - Writes Parquet in chunks (memory-bounded, never holds all rows)
 /// - Handles duplicates via INSERT OR IGNORE
 pub async fn copy_range_via_parquet(
     pg_conn: &deadpool_postgres::Object,
@@ -50,48 +58,6 @@ pub async fn copy_range_via_parquet(
     start: i64,
     end: i64,
 ) -> Result<i64> {
-    // Fetch all data from Postgres
-    let block_rows = pg_conn
-        .query(
-            "SELECT num, hash, parent_hash, timestamp, timestamp_ms, gas_limit, gas_used, miner, extra_data 
-             FROM blocks WHERE num >= $1 AND num <= $2 ORDER BY num",
-            &[&start, &end],
-        )
-        .await?;
-
-    if block_rows.is_empty() {
-        return Ok(0);
-    }
-
-    let tx_rows = pg_conn
-        .query(
-            "SELECT block_num, block_timestamp, idx, hash, type, \"from\", \"to\", value, input,
-                    gas_limit, max_fee_per_gas, max_priority_fee_per_gas, gas_used, nonce_key, nonce,
-                    fee_token, fee_payer, calls::text, call_count, valid_before, valid_after, signature_type
-             FROM txs WHERE block_num >= $1 AND block_num <= $2 ORDER BY block_num, idx",
-            &[&start, &end],
-        )
-        .await?;
-
-    let log_rows = pg_conn
-        .query(
-            "SELECT block_num, block_timestamp, log_idx, tx_idx, tx_hash, address, selector, topic0, topic1, topic2, topic3, data
-             FROM logs WHERE block_num >= $1 AND block_num <= $2 ORDER BY block_num, log_idx",
-            &[&start, &end],
-        )
-        .await?;
-
-    let receipt_rows = pg_conn
-        .query(
-            "SELECT block_num, block_timestamp, tx_idx, tx_hash, \"from\", \"to\", contract_address,
-                    gas_used, cumulative_gas_used, effective_gas_price, status, fee_payer
-             FROM receipts WHERE block_num >= $1 AND block_num <= $2 ORDER BY block_num, tx_idx",
-            &[&start, &end],
-        )
-        .await?;
-
-    let blocks_count = block_rows.len();
-
     // Create temp directory and file paths
     let temp_dir = ensure_temp_dir()?;
     let batch_id = format!("{}_{}", start, end);
@@ -100,20 +66,17 @@ pub async fn copy_range_via_parquet(
     let logs_path = temp_dir.join(format!("logs_{batch_id}.parquet"));
     let receipts_path = temp_dir.join(format!("receipts_{batch_id}.parquet"));
 
-    // Write Parquet files (blocking I/O, run in spawn_blocking)
-    let blocks_path_clone = blocks_path.clone();
-    let txs_path_clone = txs_path.clone();
-    let logs_path_clone = logs_path.clone();
-    let receipts_path_clone = receipts_path.clone();
+    // Stream blocks from Postgres and write to Parquet in chunks
+    let blocks_count = stream_blocks_to_parquet(pg_conn, &blocks_path, start, end).await?;
+    
+    if blocks_count == 0 {
+        return Ok(0);
+    }
 
-    tokio::task::spawn_blocking(move || {
-        write_blocks_parquet(&blocks_path_clone, &block_rows)?;
-        write_txs_parquet(&txs_path_clone, &tx_rows)?;
-        write_logs_parquet(&logs_path_clone, &log_rows)?;
-        write_receipts_parquet(&receipts_path_clone, &receipt_rows)?;
-        Ok::<_, anyhow::Error>(())
-    })
-    .await??;
+    // Stream txs, logs, receipts sequentially (PG connection is single-flight)
+    stream_txs_to_parquet(pg_conn, &txs_path, start, end).await?;
+    stream_logs_to_parquet(pg_conn, &logs_path, start, end).await?;
+    stream_receipts_to_parquet(pg_conn, &receipts_path, start, end).await?;
 
     // Ingest Parquet files into DuckDB
     let blocks_path_str = blocks_path.to_string_lossy().to_string();
@@ -165,7 +128,615 @@ pub async fn copy_range_via_parquet(
     Ok(blocks_count as i64)
 }
 
-/// Write blocks to Parquet file
+/// Stream blocks from Postgres to Parquet file, writing in chunks.
+async fn stream_blocks_to_parquet(
+    pg_conn: &deadpool_postgres::Object,
+    path: &PathBuf,
+    start: i64,
+    end: i64,
+) -> Result<usize> {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("num", DataType::Int64, false),
+        Field::new("hash", DataType::Utf8, false),
+        Field::new("parent_hash", DataType::Utf8, false),
+        Field::new("timestamp", DataType::Utf8, false),
+        Field::new("timestamp_ms", DataType::Int64, false),
+        Field::new("gas_limit", DataType::Int64, false),
+        Field::new("gas_used", DataType::Int64, false),
+        Field::new("miner", DataType::Utf8, false),
+        Field::new("extra_data", DataType::Utf8, true),
+    ]));
+
+    let props = WriterProperties::builder()
+        .set_compression(Compression::ZSTD(Default::default()))
+        .build();
+
+    let file = File::create(path).context("Failed to create blocks parquet file")?;
+    let mut writer = ArrowWriter::try_new(file, schema.clone(), Some(props))?;
+
+    let params: [&(dyn ToSql + Sync); 2] = [&start, &end];
+    let stream = pg_conn
+        .query_raw(
+            "SELECT num, hash, parent_hash, timestamp, timestamp_ms, gas_limit, gas_used, miner, extra_data 
+             FROM blocks WHERE num >= $1 AND num <= $2 ORDER BY num",
+            params,
+        )
+        .await?;
+    futures::pin_mut!(stream);
+
+    let mut total_rows = 0usize;
+    let mut chunk: Vec<tokio_postgres::Row> = Vec::with_capacity(CHUNK_SIZE_BLOCKS);
+
+    while let Some(row_result) = stream.next().await {
+        let row = row_result?;
+        chunk.push(row);
+
+        if chunk.len() >= CHUNK_SIZE_BLOCKS {
+            let batch = build_blocks_batch(&schema, &chunk)?;
+            writer.write(&batch)?;
+            total_rows += chunk.len();
+            chunk.clear();
+        }
+    }
+
+    // Write remaining rows
+    if !chunk.is_empty() {
+        let batch = build_blocks_batch(&schema, &chunk)?;
+        writer.write(&batch)?;
+        total_rows += chunk.len();
+    }
+
+    writer.close()?;
+    Ok(total_rows)
+}
+
+/// Build a RecordBatch from a chunk of block rows
+fn build_blocks_batch(schema: &Arc<Schema>, rows: &[tokio_postgres::Row]) -> Result<RecordBatch> {
+    let mut num_builder = Int64Array::builder(rows.len());
+    let mut hash_builder = StringBuilder::new();
+    let mut parent_hash_builder = StringBuilder::new();
+    let mut timestamp_builder = StringBuilder::new();
+    let mut timestamp_ms_builder = Int64Array::builder(rows.len());
+    let mut gas_limit_builder = Int64Array::builder(rows.len());
+    let mut gas_used_builder = Int64Array::builder(rows.len());
+    let mut miner_builder = StringBuilder::new();
+    let mut extra_data_builder = StringBuilder::new();
+
+    for row in rows {
+        let num: i64 = row.get(0);
+        let hash: Vec<u8> = row.get(1);
+        let parent_hash: Vec<u8> = row.get(2);
+        let timestamp: chrono::DateTime<chrono::Utc> = row.get(3);
+        let timestamp_ms: i64 = row.get(4);
+        let gas_limit: i64 = row.get(5);
+        let gas_used: i64 = row.get(6);
+        let miner: Vec<u8> = row.get(7);
+        let extra_data: Option<Vec<u8>> = row.get(8);
+
+        num_builder.append_value(num);
+        hash_builder.append_value(format!("0x{}", hex::encode(&hash)));
+        parent_hash_builder.append_value(format!("0x{}", hex::encode(&parent_hash)));
+        timestamp_builder.append_value(timestamp.to_rfc3339());
+        timestamp_ms_builder.append_value(timestamp_ms);
+        gas_limit_builder.append_value(gas_limit);
+        gas_used_builder.append_value(gas_used);
+        miner_builder.append_value(format!("0x{}", hex::encode(&miner)));
+        match extra_data {
+            Some(d) => extra_data_builder.append_value(format!("0x{}", hex::encode(&d))),
+            None => extra_data_builder.append_null(),
+        }
+    }
+
+    Ok(RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(num_builder.finish()),
+            Arc::new(hash_builder.finish()),
+            Arc::new(parent_hash_builder.finish()),
+            Arc::new(timestamp_builder.finish()),
+            Arc::new(timestamp_ms_builder.finish()),
+            Arc::new(gas_limit_builder.finish()),
+            Arc::new(gas_used_builder.finish()),
+            Arc::new(miner_builder.finish()),
+            Arc::new(extra_data_builder.finish()),
+        ],
+    )?)
+}
+
+/// Stream transactions from Postgres to Parquet file, writing in chunks.
+async fn stream_txs_to_parquet(
+    pg_conn: &deadpool_postgres::Object,
+    path: &PathBuf,
+    start: i64,
+    end: i64,
+) -> Result<usize> {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("block_num", DataType::Int64, false),
+        Field::new("block_timestamp", DataType::Utf8, false),
+        Field::new("idx", DataType::Int32, false),
+        Field::new("hash", DataType::Utf8, false),
+        Field::new("type", DataType::Int16, false),
+        Field::new("from", DataType::Utf8, false),
+        Field::new("to", DataType::Utf8, true),
+        Field::new("value", DataType::Utf8, false),
+        Field::new("input", DataType::Utf8, false),
+        Field::new("gas_limit", DataType::Int64, false),
+        Field::new("max_fee_per_gas", DataType::Utf8, false),
+        Field::new("max_priority_fee_per_gas", DataType::Utf8, true),
+        Field::new("gas_used", DataType::Int64, true),
+        Field::new("nonce_key", DataType::Utf8, false),
+        Field::new("nonce", DataType::Int64, false),
+        Field::new("fee_token", DataType::Utf8, true),
+        Field::new("fee_payer", DataType::Utf8, true),
+        Field::new("calls", DataType::Utf8, true),
+        Field::new("call_count", DataType::Int32, true),
+        Field::new("valid_before", DataType::Int64, true),
+        Field::new("valid_after", DataType::Int64, true),
+        Field::new("signature_type", DataType::Int16, true),
+    ]));
+
+    let props = WriterProperties::builder()
+        .set_compression(Compression::ZSTD(Default::default()))
+        .build();
+
+    let file = File::create(path).context("Failed to create txs parquet file")?;
+    let mut writer = ArrowWriter::try_new(file, schema.clone(), Some(props))?;
+
+    let params: [&(dyn ToSql + Sync); 2] = [&start, &end];
+    let stream = pg_conn
+        .query_raw(
+            "SELECT block_num, block_timestamp, idx, hash, type, \"from\", \"to\", value, input,
+                    gas_limit, max_fee_per_gas, max_priority_fee_per_gas, gas_used, nonce_key, nonce,
+                    fee_token, fee_payer, calls::text, call_count, valid_before, valid_after, signature_type
+             FROM txs WHERE block_num >= $1 AND block_num <= $2 ORDER BY block_num, idx",
+            params,
+        )
+        .await?;
+    futures::pin_mut!(stream);
+
+    let mut total_rows = 0usize;
+    let mut chunk: Vec<tokio_postgres::Row> = Vec::with_capacity(CHUNK_SIZE_TXS);
+
+    while let Some(row_result) = stream.next().await {
+        let row = row_result?;
+        chunk.push(row);
+
+        if chunk.len() >= CHUNK_SIZE_TXS {
+            let batch = build_txs_batch(&schema, &chunk)?;
+            writer.write(&batch)?;
+            total_rows += chunk.len();
+            chunk.clear();
+        }
+    }
+
+    if !chunk.is_empty() {
+        let batch = build_txs_batch(&schema, &chunk)?;
+        writer.write(&batch)?;
+        total_rows += chunk.len();
+    }
+
+    writer.close()?;
+    Ok(total_rows)
+}
+
+/// Build a RecordBatch from a chunk of tx rows
+fn build_txs_batch(schema: &Arc<Schema>, rows: &[tokio_postgres::Row]) -> Result<RecordBatch> {
+    let mut block_num_builder = Int64Array::builder(rows.len());
+    let mut block_timestamp_builder = StringBuilder::new();
+    let mut idx_builder = Int32Array::builder(rows.len());
+    let mut hash_builder = StringBuilder::new();
+    let mut type_builder = Int16Array::builder(rows.len());
+    let mut from_builder = StringBuilder::new();
+    let mut to_builder = StringBuilder::new();
+    let mut value_builder = StringBuilder::new();
+    let mut input_builder = StringBuilder::new();
+    let mut gas_limit_builder = Int64Array::builder(rows.len());
+    let mut max_fee_per_gas_builder = StringBuilder::new();
+    let mut max_priority_fee_per_gas_builder = StringBuilder::new();
+    let mut gas_used_builder = Int64Array::builder(rows.len());
+    let mut nonce_key_builder = StringBuilder::new();
+    let mut nonce_builder = Int64Array::builder(rows.len());
+    let mut fee_token_builder = StringBuilder::new();
+    let mut fee_payer_builder = StringBuilder::new();
+    let mut calls_builder = StringBuilder::new();
+    let mut call_count_builder = Int32Array::builder(rows.len());
+    let mut valid_before_builder = Int64Array::builder(rows.len());
+    let mut valid_after_builder = Int64Array::builder(rows.len());
+    let mut signature_type_builder = Int16Array::builder(rows.len());
+
+    for row in rows {
+        let block_num: i64 = row.get(0);
+        let block_timestamp: chrono::DateTime<chrono::Utc> = row.get(1);
+        let idx: i32 = row.get(2);
+        let hash: Vec<u8> = row.get(3);
+        let tx_type: i16 = row.get(4);
+        let from: Vec<u8> = row.get(5);
+        let to: Option<Vec<u8>> = row.get(6);
+        let value: String = row.get(7);
+        let input: Vec<u8> = row.get(8);
+        let gas_limit: i64 = row.get(9);
+        let max_fee_per_gas: String = row.get(10);
+        let max_priority_fee_per_gas: Option<String> = row.get(11);
+        let gas_used: Option<i64> = row.get(12);
+        let nonce_key: Vec<u8> = row.get(13);
+        let nonce: i64 = row.get(14);
+        let fee_token: Option<Vec<u8>> = row.get(15);
+        let fee_payer: Option<Vec<u8>> = row.get(16);
+        let calls: Option<String> = row.get(17);
+        let call_count: Option<i32> = row.get(18);
+        let valid_before: Option<i64> = row.get(19);
+        let valid_after: Option<i64> = row.get(20);
+        let signature_type: Option<i16> = row.get(21);
+
+        block_num_builder.append_value(block_num);
+        block_timestamp_builder.append_value(block_timestamp.to_rfc3339());
+        idx_builder.append_value(idx);
+        hash_builder.append_value(format!("0x{}", hex::encode(&hash)));
+        type_builder.append_value(tx_type);
+        from_builder.append_value(format!("0x{}", hex::encode(&from)));
+        match to {
+            Some(t) => to_builder.append_value(format!("0x{}", hex::encode(&t))),
+            None => to_builder.append_null(),
+        }
+        value_builder.append_value(&value);
+        input_builder.append_value(format!("0x{}", hex::encode(&input)));
+        gas_limit_builder.append_value(gas_limit);
+        max_fee_per_gas_builder.append_value(&max_fee_per_gas);
+        match max_priority_fee_per_gas {
+            Some(v) => max_priority_fee_per_gas_builder.append_value(&v),
+            None => max_priority_fee_per_gas_builder.append_null(),
+        }
+        match gas_used {
+            Some(v) => gas_used_builder.append_value(v),
+            None => gas_used_builder.append_null(),
+        }
+        nonce_key_builder.append_value(format!("0x{}", hex::encode(&nonce_key)));
+        nonce_builder.append_value(nonce);
+        match fee_token {
+            Some(t) => fee_token_builder.append_value(format!("0x{}", hex::encode(&t))),
+            None => fee_token_builder.append_null(),
+        }
+        match fee_payer {
+            Some(p) => fee_payer_builder.append_value(format!("0x{}", hex::encode(&p))),
+            None => fee_payer_builder.append_null(),
+        }
+        match calls {
+            Some(c) => calls_builder.append_value(&c),
+            None => calls_builder.append_null(),
+        }
+        match call_count {
+            Some(c) => call_count_builder.append_value(c),
+            None => call_count_builder.append_null(),
+        }
+        match valid_before {
+            Some(v) => valid_before_builder.append_value(v),
+            None => valid_before_builder.append_null(),
+        }
+        match valid_after {
+            Some(v) => valid_after_builder.append_value(v),
+            None => valid_after_builder.append_null(),
+        }
+        match signature_type {
+            Some(s) => signature_type_builder.append_value(s),
+            None => signature_type_builder.append_null(),
+        }
+    }
+
+    Ok(RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(block_num_builder.finish()),
+            Arc::new(block_timestamp_builder.finish()),
+            Arc::new(idx_builder.finish()),
+            Arc::new(hash_builder.finish()),
+            Arc::new(type_builder.finish()),
+            Arc::new(from_builder.finish()),
+            Arc::new(to_builder.finish()),
+            Arc::new(value_builder.finish()),
+            Arc::new(input_builder.finish()),
+            Arc::new(gas_limit_builder.finish()),
+            Arc::new(max_fee_per_gas_builder.finish()),
+            Arc::new(max_priority_fee_per_gas_builder.finish()),
+            Arc::new(gas_used_builder.finish()),
+            Arc::new(nonce_key_builder.finish()),
+            Arc::new(nonce_builder.finish()),
+            Arc::new(fee_token_builder.finish()),
+            Arc::new(fee_payer_builder.finish()),
+            Arc::new(calls_builder.finish()),
+            Arc::new(call_count_builder.finish()),
+            Arc::new(valid_before_builder.finish()),
+            Arc::new(valid_after_builder.finish()),
+            Arc::new(signature_type_builder.finish()),
+        ],
+    )?)
+}
+
+/// Stream logs from Postgres to Parquet file, writing in chunks.
+/// Uses smaller chunks since logs have wide rows with large data fields.
+async fn stream_logs_to_parquet(
+    pg_conn: &deadpool_postgres::Object,
+    path: &PathBuf,
+    start: i64,
+    end: i64,
+) -> Result<usize> {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("block_num", DataType::Int64, false),
+        Field::new("block_timestamp", DataType::Utf8, false),
+        Field::new("log_idx", DataType::Int32, false),
+        Field::new("tx_idx", DataType::Int32, false),
+        Field::new("tx_hash", DataType::Utf8, false),
+        Field::new("address", DataType::Utf8, false),
+        Field::new("selector", DataType::Utf8, true),
+        Field::new("topic0", DataType::Utf8, true),
+        Field::new("topic1", DataType::Utf8, true),
+        Field::new("topic2", DataType::Utf8, true),
+        Field::new("topic3", DataType::Utf8, true),
+        Field::new("data", DataType::Utf8, false),
+    ]));
+
+    let props = WriterProperties::builder()
+        .set_compression(Compression::ZSTD(Default::default()))
+        .build();
+
+    let file = File::create(path).context("Failed to create logs parquet file")?;
+    let mut writer = ArrowWriter::try_new(file, schema.clone(), Some(props))?;
+
+    let params: [&(dyn ToSql + Sync); 2] = [&start, &end];
+    let stream = pg_conn
+        .query_raw(
+            "SELECT block_num, block_timestamp, log_idx, tx_idx, tx_hash, address, selector, topic0, topic1, topic2, topic3, data
+             FROM logs WHERE block_num >= $1 AND block_num <= $2 ORDER BY block_num, log_idx",
+            params,
+        )
+        .await?;
+    futures::pin_mut!(stream);
+
+    let mut total_rows = 0usize;
+    let mut chunk: Vec<tokio_postgres::Row> = Vec::with_capacity(CHUNK_SIZE_LOGS);
+
+    while let Some(row_result) = stream.next().await {
+        let row = row_result?;
+        chunk.push(row);
+
+        if chunk.len() >= CHUNK_SIZE_LOGS {
+            let batch = build_logs_batch(&schema, &chunk)?;
+            writer.write(&batch)?;
+            total_rows += chunk.len();
+            chunk.clear();
+        }
+    }
+
+    if !chunk.is_empty() {
+        let batch = build_logs_batch(&schema, &chunk)?;
+        writer.write(&batch)?;
+        total_rows += chunk.len();
+    }
+
+    writer.close()?;
+    Ok(total_rows)
+}
+
+/// Build a RecordBatch from a chunk of log rows
+fn build_logs_batch(schema: &Arc<Schema>, rows: &[tokio_postgres::Row]) -> Result<RecordBatch> {
+    let mut block_num_builder = Int64Array::builder(rows.len());
+    let mut block_timestamp_builder = StringBuilder::new();
+    let mut log_idx_builder = Int32Array::builder(rows.len());
+    let mut tx_idx_builder = Int32Array::builder(rows.len());
+    let mut tx_hash_builder = StringBuilder::new();
+    let mut address_builder = StringBuilder::new();
+    let mut selector_builder = StringBuilder::new();
+    let mut topic0_builder = StringBuilder::new();
+    let mut topic1_builder = StringBuilder::new();
+    let mut topic2_builder = StringBuilder::new();
+    let mut topic3_builder = StringBuilder::new();
+    let mut data_builder = StringBuilder::new();
+
+    for row in rows {
+        let block_num: i64 = row.get(0);
+        let block_timestamp: chrono::DateTime<chrono::Utc> = row.get(1);
+        let log_idx: i32 = row.get(2);
+        let tx_idx: i32 = row.get(3);
+        let tx_hash: Vec<u8> = row.get(4);
+        let address: Vec<u8> = row.get(5);
+        let selector: Option<Vec<u8>> = row.get(6);
+        let topic0: Option<Vec<u8>> = row.get(7);
+        let topic1: Option<Vec<u8>> = row.get(8);
+        let topic2: Option<Vec<u8>> = row.get(9);
+        let topic3: Option<Vec<u8>> = row.get(10);
+        let data: Vec<u8> = row.get(11);
+
+        block_num_builder.append_value(block_num);
+        block_timestamp_builder.append_value(block_timestamp.to_rfc3339());
+        log_idx_builder.append_value(log_idx);
+        tx_idx_builder.append_value(tx_idx);
+        tx_hash_builder.append_value(format!("0x{}", hex::encode(&tx_hash)));
+        address_builder.append_value(format!("0x{}", hex::encode(&address)));
+        match selector {
+            Some(s) => selector_builder.append_value(format!("0x{}", hex::encode(&s))),
+            None => selector_builder.append_null(),
+        }
+        match topic0 {
+            Some(t) => topic0_builder.append_value(format!("0x{}", hex::encode(&t))),
+            None => topic0_builder.append_null(),
+        }
+        match topic1 {
+            Some(t) => topic1_builder.append_value(format!("0x{}", hex::encode(&t))),
+            None => topic1_builder.append_null(),
+        }
+        match topic2 {
+            Some(t) => topic2_builder.append_value(format!("0x{}", hex::encode(&t))),
+            None => topic2_builder.append_null(),
+        }
+        match topic3 {
+            Some(t) => topic3_builder.append_value(format!("0x{}", hex::encode(&t))),
+            None => topic3_builder.append_null(),
+        }
+        data_builder.append_value(format!("0x{}", hex::encode(&data)));
+    }
+
+    Ok(RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(block_num_builder.finish()),
+            Arc::new(block_timestamp_builder.finish()),
+            Arc::new(log_idx_builder.finish()),
+            Arc::new(tx_idx_builder.finish()),
+            Arc::new(tx_hash_builder.finish()),
+            Arc::new(address_builder.finish()),
+            Arc::new(selector_builder.finish()),
+            Arc::new(topic0_builder.finish()),
+            Arc::new(topic1_builder.finish()),
+            Arc::new(topic2_builder.finish()),
+            Arc::new(topic3_builder.finish()),
+            Arc::new(data_builder.finish()),
+        ],
+    )?)
+}
+
+/// Stream receipts from Postgres to Parquet file, writing in chunks.
+async fn stream_receipts_to_parquet(
+    pg_conn: &deadpool_postgres::Object,
+    path: &PathBuf,
+    start: i64,
+    end: i64,
+) -> Result<usize> {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("block_num", DataType::Int64, false),
+        Field::new("block_timestamp", DataType::Utf8, false),
+        Field::new("tx_idx", DataType::Int32, false),
+        Field::new("tx_hash", DataType::Utf8, false),
+        Field::new("from", DataType::Utf8, false),
+        Field::new("to", DataType::Utf8, true),
+        Field::new("contract_address", DataType::Utf8, true),
+        Field::new("gas_used", DataType::Int64, false),
+        Field::new("cumulative_gas_used", DataType::Int64, false),
+        Field::new("effective_gas_price", DataType::Utf8, true),
+        Field::new("status", DataType::Int16, true),
+        Field::new("fee_payer", DataType::Utf8, true),
+    ]));
+
+    let props = WriterProperties::builder()
+        .set_compression(Compression::ZSTD(Default::default()))
+        .build();
+
+    let file = File::create(path).context("Failed to create receipts parquet file")?;
+    let mut writer = ArrowWriter::try_new(file, schema.clone(), Some(props))?;
+
+    let params: [&(dyn ToSql + Sync); 2] = [&start, &end];
+    let stream = pg_conn
+        .query_raw(
+            "SELECT block_num, block_timestamp, tx_idx, tx_hash, \"from\", \"to\", contract_address,
+                    gas_used, cumulative_gas_used, effective_gas_price, status, fee_payer
+             FROM receipts WHERE block_num >= $1 AND block_num <= $2 ORDER BY block_num, tx_idx",
+            params,
+        )
+        .await?;
+    futures::pin_mut!(stream);
+
+    let mut total_rows = 0usize;
+    let mut chunk: Vec<tokio_postgres::Row> = Vec::with_capacity(CHUNK_SIZE_RECEIPTS);
+
+    while let Some(row_result) = stream.next().await {
+        let row = row_result?;
+        chunk.push(row);
+
+        if chunk.len() >= CHUNK_SIZE_RECEIPTS {
+            let batch = build_receipts_batch(&schema, &chunk)?;
+            writer.write(&batch)?;
+            total_rows += chunk.len();
+            chunk.clear();
+        }
+    }
+
+    if !chunk.is_empty() {
+        let batch = build_receipts_batch(&schema, &chunk)?;
+        writer.write(&batch)?;
+        total_rows += chunk.len();
+    }
+
+    writer.close()?;
+    Ok(total_rows)
+}
+
+/// Build a RecordBatch from a chunk of receipt rows
+fn build_receipts_batch(schema: &Arc<Schema>, rows: &[tokio_postgres::Row]) -> Result<RecordBatch> {
+    let mut block_num_builder = Int64Array::builder(rows.len());
+    let mut block_timestamp_builder = StringBuilder::new();
+    let mut tx_idx_builder = Int32Array::builder(rows.len());
+    let mut tx_hash_builder = StringBuilder::new();
+    let mut from_builder = StringBuilder::new();
+    let mut to_builder = StringBuilder::new();
+    let mut contract_address_builder = StringBuilder::new();
+    let mut gas_used_builder = Int64Array::builder(rows.len());
+    let mut cumulative_gas_used_builder = Int64Array::builder(rows.len());
+    let mut effective_gas_price_builder = StringBuilder::new();
+    let mut status_builder = Int16Array::builder(rows.len());
+    let mut fee_payer_builder = StringBuilder::new();
+
+    for row in rows {
+        let block_num: i64 = row.get(0);
+        let block_timestamp: chrono::DateTime<chrono::Utc> = row.get(1);
+        let tx_idx: i32 = row.get(2);
+        let tx_hash: Vec<u8> = row.get(3);
+        let from: Vec<u8> = row.get(4);
+        let to: Option<Vec<u8>> = row.get(5);
+        let contract_address: Option<Vec<u8>> = row.get(6);
+        let gas_used: i64 = row.get(7);
+        let cumulative_gas_used: i64 = row.get(8);
+        let effective_gas_price: Option<String> = row.get(9);
+        let status: Option<i16> = row.get(10);
+        let fee_payer: Option<Vec<u8>> = row.get(11);
+
+        block_num_builder.append_value(block_num);
+        block_timestamp_builder.append_value(block_timestamp.to_rfc3339());
+        tx_idx_builder.append_value(tx_idx);
+        tx_hash_builder.append_value(format!("0x{}", hex::encode(&tx_hash)));
+        from_builder.append_value(format!("0x{}", hex::encode(&from)));
+        match to {
+            Some(t) => to_builder.append_value(format!("0x{}", hex::encode(&t))),
+            None => to_builder.append_null(),
+        }
+        match contract_address {
+            Some(c) => contract_address_builder.append_value(format!("0x{}", hex::encode(&c))),
+            None => contract_address_builder.append_null(),
+        }
+        gas_used_builder.append_value(gas_used);
+        cumulative_gas_used_builder.append_value(cumulative_gas_used);
+        match effective_gas_price {
+            Some(p) => effective_gas_price_builder.append_value(&p),
+            None => effective_gas_price_builder.append_null(),
+        }
+        match status {
+            Some(s) => status_builder.append_value(s),
+            None => status_builder.append_null(),
+        }
+        match fee_payer {
+            Some(p) => fee_payer_builder.append_value(format!("0x{}", hex::encode(&p))),
+            None => fee_payer_builder.append_null(),
+        }
+    }
+
+    Ok(RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(block_num_builder.finish()),
+            Arc::new(block_timestamp_builder.finish()),
+            Arc::new(tx_idx_builder.finish()),
+            Arc::new(tx_hash_builder.finish()),
+            Arc::new(from_builder.finish()),
+            Arc::new(to_builder.finish()),
+            Arc::new(contract_address_builder.finish()),
+            Arc::new(gas_used_builder.finish()),
+            Arc::new(cumulative_gas_used_builder.finish()),
+            Arc::new(effective_gas_price_builder.finish()),
+            Arc::new(status_builder.finish()),
+            Arc::new(fee_payer_builder.finish()),
+        ],
+    )?)
+}
+
+/// Write blocks to Parquet file (used by tests only)
+#[allow(dead_code)]
 fn write_blocks_parquet(path: &PathBuf, rows: &[tokio_postgres::Row]) -> Result<()> {
     let schema = Arc::new(Schema::new(vec![
         Field::new("num", DataType::Int64, false),
@@ -232,7 +803,8 @@ fn write_blocks_parquet(path: &PathBuf, rows: &[tokio_postgres::Row]) -> Result<
     write_parquet_file(path, schema, batch)
 }
 
-/// Write transactions to Parquet file
+/// Write transactions to Parquet file (used by tests only)
+#[allow(dead_code)]
 fn write_txs_parquet(path: &PathBuf, rows: &[tokio_postgres::Row]) -> Result<()> {
     if rows.is_empty() {
         // Write empty file with schema
@@ -415,7 +987,8 @@ fn write_txs_parquet(path: &PathBuf, rows: &[tokio_postgres::Row]) -> Result<()>
     write_parquet_file(path, schema, batch)
 }
 
-/// Write logs to Parquet file
+/// Write logs to Parquet file (used by tests only)
+#[allow(dead_code)]
 fn write_logs_parquet(path: &PathBuf, rows: &[tokio_postgres::Row]) -> Result<()> {
     let schema = Arc::new(Schema::new(vec![
         Field::new("block_num", DataType::Int64, false),
@@ -514,7 +1087,8 @@ fn write_logs_parquet(path: &PathBuf, rows: &[tokio_postgres::Row]) -> Result<()
     write_parquet_file(path, schema, batch)
 }
 
-/// Write receipts to Parquet file
+/// Write receipts to Parquet file (used by tests only)
+#[allow(dead_code)]
 fn write_receipts_parquet(path: &PathBuf, rows: &[tokio_postgres::Row]) -> Result<()> {
     let schema = Arc::new(Schema::new(vec![
         Field::new("block_num", DataType::Int64, false),
@@ -613,7 +1187,8 @@ fn write_receipts_parquet(path: &PathBuf, rows: &[tokio_postgres::Row]) -> Resul
     write_parquet_file(path, schema, batch)
 }
 
-/// Write a RecordBatch to a Parquet file with compression
+/// Write a RecordBatch to a Parquet file with compression (used by tests only)
+#[allow(dead_code)]
 fn write_parquet_file(path: &PathBuf, schema: Arc<Schema>, batch: RecordBatch) -> Result<()> {
     let file = fs::File::create(path).context("Failed to create Parquet file")?;
 
