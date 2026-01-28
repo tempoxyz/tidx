@@ -430,11 +430,24 @@ impl Replicator {
 
             // Always log tail check to debug sync issues
             if lag > 0 {
+                // Log memory at start of tail sync
+                let mem_start = self.duckdb.with_connection_result(|conn| {
+                    let mem: i64 = conn
+                        .prepare("SELECT COALESCE(SUM(memory_usage_bytes), 0) FROM duckdb_memory()")
+                        .ok()
+                        .and_then(|mut stmt| stmt.query_row([], |row| row.get(0)).ok())
+                        .unwrap_or(0);
+                    Ok(mem)
+                }).await.unwrap_or(0);
+
                 tracing::info!(
                     chain_id = self.chain_id,
                     duck_tip,
                     pg_tip,
                     lag,
+                    mem_mb = mem_start / 1024 / 1024,
+                    batch_size = BATCH_SIZE,
+                    max_blocks = MAX_BLOCKS_PER_TICK,
                     "DuckDB tail sync starting"
                 );
             } else {
@@ -484,8 +497,45 @@ impl Replicator {
         start: i64,
         end: i64,
     ) -> Result<()> {
+        // Log memory before parquet ingestion
+        let mem_before = self.duckdb.with_connection_result(|conn| {
+            let mem: i64 = conn
+                .prepare("SELECT COALESCE(SUM(memory_usage_bytes), 0) FROM duckdb_memory()")
+                .ok()
+                .and_then(|mut stmt| stmt.query_row([], |row| row.get(0)).ok())
+                .unwrap_or(0);
+            Ok(mem)
+        }).await.unwrap_or(0);
+
         // Use Parquet for memory-safe, streaming data transfer
-        super::parquet::copy_range_via_parquet(pg_conn, &self.duckdb, start, end).await?;
+        let blocks_copied = super::parquet::copy_range_via_parquet(pg_conn, &self.duckdb, start, end).await?;
+
+        // Log memory after parquet ingestion
+        let (mem_after, temp_files) = self.duckdb.with_connection_result(|conn| {
+            let mem: i64 = conn
+                .prepare("SELECT COALESCE(SUM(memory_usage_bytes), 0) FROM duckdb_memory()")
+                .ok()
+                .and_then(|mut stmt| stmt.query_row([], |row| row.get(0)).ok())
+                .unwrap_or(0);
+            let temps: i64 = conn
+                .prepare("SELECT COUNT(*) FROM duckdb_temporary_files()")
+                .ok()
+                .and_then(|mut stmt| stmt.query_row([], |row| row.get(0)).ok())
+                .unwrap_or(0);
+            Ok((mem, temps))
+        }).await.unwrap_or((0, 0));
+
+        tracing::debug!(
+            chain_id = self.chain_id,
+            start,
+            end,
+            blocks = blocks_copied,
+            mem_before_mb = mem_before / 1024 / 1024,
+            mem_after_mb = mem_after / 1024 / 1024,
+            mem_delta_mb = (mem_after - mem_before) / 1024 / 1024,
+            temp_files,
+            "DuckDB copy_range memory profile"
+        );
 
         // Update watermark and checkpoint to release memory
         let end_copy = end;
