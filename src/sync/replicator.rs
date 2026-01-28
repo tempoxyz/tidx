@@ -363,8 +363,9 @@ impl Replicator {
     /// Tails Postgres by copying new blocks from watermark to tip.
     /// Copies all tables (blocks, txs, logs, receipts) for each range atomically.
     async fn tail_postgres(&self) -> Result<()> {
-        const BATCH_SIZE: i64 = 1000;
-        const MAX_BLOCKS_PER_TICK: i64 = 5000;
+        // Smaller batches to avoid OOM - each batch creates parquet files
+        const BATCH_SIZE: i64 = 100;
+        const MAX_BLOCKS_PER_TICK: i64 = 2000;
 
         let pg_conn = self.pg_pool.get().await?;
         
@@ -486,13 +487,15 @@ impl Replicator {
         // Use Parquet for memory-safe, streaming data transfer
         super::parquet::copy_range_via_parquet(pg_conn, &self.duckdb, start, end).await?;
 
-        // Update watermark
+        // Update watermark and checkpoint to release memory
         let end_copy = end;
         self.duckdb.with_connection(move |conn| {
             conn.execute(
                 "UPDATE duckdb_sync_state SET latest_block = $1, updated_at = CURRENT_TIMESTAMP WHERE id = 1",
                 duckdb::params![end_copy],
             )?;
+            // Checkpoint to release memory between batches
+            let _ = conn.execute("CHECKPOINT", []);
             Ok(())
         }).await?;
 
