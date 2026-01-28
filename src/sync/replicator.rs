@@ -302,8 +302,8 @@ impl Replicator {
         pg_pool: &Pool,
         chain_id: u64,
     ) -> Result<i64> {
-        // Use smaller batches to avoid OOM - high-tx blocks can have lots of logs
-        const BATCH_SIZE: i64 = 50;
+        // Spilling to disk handles memory pressure
+        const BATCH_SIZE: i64 = 100;
 
         let duck_min = {
             let (min, _max) = duckdb.block_range().await?;
@@ -461,9 +461,9 @@ impl Replicator {
         // Sort by start descending (most recent first)
         gaps.sort_by(|a, b| b.0.cmp(&a.0));
 
-        // Process gaps in smaller batches (100 blocks keeps memory usage low)
-        // Use smaller batches to avoid OOM - high-tx blocks can have lots of logs
-        const BATCH_SIZE: i64 = 50;
+        // Process gaps in batches - spilling to disk handles memory pressure
+        // 100 blocks is a good balance of throughput vs memory
+        const BATCH_SIZE: i64 = 100;
         let mut total_synced = 0i64;
         let start_time = Instant::now();
 
@@ -568,7 +568,12 @@ impl Replicator {
         );
         conn.execute(&txs_sql, [])?;
 
-        // Copy logs
+        // Force checkpoint after txs to release memory before logs (largest table)
+        // This triggers spilling and frees buffer manager memory
+        conn.execute("FORCE CHECKPOINT", [])?;
+
+        // Copy logs - this is the memory-intensive table
+        // Use ORDER BY to help DuckDB spill efficiently
         let logs_sql = format!(
             "INSERT OR IGNORE INTO logs \
              SELECT block_num, block_timestamp, log_idx, tx_idx, '0x' || lower(hex(tx_hash)), \
@@ -580,9 +585,13 @@ impl Replicator {
                     CASE WHEN topic3 IS NOT NULL THEN '0x' || lower(hex(topic3)) ELSE NULL END, \
                     '0x' || lower(hex(data)) \
              FROM {pg_alias}.public.logs \
-             WHERE block_num >= {start} AND block_num <= {end}"
+             WHERE block_num >= {start} AND block_num <= {end} \
+             ORDER BY block_num, log_idx"
         );
         conn.execute(&logs_sql, [])?;
+
+        // Force checkpoint after logs to release memory before receipts
+        conn.execute("FORCE CHECKPOINT", [])?;
 
         // Copy receipts
         let receipts_sql = format!(

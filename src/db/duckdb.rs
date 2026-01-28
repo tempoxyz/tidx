@@ -96,16 +96,29 @@ impl DuckDbPool {
                     }
                 };
 
-                // Performance tuning
-                // Use 12GB per instance for gap-fill with high-tx blocks
-                if let Err(e) = conn.execute_batch(
+                // Performance tuning for larger-than-memory workloads
+                // - memory_limit: Buffer manager limit (12GB per instance)
+                // - temp_directory: Enable spilling to disk for blocking operators
+                // - threads: Limit parallelism to reduce peak memory
+                // - preserve_insertion_order: false allows reordering to reduce memory
+                // - max_temp_directory_size: Limit temp disk usage
+                let temp_dir = if path_for_thread == ":memory:" {
+                    ".tmp".to_string()
+                } else {
+                    format!("{}.tmp", path_for_thread)
+                };
+                let config_sql = format!(
                     r#"
-                    SET memory_limit = '12GB';
+                    SET memory_limit = '10GB';
+                    SET temp_directory = '{}';
+                    SET max_temp_directory_size = '50GB';
                     SET threads = 4;
                     SET checkpoint_threshold = '100MB';
                     SET preserve_insertion_order = false;
                     "#,
-                ) {
+                    temp_dir.replace('\'', "''")
+                );
+                if let Err(e) = conn.execute_batch(&config_sql) {
                     tracing::error!(error = %e, "Failed to configure DuckDB");
                     return;
                 }
