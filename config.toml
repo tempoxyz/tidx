@@ -17,6 +17,9 @@ pg_url = "postgres://tidx:tidx@postgres:5432/tidx_moderato"
 backfill = true
 batch_size = 500
 concurrency = 8
+# DuckDB gap-fill mode: "auto" (default), "scanner" (fast), or "row" (reliable)
+# Use "row" for large DuckDB files (>50GB) to avoid OOM in postgres extension
+duckdb_gap_fill_mode = "row"
 
 [[chains]]
 name = "mainnet"
