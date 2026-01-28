@@ -5,6 +5,7 @@ use std::time::{Duration, Instant};
 use anyhow::Result;
 use tokio::sync::mpsc;
 
+use crate::config::GapFillMode;
 use crate::db::{DuckDbPool, Pool};
 use crate::metrics;
 use crate::types::{BlockRow, LogRow, ReceiptRow, TxRow};
@@ -35,6 +36,8 @@ pub struct Replicator {
     chain_id: u64,
     /// Flag set when channel receives data, signals to poll immediately
     needs_sync: Arc<AtomicBool>,
+    /// Gap-fill mode (auto/scanner/row)
+    gap_fill_mode: GapFillMode,
 }
 
 /// Handle for sending hints to the replicator.
@@ -92,11 +95,18 @@ impl ReplicatorHandle {
 
 impl Replicator {
     /// Creates a new replicator with a channel for receiving batches.
-    pub fn new(duckdb: Arc<DuckDbPool>, pg_pool: Pool, pg_url: String, buffer_size: usize, chain_id: u64) -> (Self, ReplicatorHandle) {
+    pub fn new(
+        duckdb: Arc<DuckDbPool>,
+        pg_pool: Pool,
+        pg_url: String,
+        buffer_size: usize,
+        chain_id: u64,
+        gap_fill_mode: GapFillMode,
+    ) -> (Self, ReplicatorHandle) {
         let (tx, rx) = mpsc::channel(buffer_size);
         let needs_sync = Arc::new(AtomicBool::new(false));
         (
-            Self { duckdb: duckdb.clone(), pg_pool, pg_url, rx, chain_id, needs_sync: needs_sync.clone() },
+            Self { duckdb: duckdb.clone(), pg_pool, pg_url, rx, chain_id, needs_sync: needs_sync.clone(), gap_fill_mode },
             ReplicatorHandle { tx, needs_sync, duckdb },
         )
     }
@@ -107,17 +117,18 @@ impl Replicator {
     ///
     /// Both tasks share the same DuckDB pool (writes serialize on mutex).
     pub async fn run(mut self) -> Result<()> {
-        tracing::info!(chain_id = self.chain_id, "DuckDB replicator started");
+        tracing::info!(chain_id = self.chain_id, gap_fill_mode = ?self.gap_fill_mode, "DuckDB replicator started");
 
         let duckdb = self.duckdb.clone();
         let pg_pool = self.pg_pool.clone();
         let pg_url = self.pg_url.clone();
         let chain_id = self.chain_id;
+        let gap_fill_mode = self.gap_fill_mode;
 
         // Spawn gap-fill task (runs continuously until caught up)
         let gap_fill_duckdb = duckdb.clone();
         let gap_fill_handle = tokio::spawn(async move {
-            Self::run_gap_fill_task(gap_fill_duckdb, pg_pool, pg_url, chain_id).await
+            Self::run_gap_fill_task(gap_fill_duckdb, pg_pool, pg_url, chain_id, gap_fill_mode).await
         });
 
         // Run tail task in current task
@@ -196,18 +207,27 @@ impl Replicator {
     /// - Single query per table (no application-level batch loops)
     /// - No lock contention (single bulk operation)
     /// 
-    /// Falls back to row-by-row copy if the extension isn't available.
+    /// Falls back to row-by-row copy if the extension isn't available or causes OOM.
+    /// 
+    /// Circuit breaker: If scanner fails with OOM-like error, permanently disable
+    /// scanner for this process lifetime and continue with row-by-row mode.
     async fn run_gap_fill_task(
         duckdb: Arc<DuckDbPool>,
         pg_pool: Pool,
         pg_url: String,
         chain_id: u64,
+        configured_mode: GapFillMode,
     ) -> Result<()> {
         // Initial delay to let tail task establish watermark
         tokio::time::sleep(Duration::from_secs(2)).await;
 
-        // Check if postgres extension is available and log diagnostic info
-        let (extension_available, extension_info) = {
+        // Circuit breaker: tracks if scanner has OOM'd
+        let mut scanner_disabled = configured_mode == GapFillMode::Row;
+        
+        // Check if postgres extension is available (only if mode allows scanner)
+        let (extension_available, extension_info) = if configured_mode == GapFillMode::Row {
+            (false, "disabled via duckdb_gap_fill_mode = \"row\"".to_string())
+        } else {
             let (tx, rx) = std::sync::mpsc::channel();
             let check_result = duckdb.with_connection(move |conn| {
                 // Try to install (may already be installed/cached)
@@ -247,24 +267,70 @@ impl Replicator {
             }
         };
 
-        if extension_available {
+        // Determine initial mode
+        let use_scanner = extension_available && !scanner_disabled;
+        
+        if use_scanner {
             tracing::info!(
                 chain_id,
                 extension_info,
+                mode = ?configured_mode,
                 "DuckDB gap-fill task started (postgres extension mode - fast)"
             );
         } else {
-            tracing::warn!(
+            tracing::info!(
                 chain_id,
                 extension_info,
-                "DuckDB postgres extension not available, falling back to row-by-row mode (slower)"
+                mode = ?configured_mode,
+                scanner_disabled,
+                "DuckDB gap-fill task started (row-by-row mode - reliable)"
             );
         }
 
         let mut last_checkpoint = Instant::now();
+        
+        // Maximum tail lag before pausing gap-fill (blocks)
+        const MAX_TAIL_LAG: i64 = 10;
 
         loop {
-            let result = if extension_available {
+            // Lag-aware throttle: pause gap-fill if tail is lagging
+            // This ensures tail sync always takes priority
+            let pg_conn = match pg_pool.get().await {
+                Ok(conn) => conn,
+                Err(e) => {
+                    tracing::warn!(chain_id, error = %e, "Failed to get PG connection for lag check");
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                    continue;
+                }
+            };
+            
+            let pg_tip: i64 = pg_conn
+                .query_one("SELECT COALESCE(MAX(num), 0) FROM blocks", &[])
+                .await
+                .map(|r| r.get(0))
+                .unwrap_or(0);
+            
+            let duck_tip = duckdb.latest_block().await.unwrap_or(None).unwrap_or(0);
+            let tail_lag = pg_tip - duck_tip;
+            
+            if tail_lag > MAX_TAIL_LAG {
+                tracing::debug!(
+                    chain_id,
+                    tail_lag,
+                    pg_tip,
+                    duck_tip,
+                    "Gap-fill paused: tail lag too high"
+                );
+                tokio::time::sleep(Duration::from_millis(500)).await;
+                continue;
+            }
+            
+            drop(pg_conn);
+
+            // Choose mode: scanner (if available and not disabled) or row-by-row
+            let use_scanner_now = extension_available && !scanner_disabled && configured_mode != GapFillMode::Row;
+            
+            let result = if use_scanner_now {
                 Self::gap_fill_with_scanner(&duckdb, &pg_url, chain_id).await
             } else {
                 Self::gap_fill_with_fallback(&duckdb, &pg_pool, chain_id).await
@@ -287,9 +353,31 @@ impl Replicator {
                     }
                 }
                 Err(e) => {
-                    tracing::error!(chain_id, error = %e, "DuckDB gap-fill failed");
-                    metrics::increment_duckdb_errors("gap_fill");
-                    tokio::time::sleep(Duration::from_secs(5)).await;
+                    let error_str = e.to_string().to_lowercase();
+                    let is_oom = error_str.contains("out of memory")
+                        || error_str.contains("oom")
+                        || error_str.contains("malloc")
+                        || error_str.contains("failed to allocate")
+                        || error_str.contains("memory limit");
+                    
+                    if use_scanner_now && is_oom {
+                        // Circuit breaker: disable scanner permanently for this process
+                        tracing::error!(
+                            chain_id,
+                            error = %e,
+                            "DuckDB postgres scanner OOM - disabling scanner, switching to row-by-row mode"
+                        );
+                        scanner_disabled = true;
+                        metrics::increment_duckdb_errors("scanner_oom");
+                        
+                        // Force checkpoint to release memory
+                        let _ = duckdb.checkpoint().await;
+                        tokio::time::sleep(Duration::from_secs(2)).await;
+                    } else {
+                        tracing::error!(chain_id, error = %e, "DuckDB gap-fill failed");
+                        metrics::increment_duckdb_errors("gap_fill");
+                        tokio::time::sleep(Duration::from_secs(5)).await;
+                    }
                 }
             }
         }
@@ -1806,7 +1894,7 @@ mod tests {
     async fn test_non_blocking_send_sets_needs_sync_flag() {
         let duckdb = Arc::new(DuckDbPool::in_memory().unwrap());
         let pg_pool = create_test_pg_pool();
-        let (replicator, handle) = Replicator::new(duckdb.clone(), pg_pool, "postgresql://localhost/test".to_string(), 2, 1);
+        let (replicator, handle) = Replicator::new(duckdb.clone(), pg_pool, "postgresql://localhost/test".to_string(), 2, 1, GapFillMode::Auto);
 
         // Initially needs_sync should be false
         assert!(!replicator.needs_sync.load(Ordering::Relaxed));
@@ -1834,7 +1922,7 @@ mod tests {
         let duckdb = Arc::new(DuckDbPool::in_memory().unwrap());
         let pg_pool = create_test_pg_pool();
         // Create a tiny buffer of 2
-        let (replicator, handle) = Replicator::new(duckdb.clone(), pg_pool, "postgresql://localhost/test".to_string(), 2, 1);
+        let (replicator, handle) = Replicator::new(duckdb.clone(), pg_pool, "postgresql://localhost/test".to_string(), 2, 1, GapFillMode::Auto);
 
         // Don't start the replicator - channel will fill up
         let _replicator = replicator;
@@ -2170,5 +2258,37 @@ mod tests {
         assert!(sql.contains("p''ass")); // Properly escaped
         assert!(sql.contains("TYPE postgres"));
         assert!(sql.contains("READ_ONLY"));
+    }
+
+    #[test]
+    fn test_gap_fill_mode_serde() {
+        // Test that GapFillMode deserializes correctly from TOML strings
+        use serde::Deserialize;
+        
+        #[derive(Deserialize)]
+        struct TestConfig {
+            mode: GapFillMode,
+        }
+        
+        // Test "auto"
+        let config: TestConfig = toml::from_str(r#"mode = "auto""#).unwrap();
+        assert_eq!(config.mode, GapFillMode::Auto);
+        
+        // Test "scanner"
+        let config: TestConfig = toml::from_str(r#"mode = "scanner""#).unwrap();
+        assert_eq!(config.mode, GapFillMode::Scanner);
+        
+        // Test "row"
+        let config: TestConfig = toml::from_str(r#"mode = "row""#).unwrap();
+        assert_eq!(config.mode, GapFillMode::Row);
+        
+        // Test default (missing field)
+        #[derive(Deserialize)]
+        struct TestConfigOptional {
+            #[serde(default)]
+            mode: GapFillMode,
+        }
+        let config: TestConfigOptional = toml::from_str("").unwrap();
+        assert_eq!(config.mode, GapFillMode::Auto);
     }
 }
