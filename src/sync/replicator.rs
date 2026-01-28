@@ -9,6 +9,28 @@ use crate::db::{DuckDbPool, Pool};
 use crate::metrics;
 use crate::types::{BlockRow, LogRow, ReceiptRow, TxRow};
 
+/// Gap-fill mode for DuckDB replication.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GapFillMode {
+    /// Automatically choose based on extension availability and circuit breaker
+    Auto,
+    /// Always use postgres scanner extension (fast but may OOM on large DBs)
+    Scanner,
+    /// Always use row-by-row copy (slower but reliable)
+    Row,
+}
+
+impl GapFillMode {
+    /// Parse from environment variable DUCKDB_GAP_FILL_MODE
+    pub fn from_env() -> Self {
+        match std::env::var("DUCKDB_GAP_FILL_MODE").as_deref() {
+            Ok("scanner") => GapFillMode::Scanner,
+            Ok("row") => GapFillMode::Row,
+            _ => GapFillMode::Auto,
+        }
+    }
+}
+
 /// Batch of rows to replicate to DuckDB (used only as optimization hint).
 #[derive(Debug)]
 pub enum ReplicaBatch {
@@ -196,7 +218,10 @@ impl Replicator {
     /// - Single query per table (no application-level batch loops)
     /// - No lock contention (single bulk operation)
     /// 
-    /// Falls back to row-by-row copy if the extension isn't available.
+    /// Falls back to row-by-row copy if the extension isn't available or causes OOM.
+    /// 
+    /// Circuit breaker: If scanner fails with OOM-like error, permanently disable
+    /// scanner for this process lifetime and continue with row-by-row mode.
     async fn run_gap_fill_task(
         duckdb: Arc<DuckDbPool>,
         pg_pool: Pool,
@@ -206,8 +231,16 @@ impl Replicator {
         // Initial delay to let tail task establish watermark
         tokio::time::sleep(Duration::from_secs(2)).await;
 
-        // Check if postgres extension is available and log diagnostic info
-        let (extension_available, extension_info) = {
+        // Check gap-fill mode from environment
+        let configured_mode = GapFillMode::from_env();
+        
+        // Circuit breaker: tracks if scanner has OOM'd
+        let mut scanner_disabled = configured_mode == GapFillMode::Row;
+        
+        // Check if postgres extension is available (only if mode allows scanner)
+        let (extension_available, extension_info) = if configured_mode == GapFillMode::Row {
+            (false, "disabled via DUCKDB_GAP_FILL_MODE=row".to_string())
+        } else {
             let (tx, rx) = std::sync::mpsc::channel();
             let check_result = duckdb.with_connection(move |conn| {
                 // Try to install (may already be installed/cached)
@@ -247,24 +280,70 @@ impl Replicator {
             }
         };
 
-        if extension_available {
+        // Determine initial mode
+        let use_scanner = extension_available && !scanner_disabled;
+        
+        if use_scanner {
             tracing::info!(
                 chain_id,
                 extension_info,
+                mode = ?configured_mode,
                 "DuckDB gap-fill task started (postgres extension mode - fast)"
             );
         } else {
-            tracing::warn!(
+            tracing::info!(
                 chain_id,
                 extension_info,
-                "DuckDB postgres extension not available, falling back to row-by-row mode (slower)"
+                mode = ?configured_mode,
+                scanner_disabled,
+                "DuckDB gap-fill task started (row-by-row mode - reliable)"
             );
         }
 
         let mut last_checkpoint = Instant::now();
+        
+        // Maximum tail lag before pausing gap-fill (blocks)
+        const MAX_TAIL_LAG: i64 = 10;
 
         loop {
-            let result = if extension_available {
+            // Lag-aware throttle: pause gap-fill if tail is lagging
+            // This ensures tail sync always takes priority
+            let pg_conn = match pg_pool.get().await {
+                Ok(conn) => conn,
+                Err(e) => {
+                    tracing::warn!(chain_id, error = %e, "Failed to get PG connection for lag check");
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                    continue;
+                }
+            };
+            
+            let pg_tip: i64 = pg_conn
+                .query_one("SELECT COALESCE(MAX(num), 0) FROM blocks", &[])
+                .await
+                .map(|r| r.get(0))
+                .unwrap_or(0);
+            
+            let duck_tip = duckdb.latest_block().await.unwrap_or(None).unwrap_or(0);
+            let tail_lag = pg_tip - duck_tip;
+            
+            if tail_lag > MAX_TAIL_LAG {
+                tracing::debug!(
+                    chain_id,
+                    tail_lag,
+                    pg_tip,
+                    duck_tip,
+                    "Gap-fill paused: tail lag too high"
+                );
+                tokio::time::sleep(Duration::from_millis(500)).await;
+                continue;
+            }
+            
+            drop(pg_conn);
+
+            // Choose mode: scanner (if available and not disabled) or row-by-row
+            let use_scanner_now = extension_available && !scanner_disabled && configured_mode != GapFillMode::Row;
+            
+            let result = if use_scanner_now {
                 Self::gap_fill_with_scanner(&duckdb, &pg_url, chain_id).await
             } else {
                 Self::gap_fill_with_fallback(&duckdb, &pg_pool, chain_id).await
@@ -287,9 +366,31 @@ impl Replicator {
                     }
                 }
                 Err(e) => {
-                    tracing::error!(chain_id, error = %e, "DuckDB gap-fill failed");
-                    metrics::increment_duckdb_errors("gap_fill");
-                    tokio::time::sleep(Duration::from_secs(5)).await;
+                    let error_str = e.to_string().to_lowercase();
+                    let is_oom = error_str.contains("out of memory")
+                        || error_str.contains("oom")
+                        || error_str.contains("malloc")
+                        || error_str.contains("failed to allocate")
+                        || error_str.contains("memory limit");
+                    
+                    if use_scanner_now && is_oom {
+                        // Circuit breaker: disable scanner permanently for this process
+                        tracing::error!(
+                            chain_id,
+                            error = %e,
+                            "DuckDB postgres scanner OOM - disabling scanner, switching to row-by-row mode"
+                        );
+                        scanner_disabled = true;
+                        metrics::increment_duckdb_errors("scanner_oom");
+                        
+                        // Force checkpoint to release memory
+                        let _ = duckdb.checkpoint().await;
+                        tokio::time::sleep(Duration::from_secs(2)).await;
+                    } else {
+                        tracing::error!(chain_id, error = %e, "DuckDB gap-fill failed");
+                        metrics::increment_duckdb_errors("gap_fill");
+                        tokio::time::sleep(Duration::from_secs(5)).await;
+                    }
                 }
             }
         }
@@ -2170,5 +2271,31 @@ mod tests {
         assert!(sql.contains("p''ass")); // Properly escaped
         assert!(sql.contains("TYPE postgres"));
         assert!(sql.contains("READ_ONLY"));
+    }
+
+    #[test]
+    fn test_gap_fill_mode_from_env() {
+        // This test modifies environment variables - use unsafe blocks as required by Rust 2024
+        // SAFETY: This is a single-threaded test, no race conditions with other tests
+        unsafe {
+            // Default (no env var) -> Auto
+            std::env::remove_var("DUCKDB_GAP_FILL_MODE");
+            assert_eq!(GapFillMode::from_env(), GapFillMode::Auto);
+            
+            // scanner -> Scanner
+            std::env::set_var("DUCKDB_GAP_FILL_MODE", "scanner");
+            assert_eq!(GapFillMode::from_env(), GapFillMode::Scanner);
+            
+            // row -> Row
+            std::env::set_var("DUCKDB_GAP_FILL_MODE", "row");
+            assert_eq!(GapFillMode::from_env(), GapFillMode::Row);
+            
+            // Unknown value -> Auto
+            std::env::set_var("DUCKDB_GAP_FILL_MODE", "invalid");
+            assert_eq!(GapFillMode::from_env(), GapFillMode::Auto);
+            
+            // Cleanup
+            std::env::remove_var("DUCKDB_GAP_FILL_MODE");
+        }
     }
 }
