@@ -496,3 +496,55 @@ pub async fn detect_all_gaps(pool: &Pool, tip_num: u64) -> Result<Vec<(u64, u64)
 
     Ok(gaps)
 }
+
+/// Delete all blocks (and related txs, logs, receipts) from a given block number onwards.
+/// Used for reorg handling - removes orphaned blocks so they can be re-synced.
+/// Returns the number of blocks deleted.
+pub async fn delete_blocks_from(pool: &Pool, from_block: u64) -> Result<u64> {
+    let conn = pool.get().await?;
+    let from_block_i64 = from_block as i64;
+
+    // Delete in order: logs, receipts, txs, blocks (foreign key order)
+    conn.execute("DELETE FROM logs WHERE block_num >= $1", &[&from_block_i64])
+        .await?;
+    conn.execute("DELETE FROM receipts WHERE block_num >= $1", &[&from_block_i64])
+        .await?;
+    conn.execute("DELETE FROM txs WHERE block_num >= $1", &[&from_block_i64])
+        .await?;
+    let deleted = conn
+        .execute("DELETE FROM blocks WHERE num >= $1", &[&from_block_i64])
+        .await?;
+
+    Ok(deleted)
+}
+
+/// Find the fork point by walking back from a mismatch until we find a matching hash.
+/// Returns the last block number where the stored hash matches the chain.
+/// If no match is found within max_depth, returns None.
+pub async fn find_fork_point(
+    pool: &Pool,
+    rpc: &super::fetcher::RpcClient,
+    mismatch_block: u64,
+    max_depth: u64,
+) -> Result<Option<u64>> {
+    let min_block = mismatch_block.saturating_sub(max_depth).max(1);
+
+    for block_num in (min_block..mismatch_block).rev() {
+        let stored_hash = get_block_hash(pool, block_num).await?;
+
+        if let Some(stored) = stored_hash {
+            // Fetch the canonical hash from RPC
+            let rpc_block = rpc.get_block(block_num, false).await?;
+            let rpc_hash = rpc_block.header.hash.0.to_vec();
+
+            if stored == rpc_hash {
+                return Ok(Some(block_num));
+            }
+        } else {
+            // No stored block at this height - this is the fork point
+            return Ok(Some(block_num));
+        }
+    }
+
+    Ok(None)
+}

@@ -15,9 +15,9 @@ use super::decoder::{decode_block, decode_log, decode_receipt, decode_transactio
 use super::fetcher::RpcClient;
 use super::replicator::ReplicatorHandle;
 use super::writer::{
-    detect_all_gaps, get_block_hash, load_sync_state, save_sync_state, update_sync_rate,
-    update_synced_num, update_tip_num, write_block, write_blocks, write_logs, write_receipts,
-    write_txs,
+    delete_blocks_from, detect_all_gaps, find_fork_point, get_block_hash, load_sync_state,
+    save_sync_state, update_sync_rate, update_synced_num, update_tip_num, write_block,
+    write_blocks, write_logs, write_receipts, write_txs,
 };
 
 /// RPC concurrency limits
@@ -419,8 +419,8 @@ impl SyncEngine {
         Ok(())
     }
 
-    /// Validate parent hash chain for a batch of blocks
-    /// Returns Ok(()) if chain is valid, Err with details if not
+    /// Validate parent hash chain for a batch of blocks.
+    /// Returns Ok(()) if chain is valid, Err(ReorgDetected { block }) if a reorg is detected.
     async fn validate_parent_chain(&self, blocks: &[crate::tempo::Block]) -> Result<()> {
         if blocks.is_empty() {
             return Ok(());
@@ -437,12 +437,8 @@ impl SyncEngine {
                 .try_into()
                 .map_err(|_| anyhow::anyhow!("Invalid stored hash length"))?;
             if first_block.header.parent_hash.0 != expected_parent {
-                return Err(anyhow::anyhow!(
-                    "Parent hash mismatch at block {}: expected {:?}, got {:?}",
-                    first_num,
-                    hex::encode(expected_parent),
-                    hex::encode(first_block.header.parent_hash.0)
-                ));
+                // Reorg detected - handle it automatically
+                return self.handle_reorg(first_num).await;
             }
         }
 
@@ -459,6 +455,53 @@ impl SyncEngine {
         }
 
         Ok(())
+    }
+
+    /// Handle a chain reorganization by finding the fork point and deleting orphaned blocks.
+    /// After this, the next sync tick will re-fetch the canonical chain.
+    async fn handle_reorg(&self, mismatch_block: u64) -> Result<()> {
+        const MAX_REORG_DEPTH: u64 = 128;
+
+        info!(
+            chain_id = self.chain_id,
+            mismatch_block,
+            "Reorg detected, finding fork point"
+        );
+
+        // Find where the chain diverged
+        let fork_point = find_fork_point(
+            self.pool(),
+            &self.realtime_rpc,
+            mismatch_block,
+            MAX_REORG_DEPTH,
+        )
+        .await?;
+
+        match fork_point {
+            Some(fork_block) => {
+                let delete_from = fork_block + 1;
+                let deleted = delete_blocks_from(self.pool(), delete_from).await?;
+
+                info!(
+                    chain_id = self.chain_id,
+                    fork_point = fork_block,
+                    deleted_blocks = deleted,
+                    "Reorg handled: deleted orphaned blocks"
+                );
+
+                // Update tip_num to fork point so realtime sync continues from there
+                update_tip_num(self.pool(), self.chain_id, fork_block, fork_block).await?;
+
+                Ok(())
+            }
+            None => {
+                Err(anyhow::anyhow!(
+                    "Could not find fork point within {} blocks of mismatch at block {}",
+                    MAX_REORG_DEPTH,
+                    mismatch_block
+                ))
+            }
+        }
     }
 
     /// Detect and fill any gaps in the indexed block sequence
