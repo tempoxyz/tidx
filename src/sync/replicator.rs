@@ -479,6 +479,9 @@ impl Replicator {
                 let current_copy = current;
                 
                 let synced = duckdb.with_connection_result(move |conn| {
+                    // Query memory stats before batch
+                    let mem_before = Self::get_memory_stats(conn);
+                    
                     // Re-attach postgres (may already be attached from previous batch)
                     let attach_sql = format!(
                         "ATTACH IF NOT EXISTS '{}' AS {} (TYPE postgres, READ_ONLY)",
@@ -490,9 +493,27 @@ impl Replicator {
                     
                     let synced = Self::copy_range_with_scanner(conn, &pg_alias_clone, batch_start_copy, current_copy)?;
                     
+                    // Query memory stats after copy (before cleanup)
+                    let mem_after_copy = Self::get_memory_stats(conn);
+                    
                     // Detach postgres to release extension memory, then checkpoint
                     let _ = conn.execute(&format!("DETACH {}", pg_alias_clone), []);
                     let _ = conn.execute("FORCE CHECKPOINT", []);
+                    
+                    // Query memory stats after cleanup
+                    let mem_after_cleanup = Self::get_memory_stats(conn);
+                    
+                    tracing::debug!(
+                        batch_start = batch_start_copy,
+                        batch_end = current_copy,
+                        blocks = current_copy - batch_start_copy + 1,
+                        mem_before_mb = mem_before.0 / 1024 / 1024,
+                        mem_after_copy_mb = mem_after_copy.0 / 1024 / 1024,
+                        mem_after_cleanup_mb = mem_after_cleanup.0 / 1024 / 1024,
+                        temp_files_before = mem_before.1,
+                        temp_files_after = mem_after_cleanup.1,
+                        "DuckDB gap-fill batch memory stats"
+                    );
                     
                     Ok(synced)
                 }).await?;
@@ -524,6 +545,26 @@ impl Replicator {
         Ok(total_synced)
     }
 
+    /// Get DuckDB memory statistics for debugging OOM issues.
+    /// Returns (memory_usage_bytes, temp_file_count).
+    fn get_memory_stats(conn: &duckdb::Connection) -> (i64, i64) {
+        // Get memory usage from duckdb_memory()
+        let memory_usage: i64 = conn
+            .prepare("SELECT COALESCE(SUM(memory_usage_bytes), 0) FROM duckdb_memory()")
+            .ok()
+            .and_then(|mut stmt| stmt.query_row([], |row| row.get(0)).ok())
+            .unwrap_or(0);
+        
+        // Get temp file count from duckdb_temporary_files()
+        let temp_files: i64 = conn
+            .prepare("SELECT COUNT(*) FROM duckdb_temporary_files()")
+            .ok()
+            .and_then(|mut stmt| stmt.query_row([], |row| row.get(0)).ok())
+            .unwrap_or(0);
+        
+        (memory_usage, temp_files)
+    }
+
     /// Copies a block range from Postgres to DuckDB using the attached postgres database.
     /// 
     /// Assumes postgres database is already attached via `ATTACH ... AS {pg_alias} (TYPE postgres)`.
@@ -540,8 +581,14 @@ impl Replicator {
         start: i64,
         end: i64,
     ) -> Result<i64> {
+        use std::time::Instant;
+        
+        let batch_start_time = Instant::now();
+        let mem_initial = Self::get_memory_stats(conn);
+        
         // Copy blocks - use lower(hex()) for BLOB→VARCHAR conversion (DuckDB functions)
         // lower() ensures consistency with existing data (hex::encode produces lowercase)
+        let t0 = Instant::now();
         let blocks_sql = format!(
             "INSERT OR IGNORE INTO blocks \
              SELECT num, '0x' || lower(hex(hash)), '0x' || lower(hex(parent_hash)), \
@@ -551,9 +598,12 @@ impl Replicator {
              WHERE num >= {start} AND num <= {end}"
         );
         let blocks_inserted = conn.execute(&blocks_sql, [])?;
+        let blocks_ms = t0.elapsed().as_millis();
+        let mem_after_blocks = Self::get_memory_stats(conn);
 
         // Copy transactions
         // Note: JSONB 'calls' column is auto-converted to VARCHAR by postgres extension
+        let t0 = Instant::now();
         let txs_sql = format!(
             "INSERT OR IGNORE INTO txs \
              SELECT block_num, block_timestamp, idx, '0x' || lower(hex(hash)), type, \
@@ -567,14 +617,18 @@ impl Replicator {
              FROM {pg_alias}.public.txs \
              WHERE block_num >= {start} AND block_num <= {end}"
         );
-        conn.execute(&txs_sql, [])?;
+        let txs_inserted = conn.execute(&txs_sql, [])?;
+        let txs_ms = t0.elapsed().as_millis();
+        let mem_after_txs = Self::get_memory_stats(conn);
 
         // Force checkpoint after txs to release memory before logs (largest table)
         // This triggers spilling and frees buffer manager memory
         conn.execute("FORCE CHECKPOINT", [])?;
+        let mem_after_txs_checkpoint = Self::get_memory_stats(conn);
 
         // Copy logs - this is the memory-intensive table
         // Use ORDER BY to help DuckDB spill efficiently
+        let t0 = Instant::now();
         let logs_sql = format!(
             "INSERT OR IGNORE INTO logs \
              SELECT block_num, block_timestamp, log_idx, tx_idx, '0x' || lower(hex(tx_hash)), \
@@ -589,12 +643,16 @@ impl Replicator {
              WHERE block_num >= {start} AND block_num <= {end} \
              ORDER BY block_num, log_idx"
         );
-        conn.execute(&logs_sql, [])?;
+        let logs_inserted = conn.execute(&logs_sql, [])?;
+        let logs_ms = t0.elapsed().as_millis();
+        let mem_after_logs = Self::get_memory_stats(conn);
 
         // Force checkpoint after logs to release memory before receipts
         conn.execute("FORCE CHECKPOINT", [])?;
+        let mem_after_logs_checkpoint = Self::get_memory_stats(conn);
 
         // Copy receipts
+        let t0 = Instant::now();
         let receipts_sql = format!(
             "INSERT OR IGNORE INTO receipts \
              SELECT block_num, block_timestamp, tx_idx, '0x' || lower(hex(tx_hash)), \
@@ -606,7 +664,34 @@ impl Replicator {
              FROM {pg_alias}.public.receipts \
              WHERE block_num >= {start} AND block_num <= {end}"
         );
-        conn.execute(&receipts_sql, [])?;
+        let receipts_inserted = conn.execute(&receipts_sql, [])?;
+        let receipts_ms = t0.elapsed().as_millis();
+        let mem_final = Self::get_memory_stats(conn);
+        
+        // Log detailed memory stats for debugging OOM
+        tracing::info!(
+            blocks = start,
+            block_end = end,
+            block_count = end - start + 1,
+            blocks_rows = blocks_inserted,
+            txs_rows = txs_inserted,
+            logs_rows = logs_inserted,
+            receipts_rows = receipts_inserted,
+            blocks_ms,
+            txs_ms,
+            logs_ms,
+            receipts_ms,
+            total_ms = batch_start_time.elapsed().as_millis(),
+            mem_initial_mb = mem_initial.0 / 1024 / 1024,
+            mem_after_blocks_mb = mem_after_blocks.0 / 1024 / 1024,
+            mem_after_txs_mb = mem_after_txs.0 / 1024 / 1024,
+            mem_after_txs_ckpt_mb = mem_after_txs_checkpoint.0 / 1024 / 1024,
+            mem_after_logs_mb = mem_after_logs.0 / 1024 / 1024,
+            mem_after_logs_ckpt_mb = mem_after_logs_checkpoint.0 / 1024 / 1024,
+            mem_final_mb = mem_final.0 / 1024 / 1024,
+            temp_files = mem_final.1,
+            "DuckDB copy_range_with_scanner memory profile"
+        );
 
         Ok(blocks_inserted as i64)
     }
