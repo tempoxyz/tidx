@@ -97,10 +97,10 @@ impl DuckDbPool {
                 };
 
                 // Performance tuning
-                // Use 6GB per instance to avoid OOM when multiple chains run concurrently
+                // Use 12GB per instance for gap-fill with high-tx blocks
                 if let Err(e) = conn.execute_batch(
                     r#"
-                    SET memory_limit = '6GB';
+                    SET memory_limit = '12GB';
                     SET threads = 4;
                     SET checkpoint_threshold = '100MB';
                     SET preserve_insertion_order = false;
