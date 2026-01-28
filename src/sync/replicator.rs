@@ -3,7 +3,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, Semaphore};
 
 use crate::db::{DuckDbPool, Pool};
 use crate::metrics;
@@ -27,6 +27,7 @@ pub enum ReplicaBatch {
 /// - All tables (blocks, txs, logs, receipts) are copied together for each range
 /// - Watermark only advances after ALL tables for a range are written
 /// - Data transfer uses Parquet as intermediate format (memory-safe, no OOM)
+/// - Single-flight semaphore ensures only one task copies data at a time
 pub struct Replicator {
     duckdb: Arc<DuckDbPool>,
     pg_pool: Pool,
@@ -34,6 +35,8 @@ pub struct Replicator {
     chain_id: u64,
     /// Flag set when channel receives data, signals to poll immediately
     needs_sync: Arc<AtomicBool>,
+    /// Semaphore to ensure only one task (tail or gap-fill) copies data at a time
+    copy_semaphore: Arc<Semaphore>,
 }
 
 /// Handle for sending hints to the replicator.
@@ -99,8 +102,16 @@ impl Replicator {
     ) -> (Self, ReplicatorHandle) {
         let (tx, rx) = mpsc::channel(buffer_size);
         let needs_sync = Arc::new(AtomicBool::new(false));
+        let copy_semaphore = Arc::new(Semaphore::new(1));
         (
-            Self { duckdb: duckdb.clone(), pg_pool, rx, chain_id, needs_sync: needs_sync.clone() },
+            Self {
+                duckdb: duckdb.clone(),
+                pg_pool,
+                rx,
+                chain_id,
+                needs_sync: needs_sync.clone(),
+                copy_semaphore,
+            },
             ReplicatorHandle { tx, needs_sync, duckdb },
         )
     }
@@ -111,17 +122,19 @@ impl Replicator {
     ///
     /// Both tasks share the same DuckDB pool (writes serialize on mutex).
     /// Data transfer uses Parquet as intermediate format (memory-safe, no OOM).
+    /// Single-flight semaphore ensures only one task copies data at a time.
     pub async fn run(mut self) -> Result<()> {
         tracing::info!(chain_id = self.chain_id, "DuckDB replicator started (parquet mode)");
 
         let duckdb = self.duckdb.clone();
         let pg_pool = self.pg_pool.clone();
         let chain_id = self.chain_id;
+        let copy_semaphore = self.copy_semaphore.clone();
 
         // Spawn gap-fill task (runs continuously until caught up)
         let gap_fill_duckdb = duckdb.clone();
         let gap_fill_handle = tokio::spawn(async move {
-            Self::run_gap_fill_task(gap_fill_duckdb, pg_pool, chain_id).await
+            Self::run_gap_fill_task(gap_fill_duckdb, pg_pool, chain_id, copy_semaphore).await
         });
 
         // Run tail task in current task
@@ -199,10 +212,12 @@ impl Replicator {
     /// - Write to temporary Parquet file (ZSTD compressed)
     /// - DuckDB ingests via read_parquet()
     /// - No OOM risk (unlike postgres scanner extension)
+    /// - Acquires single-flight semaphore before copying to avoid memory doubling
     async fn run_gap_fill_task(
         duckdb: Arc<DuckDbPool>,
         pg_pool: Pool,
         chain_id: u64,
+        copy_semaphore: Arc<Semaphore>,
     ) -> Result<()> {
         // Initial delay to let tail task establish watermark
         tokio::time::sleep(Duration::from_secs(2)).await;
@@ -249,7 +264,10 @@ impl Replicator {
             
             drop(pg_conn);
 
+            // Acquire semaphore before copying (prevents memory doubling with tail sync)
+            let _permit = copy_semaphore.acquire().await.expect("semaphore closed");
             let result = Self::gap_fill_via_parquet(&duckdb, &pg_pool, chain_id).await;
+            drop(_permit);
 
             match result {
                 Ok(synced) => {
@@ -405,12 +423,17 @@ impl Replicator {
             let mut synced = 0i64;
             let mut current = sync_start;
 
+            // Acquire semaphore before copying (prevents memory doubling with gap-fill)
+            let _permit = self.copy_semaphore.acquire().await.expect("semaphore closed");
+            
             while current <= pg_tip {
                 let batch_end = (current + BATCH_SIZE - 1).min(pg_tip);
                 self.copy_range_from_postgres(&pg_conn, current, batch_end).await?;
                 synced += batch_end - current + 1;
                 current = batch_end + 1;
             }
+            
+            drop(_permit);
 
             let elapsed = start.elapsed();
             let rate = synced as f64 / elapsed.as_secs_f64();
@@ -465,12 +488,17 @@ impl Replicator {
             let mut synced = 0i64;
             let mut current = duck_tip + 1;
 
+            // Acquire semaphore before copying (prevents memory doubling with gap-fill)
+            let _permit = self.copy_semaphore.acquire().await.expect("semaphore closed");
+            
             while current <= sync_end {
                 let batch_end = (current + BATCH_SIZE - 1).min(sync_end);
                 self.copy_range_from_postgres(&pg_conn, current, batch_end).await?;
                 synced += batch_end - current + 1;
                 current = batch_end + 1;
             }
+            
+            drop(_permit);
 
             let elapsed = start.elapsed();
             let rate = synced as f64 / elapsed.as_secs_f64();
