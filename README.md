@@ -1,4 +1,10 @@
-<h1 align="center">tidx</h1>
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset=".github/banner-dark.svg">
+    <source media="(prefers-color-scheme: light)" srcset=".github/banner-light.svg">
+    <img alt="tidx" src=".github/banner-light.svg" width="100%">
+  </picture>
+</p>
 
 <p align="center">
   <strong>Indexer for Tempo</strong>
