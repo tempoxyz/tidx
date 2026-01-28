@@ -43,6 +43,7 @@ pub struct Replicator {
 pub struct ReplicatorHandle {
     tx: mpsc::Sender<ReplicaBatch>,
     needs_sync: Arc<AtomicBool>,
+    duckdb: Arc<DuckDbPool>,
 }
 
 impl ReplicatorHandle {
@@ -82,6 +83,11 @@ impl ReplicatorHandle {
         self.needs_sync.store(true, Ordering::Relaxed);
         let _ = self.tx.try_send(ReplicaBatch::Receipts(receipts));
     }
+
+    /// Delete blocks from a given height onwards (used for reorg handling).
+    pub async fn delete_blocks_from(&self, from_block: u64) -> Result<u64> {
+        self.duckdb.delete_blocks_from(from_block as i64).await
+    }
 }
 
 impl Replicator {
@@ -90,8 +96,8 @@ impl Replicator {
         let (tx, rx) = mpsc::channel(buffer_size);
         let needs_sync = Arc::new(AtomicBool::new(false));
         (
-            Self { duckdb, pg_pool, pg_url, rx, chain_id, needs_sync: needs_sync.clone() },
-            ReplicatorHandle { tx, needs_sync },
+            Self { duckdb: duckdb.clone(), pg_pool, pg_url, rx, chain_id, needs_sync: needs_sync.clone() },
+            ReplicatorHandle { tx, needs_sync, duckdb },
         )
     }
 

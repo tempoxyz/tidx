@@ -480,7 +480,19 @@ impl SyncEngine {
         match fork_point {
             Some(fork_block) => {
                 let delete_from = fork_block + 1;
+
+                // Delete orphaned blocks from PostgreSQL
                 let deleted = delete_blocks_from(self.pool(), delete_from).await?;
+
+                // Delete orphaned blocks from DuckDB (if replicator is configured)
+                if let Some(ref replicator) = self.replicator {
+                    let duckdb_deleted = replicator.delete_blocks_from(delete_from).await?;
+                    debug!(
+                        chain_id = self.chain_id,
+                        duckdb_deleted,
+                        "Deleted orphaned blocks from DuckDB"
+                    );
+                }
 
                 info!(
                     chain_id = self.chain_id,

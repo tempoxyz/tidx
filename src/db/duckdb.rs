@@ -347,6 +347,33 @@ impl DuckDbPool {
         }).await
     }
 
+    /// Delete all blocks (and related txs, logs, receipts) from a given block number onwards.
+    /// Used for reorg handling - removes orphaned blocks so they can be re-synced.
+    /// Returns the number of blocks deleted.
+    pub async fn delete_blocks_from(&self, from_block: i64) -> Result<u64> {
+        self.with_connection_result(move |conn| {
+            // Delete in order: logs, receipts, txs, blocks
+            conn.execute(
+                &format!("DELETE FROM logs WHERE block_num >= {}", from_block),
+                [],
+            )?;
+            conn.execute(
+                &format!("DELETE FROM receipts WHERE block_num >= {}", from_block),
+                [],
+            )?;
+            conn.execute(
+                &format!("DELETE FROM txs WHERE block_num >= {}", from_block),
+                [],
+            )?;
+            let deleted = conn.execute(
+                &format!("DELETE FROM blocks WHERE num >= {}", from_block),
+                [],
+            )?;
+            Ok(deleted as u64)
+        })
+        .await
+    }
+
     /// Gets the latest synced block number from DuckDB.
     pub async fn latest_block(&self) -> Result<Option<i64>> {
         let (_min, max) = self.block_range().await?;
