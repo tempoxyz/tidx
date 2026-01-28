@@ -7,10 +7,6 @@
 </p>
 
 <p align="center">
-  <strong>Indexer for Tempo</strong>
-</p>
-
-<p align="center">
   <a href="#quickstart">Quickstart</a> •
   <a href="#installation">Installation</a> •
   <a href="#configuration">Configuration</a> •
