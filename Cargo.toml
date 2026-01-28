@@ -64,6 +64,10 @@ chrono = { version = "0.4", features = ["serde"] }
 hex = "0.4"
 rust_decimal = { version = "1.40.0", features = ["db-tokio-postgres"] }
 
+# Parquet/Arrow for efficient data transfer
+arrow = { version = "54", default-features = false, features = ["ffi"] }
+parquet = { version = "54", default-features = false, features = ["arrow", "snap", "zstd"] }
+
 # Random
 rand = "0.9"
 url = "2.5.8"
