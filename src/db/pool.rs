@@ -12,14 +12,11 @@ pub async fn create_pool(database_url: &str) -> Result<Pool> {
 pub async fn create_pool_with_size(database_url: &str, max_size: usize) -> Result<Pool> {
     ensure_database_exists(database_url).await?;
 
-    // Connection options to prevent stale connections from blocking on restart:
-    // - idle_in_transaction_session_timeout: kill idle-in-transaction after 60s
-    // - keepalives/keepalives_idle/keepalives_interval: detect dead TCP connections
-    // When container crashes, TCP FIN is never sent. Keepalives detect this in ~25s.
+    // Kill idle-in-transaction connections after 60s to prevent lock contention on restart
     let url_with_timeout = if database_url.contains('?') {
-        format!("{}&keepalives=1&keepalives_idle=10&keepalives_interval=5&keepalives_count=3&options=-c%20idle_in_transaction_session_timeout%3D60000", database_url)
+        format!("{}&options=-c%20idle_in_transaction_session_timeout%3D60000", database_url)
     } else {
-        format!("{}?keepalives=1&keepalives_idle=10&keepalives_interval=5&keepalives_count=3&options=-c%20idle_in_transaction_session_timeout%3D60000", database_url)
+        format!("{}?options=-c%20idle_in_transaction_session_timeout%3D60000", database_url)
     };
 
     let mut config = Config::new();
