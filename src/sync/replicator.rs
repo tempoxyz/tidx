@@ -302,7 +302,8 @@ impl Replicator {
         pg_pool: &Pool,
         chain_id: u64,
     ) -> Result<i64> {
-        const BATCH_SIZE: i64 = 100;
+        // Use smaller batches to avoid OOM - high-tx blocks can have lots of logs
+        const BATCH_SIZE: i64 = 50;
 
         let duck_min = {
             let (min, _max) = duckdb.block_range().await?;
@@ -461,7 +462,8 @@ impl Replicator {
         gaps.sort_by(|a, b| b.0.cmp(&a.0));
 
         // Process gaps in smaller batches (100 blocks keeps memory usage low)
-        const BATCH_SIZE: i64 = 100;
+        // Use smaller batches to avoid OOM - high-tx blocks can have lots of logs
+        const BATCH_SIZE: i64 = 50;
         let mut total_synced = 0i64;
         let start_time = Instant::now();
 
