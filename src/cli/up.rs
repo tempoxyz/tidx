@@ -196,10 +196,8 @@ async fn initialize_chain(
         let (replicator, handle) = Replicator::new(
             duckdb_pool.clone(),
             throttled_pool.pool.clone(),
-            chain.pg_url.clone(),
             10_000,
             chain.chain_id,
-            chain.duckdb_gap_fill_mode,
         );
         tokio::spawn(replicator.run());
 

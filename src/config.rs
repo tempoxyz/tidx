@@ -167,26 +167,6 @@ pub struct ChainConfig {
     /// When false (default), runs realtime and backfill concurrently.
     #[serde(default)]
     pub backfill_first: bool,
-
-    /// DuckDB gap-fill mode: "auto", "scanner", or "row" (default: "auto")
-    /// - "auto": Use postgres scanner with circuit breaker fallback to row-by-row
-    /// - "scanner": Force postgres scanner (fast but may OOM on large DBs)
-    /// - "row": Force row-by-row copy (slower but reliable, ~150 blk/s)
-    #[serde(default)]
-    pub duckdb_gap_fill_mode: GapFillMode,
-}
-
-/// DuckDB gap-fill mode for replication.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum GapFillMode {
-    /// Automatically choose based on extension availability and circuit breaker
-    #[default]
-    Auto,
-    /// Always use postgres scanner extension (fast but may OOM on large DBs)
-    Scanner,
-    /// Always use row-by-row copy (slower but reliable)
-    Row,
 }
 
 fn default_backfill() -> bool {
