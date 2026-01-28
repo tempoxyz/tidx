@@ -302,8 +302,8 @@ impl Replicator {
         pg_pool: &Pool,
         chain_id: u64,
     ) -> Result<i64> {
-        // Spilling to disk handles memory pressure
-        const BATCH_SIZE: i64 = 100;
+        // Small batches - postgres extension buffers outside DuckDB's buffer manager
+        const BATCH_SIZE: i64 = 25;
 
         let duck_min = {
             let (min, _max) = duckdb.block_range().await?;
@@ -461,9 +461,9 @@ impl Replicator {
         // Sort by start descending (most recent first)
         gaps.sort_by(|a, b| b.0.cmp(&a.0));
 
-        // Process gaps in batches - spilling to disk handles memory pressure
-        // 100 blocks is a good balance of throughput vs memory
-        const BATCH_SIZE: i64 = 100;
+        // Process gaps in small batches - postgres extension buffers data outside
+        // DuckDB's buffer manager, so spilling doesn't help with extension memory
+        const BATCH_SIZE: i64 = 25;
         let mut total_synced = 0i64;
         let start_time = Instant::now();
 
@@ -490,8 +490,9 @@ impl Replicator {
                     
                     let synced = Self::copy_range_with_scanner(conn, &pg_alias_clone, batch_start_copy, current_copy)?;
                     
-                    // Checkpoint to flush WAL
-                    let _ = conn.execute("CHECKPOINT", []);
+                    // Detach postgres to release extension memory, then checkpoint
+                    let _ = conn.execute(&format!("DETACH {}", pg_alias_clone), []);
+                    let _ = conn.execute("FORCE CHECKPOINT", []);
                     
                     Ok(synced)
                 }).await?;
