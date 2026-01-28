@@ -773,6 +773,27 @@ impl Replicator {
         // Update cached status for fast status endpoint queries
         self.duckdb.update_cached_status(duck_max, gaps.clone(), internal_gap_blocks);
 
+        // Check for stale DuckDB data (DuckDB ahead of PostgreSQL)
+        // This shouldn't happen normally but can occur after reorgs or data issues
+        if duck_max > pg_max && pg_max > 0 {
+            let stale_blocks = duck_max - pg_max;
+            tracing::warn!(
+                chain_id = self.chain_id,
+                duck_max,
+                pg_max,
+                stale_blocks,
+                "DuckDB has stale blocks beyond PostgreSQL tip, cleaning up"
+            );
+            // Delete blocks from DuckDB that don't exist in PostgreSQL
+            if let Err(e) = self.duckdb.delete_blocks_from(pg_max + 1).await {
+                tracing::error!(
+                    chain_id = self.chain_id,
+                    error = %e,
+                    "Failed to clean up stale DuckDB blocks"
+                );
+            }
+        }
+
         // Log sync status
         if tip_lag > 10 {
             tracing::warn!(
