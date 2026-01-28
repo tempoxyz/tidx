@@ -454,8 +454,8 @@ impl Replicator {
         // Sort by start descending (most recent first)
         gaps.sort_by(|a, b| b.0.cmp(&a.0));
 
-        // Process gaps in smaller batches
-        const BATCH_SIZE: i64 = 1_000;
+        // Process gaps in smaller batches (100 blocks keeps memory usage low)
+        const BATCH_SIZE: i64 = 100;
         let mut total_synced = 0i64;
         let start_time = Instant::now();
 
