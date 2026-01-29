@@ -9,10 +9,10 @@ use metrics_exporter_prometheus::PrometheusBuilder;
 use tokio::sync::RwLock;
 use tracing::{error, info};
 
-use tidx::api::{self, SharedDuckDbPools, SharedPools};
+use tidx::api::{self, SharedDuckDbLsm, SharedDuckDbPools, SharedPools};
 use tidx::broadcast::Broadcaster;
 use tidx::config::{ChainConfig, Config, ConfigWatcher, NewChainEvent};
-use tidx::db::{self, DuckDbPool, ThrottledPool};
+use tidx::db::{self, DuckDbLsm, ThrottledPool};
 use tidx::sync::engine::SyncEngine;
 use tidx::sync::{Replicator, ReplicatorHandle};
 
@@ -60,12 +60,14 @@ pub async fn run(args: Args) -> Result<()> {
 
     let pools: SharedPools = Arc::new(RwLock::new(HashMap::new()));
     let duckdb_pools: SharedDuckDbPools = Arc::new(RwLock::new(HashMap::new()));
+    let duckdb_lsm: SharedDuckDbLsm = Arc::new(RwLock::new(HashMap::new()));
     let mut default_chain_id = 0u64;
 
     for chain in &config.chains {
         let (throttled_pool, replicator_handle) = initialize_chain(
             chain,
             Arc::clone(&duckdb_pools),
+            Arc::clone(&duckdb_lsm),
         ).await?;
 
         if default_chain_id == 0 {
@@ -98,6 +100,7 @@ pub async fn run(args: Args) -> Result<()> {
                 default_chain_id,
                 broadcaster.clone(),
                 Arc::clone(&duckdb_pools),
+                Arc::clone(&duckdb_lsm),
                 http_config,
             );
 
@@ -121,12 +124,13 @@ pub async fn run(args: Args) -> Result<()> {
 
         let pools_for_watcher = Arc::clone(&pools);
         let duckdb_pools_for_watcher = Arc::clone(&duckdb_pools);
+        let duckdb_lsm_for_watcher = Arc::clone(&duckdb_lsm);
         let broadcaster_for_watcher = broadcaster.clone();
         let shutdown_tx_for_watcher = shutdown_tx.clone();
 
         tokio::spawn(async move {
             while let Some(event) = chain_rx.recv().await {
-                match initialize_chain(&event.chain, Arc::clone(&duckdb_pools_for_watcher)).await {
+                match initialize_chain(&event.chain, Arc::clone(&duckdb_pools_for_watcher), Arc::clone(&duckdb_lsm_for_watcher)).await {
                     Ok((throttled_pool, replicator_handle)) => {
                         pools_for_watcher.write().await.insert(event.chain.chain_id, throttled_pool.pool.clone());
 
@@ -180,7 +184,8 @@ pub async fn run(args: Args) -> Result<()> {
 
 async fn initialize_chain(
     chain: &ChainConfig,
-    duckdb_pools: SharedDuckDbPools,
+    _duckdb_pools: SharedDuckDbPools,
+    duckdb_lsm_pools: SharedDuckDbLsm,
 ) -> Result<(ThrottledPool, Option<ReplicatorHandle>)> {
     info!(chain = %chain.name, db = %chain.pg_url, "Connecting to database with throttled pool...");
     let throttled_pool = ThrottledPool::new(&chain.pg_url).await?;
@@ -189,19 +194,29 @@ async fn initialize_chain(
     db::run_migrations(&throttled_pool.pool).await?;
 
     let replicator_handle = if let Some(ref duckdb_path) = chain.duckdb_path {
-        info!(chain = %chain.name, path = %duckdb_path, "Initializing DuckDB");
-        let duckdb_pool = Arc::new(DuckDbPool::new(duckdb_path)?);
+        info!(chain = %chain.name, path = %duckdb_path, "Initializing DuckDB LSM");
+        
+        // Use LSM-style DuckDB for read/write separation
+        let lsm = Arc::new(DuckDbLsm::new(duckdb_path, chain.chain_id)?);
+        
+        // Start the background merge loop (every 60s)
+        let lsm_for_merge = Arc::clone(&lsm);
+        tokio::spawn(async move {
+            lsm_for_merge.run_merge_loop(std::time::Duration::from_secs(60)).await;
+        });
 
-        // Replicator uses the shared pool (its gap-fill is lower priority)
+        // Replicator uses the LSM writer pool
         let (replicator, handle) = Replicator::new(
-            duckdb_pool.clone(),
+            lsm.writer().clone(),
             throttled_pool.pool.clone(),
             10_000,
             chain.chain_id,
         );
         tokio::spawn(replicator.run());
 
-        duckdb_pools.write().await.insert(chain.chain_id, duckdb_pool);
+        // Store LSM manager for API to get reader
+        duckdb_lsm_pools.write().await.insert(chain.chain_id, lsm);
+        
         Some(handle)
     } else {
         None

@@ -98,8 +98,11 @@ impl DuckDbLsm {
     ///
     /// Process:
     /// 1. Checkpoint writer to flush WAL
-    /// 2. ATTACH writer to reader and merge (using current reader connection)
-    /// 3. Clear writer tables
+    /// 2. Drop read-only reader, open read-write temp connection
+    /// 3. ATTACH writer and merge data
+    /// 4. Checkpoint and close temp connection
+    /// 5. Reopen reader as read-only and swap
+    /// 6. Clear writer tables
     pub async fn merge(&self) -> Result<u64> {
         let start = std::time::Instant::now();
 
@@ -107,13 +110,20 @@ impl DuckDbLsm {
         self.writer.checkpoint().await?;
 
         let writer_path = self.writer_path.to_string_lossy().to_string();
+        let reader_path = self.reader_path.to_string_lossy().to_string();
 
-        // 2. Merge using the current reader connection
-        // Note: If reader is read-only, this will fail - that's expected on existing DBs
-        // We handle this by trying on reader first, then falling back to reopening
-        let reader = self.reader.read().await.clone();
+        // 2. Drop the current read-only reader to release file locks
+        {
+            let mut reader_guard = self.reader.write().await;
+            // Replace with a dummy in-memory pool temporarily
+            // This drops the old reader, releasing the file lock
+            *reader_guard = Arc::new(DuckDbPool::in_memory()?);
+        }
+
+        // 3. Open a temporary read-write connection for the merge
+        let temp_pool = DuckDbPool::new(&reader_path)?;
         
-        let blocks_merged = reader
+        let blocks_merged = temp_pool
             .with_connection_result(move |conn| {
                 // Attach writer database
                 conn.execute(
@@ -161,7 +171,17 @@ impl DuckDbLsm {
             })
             .await?;
 
-        // 3. Clear writer tables
+        // 4. Drop temp_pool to release the file lock
+        drop(temp_pool);
+
+        // 5. Reopen reader as read-only and swap it back
+        {
+            let new_reader = Arc::new(DuckDbPool::open_readonly(&self.reader_path.to_string_lossy())?);
+            let mut reader_guard = self.reader.write().await;
+            *reader_guard = new_reader;
+        }
+
+        // 6. Clear writer tables
         if blocks_merged > 0 {
             self.writer
                 .with_connection(|conn| {
