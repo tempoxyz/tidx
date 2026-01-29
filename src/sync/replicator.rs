@@ -300,8 +300,8 @@ impl Replicator {
         pg_pool: &Pool,
         chain_id: u64,
     ) -> Result<i64> {
-        // Small batches - postgres extension buffers outside DuckDB's buffer manager
-        const BATCH_SIZE: i64 = 25;
+        // Larger batches are safe now - Parquet streaming bounds memory regardless of size
+        const BATCH_SIZE: i64 = 500;
 
         let duck_min = {
             let (min, _max) = duckdb.block_range().await?;
