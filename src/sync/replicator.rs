@@ -303,17 +303,13 @@ impl Replicator {
         // Larger batches are safe now - Parquet streaming bounds memory regardless of size
         const BATCH_SIZE: i64 = 500;
 
-        let duck_min = {
-            let (min, _max) = duckdb.block_range().await?;
-            min.unwrap_or(0)
-        };
+        let (min, _max) = duckdb.block_range().await?;
+        let duck_min = min.unwrap_or(0);
+        let internal_gaps = detect_gaps_duckdb(duckdb).await?;
 
         if duck_min == 0 {
             return Ok(0);
         }
-
-        // Detect gaps
-        let internal_gaps = detect_gaps_duckdb(duckdb).await?;
         
         let pg_conn = pg_pool.get().await?;
         let (pg_min, pg_max): (i64, i64) = {

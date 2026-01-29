@@ -25,15 +25,13 @@ use tower_http::trace::TraceLayer;
 
 use crate::broadcast::Broadcaster;
 use crate::config::{HttpConfig, SharedHttpConfig};
-use crate::db::{DuckDbLsm, DuckDbPool, Pool};
+use crate::db::{DuckDbPool, Pool};
 use crate::service::{QueryOptions, QueryResult, SyncStatus};
 
 pub use rate_limit::{RateLimiter, SseConnectionGuard};
 
 pub type SharedPools = Arc<RwLock<HashMap<u64, Pool>>>;
 pub type SharedDuckDbPools = Arc<RwLock<HashMap<u64, Arc<DuckDbPool>>>>;
-/// LSM-style DuckDB managers (writer + reader separation)
-pub type SharedDuckDbLsm = Arc<RwLock<HashMap<u64, Arc<DuckDbLsm>>>>;
 
 #[derive(Clone)]
 pub struct AppState {
@@ -42,10 +40,8 @@ pub struct AppState {
     /// Default chain_id (first chain)
     pub default_chain_id: u64,
     pub broadcaster: Arc<Broadcaster>,
-    /// Per-chain DuckDB pools for analytical queries (hot-reloadable, legacy)
+    /// Per-chain DuckDB pools for analytical queries (hot-reloadable)
     pub duckdb_pools: SharedDuckDbPools,
-    /// Per-chain LSM-style DuckDB managers (hot-reloadable)
-    pub duckdb_lsm: SharedDuckDbLsm,
     /// Rate limiter for request throttling
     pub rate_limiter: RateLimiter,
 }
@@ -58,10 +54,6 @@ impl AppState {
 
     async fn get_duckdb_pool(&self, chain_id: Option<u64>) -> Option<Arc<DuckDbPool>> {
         let id = chain_id.unwrap_or(self.default_chain_id);
-        // First try LSM reader (preferred), fall back to legacy pool
-        if let Some(lsm) = self.duckdb_lsm.read().await.get(&id) {
-            return Some(lsm.reader().await);
-        }
         self.duckdb_pools.read().await.get(&id).cloned()
     }
 }
@@ -89,7 +81,6 @@ pub fn router_with_options(
         default_chain_id,
         broadcaster,
         duckdb_pools: Arc::new(RwLock::new(duckdb_pools)),
-        duckdb_lsm: Arc::new(RwLock::new(HashMap::new())),
         rate_limiter: rate_limiter.clone(),
     };
 
@@ -101,7 +92,6 @@ pub fn router_shared(
     default_chain_id: u64,
     broadcaster: Arc<Broadcaster>,
     duckdb_pools: SharedDuckDbPools,
-    duckdb_lsm: SharedDuckDbLsm,
     http_config: SharedHttpConfig,
 ) -> Router<()> {
     let rate_limiter = RateLimiter::new_shared(http_config);
@@ -113,7 +103,6 @@ pub fn router_shared(
         default_chain_id,
         broadcaster,
         duckdb_pools,
-        duckdb_lsm,
         rate_limiter: rate_limiter.clone(),
     };
 
@@ -159,21 +148,12 @@ async fn handle_status(State(state): State<AppState>) -> Result<Json<StatusRespo
     }
     drop(pools);
 
-    // Try LSM first (preferred), then fall back to legacy pools
-    let duckdb_lsm = state.duckdb_lsm.read().await;
     let duckdb_pools = state.duckdb_pools.read().await;
     
     for chain in &mut all_chains {
         let chain_id = chain.chain_id as u64;
         
-        // Get the DuckDB reader pool (from LSM or legacy)
-        let duckdb_pool: Option<Arc<DuckDbPool>> = if let Some(lsm) = duckdb_lsm.get(&chain_id) {
-            Some(lsm.reader().await)
-        } else {
-            duckdb_pools.get(&chain_id).cloned()
-        };
-        
-        if let Some(duckdb_pool) = duckdb_pool {
+        if let Some(duckdb_pool) = duckdb_pools.get(&chain_id) {
             // Get DuckDB range
             if let Ok((duck_min, duck_max)) = duckdb_pool.block_range().await {
                 let duck_min = duck_min.unwrap_or(0);

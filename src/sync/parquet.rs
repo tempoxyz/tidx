@@ -51,16 +51,17 @@ fn ensure_temp_dir() -> Result<PathBuf> {
 /// This is the unified approach for both tail sync and gap-fill:
 /// - **Streams** data from PostgreSQL using query_raw (cursor-based)
 /// - Writes Parquet in chunks (memory-bounded, never holds all rows)
-/// - Handles duplicates via INSERT OR IGNORE
+/// - **Atomic transaction**: DELETE range + INSERT ensures consistency
+/// - Handles reorgs, retries, and gap-fill overlaps cleanly
 pub async fn copy_range_via_parquet(
     pg_conn: &deadpool_postgres::Object,
     duckdb: &Arc<DuckDbPool>,
     start: i64,
     end: i64,
 ) -> Result<i64> {
-    // Create temp directory and file paths
+    // Create temp directory and file paths (include timestamp for uniqueness)
     let temp_dir = ensure_temp_dir()?;
-    let batch_id = format!("{}_{}", start, end);
+    let batch_id = format!("{}_{}_{}", start, end, std::process::id());
     let blocks_path = temp_dir.join(format!("blocks_{batch_id}.parquet"));
     let txs_path = temp_dir.join(format!("txs_{batch_id}.parquet"));
     let logs_path = temp_dir.join(format!("logs_{batch_id}.parquet"));
@@ -78,7 +79,7 @@ pub async fn copy_range_via_parquet(
     stream_logs_to_parquet(pg_conn, &logs_path, start, end).await?;
     stream_receipts_to_parquet(pg_conn, &receipts_path, start, end).await?;
 
-    // Ingest Parquet files into DuckDB
+    // Ingest Parquet files into DuckDB atomically
     let blocks_path_str = blocks_path.to_string_lossy().to_string();
     let txs_path_str = txs_path.to_string_lossy().to_string();
     let logs_path_str = logs_path.to_string_lossy().to_string();
@@ -86,35 +87,60 @@ pub async fn copy_range_via_parquet(
 
     duckdb
         .with_connection(move |conn| {
-            // Ingest with INSERT OR IGNORE for dedup safety
+            // Atomic transaction: DELETE range + INSERT
+            // This is faster than INSERT OR IGNORE (no per-row conflict check)
+            // and handles reorgs/retries cleanly (idempotent)
+            conn.execute("BEGIN TRANSACTION", [])?;
+
+            // Delete existing data in range (order: logs/receipts first due to FK-like deps)
+            conn.execute(
+                &format!("DELETE FROM logs WHERE block_num BETWEEN {} AND {}", start, end),
+                [],
+            )?;
+            conn.execute(
+                &format!("DELETE FROM receipts WHERE block_num BETWEEN {} AND {}", start, end),
+                [],
+            )?;
+            conn.execute(
+                &format!("DELETE FROM txs WHERE block_num BETWEEN {} AND {}", start, end),
+                [],
+            )?;
+            conn.execute(
+                &format!("DELETE FROM blocks WHERE num BETWEEN {} AND {}", start, end),
+                [],
+            )?;
+
+            // Insert fresh data from Parquet
             conn.execute(
                 &format!(
-                    "INSERT OR IGNORE INTO blocks SELECT * FROM read_parquet('{}')",
+                    "INSERT INTO blocks SELECT * FROM read_parquet('{}')",
                     blocks_path_str.replace('\'', "''")
                 ),
                 [],
             )?;
             conn.execute(
                 &format!(
-                    "INSERT OR IGNORE INTO txs SELECT * FROM read_parquet('{}')",
+                    "INSERT INTO txs SELECT * FROM read_parquet('{}')",
                     txs_path_str.replace('\'', "''")
                 ),
                 [],
             )?;
             conn.execute(
                 &format!(
-                    "INSERT OR IGNORE INTO logs SELECT * FROM read_parquet('{}')",
+                    "INSERT INTO logs SELECT * FROM read_parquet('{}')",
                     logs_path_str.replace('\'', "''")
                 ),
                 [],
             )?;
             conn.execute(
                 &format!(
-                    "INSERT OR IGNORE INTO receipts SELECT * FROM read_parquet('{}')",
+                    "INSERT INTO receipts SELECT * FROM read_parquet('{}')",
                     receipts_path_str.replace('\'', "''")
                 ),
                 [],
             )?;
+
+            conn.execute("COMMIT", [])?;
             Ok(())
         })
         .await?;
@@ -1478,28 +1504,46 @@ mod tests {
         let path1_str = path1.to_string_lossy().to_string();
         let path2_str = path2.to_string_lossy().to_string();
 
-        // Ingest both with INSERT OR IGNORE
-        let (count, hash2) = duckdb
+        // Simulate atomic range ingest: DELETE range + INSERT
+        // First ingest: blocks 1-2
+        let count1: i64 = duckdb
             .with_connection_result(move |conn| {
+                conn.execute("BEGIN TRANSACTION", [])?;
+                conn.execute("DELETE FROM blocks WHERE num BETWEEN 1 AND 2", [])?;
                 conn.execute(
                     &format!(
-                        "INSERT OR IGNORE INTO blocks SELECT * FROM read_parquet('{}')",
+                        "INSERT INTO blocks SELECT * FROM read_parquet('{}')",
                         path1_str.replace('\'', "''")
                     ),
                     [],
                 )?;
+                conn.execute("COMMIT", [])?;
+
+                let mut stmt = conn.prepare("SELECT COUNT(*) FROM blocks")?;
+                Ok(stmt.query_row([], |row| row.get(0))?)
+            })
+            .await
+            .unwrap();
+        assert_eq!(count1, 2);
+
+        // Second ingest: blocks 2-3 (overlaps on block 2 - simulates reorg/retry)
+        let (count2, hash2) = duckdb
+            .with_connection_result(move |conn| {
+                conn.execute("BEGIN TRANSACTION", [])?;
+                conn.execute("DELETE FROM blocks WHERE num BETWEEN 2 AND 3", [])?;
                 conn.execute(
                     &format!(
-                        "INSERT OR IGNORE INTO blocks SELECT * FROM read_parquet('{}')",
+                        "INSERT INTO blocks SELECT * FROM read_parquet('{}')",
                         path2_str.replace('\'', "''")
                     ),
                     [],
                 )?;
+                conn.execute("COMMIT", [])?;
 
                 let mut stmt = conn.prepare("SELECT COUNT(*) FROM blocks")?;
                 let count: i64 = stmt.query_row([], |row| row.get(0))?;
 
-                // Block 2 should have original hash, not duplicate
+                // Block 2 should have NEW hash (DELETE+INSERT replaces, not ignores)
                 let mut stmt2 = conn.prepare("SELECT hash FROM blocks WHERE num = 2")?;
                 let hash: String = stmt2.query_row([], |row| row.get(0))?;
 
@@ -1508,8 +1552,8 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(count, 3); // Only 3 unique blocks
-        assert_eq!(hash2, "0xh2"); // Original hash, not 0xh2_dup
+        assert_eq!(count2, 3); // 3 blocks total: 1, 2, 3
+        assert_eq!(hash2, "0xh2_dup"); // NEW hash replaces old (correct for reorgs)
 
         // Cleanup
         std::fs::remove_file(&path1).unwrap();
