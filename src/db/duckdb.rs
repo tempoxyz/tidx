@@ -115,6 +115,7 @@ impl DuckDbPool {
                     SET threads = 4;
                     SET checkpoint_threshold = '100MB';
                     SET preserve_insertion_order = false;
+                    SET disabled_compression_methods = 'bitpacking';
                     "#,
                     temp_dir.replace('\'', "''")
                 );
