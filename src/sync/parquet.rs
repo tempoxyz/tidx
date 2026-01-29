@@ -269,7 +269,7 @@ async fn stream_txs_to_parquet(
         Field::new("fee_token", DataType::Utf8, true),
         Field::new("fee_payer", DataType::Utf8, true),
         Field::new("calls", DataType::Utf8, true),
-        Field::new("call_count", DataType::Int32, true),
+        Field::new("call_count", DataType::Int16, false),
         Field::new("valid_before", DataType::Int64, true),
         Field::new("valid_after", DataType::Int64, true),
         Field::new("signature_type", DataType::Int16, true),
@@ -339,7 +339,7 @@ fn build_txs_batch(schema: &Arc<Schema>, rows: &[tokio_postgres::Row]) -> Result
     let mut fee_token_builder = StringBuilder::new();
     let mut fee_payer_builder = StringBuilder::new();
     let mut calls_builder = StringBuilder::new();
-    let mut call_count_builder = Int32Array::builder(rows.len());
+    let mut call_count_builder = Int16Array::builder(rows.len());
     let mut valid_before_builder = Int64Array::builder(rows.len());
     let mut valid_after_builder = Int64Array::builder(rows.len());
     let mut signature_type_builder = Int16Array::builder(rows.len());
@@ -363,7 +363,7 @@ fn build_txs_batch(schema: &Arc<Schema>, rows: &[tokio_postgres::Row]) -> Result
         let fee_token: Option<Vec<u8>> = row.get(15);
         let fee_payer: Option<Vec<u8>> = row.get(16);
         let calls: Option<String> = row.get(17);
-        let call_count: Option<i32> = row.get(18);
+        let call_count: i16 = row.get(18);
         let valid_before: Option<i64> = row.get(19);
         let valid_after: Option<i64> = row.get(20);
         let signature_type: Option<i16> = row.get(21);
@@ -404,10 +404,7 @@ fn build_txs_batch(schema: &Arc<Schema>, rows: &[tokio_postgres::Row]) -> Result
             Some(c) => calls_builder.append_value(&c),
             None => calls_builder.append_null(),
         }
-        match call_count {
-            Some(c) => call_count_builder.append_value(c),
-            None => call_count_builder.append_null(),
-        }
+        call_count_builder.append_value(call_count);
         match valid_before {
             Some(v) => valid_before_builder.append_value(v),
             None => valid_before_builder.append_null(),
