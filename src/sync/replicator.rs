@@ -3,7 +3,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
-use tokio::sync::{mpsc, Semaphore};
+use tokio::sync::mpsc;
 
 use crate::db::{DuckDbPool, Pool};
 use crate::metrics;
@@ -24,10 +24,9 @@ pub enum ReplicaBatch {
 /// - Postgres is the source of truth; DuckDB tails it via a watermark
 /// - A tight polling loop (500ms) copies new blocks from Postgres to DuckDB
 /// - The channel serves only as a low-latency hint to poll sooner
-/// - All tables (blocks, txs, logs, receipts) are copied together for each range
-/// - Watermark only advances after ALL tables for a range are written
+/// - Tail sync: all tables (blocks, txs, logs, receipts) copied atomically per range
+/// - Gap-fill: 4 independent per-table tasks backfill at their own pace
 /// - Data transfer uses Parquet as intermediate format (memory-safe, no OOM)
-/// - Single-flight semaphore ensures only one task copies data at a time
 pub struct Replicator {
     duckdb: Arc<DuckDbPool>,
     pg_pool: Pool,
@@ -35,8 +34,6 @@ pub struct Replicator {
     chain_id: u64,
     /// Flag set when channel receives data, signals to poll immediately
     needs_sync: Arc<AtomicBool>,
-    /// Semaphore to ensure only one task (tail or gap-fill) copies data at a time
-    copy_semaphore: Arc<Semaphore>,
 }
 
 /// Handle for sending hints to the replicator.
@@ -102,7 +99,6 @@ impl Replicator {
     ) -> (Self, ReplicatorHandle) {
         let (tx, rx) = mpsc::channel(buffer_size);
         let needs_sync = Arc::new(AtomicBool::new(false));
-        let copy_semaphore = Arc::new(Semaphore::new(1));
         (
             Self {
                 duckdb: duckdb.clone(),
@@ -110,38 +106,48 @@ impl Replicator {
                 rx,
                 chain_id,
                 needs_sync: needs_sync.clone(),
-                copy_semaphore,
             },
             ReplicatorHandle { tx, needs_sync, duckdb },
         )
     }
 
-    /// Runs the replicator with two concurrent tasks:
-    /// 1. Tail task: low-latency sync of new blocks from pg_tip (every 500ms)
-    /// 2. Gap-fill task: high-throughput backfill of historical blocks (continuous)
+    /// Runs the replicator with multiple concurrent tasks:
+    /// 1. Tail task: low-latency sync of new blocks from pg_tip (every 500ms, atomic 4-table)
+    /// 2. Gap-fill tasks: 4 independent per-table backfill tasks (blocks, txs, logs, receipts)
     ///
-    /// Both tasks share the same DuckDB pool (writes serialize on mutex).
+    /// Gap-fill is decoupled: each table backfills independently at its own pace.
+    /// This removes the "wait for all 4 streams" barrier and maximizes throughput.
+    /// Tail sync remains atomic (all 4 tables together) for consistency at the head.
+    ///
     /// Data transfer uses Parquet as intermediate format (memory-safe, no OOM).
-    /// Single-flight semaphore ensures only one task copies data at a time.
+    /// DuckDB writes serialize on a single thread, but PG→Parquet is pipelined.
     pub async fn run(mut self) -> Result<()> {
-        tracing::info!(chain_id = self.chain_id, "DuckDB replicator started (parquet mode)");
+        tracing::info!(chain_id = self.chain_id, "DuckDB replicator started (parquet mode, per-table gap-fill)");
 
         let duckdb = self.duckdb.clone();
         let pg_pool = self.pg_pool.clone();
         let chain_id = self.chain_id;
-        let copy_semaphore = self.copy_semaphore.clone();
 
-        // Spawn gap-fill task (runs continuously until caught up)
-        let gap_fill_duckdb = duckdb.clone();
-        let gap_fill_handle = tokio::spawn(async move {
-            Self::run_gap_fill_task(gap_fill_duckdb, pg_pool, chain_id, copy_semaphore).await
-        });
+        // Spawn 4 independent gap-fill tasks (one per table)
+        use super::parquet::TableKind;
+        let tables = [TableKind::Blocks, TableKind::Txs, TableKind::Logs, TableKind::Receipts];
+        let mut gap_fill_handles = Vec::with_capacity(4);
+
+        for table in tables {
+            let duckdb = duckdb.clone();
+            let pg_pool = pg_pool.clone();
+            gap_fill_handles.push(tokio::spawn(async move {
+                Self::run_table_gap_fill_task(duckdb, pg_pool, chain_id, table).await
+            }));
+        }
 
         // Run tail task in current task
         let tail_result = self.run_tail_task().await;
 
-        // Cancel gap-fill when tail task exits
-        gap_fill_handle.abort();
+        // Cancel all gap-fill tasks when tail task exits
+        for handle in gap_fill_handles {
+            handle.abort();
+        }
 
         tracing::info!(chain_id = self.chain_id, "DuckDB replicator stopped");
         tail_result
@@ -219,173 +225,185 @@ impl Replicator {
         Ok(())
     }
 
-    /// Gap-fill task: backfill historical blocks using Parquet-based transfer.
-    /// 
-    /// Uses Parquet as intermediate format for memory-safe, streaming data transfer:
-    /// - Query PostgreSQL for block range data
-    /// - Write to temporary Parquet file (ZSTD compressed)
-    /// - DuckDB ingests via read_parquet()
-    /// - No OOM risk (unlike postgres scanner extension)
-    /// - Acquires single-flight semaphore before copying to avoid memory doubling
-    async fn run_gap_fill_task(
+    /// Per-table gap-fill task: backfills a single table independently.
+    ///
+    /// Each table runs its own backfill loop with table-specific batch sizes.
+    /// This removes the "wait for all 4 streams" barrier and maximizes throughput:
+    /// - Blocks are lightweight → large batches (10k blocks)
+    /// - Logs are heavy → small batches (500 blocks)
+    ///
+    /// Tables can have different watermarks; temporary inconsistency is acceptable
+    /// during backfill. The tail sync (atomic 4-table) handles consistency at the head.
+    async fn run_table_gap_fill_task(
         duckdb: Arc<DuckDbPool>,
         pg_pool: Pool,
         chain_id: u64,
-        copy_semaphore: Arc<Semaphore>,
+        table: super::parquet::TableKind,
     ) -> Result<()> {
-        // Initial delay to let tail task establish watermark
-        tokio::time::sleep(Duration::from_secs(2)).await;
+        use super::parquet::{copy_table_range_via_parquet, TableKind};
 
-        tracing::info!(chain_id, "DuckDB gap-fill task started (parquet mode)");
+        // Stagger startup to avoid thundering herd on DuckDB
+        let delay = match table {
+            TableKind::Blocks => 2,
+            TableKind::Txs => 3,
+            TableKind::Logs => 4,
+            TableKind::Receipts => 5,
+        };
+        tokio::time::sleep(Duration::from_secs(delay)).await;
 
-        let mut last_checkpoint = Instant::now();
-        
-        // Maximum tail lag before pausing gap-fill (blocks)
-        const MAX_TAIL_LAG: i64 = 10;
+        tracing::info!(chain_id, table = table.name(), "Per-table gap-fill started");
+
+        let batch_size = table.batch_size();
+        let mut last_log = Instant::now();
+        let mut total_rows: i64 = 0;
+
+        // Maximum tail lag before pausing gap-fill (protects tail sync priority)
+        const MAX_TAIL_LAG: i64 = 20;
+        // Head safety boundary: don't gap-fill within N blocks of tip
+        const HEAD_SAFETY: i64 = 100;
 
         loop {
-            // Lag-aware throttle: pause gap-fill if tail is lagging
-            // This ensures tail sync always takes priority
+            // Get PG range
             let pg_conn = match pg_pool.get().await {
                 Ok(conn) => conn,
                 Err(e) => {
-                    tracing::warn!(chain_id, error = %e, "Failed to get PG connection for lag check");
+                    tracing::warn!(chain_id, table = table.name(), error = %e, "Failed to get PG connection");
                     tokio::time::sleep(Duration::from_secs(1)).await;
                     continue;
                 }
             };
-            
-            let pg_tip: i64 = pg_conn
-                .query_one("SELECT COALESCE(MAX(num), 0) FROM blocks", &[])
+
+            let (pg_min, pg_max): (i64, i64) = match pg_conn
+                .query_one("SELECT COALESCE(MIN(num), 0), COALESCE(MAX(num), 0) FROM blocks", &[])
                 .await
-                .map(|r| r.get(0))
-                .unwrap_or(0);
-            
+            {
+                Ok(row) => (row.get(0), row.get(1)),
+                Err(_) => {
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                    continue;
+                }
+            };
+            drop(pg_conn);
+
+            if pg_max == 0 {
+                tokio::time::sleep(Duration::from_secs(5)).await;
+                continue;
+            }
+
+            // Check tail lag - pause if tail is behind
             let duck_tip = duckdb.latest_block().await.unwrap_or(None).unwrap_or(0);
-            let tail_lag = pg_tip - duck_tip;
-            
+            let tail_lag = pg_max - duck_tip;
+
             if tail_lag > MAX_TAIL_LAG {
                 tracing::debug!(
                     chain_id,
+                    table = table.name(),
                     tail_lag,
-                    pg_tip,
-                    duck_tip,
-                    "Gap-fill paused: tail lag too high"
+                    "Per-table gap-fill paused: tail lag too high"
                 );
                 tokio::time::sleep(Duration::from_millis(500)).await;
                 continue;
             }
-            
-            drop(pg_conn);
 
-            // Acquire semaphore before copying (prevents memory doubling with tail sync)
-            let _permit = copy_semaphore.acquire().await.expect("semaphore closed");
-            let result = Self::gap_fill_via_parquet(&duckdb, &pg_pool, chain_id).await;
-            drop(_permit);
+            // Head safety boundary: never gap-fill within HEAD_SAFETY blocks of pg_tip
+            let head_boundary = pg_max - HEAD_SAFETY;
 
-            match result {
-                Ok(synced) => {
-                    // Checkpoint every 60s after syncing
-                    if synced > 0 && last_checkpoint.elapsed() > Duration::from_secs(60) {
-                        let _ = duckdb.checkpoint().await;
-                        last_checkpoint = Instant::now();
+            // Get this table's current min block in DuckDB
+            let table_min = Self::get_table_min_block(&duckdb, table).await.unwrap_or(0);
+
+            if table_min == 0 {
+                // Table is empty or doesn't have data yet - wait for tail sync
+                tokio::time::sleep(Duration::from_secs(5)).await;
+                continue;
+            }
+
+            // Determine what to backfill: from pg_min up to (table_min - 1)
+            // But don't exceed head_boundary
+            let gap_end = (table_min - 1).min(head_boundary);
+
+            if gap_end < pg_min {
+                // Fully caught up for this table
+                if last_log.elapsed() > Duration::from_secs(60) {
+                    tracing::debug!(
+                        chain_id,
+                        table = table.name(),
+                        table_min,
+                        pg_min,
+                        "Per-table gap-fill: fully caught up"
+                    );
+                    last_log = Instant::now();
+                }
+                tokio::time::sleep(Duration::from_secs(5)).await;
+                continue;
+            }
+
+            // Backfill one batch (from most recent gap backwards)
+            let batch_start = (gap_end - batch_size + 1).max(pg_min);
+            let batch_end = gap_end;
+
+            let start_time = Instant::now();
+            match copy_table_range_via_parquet(&pg_pool, &duckdb, table, batch_start, batch_end).await {
+                Ok(rows) => {
+                    total_rows += rows;
+                    let elapsed = start_time.elapsed();
+                    let blocks = batch_end - batch_start + 1;
+                    let rate = blocks as f64 / elapsed.as_secs_f64();
+
+                    if last_log.elapsed() > Duration::from_secs(10) || rows > 10000 {
+                        tracing::info!(
+                            chain_id,
+                            table = table.name(),
+                            range = format!("{}-{}", batch_start, batch_end),
+                            rows,
+                            elapsed_ms = elapsed.as_millis(),
+                            rate = format!("{:.0} blk/s", rate),
+                            total_rows,
+                            "Per-table gap-fill batch"
+                        );
+                        last_log = Instant::now();
                     }
 
-                    if synced == 0 {
-                        // Fully caught up, sleep longer
-                        tokio::time::sleep(Duration::from_secs(5)).await;
-                    } else {
-                        // More to sync, short pause before next batch
-                        tokio::time::sleep(Duration::from_millis(100)).await;
-                    }
+                    // Short pause before next batch
+                    tokio::time::sleep(Duration::from_millis(50)).await;
                 }
                 Err(e) => {
-                    tracing::error!(chain_id, error = %e, "DuckDB gap-fill failed");
-                    metrics::increment_duckdb_errors("gap_fill");
+                    let err_str = e.to_string();
+                    tracing::error!(
+                        chain_id,
+                        table = table.name(),
+                        error = %e,
+                        "Per-table gap-fill failed"
+                    );
+                    metrics::increment_duckdb_errors(&format!("gap_fill_{}", table.name()));
+
+                    // Recover from aborted transaction state
+                    if err_str.contains("transaction is aborted") || err_str.contains("TransactionContext") {
+                        let _ = duckdb.execute("ROLLBACK").await;
+                    }
+
                     tokio::time::sleep(Duration::from_secs(5)).await;
                 }
             }
         }
     }
 
-    /// Gap-fill using Parquet-based transfer.
-    async fn gap_fill_via_parquet(
+    /// Get the minimum block number for a table in DuckDB.
+    async fn get_table_min_block(
         duckdb: &Arc<DuckDbPool>,
-        pg_pool: &Pool,
-        chain_id: u64,
-    ) -> Result<i64> {
-        // Larger batches are safe now - Parquet streaming bounds memory regardless of size
-        const BATCH_SIZE: i64 = 500;
+        table: super::parquet::TableKind,
+    ) -> Option<i64> {
+        let table_name = table.name().to_string();
+        let block_col = table.block_column().to_string();
 
-        let (min, _max) = duckdb.block_range().await?;
-        let duck_min = min.unwrap_or(0);
-        let internal_gaps = detect_gaps_duckdb(duckdb).await?;
-
-        if duck_min == 0 {
-            return Ok(0);
-        }
-        
-        let pg_conn = pg_pool.get().await?;
-        let (pg_min, pg_max): (i64, i64) = {
-            let row = pg_conn
-                .query_one("SELECT COALESCE(MIN(num), 0), COALESCE(MAX(num), 0) FROM blocks", &[])
-                .await?;
-            (row.get(0), row.get(1))
-        };
-
-        if pg_max == 0 {
-            return Ok(0);
-        }
-
-        // Build gaps list
-        let mut gaps: Vec<(i64, i64)> = Vec::new();
-        if pg_min < duck_min {
-            gaps.push((pg_min, duck_min - 1));
-        }
-        for (start, end) in internal_gaps {
-            if end >= pg_min && start <= pg_max {
-                let clamped_start = start.max(pg_min);
-                let clamped_end = end.min(pg_max);
-                if clamped_start <= clamped_end {
-                    gaps.push((clamped_start, clamped_end));
-                }
-            }
-        }
-
-        if gaps.is_empty() {
-            return Ok(0);
-        }
-
-        // Sort by start descending (most recent first)
-        gaps.sort_by(|a, b| b.0.cmp(&a.0));
-
-        let mut total_synced = 0i64;
-        let start_time = Instant::now();
-
-        for (gap_start, gap_end) in gaps {
-            let mut current = gap_end;
-            while current >= gap_start {
-                let batch_start = (current - BATCH_SIZE + 1).max(gap_start);
-                // Use Parquet for memory-safe, streaming data transfer (parallel connections)
-                let synced = super::parquet::copy_range_via_parquet(pg_pool, duckdb, batch_start, current).await?;
-                total_synced += synced;
-                current = batch_start - 1;
-            }
-        }
-
-        if total_synced > 0 {
-            let elapsed = start_time.elapsed();
-            let rate = total_synced as f64 / elapsed.as_secs_f64();
-            tracing::info!(
-                chain_id,
-                synced = total_synced,
-                elapsed_ms = elapsed.as_millis(),
-                rate = format!("{:.0} blk/s", rate),
-                "DuckDB parquet gap-fill complete"
-            );
-        }
-
-        Ok(total_synced)
+        duckdb
+            .with_connection_result(move |conn: &duckdb::Connection| {
+                let sql = format!("SELECT MIN({}) FROM {}", block_col, table_name);
+                let mut stmt = conn.prepare(&sql)?;
+                let result: Option<i64> = stmt.query_row([], |row: &duckdb::Row| row.get(0)).ok();
+                Ok(result.unwrap_or(0))
+            })
+            .await
+            .ok()
     }
 
     /// Tails Postgres by copying new blocks from watermark to tip.
@@ -433,17 +451,12 @@ impl Replicator {
             let mut synced = 0i64;
             let mut current = sync_start;
 
-            // Acquire semaphore before copying (prevents memory doubling with gap-fill)
-            let _permit = self.copy_semaphore.acquire().await.expect("semaphore closed");
-            
             while current <= pg_tip {
                 let batch_end = (current + BATCH_SIZE - 1).min(pg_tip);
                 self.copy_range_from_postgres(current, batch_end).await?;
                 synced += batch_end - current + 1;
                 current = batch_end + 1;
             }
-            
-            drop(_permit);
 
             let elapsed = start.elapsed();
             let rate = synced as f64 / elapsed.as_secs_f64();
@@ -498,17 +511,12 @@ impl Replicator {
             let mut synced = 0i64;
             let mut current = duck_tip + 1;
 
-            // Acquire semaphore before copying (prevents memory doubling with gap-fill)
-            let _permit = self.copy_semaphore.acquire().await.expect("semaphore closed");
-            
             while current <= sync_end {
                 let batch_end = (current + BATCH_SIZE - 1).min(sync_end);
                 self.copy_range_from_postgres(current, batch_end).await?;
                 synced += batch_end - current + 1;
                 current = batch_end + 1;
             }
-            
-            drop(_permit);
 
             let elapsed = start.elapsed();
             let rate = synced as f64 / elapsed.as_secs_f64();

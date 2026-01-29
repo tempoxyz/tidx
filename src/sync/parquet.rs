@@ -169,6 +169,127 @@ pub async fn copy_range_via_parquet(
     Ok(blocks_count as i64)
 }
 
+/// Table kind for per-table gap-fill operations.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TableKind {
+    Blocks,
+    Txs,
+    Logs,
+    Receipts,
+}
+
+impl TableKind {
+    pub fn name(&self) -> &'static str {
+        match self {
+            TableKind::Blocks => "blocks",
+            TableKind::Txs => "txs",
+            TableKind::Logs => "logs",
+            TableKind::Receipts => "receipts",
+        }
+    }
+
+    /// Block column name for DELETE/range queries
+    pub fn block_column(&self) -> &'static str {
+        match self {
+            TableKind::Blocks => "num",
+            _ => "block_num",
+        }
+    }
+
+    /// Recommended batch size (block range) for gap-fill.
+    /// Tuned per table: logs are heavy, blocks are light.
+    pub fn batch_size(&self) -> i64 {
+        match self {
+            TableKind::Blocks => 10_000,   // Very lightweight
+            TableKind::Txs => 2_000,       // Medium weight
+            TableKind::Logs => 500,        // Heavy (large data fields)
+            TableKind::Receipts => 2_000,  // Medium weight
+        }
+    }
+}
+
+/// Copy a single table's block range from Postgres to DuckDB via Parquet.
+///
+/// Used by independent gap-fill tasks for decoupled table backfill:
+/// - Streams only the specified table (no 4-table barrier)
+/// - Uses DELETE + INSERT for idempotent range replacement
+/// - Updates per-table watermark in `duckdb_gapfill_state`
+/// - Returns row count copied
+pub async fn copy_table_range_via_parquet(
+    pg_pool: &Pool,
+    duckdb: &Arc<DuckDbPool>,
+    table: TableKind,
+    start: i64,
+    end: i64,
+) -> Result<i64> {
+    let temp_dir = ensure_temp_dir()?;
+    let batch_id = format!("{}_{}_{}_{}", table.name(), start, end, std::process::id());
+    let parquet_path = temp_dir.join(format!("{batch_id}.parquet"));
+
+    let pg_conn = pg_pool.get().await?;
+
+    // Stream table to Parquet
+    let row_count = match table {
+        TableKind::Blocks => stream_blocks_to_parquet(&pg_conn, &parquet_path, start, end).await?,
+        TableKind::Txs => stream_txs_to_parquet(&pg_conn, &parquet_path, start, end).await?,
+        TableKind::Logs => stream_logs_to_parquet(&pg_conn, &parquet_path, start, end).await?,
+        TableKind::Receipts => stream_receipts_to_parquet(&pg_conn, &parquet_path, start, end).await?,
+    };
+
+    if row_count == 0 {
+        let _ = fs::remove_file(&parquet_path);
+        return Ok(0);
+    }
+
+    // Ingest into DuckDB with atomic DELETE + INSERT
+    let parquet_path_str = parquet_path.to_string_lossy().to_string();
+    let table_name = table.name().to_string();
+    let block_col = table.block_column().to_string();
+
+    duckdb
+        .with_connection(move |conn| {
+            conn.execute("BEGIN TRANSACTION", [])?;
+
+            // Delete existing range
+            conn.execute(
+                &format!(
+                    "DELETE FROM {} WHERE {} BETWEEN {} AND {}",
+                    table_name, block_col, start, end
+                ),
+                [],
+            )?;
+
+            // Insert from Parquet
+            conn.execute(
+                &format!(
+                    "INSERT INTO {} SELECT * FROM read_parquet('{}')",
+                    table_name,
+                    parquet_path_str.replace('\'', "''")
+                ),
+                [],
+            )?;
+
+            // Update per-table watermark
+            conn.execute(
+                &format!(
+                    "UPDATE duckdb_gapfill_state SET next_block = {}, updated_at = CURRENT_TIMESTAMP WHERE table_name = '{}'",
+                    start, // We're backfilling backwards, so next_block is the start of what we just filled
+                    table_name
+                ),
+                [],
+            )?;
+
+            conn.execute("COMMIT", [])?;
+            Ok(())
+        })
+        .await?;
+
+    // Cleanup
+    let _ = fs::remove_file(&parquet_path);
+
+    Ok(row_count as i64)
+}
+
 /// Stream blocks from Postgres to Parquet file, building Arrow arrays directly.
 /// No Vec<Row> buffering - rows are appended to Arrow builders as they stream in.
 async fn stream_blocks_to_parquet(

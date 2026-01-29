@@ -536,6 +536,24 @@ fn run_schema(conn: &Connection) -> Result<()> {
         SELECT 1, 0
         WHERE NOT EXISTS (SELECT 1 FROM duckdb_sync_state WHERE id = 1);
 
+        -- Per-table gap-fill watermarks (independent of tail sync)
+        -- Each table tracks its own backfill progress for decoupled gap-fill
+        CREATE TABLE IF NOT EXISTS duckdb_gapfill_state (
+            table_name  VARCHAR PRIMARY KEY,
+            next_block  BIGINT NOT NULL,
+            updated_at  TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
+        );
+
+        -- Initialize per-table watermarks if missing
+        INSERT INTO duckdb_gapfill_state (table_name, next_block)
+        SELECT * FROM (VALUES
+            ('blocks', 0),
+            ('txs', 0),
+            ('logs', 0),
+            ('receipts', 0)
+        ) AS v(table_name, next_block)
+        WHERE NOT EXISTS (SELECT 1 FROM duckdb_gapfill_state WHERE table_name = v.table_name);
+
         -- Create indexes for common query patterns
         CREATE INDEX IF NOT EXISTS idx_blocks_timestamp ON blocks (timestamp);
         CREATE INDEX IF NOT EXISTS idx_txs_hash ON txs (hash);
