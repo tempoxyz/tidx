@@ -32,7 +32,7 @@ use crate::db::{DuckDbPool, Pool};
 /// Larger batches reduce per-batch overhead while staying memory-bounded
 const CHUNK_SIZE_BLOCKS: usize = 50_000;
 const CHUNK_SIZE_TXS: usize = 20_000;
-const CHUNK_SIZE_LOGS: usize = 10_000;  // logs have large data fields, keep reasonable
+const CHUNK_SIZE_LOGS: usize = 25_000;  // Increased from 10k - logs are row-heavy
 const CHUNK_SIZE_RECEIPTS: usize = 20_000;
 
 /// Temporary directory for Parquet files
@@ -198,11 +198,12 @@ impl TableKind {
 
     /// Recommended batch size (block range) for gap-fill.
     /// Tuned per table: logs are heavy, blocks are light.
+    /// Note: Larger batches reduce per-batch overhead (PG query, Parquet write, DuckDB ingest).
     pub fn batch_size(&self) -> i64 {
         match self {
             TableKind::Blocks => 10_000,   // Very lightweight
             TableKind::Txs => 2_000,       // Medium weight
-            TableKind::Logs => 500,        // Heavy (large data fields)
+            TableKind::Logs => 2_000,      // Increased from 500 to reduce overhead
             TableKind::Receipts => 2_000,  // Medium weight
         }
     }
