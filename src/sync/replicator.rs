@@ -167,8 +167,15 @@ impl Replicator {
                         Some(_) => {
                             while self.rx.try_recv().is_ok() {}
                             if let Err(e) = self.tail_postgres().await {
+                                let err_str = e.to_string();
                                 tracing::error!(chain_id = self.chain_id, error = %e, "DuckDB tail sync failed");
                                 metrics::increment_duckdb_errors("tail_sync");
+                                
+                                // Recover from aborted transaction state
+                                if err_str.contains("transaction is aborted") || err_str.contains("TransactionContext") {
+                                    tracing::warn!(chain_id = self.chain_id, "Issuing ROLLBACK to recover DuckDB connection");
+                                    let _ = self.duckdb.execute("ROLLBACK").await;
+                                }
                             }
                         }
                         None => {
@@ -182,8 +189,15 @@ impl Replicator {
                     // Clear the flag (we're about to sync anyway)
                     self.needs_sync.store(false, Ordering::Relaxed);
                     if let Err(e) = self.tail_postgres().await {
+                        let err_str = e.to_string();
                         tracing::error!(chain_id = self.chain_id, error = %e, "DuckDB tail sync failed");
                         metrics::increment_duckdb_errors("tail_sync");
+                        
+                        // Recover from aborted transaction state
+                        if err_str.contains("transaction is aborted") || err_str.contains("TransactionContext") {
+                            tracing::warn!(chain_id = self.chain_id, "Issuing ROLLBACK to recover DuckDB connection");
+                            let _ = self.duckdb.execute("ROLLBACK").await;
+                        }
                     }
                 }
                 _ = checkpoint_interval.tick() => {
