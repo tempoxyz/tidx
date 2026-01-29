@@ -227,6 +227,7 @@ fn spawn_sync_engine(
     );
 
     let backfill_first = chain.backfill_first;
+    let trust_rpc = chain.trust_rpc;
 
     tokio::spawn(async move {
         // Create sync engine with throttled pool
@@ -235,7 +236,8 @@ fn spawn_sync_engine(
                 .with_broadcaster(broadcaster)
                 .with_batch_size(chain.batch_size)
                 .with_concurrency(chain.concurrency)
-                .with_backfill_first(backfill_first),
+                .with_backfill_first(backfill_first)
+                .with_trust_rpc(trust_rpc),
             Err(e) => {
                 error!(error = %e, chain = %chain.name, "Failed to create sync engine");
                 return;

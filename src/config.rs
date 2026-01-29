@@ -167,6 +167,12 @@ pub struct ChainConfig {
     /// When false (default), runs realtime and backfill concurrently.
     #[serde(default)]
     pub backfill_first: bool,
+
+    /// Trust RPC data without validating parent hashes (default: false)
+    /// When true, skips reorg detection for faster sync on trusted RPCs.
+    /// Use for chains with frequent shallow reorgs where RPC is authoritative.
+    #[serde(default)]
+    pub trust_rpc: bool,
 }
 
 fn default_backfill() -> bool {

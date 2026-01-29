@@ -37,6 +37,8 @@ pub struct SyncEngine {
     batch_size: u64,
     concurrency: usize,
     backfill_first: bool,
+    /// Skip parent hash validation (trust RPC for reorg handling)
+    trust_rpc: bool,
 }
 
 impl SyncEngine {
@@ -64,6 +66,7 @@ impl SyncEngine {
             batch_size: 100,
             concurrency: 4,
             backfill_first: false,
+            trust_rpc: false,
         })
     }
 
@@ -89,6 +92,11 @@ impl SyncEngine {
 
     pub fn with_backfill_first(mut self, backfill_first: bool) -> Self {
         self.backfill_first = backfill_first;
+        self
+    }
+
+    pub fn with_trust_rpc(mut self, trust_rpc: bool) -> Self {
+        self.trust_rpc = trust_rpc;
         self
     }
 
@@ -212,6 +220,7 @@ impl SyncEngine {
             chain_id = self.chain_id,
             tip_num = state.tip_num,
             synced_num = state.synced_num,
+            trust_rpc = self.trust_rpc,
             "Starting sync engine with realtime + gap-fill + receipt backfill"
         );
 
@@ -428,8 +437,9 @@ impl SyncEngine {
 
     /// Validate parent hash chain for a batch of blocks.
     /// Returns Ok(()) if chain is valid, Err(ReorgDetected { block }) if a reorg is detected.
+    /// Skipped entirely if trust_rpc is enabled.
     async fn validate_parent_chain(&self, blocks: &[crate::tempo::Block]) -> Result<()> {
-        if blocks.is_empty() {
+        if blocks.is_empty() || self.trust_rpc {
             return Ok(());
         }
 
