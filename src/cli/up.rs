@@ -9,7 +9,7 @@ use metrics_exporter_prometheus::PrometheusBuilder;
 use tokio::sync::RwLock;
 use tracing::{error, info};
 
-use tidx::api::{self, SharedDuckDbLsm, SharedDuckDbPools, SharedPools};
+use tidx::api::{self, SharedDuckDbLsm, SharedPools};
 use tidx::broadcast::Broadcaster;
 use tidx::config::{ChainConfig, Config, ConfigWatcher, NewChainEvent};
 use tidx::db::{self, DuckDbLsm, ThrottledPool};
@@ -59,14 +59,12 @@ pub async fn run(args: Args) -> Result<()> {
     });
 
     let pools: SharedPools = Arc::new(RwLock::new(HashMap::new()));
-    let duckdb_pools: SharedDuckDbPools = Arc::new(RwLock::new(HashMap::new()));
     let duckdb_lsm: SharedDuckDbLsm = Arc::new(RwLock::new(HashMap::new()));
     let mut default_chain_id = 0u64;
 
     for chain in &config.chains {
         let (throttled_pool, replicator_handle) = initialize_chain(
             chain,
-            Arc::clone(&duckdb_pools),
             Arc::clone(&duckdb_lsm),
         ).await?;
 
@@ -99,7 +97,6 @@ pub async fn run(args: Args) -> Result<()> {
                 Arc::clone(&pools),
                 default_chain_id,
                 broadcaster.clone(),
-                Arc::clone(&duckdb_pools),
                 Arc::clone(&duckdb_lsm),
                 http_config,
             );
@@ -123,14 +120,13 @@ pub async fn run(args: Args) -> Result<()> {
         }
 
         let pools_for_watcher = Arc::clone(&pools);
-        let duckdb_pools_for_watcher = Arc::clone(&duckdb_pools);
         let duckdb_lsm_for_watcher = Arc::clone(&duckdb_lsm);
         let broadcaster_for_watcher = broadcaster.clone();
         let shutdown_tx_for_watcher = shutdown_tx.clone();
 
         tokio::spawn(async move {
             while let Some(event) = chain_rx.recv().await {
-                match initialize_chain(&event.chain, Arc::clone(&duckdb_pools_for_watcher), Arc::clone(&duckdb_lsm_for_watcher)).await {
+                match initialize_chain(&event.chain, Arc::clone(&duckdb_lsm_for_watcher)).await {
                     Ok((throttled_pool, replicator_handle)) => {
                         pools_for_watcher.write().await.insert(event.chain.chain_id, throttled_pool.pool.clone());
 
@@ -154,7 +150,6 @@ pub async fn run(args: Args) -> Result<()> {
             pools.read().await.clone(),
             default_chain_id,
             broadcaster.clone(),
-            duckdb_pools.read().await.clone(),
             &config.http,
         );
 
@@ -184,7 +179,6 @@ pub async fn run(args: Args) -> Result<()> {
 
 async fn initialize_chain(
     chain: &ChainConfig,
-    _duckdb_pools: SharedDuckDbPools,
     duckdb_lsm_pools: SharedDuckDbLsm,
 ) -> Result<(ThrottledPool, Option<ReplicatorHandle>)> {
     info!(chain = %chain.name, db = %chain.pg_url, "Connecting to database with throttled pool...");
