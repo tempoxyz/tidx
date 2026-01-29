@@ -464,6 +464,29 @@ pub async fn detect_gaps(pool: &Pool) -> Result<Vec<(u64, u64)>> {
         .collect())
 }
 
+/// Detect blocks that have no receipts (for deferred receipt backfill).
+/// Returns block numbers that exist in blocks table but have no receipts.
+/// Limited to a batch size and ordered by block_num DESC (most recent first).
+pub async fn detect_blocks_missing_receipts(pool: &Pool, limit: i64) -> Result<Vec<u64>> {
+    let conn = pool.get().await?;
+
+    let rows = conn
+        .query(
+            r#"
+            SELECT b.num
+            FROM blocks b
+            LEFT JOIN receipts r ON r.block_num = b.num
+            WHERE r.block_num IS NULL
+            ORDER BY b.num DESC
+            LIMIT $1
+            "#,
+            &[&limit],
+        )
+        .await?;
+
+    Ok(rows.iter().map(|r| r.get::<_, i64>(0) as u64).collect())
+}
+
 /// Detect ALL gaps including from genesis to first block
 /// Returns gaps sorted by end block descending (most recent first)
 pub async fn detect_all_gaps(pool: &Pool, tip_num: u64) -> Result<Vec<(u64, u64)>> {

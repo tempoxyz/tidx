@@ -15,9 +15,9 @@ use super::decoder::{decode_block, decode_log, decode_receipt, decode_transactio
 use super::fetcher::RpcClient;
 use super::replicator::ReplicatorHandle;
 use super::writer::{
-    delete_blocks_from, detect_all_gaps, find_fork_point, get_block_hash, load_sync_state,
-    save_sync_state, update_sync_rate, update_synced_num, update_tip_num, write_block,
-    write_blocks, write_logs, write_receipts, write_txs,
+    delete_blocks_from, detect_all_gaps, detect_blocks_missing_receipts, find_fork_point,
+    get_block_hash, load_sync_state, save_sync_state, update_sync_rate, update_synced_num,
+    update_tip_num, write_block, write_blocks, write_logs, write_receipts, write_txs,
 };
 
 /// RPC concurrency limits
@@ -199,19 +199,20 @@ impl SyncEngine {
         Ok(())
     }
 
-    /// Run realtime and gap-fill concurrently (default mode).
+    /// Run realtime, gap-fill, and receipt backfill concurrently (default mode).
     async fn run_concurrent(&mut self, shutdown: broadcast::Receiver<()>) -> Result<()> {
         let state = load_sync_state(self.pool(), self.chain_id).await?.unwrap_or_default();
         let mut realtime_progress = SyncProgress::new(self.chain_id, state.tip_num);
 
         let mut realtime_shutdown = shutdown.resubscribe();
         let gapfill_shutdown = shutdown.resubscribe();
+        let receipt_shutdown = shutdown.resubscribe();
 
         info!(
             chain_id = self.chain_id,
             tip_num = state.tip_num,
             synced_num = state.synced_num,
-            "Starting sync engine with realtime + gap-fill"
+            "Starting sync engine with realtime + gap-fill + receipt backfill"
         );
 
         // Spawn gap-fill as a separate background task (throttled by semaphore)
@@ -236,6 +237,23 @@ impl SyncEngine {
             .await
         });
 
+        // Spawn receipt backfill as a separate background task
+        // This fills in receipts/logs for blocks that were synced without them
+        let receipt_pool = self.pool().clone();
+        let receipt_rpc = self.backfill_rpc.clone();
+        let receipt_chain_id = self.chain_id;
+        let receipt_replicator = self.replicator.clone();
+        let receipt_handle = tokio::spawn(async move {
+            run_receipt_backfill_loop(
+                receipt_pool,
+                receipt_rpc,
+                receipt_chain_id,
+                receipt_replicator,
+                receipt_shutdown,
+            )
+            .await
+        });
+
         // Run realtime loop in foreground
         loop {
             tokio::select! {
@@ -252,29 +270,28 @@ impl SyncEngine {
             }
         }
 
-        // Wait for gap-fill to finish
+        // Abort background tasks
         gapfill_handle.abort();
+        receipt_handle.abort();
         Ok(())
     }
 
-    /// Realtime sync: always follows chain head immediately
-    /// Jumps to near head on startup, then follows new blocks with minimal lag
-    /// Updates tip_num only, leaves synced_num for gap-fill
+    /// Realtime sync: follows chain head with fast tip advancement.
+    /// 
+    /// Strategy: Write blocks + txs immediately to move tip forward fast.
+    /// Receipts/logs are backfilled asynchronously by a separate task.
+    /// This decouples tip advancement from slow receipt RPC calls.
     async fn tick_realtime(&mut self, progress: &mut SyncProgress) -> Result<()> {
         let state = load_sync_state(self.pool(), self.chain_id).await?.unwrap_or_default();
         let remote_head = self.realtime_rpc.latest_block_number().await?;
 
         // TAIL_WINDOW: how many blocks behind head to start realtime sync
-        // This ensures we're always near head, gap-fill handles the rest
         const TAIL_WINDOW: u64 = 10;
 
         // Jump to near head immediately, don't catch up sequentially
         let start_from = if state.tip_num >= remote_head.saturating_sub(TAIL_WINDOW) {
-            // Already near head, continue from tip
             state.tip_num + 1
         } else {
-            // Behind by more than TAIL_WINDOW, jump to near head
-            // Gap-fill will handle the blocks we skip
             let jump_to = remote_head.saturating_sub(TAIL_WINDOW);
             if state.tip_num > 0 && jump_to > state.tip_num {
                 info!(
@@ -296,9 +313,10 @@ impl SyncEngine {
         const BATCH_SIZE: u64 = 10;
         let mut current_from = start_from;
         let mut current_to = (current_from + BATCH_SIZE - 1).min(remote_head);
-        
+
+        // Fast path: fetch blocks only (no receipts) for tip advancement
         let fetch_start = std::time::Instant::now();
-        let mut current_fetch = Some(self.fetch_range(current_from, current_to).await?);
+        let mut current_fetch = Some(self.fetch_blocks_only(current_from, current_to).await?);
         let initial_fetch_ms = fetch_start.elapsed().as_millis();
         if initial_fetch_ms > 1000 {
             tracing::warn!(
@@ -306,24 +324,22 @@ impl SyncEngine {
                 fetch_ms = initial_fetch_ms,
                 from = current_from,
                 to = current_to,
-                "Slow initial RPC fetch"
+                "Slow initial block fetch"
             );
         }
 
         while current_from <= remote_head {
             let batch_start = std::time::Instant::now();
-            let (blocks, block_rows, all_txs, all_logs, all_receipts) = current_fetch.take().unwrap();
-            
-            // Capture counts before moving into async block
+            let (blocks, block_rows, all_txs) = current_fetch.take().unwrap();
             let tx_count = all_txs.len() as u64;
-            let log_count = all_logs.len() as u64;
 
             let next_from = current_to + 1;
             let next_to = (next_from + BATCH_SIZE - 1).min(remote_head);
             let has_next = next_from <= remote_head;
 
+            // Pipeline: fetch next batch while writing current
             let next_fetch_future = if has_next {
-                Some(self.fetch_range(next_from, next_to))
+                Some(self.fetch_blocks_only(next_from, next_to))
             } else {
                 None
             };
@@ -331,22 +347,16 @@ impl SyncEngine {
             let replicator = self.replicator.clone();
             let block_rows_clone = block_rows.clone();
             let all_txs_clone = all_txs.clone();
-            let all_logs_clone = all_logs.clone();
-            let all_receipts_clone = all_receipts.clone();
             let pool = self.pool().clone();
             let write_future = async move {
                 let write_start = std::time::Instant::now();
                 write_blocks(&pool, &block_rows).await?;
                 write_txs(&pool, &all_txs).await?;
-                write_logs(&pool, &all_logs).await?;
-                write_receipts(&pool, &all_receipts).await?;
                 let write_ms = write_start.elapsed().as_millis();
 
                 if let Some(ref rep) = replicator {
                     rep.send_blocks(block_rows_clone);
                     rep.send_txs(all_txs_clone);
-                    rep.send_logs(all_logs_clone);
-                    rep.send_receipts(all_receipts_clone);
                 }
 
                 Ok::<_, anyhow::Error>(write_ms)
@@ -365,9 +375,9 @@ impl SyncEngine {
                 fetch_ms = 0;
             }
 
-            // Update only tip_num (partial update to avoid clobbering synced_num)
+            // Update tip_num (receipts will be backfilled by receipt_backfill task)
             update_tip_num(self.pool(), self.chain_id, current_to, remote_head).await?;
-            
+
             let batch_ms = batch_start.elapsed().as_millis();
             let block_count = blocks.len();
             if batch_ms > 2000 {
@@ -384,10 +394,8 @@ impl SyncEngine {
             }
 
             let block_count = blocks.len() as u64;
-
             metrics::record_blocks_indexed(self.chain_id, block_count);
             metrics::record_txs_indexed(self.chain_id, tx_count);
-            metrics::record_logs_indexed(self.chain_id, log_count);
             progress.report_forward(current_to, remote_head, block_count);
 
             if let Some(ref broadcaster) = self.broadcaster {
@@ -408,8 +416,7 @@ impl SyncEngine {
                 to = current_to,
                 blocks = block_count,
                 txs = tx_count,
-                logs = log_count,
-                "Realtime: wrote batch"
+                "Realtime: wrote blocks+txs (receipts deferred)"
             );
 
             current_from = next_from;
@@ -531,7 +538,35 @@ impl SyncEngine {
         Ok(filled)
     }
 
-    /// Fetch and decode a range of blocks (used by pipelined sync)
+    /// Fetch and decode blocks only (no receipts) - fast path for tip advancement
+    async fn fetch_blocks_only(
+        &self,
+        from: u64,
+        to: u64,
+    ) -> Result<(Vec<crate::tempo::Block>, Vec<crate::types::BlockRow>, Vec<crate::types::TxRow>)>
+    {
+        let blocks = self.realtime_rpc.get_blocks_batch(from..=to).await?;
+
+        // Validate parent hash chain
+        self.validate_parent_chain(&blocks).await?;
+
+        let block_rows: Vec<_> = blocks.iter().map(decode_block).collect();
+
+        let all_txs: Vec<_> = blocks
+            .iter()
+            .flat_map(|block| {
+                block
+                    .transactions
+                    .txns()
+                    .enumerate()
+                    .map(|(i, tx)| decode_transaction(tx, block, i as u32))
+            })
+            .collect();
+
+        Ok((blocks, block_rows, all_txs))
+    }
+
+    /// Fetch and decode a range of blocks with receipts (full sync)
     async fn fetch_range(
         &self,
         from: u64,
@@ -595,54 +630,9 @@ impl SyncEngine {
     }
 
     pub async fn sync_range(&self, from: u64, to: u64) -> Result<()> {
-        // Fetch blocks and receipts in parallel (receipts contain logs)
-        let (blocks, receipts) = tokio::try_join!(
-            self.realtime_rpc.get_blocks_batch(from..=to),
-            self.realtime_rpc.get_receipts_batch(from..=to)
-        )?;
+        let (_blocks, block_rows, all_txs, all_logs, all_receipts) =
+            self.fetch_range(from, to).await?;
 
-        let block_timestamps: HashMap<u64, _> = blocks
-            .iter()
-            .map(|b| (b.header.number, timestamp_from_secs(b.header.timestamp)))
-            .collect();
-
-        // Decode all blocks, transactions, and logs upfront
-        let block_rows: Vec<_> = blocks.iter().map(decode_block).collect();
-
-        let all_txs: Vec<_> = blocks
-            .iter()
-            .flat_map(|block| {
-                block
-                    .transactions
-                    .txns()
-                    .enumerate()
-                    .map(|(i, tx)| decode_transaction(tx, block, i as u32))
-            })
-            .collect();
-
-        let all_logs: Vec<_> = receipts
-            .iter()
-            .flatten()
-            .flat_map(|receipt| {
-                let block_num = receipt.block_number().unwrap_or(0);
-                block_timestamps
-                    .get(&block_num)
-                    .map(|&ts| receipt.inner.logs().iter().map(move |log| decode_log(log, ts)))
-                    .into_iter()
-                    .flatten()
-            })
-            .collect();
-
-        let all_receipts: Vec<_> = receipts
-            .iter()
-            .flatten()
-            .filter_map(|receipt| {
-                let block_num = receipt.block_number().unwrap_or(0);
-                block_timestamps.get(&block_num).map(|&ts| decode_receipt(receipt, ts))
-            })
-            .collect();
-
-        // Batch write all data (single query per table)
         write_blocks(self.pool(), &block_rows).await?;
         write_txs(self.pool(), &all_txs).await?;
         write_logs(self.pool(), &all_logs).await?;
@@ -1277,4 +1267,219 @@ async fn sync_range_standalone(
     }
 
     Ok(())
+}
+
+/// Receipt backfill loop: fills in receipts/logs for blocks synced without them.
+/// 
+/// This runs as a background task and handles blocks where realtime sync wrote
+/// blocks + txs but skipped receipts for faster tip advancement.
+async fn run_receipt_backfill_loop(
+    pool: Pool,
+    rpc: RpcClient,
+    chain_id: u64,
+    replicator: Option<ReplicatorHandle>,
+    mut shutdown: broadcast::Receiver<()>,
+) -> Result<()> {
+    info!(chain_id, "Receipt backfill: starting");
+
+    loop {
+        tokio::select! {
+            biased;
+
+            _ = shutdown.recv() => {
+                info!(chain_id, "Receipt backfill: shutting down");
+                break;
+            }
+            result = tick_receipt_backfill(&pool, &rpc, chain_id, &replicator) => {
+                if let Err(e) = result {
+                    error!(chain_id, error = %e, "Receipt backfill tick failed");
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// One tick of receipt backfill: finds blocks missing receipts and fills them in.
+async fn tick_receipt_backfill(
+    pool: &Pool,
+    rpc: &RpcClient,
+    chain_id: u64,
+    replicator: &Option<ReplicatorHandle>,
+) -> Result<()> {
+    use alloy::network::ReceiptResponse;
+    use super::decoder::{decode_log, decode_receipt};
+
+    const BATCH_LIMIT: i64 = 100;
+
+    // Find blocks that have no receipts (most recent first)
+    let blocks_missing = detect_blocks_missing_receipts(pool, BATCH_LIMIT).await?;
+
+    if blocks_missing.is_empty() {
+        // All caught up, sleep before checking again
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        return Ok(());
+    }
+
+    debug!(
+        chain_id,
+        count = blocks_missing.len(),
+        first = blocks_missing.first().copied(),
+        last = blocks_missing.last().copied(),
+        "Receipt backfill: found blocks missing receipts"
+    );
+
+    // Group consecutive blocks into ranges for batch fetching
+    let ranges = group_consecutive_blocks(&blocks_missing);
+
+    for (from, to) in ranges {
+        // Fetch receipts for this range
+        let receipts = match rpc.get_receipts_batch(from..=to).await {
+            Ok(r) => r,
+            Err(e) => {
+                error!(chain_id, from, to, error = %e, "Receipt backfill: failed to fetch receipts");
+                continue;
+            }
+        };
+
+        // Get block timestamps from DB (blocks already exist)
+        let conn = pool.get().await?;
+        let rows = conn
+            .query(
+                "SELECT num, timestamp FROM blocks WHERE num >= $1 AND num <= $2",
+                &[&(from as i64), &(to as i64)],
+            )
+            .await?;
+
+        let block_timestamps: HashMap<u64, _> = rows
+            .iter()
+            .map(|r| {
+                let num: i64 = r.get(0);
+                let ts: chrono::DateTime<chrono::Utc> = r.get(1);
+                (num as u64, ts)
+            })
+            .collect();
+
+        // Decode logs and receipts
+        let all_logs: Vec<_> = receipts
+            .iter()
+            .flatten()
+            .flat_map(|receipt| {
+                let block_num = receipt.block_number().unwrap_or(0);
+                block_timestamps
+                    .get(&block_num)
+                    .map(|&ts| receipt.inner.logs().iter().map(move |log| decode_log(log, ts)))
+                    .into_iter()
+                    .flatten()
+            })
+            .collect();
+
+        let all_receipts: Vec<_> = receipts
+            .iter()
+            .flatten()
+            .filter_map(|receipt| {
+                let block_num = receipt.block_number().unwrap_or(0);
+                block_timestamps.get(&block_num).map(|&ts| decode_receipt(receipt, ts))
+            })
+            .collect();
+
+        let log_count = all_logs.len();
+        let receipt_count = all_receipts.len();
+
+        // Write to DB
+        write_logs(pool, &all_logs).await?;
+        write_receipts(pool, &all_receipts).await?;
+
+        // Signal replicator
+        if let Some(rep) = replicator {
+            rep.send_logs(all_logs);
+            rep.send_receipts(all_receipts);
+        }
+
+        metrics::record_logs_indexed(chain_id, log_count as u64);
+
+        debug!(
+            chain_id,
+            from,
+            to,
+            receipts = receipt_count,
+            logs = log_count,
+            "Receipt backfill: wrote receipts+logs"
+        );
+    }
+
+    Ok(())
+}
+
+/// Group consecutive block numbers into ranges for batch fetching.
+/// Input: [100, 99, 98, 50, 49, 10] (descending)
+/// Output: [(98, 100), (49, 50), (10, 10)]
+fn group_consecutive_blocks(blocks: &[u64]) -> Vec<(u64, u64)> {
+    if blocks.is_empty() {
+        return Vec::new();
+    }
+
+    let mut sorted: Vec<u64> = blocks.to_vec();
+    sorted.sort_unstable();
+
+    let mut ranges = Vec::new();
+    let mut start = sorted[0];
+    let mut end = sorted[0];
+
+    for &num in &sorted[1..] {
+        if num == end + 1 {
+            end = num;
+        } else {
+            ranges.push((start, end));
+            start = num;
+            end = num;
+        }
+    }
+    ranges.push((start, end));
+
+    ranges
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_group_consecutive_blocks_empty() {
+        assert_eq!(group_consecutive_blocks(&[]), Vec::<(u64, u64)>::new());
+    }
+
+    #[test]
+    fn test_group_consecutive_blocks_single() {
+        assert_eq!(group_consecutive_blocks(&[42]), vec![(42, 42)]);
+    }
+
+    #[test]
+    fn test_group_consecutive_blocks_consecutive() {
+        assert_eq!(group_consecutive_blocks(&[1, 2, 3, 4, 5]), vec![(1, 5)]);
+    }
+
+    #[test]
+    fn test_group_consecutive_blocks_descending() {
+        // Input is descending (as returned by detect_blocks_missing_receipts)
+        assert_eq!(group_consecutive_blocks(&[100, 99, 98]), vec![(98, 100)]);
+    }
+
+    #[test]
+    fn test_group_consecutive_blocks_gaps() {
+        assert_eq!(
+            group_consecutive_blocks(&[100, 99, 98, 50, 49, 10]),
+            vec![(10, 10), (49, 50), (98, 100)]
+        );
+    }
+
+    #[test]
+    fn test_group_consecutive_blocks_unsorted() {
+        assert_eq!(
+            group_consecutive_blocks(&[5, 1, 3, 2, 4]),
+            vec![(1, 5)]
+        );
+    }
 }
