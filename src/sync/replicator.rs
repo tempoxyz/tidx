@@ -352,8 +352,8 @@ impl Replicator {
             let mut current = gap_end;
             while current >= gap_start {
                 let batch_start = (current - BATCH_SIZE + 1).max(gap_start);
-                // Use Parquet for memory-safe, streaming data transfer
-                let synced = super::parquet::copy_range_via_parquet(&pg_conn, duckdb, batch_start, current).await?;
+                // Use Parquet for memory-safe, streaming data transfer (parallel connections)
+                let synced = super::parquet::copy_range_via_parquet(pg_pool, duckdb, batch_start, current).await?;
                 total_synced += synced;
                 current = batch_start - 1;
             }
@@ -424,7 +424,7 @@ impl Replicator {
             
             while current <= pg_tip {
                 let batch_end = (current + BATCH_SIZE - 1).min(pg_tip);
-                self.copy_range_from_postgres(&pg_conn, current, batch_end).await?;
+                self.copy_range_from_postgres(current, batch_end).await?;
                 synced += batch_end - current + 1;
                 current = batch_end + 1;
             }
@@ -489,7 +489,7 @@ impl Replicator {
             
             while current <= sync_end {
                 let batch_end = (current + BATCH_SIZE - 1).min(sync_end);
-                self.copy_range_from_postgres(&pg_conn, current, batch_end).await?;
+                self.copy_range_from_postgres(current, batch_end).await?;
                 synced += batch_end - current + 1;
                 current = batch_end + 1;
             }
@@ -517,7 +517,6 @@ impl Replicator {
     /// Copies all tables for a block range from Postgres to DuckDB.
     async fn copy_range_from_postgres(
         &self,
-        pg_conn: &deadpool_postgres::Object,
         start: i64,
         end: i64,
     ) -> Result<()> {
@@ -531,8 +530,8 @@ impl Replicator {
             Ok(mem)
         }).await.unwrap_or(0);
 
-        // Use Parquet for memory-safe, streaming data transfer
-        let blocks_copied = super::parquet::copy_range_via_parquet(pg_conn, &self.duckdb, start, end).await?;
+        // Use Parquet for memory-safe, streaming data transfer (parallel connections)
+        let blocks_copied = super::parquet::copy_range_via_parquet(&self.pg_pool, &self.duckdb, start, end).await?;
 
         // Log memory after parquet ingestion
         let (mem_after, temp_files) = self.duckdb.with_connection_result(|conn| {
