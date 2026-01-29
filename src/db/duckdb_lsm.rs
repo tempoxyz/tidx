@@ -241,9 +241,13 @@ mod tests {
     use super::*;
     use std::env;
 
+    fn temp_dir(name: &str) -> PathBuf {
+        env::temp_dir().join(format!("tidx_lsm_{}_{}", name, std::process::id()))
+    }
+
     #[tokio::test]
     async fn test_lsm_basic() {
-        let temp_dir = env::temp_dir().join(format!("tidx_test_{}", std::process::id()));
+        let temp_dir = temp_dir("basic");
         std::fs::create_dir_all(&temp_dir).unwrap();
         let db_path = temp_dir.join("test.duckdb");
         
@@ -269,6 +273,180 @@ mod tests {
         assert_eq!(writer_range, (None, None));
 
         // Cleanup
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[tokio::test]
+    async fn test_lsm_multiple_merges() {
+        let temp_dir = temp_dir("multi_merge");
+        std::fs::create_dir_all(&temp_dir).unwrap();
+        let db_path = temp_dir.join("test.duckdb");
+        
+        let lsm = DuckDbLsm::new(db_path.to_str().unwrap(), 1).unwrap();
+
+        // First batch
+        lsm.writer()
+            .execute("INSERT INTO blocks (num, hash, parent_hash, timestamp, timestamp_ms, gas_limit, gas_used, miner) VALUES (1, x'01', x'00', '2024-01-01', 0, 0, 0, x'00')")
+            .await
+            .unwrap();
+        let merged = lsm.merge().await.unwrap();
+        assert_eq!(merged, 1);
+
+        // Second batch
+        lsm.writer()
+            .execute("INSERT INTO blocks (num, hash, parent_hash, timestamp, timestamp_ms, gas_limit, gas_used, miner) VALUES (2, x'02', x'01', '2024-01-01', 0, 0, 0, x'00')")
+            .await
+            .unwrap();
+        lsm.writer()
+            .execute("INSERT INTO blocks (num, hash, parent_hash, timestamp, timestamp_ms, gas_limit, gas_used, miner) VALUES (3, x'03', x'02', '2024-01-01', 0, 0, 0, x'00')")
+            .await
+            .unwrap();
+        let merged = lsm.merge().await.unwrap();
+        assert_eq!(merged, 2);
+
+        // Reader should have all 3 blocks
+        let (min, max) = lsm.block_range().await.unwrap();
+        assert_eq!(min, Some(1));
+        assert_eq!(max, Some(3));
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[tokio::test]
+    async fn test_lsm_empty_merge() {
+        let temp_dir = temp_dir("empty_merge");
+        std::fs::create_dir_all(&temp_dir).unwrap();
+        let db_path = temp_dir.join("test.duckdb");
+        
+        let lsm = DuckDbLsm::new(db_path.to_str().unwrap(), 1).unwrap();
+
+        // Merge with no data should succeed and return 0
+        let merged = lsm.merge().await.unwrap();
+        assert_eq!(merged, 0);
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[tokio::test]
+    async fn test_lsm_reader_isolation() {
+        let temp_dir = temp_dir("isolation");
+        std::fs::create_dir_all(&temp_dir).unwrap();
+        let db_path = temp_dir.join("test.duckdb");
+        
+        let lsm = DuckDbLsm::new(db_path.to_str().unwrap(), 1).unwrap();
+
+        // Write block 1 and merge
+        lsm.writer()
+            .execute("INSERT INTO blocks (num, hash, parent_hash, timestamp, timestamp_ms, gas_limit, gas_used, miner) VALUES (1, x'01', x'00', '2024-01-01', 0, 0, 0, x'00')")
+            .await
+            .unwrap();
+        lsm.merge().await.unwrap();
+
+        // Get a reader reference
+        let reader1 = lsm.reader().await;
+        let (_, max1) = reader1.block_range().await.unwrap();
+        assert_eq!(max1, Some(1));
+
+        // Write more data to writer (not merged yet)
+        lsm.writer()
+            .execute("INSERT INTO blocks (num, hash, parent_hash, timestamp, timestamp_ms, gas_limit, gas_used, miner) VALUES (2, x'02', x'01', '2024-01-01', 0, 0, 0, x'00')")
+            .await
+            .unwrap();
+
+        // Reader should still only see block 1 (writer data not visible)
+        let (_, max_before) = reader1.block_range().await.unwrap();
+        assert_eq!(max_before, Some(1));
+
+        // After merge, new reader sees both blocks
+        lsm.merge().await.unwrap();
+        let reader2 = lsm.reader().await;
+        let (_, max2) = reader2.block_range().await.unwrap();
+        assert_eq!(max2, Some(2));
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[tokio::test]
+    async fn test_lsm_deduplication() {
+        let temp_dir = temp_dir("dedup");
+        std::fs::create_dir_all(&temp_dir).unwrap();
+        let db_path = temp_dir.join("test.duckdb");
+        
+        let lsm = DuckDbLsm::new(db_path.to_str().unwrap(), 1).unwrap();
+
+        // Write and merge block 1
+        lsm.writer()
+            .execute("INSERT INTO blocks (num, hash, parent_hash, timestamp, timestamp_ms, gas_limit, gas_used, miner) VALUES (1, x'01', x'00', '2024-01-01', 0, 0, 0, x'00')")
+            .await
+            .unwrap();
+        lsm.merge().await.unwrap();
+
+        // Try to write duplicate block 1 (same num, different hash - simulates reorg scenario)
+        lsm.writer()
+            .execute("INSERT INTO blocks (num, hash, parent_hash, timestamp, timestamp_ms, gas_limit, gas_used, miner) VALUES (1, x'FF', x'00', '2024-01-01', 0, 0, 0, x'00')")
+            .await
+            .unwrap();
+        lsm.merge().await.unwrap();
+
+        // Should still only have 1 block (INSERT OR IGNORE)
+        let reader = lsm.reader().await;
+        let count: i64 = reader
+            .with_connection_result(|conn| {
+                let mut stmt = conn.prepare("SELECT COUNT(*) FROM blocks")?;
+                Ok(stmt.query_row([], |row| row.get(0))?)
+            })
+            .await
+            .unwrap();
+        assert_eq!(count, 1);
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[tokio::test]
+    async fn test_lsm_concurrent_read_during_merge() {
+        let temp_dir = temp_dir("concurrent");
+        std::fs::create_dir_all(&temp_dir).unwrap();
+        let db_path = temp_dir.join("test.duckdb");
+        
+        let lsm = Arc::new(DuckDbLsm::new(db_path.to_str().unwrap(), 1).unwrap());
+
+        // Write initial data
+        lsm.writer()
+            .execute("INSERT INTO blocks (num, hash, parent_hash, timestamp, timestamp_ms, gas_limit, gas_used, miner) VALUES (1, x'01', x'00', '2024-01-01', 0, 0, 0, x'00')")
+            .await
+            .unwrap();
+        lsm.merge().await.unwrap();
+
+        // Spawn reader task
+        let lsm_reader = Arc::clone(&lsm);
+        let reader_handle = tokio::spawn(async move {
+            for _ in 0..10 {
+                let reader = lsm_reader.reader().await;
+                let result = reader.block_range().await;
+                assert!(result.is_ok(), "Reader should not fail during merge");
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        });
+
+        // Perform merges concurrently
+        for i in 2..=5 {
+            lsm.writer()
+                .execute(&format!(
+                    "INSERT INTO blocks (num, hash, parent_hash, timestamp, timestamp_ms, gas_limit, gas_used, miner) VALUES ({i}, x'{i:02x}', x'{:02x}', '2024-01-01', 0, 0, 0, x'00')",
+                    i - 1
+                ))
+                .await
+                .unwrap();
+            lsm.merge().await.unwrap();
+        }
+
+        reader_handle.await.unwrap();
+
+        // Final state should have all blocks
+        let (min, max) = lsm.block_range().await.unwrap();
+        assert_eq!(min, Some(1));
+        assert_eq!(max, Some(5));
+
         let _ = std::fs::remove_dir_all(&temp_dir);
     }
 }
