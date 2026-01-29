@@ -128,16 +128,26 @@ impl Replicator {
         let pg_pool = self.pg_pool.clone();
         let chain_id = self.chain_id;
 
-        // Spawn 4 independent gap-fill tasks (one per table)
+        // Spawn independent gap-fill tasks per table
+        // Logs get extra workers since they're the bottleneck
         use super::parquet::TableKind;
-        let tables = [TableKind::Blocks, TableKind::Txs, TableKind::Logs, TableKind::Receipts];
-        let mut gap_fill_handles = Vec::with_capacity(4);
+        let mut gap_fill_handles = Vec::with_capacity(7);
 
-        for table in tables {
+        // 1 worker each for blocks, txs, receipts
+        for table in [TableKind::Blocks, TableKind::Txs, TableKind::Receipts] {
             let duckdb = duckdb.clone();
             let pg_pool = pg_pool.clone();
             gap_fill_handles.push(tokio::spawn(async move {
-                Self::run_table_gap_fill_task(duckdb, pg_pool, chain_id, table).await
+                Self::run_table_gap_fill_task(duckdb, pg_pool, chain_id, table, 0).await
+            }));
+        }
+
+        // 4 workers for logs (the bottleneck) - each handles different block ranges
+        for worker_id in 0..4u8 {
+            let duckdb = duckdb.clone();
+            let pg_pool = pg_pool.clone();
+            gap_fill_handles.push(tokio::spawn(async move {
+                Self::run_table_gap_fill_task(duckdb, pg_pool, chain_id, TableKind::Logs, worker_id).await
             }));
         }
 
@@ -232,9 +242,11 @@ impl Replicator {
     /// 2. **Backfill gap** (backward): from pg_min to (table_min - 1)
     ///
     /// Head gap is prioritized so DuckDB catches up to realtime quickly.
-    /// Each table runs independently with table-specific batch sizes:
-    /// - Blocks are lightweight → large batches (10k blocks)
-    /// - Logs are heavy → small batches (500 blocks)
+    /// Each table runs independently with table-specific batch sizes.
+    ///
+    /// For logs (the bottleneck), multiple workers can run in parallel:
+    /// - worker_id 0: handles head gap (forward)
+    /// - worker_id 1-3: handle backfill gap (backward), partitioned by modulo
     ///
     /// Tail sync only handles the last HEAD_SAFETY blocks (atomic 4-table).
     async fn run_table_gap_fill_task(
@@ -242,6 +254,7 @@ impl Replicator {
         pg_pool: Pool,
         chain_id: u64,
         table: super::parquet::TableKind,
+        worker_id: u8,
     ) -> Result<()> {
         use super::parquet::{copy_table_range_via_parquet, TableKind};
 
@@ -249,12 +262,13 @@ impl Replicator {
         let delay = match table {
             TableKind::Blocks => 2,
             TableKind::Txs => 3,
-            TableKind::Logs => 4,
-            TableKind::Receipts => 5,
+            TableKind::Logs => 4 + worker_id as u64, // Stagger log workers
+            TableKind::Receipts => 9,
         };
         tokio::time::sleep(Duration::from_secs(delay)).await;
 
-        tracing::info!(chain_id, table = table.name(), "Per-table gap-fill started");
+        let worker_suffix = if worker_id > 0 { format!("/{}", worker_id) } else { String::new() };
+        tracing::info!(chain_id, table = format!("{}{}", table.name(), worker_suffix), "Per-table gap-fill started");
 
         let batch_size = table.batch_size();
         let mut last_log = Instant::now();
@@ -311,12 +325,22 @@ impl Replicator {
             // This is historical data we haven't backfilled yet
             let has_backfill_gap = pg_min < table_min;
 
-            if !has_head_gap && !has_backfill_gap {
-                // Fully caught up for this table
+            // For multi-worker tables (logs), partition the work:
+            // - worker 0: head gap only
+            // - workers 1-3: backfill only, each taking every 3rd batch
+            let is_multi_worker = table == TableKind::Logs && worker_id > 0;
+            let should_handle_head = worker_id == 0;
+            let should_handle_backfill = worker_id == 0 || is_multi_worker;
+
+            let effective_head_gap = has_head_gap && should_handle_head;
+            let effective_backfill_gap = has_backfill_gap && should_handle_backfill;
+
+            if !effective_head_gap && !effective_backfill_gap {
+                // Fully caught up for this worker
                 if last_log.elapsed() > Duration::from_secs(60) {
                     tracing::debug!(
                         chain_id,
-                        table = table.name(),
+                        table = format!("{}{}", table.name(), worker_suffix),
                         table_min,
                         table_max,
                         head_boundary,
@@ -329,14 +353,26 @@ impl Replicator {
             }
 
             // Prioritize HEAD GAP (catch up to realtime first)
-            let (batch_start, batch_end, direction) = if has_head_gap {
+            let (batch_start, batch_end, direction) = if effective_head_gap {
                 // Fill forward: from table_max+1 towards head_boundary
                 let start = table_max + 1;
                 let end = (start + batch_size - 1).min(head_boundary);
                 (start, end, "head")
             } else {
                 // Fill backward: from table_min-1 towards pg_min
-                let end = table_min - 1;
+                // For multi-worker backfill (logs workers 1-3), stagger start positions
+                // to reduce overlap. Workers will naturally spread out as they complete
+                // batches at different rates. Occasional overlap is fine (DELETE+INSERT is idempotent).
+                let stagger = if is_multi_worker {
+                    (worker_id - 1) as i64 * batch_size
+                } else {
+                    0
+                };
+                let end = table_min - 1 - stagger;
+                if end < pg_min {
+                    tokio::time::sleep(Duration::from_secs(5)).await;
+                    continue;
+                }
                 let start = (end - batch_size + 1).max(pg_min);
                 (start, end, "backfill")
             };
@@ -359,7 +395,7 @@ impl Replicator {
                     if last_log.elapsed() > Duration::from_secs(10) || rows > 10000 {
                         tracing::info!(
                             chain_id,
-                            table = table.name(),
+                            table = format!("{}{}", table.name(), worker_suffix),
                             direction,
                             range = format!("{}-{}", batch_start, batch_end),
                             rows,
@@ -379,7 +415,7 @@ impl Replicator {
                     let err_str = e.to_string();
                     tracing::error!(
                         chain_id,
-                        table = table.name(),
+                        table = format!("{}{}", table.name(), worker_suffix),
                         error = %e,
                         "Per-table gap-fill failed"
                     );
