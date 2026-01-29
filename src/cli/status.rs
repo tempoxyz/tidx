@@ -305,7 +305,12 @@ async fn print_status(config: &Config) -> Result<()> {
                         }
                     }
                     Err(e) => {
-                        println!("│  └─ Error:    {}", e);
+                        let err_str = e.to_string();
+                        if err_str.contains("lock") || err_str.contains("Conflicting") {
+                            println!("│  └─ Status:   Locked (use --url http://localhost:8080)");
+                        } else {
+                            println!("│  └─ Error:    {}", e);
+                        }
                     }
                 }
             }
