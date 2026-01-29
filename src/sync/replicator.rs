@@ -225,15 +225,18 @@ impl Replicator {
         Ok(())
     }
 
-    /// Per-table gap-fill task: backfills a single table independently.
+    /// Per-table gap-fill task: fills gaps for a single table independently.
     ///
-    /// Each table runs its own backfill loop with table-specific batch sizes.
-    /// This removes the "wait for all 4 streams" barrier and maximizes throughput:
+    /// Fills gaps in BOTH directions:
+    /// 1. **Head gap** (forward): from table_max to (pg_tip - HEAD_SAFETY)
+    /// 2. **Backfill gap** (backward): from pg_min to (table_min - 1)
+    ///
+    /// Head gap is prioritized so DuckDB catches up to realtime quickly.
+    /// Each table runs independently with table-specific batch sizes:
     /// - Blocks are lightweight → large batches (10k blocks)
     /// - Logs are heavy → small batches (500 blocks)
     ///
-    /// Tables can have different watermarks; temporary inconsistency is acceptable
-    /// during backfill. The tail sync (atomic 4-table) handles consistency at the head.
+    /// Tail sync only handles the last HEAD_SAFETY blocks (atomic 4-table).
     async fn run_table_gap_fill_task(
         duckdb: Arc<DuckDbPool>,
         pg_pool: Pool,
@@ -257,9 +260,7 @@ impl Replicator {
         let mut last_log = Instant::now();
         let mut total_rows: i64 = 0;
 
-        // Maximum tail lag before pausing gap-fill (protects tail sync priority)
-        const MAX_TAIL_LAG: i64 = 20;
-        // Head safety boundary: don't gap-fill within N blocks of tip
+        // Head safety boundary: tail sync handles the last N blocks (atomic 4-table)
         const HEAD_SAFETY: i64 = 100;
 
         loop {
@@ -290,45 +291,35 @@ impl Replicator {
                 continue;
             }
 
-            // Check tail lag - pause if tail is behind
-            let duck_tip = duckdb.latest_block().await.unwrap_or(None).unwrap_or(0);
-            let tail_lag = pg_max - duck_tip;
-
-            if tail_lag > MAX_TAIL_LAG {
-                tracing::debug!(
-                    chain_id,
-                    table = table.name(),
-                    tail_lag,
-                    "Per-table gap-fill paused: tail lag too high"
-                );
-                tokio::time::sleep(Duration::from_millis(500)).await;
-                continue;
-            }
-
-            // Head safety boundary: never gap-fill within HEAD_SAFETY blocks of pg_tip
+            // Head safety boundary: gap-fill up to this point, tail sync handles the rest
             let head_boundary = pg_max - HEAD_SAFETY;
 
-            // Get this table's current min block in DuckDB
-            let table_min = Self::get_table_min_block(&duckdb, table).await.unwrap_or(0);
+            // Get this table's current min/max block in DuckDB
+            let (table_min, table_max) = Self::get_table_block_range(&duckdb, table).await.unwrap_or((0, 0));
 
-            if table_min == 0 {
-                // Table is empty or doesn't have data yet - wait for tail sync
+            if table_min == 0 || table_max == 0 {
+                // Table is empty - wait for tail sync to seed initial data
                 tokio::time::sleep(Duration::from_secs(5)).await;
                 continue;
             }
 
-            // Determine what to backfill: from pg_min up to (table_min - 1)
-            // But don't exceed head_boundary
-            let gap_end = (table_min - 1).min(head_boundary);
+            // Check for HEAD GAP: table_max < head_boundary
+            // This is the gap between current table data and realtime
+            let has_head_gap = table_max < head_boundary;
 
-            if gap_end < pg_min {
+            // Check for BACKFILL GAP: pg_min < table_min
+            // This is historical data we haven't backfilled yet
+            let has_backfill_gap = pg_min < table_min;
+
+            if !has_head_gap && !has_backfill_gap {
                 // Fully caught up for this table
                 if last_log.elapsed() > Duration::from_secs(60) {
                     tracing::debug!(
                         chain_id,
                         table = table.name(),
                         table_min,
-                        pg_min,
+                        table_max,
+                        head_boundary,
                         "Per-table gap-fill: fully caught up"
                     );
                     last_log = Instant::now();
@@ -337,9 +328,18 @@ impl Replicator {
                 continue;
             }
 
-            // Backfill one batch (from most recent gap backwards)
-            let batch_start = (gap_end - batch_size + 1).max(pg_min);
-            let batch_end = gap_end;
+            // Prioritize HEAD GAP (catch up to realtime first)
+            let (batch_start, batch_end, direction) = if has_head_gap {
+                // Fill forward: from table_max+1 towards head_boundary
+                let start = table_max + 1;
+                let end = (start + batch_size - 1).min(head_boundary);
+                (start, end, "head")
+            } else {
+                // Fill backward: from table_min-1 towards pg_min
+                let end = table_min - 1;
+                let start = (end - batch_size + 1).max(pg_min);
+                (start, end, "backfill")
+            };
 
             let start_time = Instant::now();
             match copy_table_range_via_parquet(&pg_pool, &duckdb, table, batch_start, batch_end).await {
@@ -349,12 +349,21 @@ impl Replicator {
                     let blocks = batch_end - batch_start + 1;
                     let rate = blocks as f64 / elapsed.as_secs_f64();
 
+                    // Calculate remaining gap
+                    let remaining = if direction == "head" {
+                        head_boundary - batch_end
+                    } else {
+                        batch_start - pg_min
+                    };
+
                     if last_log.elapsed() > Duration::from_secs(10) || rows > 10000 {
                         tracing::info!(
                             chain_id,
                             table = table.name(),
+                            direction,
                             range = format!("{}-{}", batch_start, batch_end),
                             rows,
+                            remaining,
                             elapsed_ms = elapsed.as_millis(),
                             rate = format!("{:.0} blk/s", rate),
                             total_rows,
@@ -387,20 +396,22 @@ impl Replicator {
         }
     }
 
-    /// Get the minimum block number for a table in DuckDB.
-    async fn get_table_min_block(
+    /// Get the min and max block numbers for a table in DuckDB.
+    async fn get_table_block_range(
         duckdb: &Arc<DuckDbPool>,
         table: super::parquet::TableKind,
-    ) -> Option<i64> {
+    ) -> Option<(i64, i64)> {
         let table_name = table.name().to_string();
         let block_col = table.block_column().to_string();
 
         duckdb
             .with_connection_result(move |conn: &duckdb::Connection| {
-                let sql = format!("SELECT MIN({}) FROM {}", block_col, table_name);
+                let sql = format!("SELECT MIN({}), MAX({}) FROM {}", block_col, block_col, table_name);
                 let mut stmt = conn.prepare(&sql)?;
-                let result: Option<i64> = stmt.query_row([], |row: &duckdb::Row| row.get(0)).ok();
-                Ok(result.unwrap_or(0))
+                let result: Option<(i64, i64)> = stmt.query_row([], |row: &duckdb::Row| {
+                    Ok((row.get(0)?, row.get(1)?))
+                }).ok();
+                Ok(result.unwrap_or((0, 0)))
             })
             .await
             .ok()
