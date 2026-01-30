@@ -34,8 +34,7 @@ pub struct Replicator {
     chain_id: u64,
     /// Flag set when channel receives data, signals to poll immediately
     needs_sync: Arc<AtomicBool>,
-    /// Whether pg_parquet extension is available (cached on startup)
-    use_pg_parquet: bool,
+
 }
 
 /// Handle for sending hints to the replicator.
@@ -108,7 +107,6 @@ impl Replicator {
                 rx,
                 chain_id,
                 needs_sync: needs_sync.clone(),
-                use_pg_parquet: false, // Will be detected on run()
             },
             ReplicatorHandle { tx, needs_sync, duckdb },
         )
@@ -125,18 +123,11 @@ impl Replicator {
     /// Data transfer uses Parquet as intermediate format (memory-safe, no OOM).
     /// DuckDB writes serialize on a single thread, but PG→Parquet is pipelined.
     pub async fn run(mut self) -> Result<()> {
-        // Check if pg_parquet extension is available for faster server-side Parquet generation
-        self.use_pg_parquet = super::pg_parquet::is_pg_parquet_available(&self.pg_pool).await;
-        if self.use_pg_parquet {
-            tracing::info!(chain_id = self.chain_id, "DuckDB replicator started (pg_parquet mode, server-side Parquet)");
-        } else {
-            tracing::info!(chain_id = self.chain_id, "DuckDB replicator started (arrow mode, client-side Parquet)");
-        }
+        tracing::info!(chain_id = self.chain_id, "DuckDB replicator started (pg_parquet mode)");
 
         let duckdb = self.duckdb.clone();
         let pg_pool = self.pg_pool.clone();
         let chain_id = self.chain_id;
-        let use_pg_parquet = self.use_pg_parquet;
 
         // Spawn independent gap-fill tasks per table
         // Logs get extra workers since they're the bottleneck
@@ -148,7 +139,7 @@ impl Replicator {
             let duckdb = duckdb.clone();
             let pg_pool = pg_pool.clone();
             gap_fill_handles.push(tokio::spawn(async move {
-                Self::run_table_gap_fill_task(duckdb, pg_pool, chain_id, table, 0, use_pg_parquet).await
+                Self::run_table_gap_fill_task(duckdb, pg_pool, chain_id, table, 0).await
             }));
         }
 
@@ -157,7 +148,7 @@ impl Replicator {
             let duckdb = duckdb.clone();
             let pg_pool = pg_pool.clone();
             gap_fill_handles.push(tokio::spawn(async move {
-                Self::run_table_gap_fill_task(duckdb, pg_pool, chain_id, TableKind::Logs, worker_id, use_pg_parquet).await
+                Self::run_table_gap_fill_task(duckdb, pg_pool, chain_id, TableKind::Logs, worker_id).await
             }));
         }
 
@@ -265,9 +256,8 @@ impl Replicator {
         chain_id: u64,
         table: super::parquet::TableKind,
         worker_id: u8,
-        use_pg_parquet: bool,
     ) -> Result<()> {
-        use super::parquet::{copy_table_range_via_parquet, TableKind};
+        use super::parquet::TableKind;
         use super::pg_parquet::copy_table_via_pg_parquet;
 
         // Stagger startup to avoid thundering herd on DuckDB
@@ -390,12 +380,7 @@ impl Replicator {
             };
 
             let start_time = Instant::now();
-            let copy_result = if use_pg_parquet {
-                copy_table_via_pg_parquet(&pg_pool, &duckdb, table, batch_start, batch_end).await
-            } else {
-                copy_table_range_via_parquet(&pg_pool, &duckdb, table, batch_start, batch_end).await
-            };
-            match copy_result {
+            match copy_table_via_pg_parquet(&pg_pool, &duckdb, table, batch_start, batch_end).await {
                 Ok(rows) => {
                     total_rows += rows;
                     let elapsed = start_time.elapsed();
@@ -616,12 +601,8 @@ impl Replicator {
             Ok(mem)
         }).await.unwrap_or(0);
 
-        // Use Parquet for memory-safe, streaming data transfer (parallel connections)
-        let blocks_copied = if self.use_pg_parquet {
-            super::pg_parquet::copy_range_via_pg_parquet(&self.pg_pool, &self.duckdb, start, end).await?
-        } else {
-            super::parquet::copy_range_via_parquet(&self.pg_pool, &self.duckdb, start, end).await?
-        };
+        // Use pg_parquet for server-side Parquet generation (fast, memory-safe)
+        let blocks_copied = super::pg_parquet::copy_range_via_pg_parquet(&self.pg_pool, &self.duckdb, start, end).await?;
 
         // Log memory after parquet ingestion
         let (mem_after, temp_files) = self.duckdb.with_connection_result(|conn| {

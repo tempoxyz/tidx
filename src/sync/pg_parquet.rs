@@ -32,21 +32,6 @@ fn ensure_temp_dir() -> Result<PathBuf> {
     Ok(dir)
 }
 
-/// Check if pg_parquet extension is available.
-pub async fn is_pg_parquet_available(pg_pool: &Pool) -> bool {
-    let conn = match pg_pool.get().await {
-        Ok(c) => c,
-        Err(_) => return false,
-    };
-    
-    conn.query_one(
-        "SELECT 1 FROM pg_extension WHERE extname = 'pg_parquet'",
-        &[],
-    )
-    .await
-    .is_ok()
-}
-
 /// Copy a single table's block range from Postgres to DuckDB via pg_parquet COPY TO STDOUT.
 ///
 /// This replaces the Arrow-based streaming approach with server-side Parquet generation.
