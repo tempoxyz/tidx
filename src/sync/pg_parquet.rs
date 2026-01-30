@@ -48,13 +48,13 @@ impl TableKind {
     }
 
     /// Recommended batch size (block range) for gap-fill.
-    /// Tuned per table: logs are heavy, blocks are light.
+    /// Aggressive sizing for servers with 64GB+ RAM.
     pub fn batch_size(&self) -> i64 {
         match self {
-            TableKind::Blocks => 10_000,   // Very lightweight
-            TableKind::Txs => 2_000,       // Medium weight
-            TableKind::Logs => 2_000,      // Heavy but batched for throughput
-            TableKind::Receipts => 2_000,  // Medium weight
+            TableKind::Blocks => 50_000,   // Very lightweight
+            TableKind::Txs => 50_000,      // ~25M rows/batch
+            TableKind::Logs => 20_000,     // ~10M rows/batch (heaviest)
+            TableKind::Receipts => 50_000, // ~25M rows/batch
         }
     }
 }
