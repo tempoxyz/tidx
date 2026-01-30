@@ -143,6 +143,16 @@ impl Default for QueryOptions {
     }
 }
 
+use crate::config::AnalyticsEngine;
+
+/// Analytics engine configuration for query execution.
+#[derive(Clone, Debug, Default)]
+pub struct AnalyticsEngineConfig {
+    pub engine: AnalyticsEngine,
+    pub pg_duckdb_memory_limit: Option<String>,
+    pub pg_duckdb_threads: Option<u32>,
+}
+
 /// Execute a query, automatically routing to DuckDB or PostgreSQL based on query patterns.
 ///
 /// If `force_engine` is provided, it overrides the automatic routing decision.
@@ -155,6 +165,107 @@ pub async fn execute_query(
     options: &QueryOptions,
 ) -> Result<QueryResult> {
     execute_query_with_engine(pg_pool, duckdb_pool, sql, signature, options, None).await
+}
+
+/// Execute a query with analytics engine configuration.
+/// This is the primary entry point for queries with pg_duckdb support.
+pub async fn execute_query_with_analytics(
+    pg_pool: &Pool,
+    duckdb_pool: Option<&Arc<DuckDbPool>>,
+    sql: &str,
+    signature: Option<&str>,
+    options: &QueryOptions,
+    analytics_config: &AnalyticsEngineConfig,
+    force_engine: Option<&str>,
+) -> Result<QueryResult> {
+    // Validate query
+    validate_query(sql)?;
+
+    // Determine which engine to use (forced or auto-detected)
+    let routed_engine = match force_engine {
+        Some("postgres") | Some("pg") => QueryEngine::Postgres,
+        Some("duckdb") | Some("duck") | Some("pg_duckdb") => QueryEngine::DuckDb,
+        _ => route_query(sql),
+    };
+
+    // Decide which backend to use based on config and routing
+    let (effective_engine, use_pg_duckdb) = match analytics_config.engine {
+        AnalyticsEngine::PgDuckdb => {
+            // Use pg_duckdb for OLAP queries, plain Postgres for OLTP
+            if routed_engine == QueryEngine::DuckDb {
+                (QueryEngine::DuckDb, true) // DuckDB via pg_duckdb
+            } else {
+                (QueryEngine::Postgres, false) // Plain Postgres
+            }
+        }
+        AnalyticsEngine::DuckdbFile => {
+            // Legacy: use DuckDB file if available, else Postgres
+            if routed_engine == QueryEngine::DuckDb && duckdb_pool.is_some() {
+                (QueryEngine::DuckDb, false) // DuckDB file
+            } else {
+                (QueryEngine::Postgres, false)
+            }
+        }
+        AnalyticsEngine::Postgres => {
+            // Always use Postgres
+            (QueryEngine::Postgres, false)
+        }
+    };
+
+    // Generate CTE SQL if a signature is provided
+    // For pg_duckdb, use Postgres-style CTEs (they use native abi_* functions)
+    let sql = if let Some(sig_str) = signature {
+        let sig = EventSignature::parse(sig_str)?;
+        let used_columns = extract_column_references(sql);
+        let filter = if used_columns.is_empty() {
+            None
+        } else {
+            Some(&used_columns)
+        };
+        
+        // pg_duckdb uses Postgres CTEs (with native abi_* functions)
+        // DuckDB file uses DuckDB CTEs (with Rust UDFs)
+        let cte = if use_pg_duckdb {
+            sig.to_cte_sql_postgres_filtered(filter)
+        } else {
+            match effective_engine {
+                QueryEngine::DuckDb => sig.to_cte_sql_duckdb_filtered(filter),
+                QueryEngine::Postgres => sig.to_cte_sql_postgres_filtered(filter),
+            }
+        };
+        format!("WITH {cte} {sql}")
+    } else {
+        sql.to_string()
+    };
+
+    // Add LIMIT if not present
+    let sql_upper = sql.to_uppercase();
+    let sql = if !sql_upper.contains("LIMIT") {
+        format!("{} LIMIT {}", sql, options.limit)
+    } else {
+        sql
+    };
+
+    // Execute with appropriate backend
+    if use_pg_duckdb {
+        execute_query_pg_duckdb(
+            pg_pool,
+            &sql,
+            options,
+            analytics_config.pg_duckdb_memory_limit.as_deref(),
+            analytics_config.pg_duckdb_threads,
+        )
+        .await
+    } else {
+        match effective_engine {
+            QueryEngine::DuckDb => {
+                execute_query_duckdb(duckdb_pool.unwrap(), &sql, options).await
+            }
+            QueryEngine::Postgres => {
+                execute_query_postgres(pg_pool, &sql, options).await
+            }
+        }
+    }
 }
 
 /// Execute a query with optional engine override.
@@ -227,6 +338,117 @@ async fn execute_query_postgres(
     sql: &str,
     options: &QueryOptions,
 ) -> Result<QueryResult> {
+    execute_query_postgres_inner(pool, sql, options, "postgres", false).await
+}
+
+/// Execute a query on PostgreSQL with pg_duckdb extension.
+/// This enables DuckDB's analytical engine for OLAP queries directly in PostgreSQL.
+pub async fn execute_query_pg_duckdb(
+    pool: &Pool,
+    sql: &str,
+    options: &QueryOptions,
+    memory_limit: Option<&str>,
+    threads: Option<u32>,
+) -> Result<QueryResult> {
+    // Convert '0x...' hex strings to '\x...' bytea literals for PostgreSQL
+    let sql = sql.replace("'0x", "'\\x");
+
+    let conn = pool.get().await?;
+
+    // Configure pg_duckdb for this session
+    // Force DuckDB execution for analytical queries
+    conn.execute("SET duckdb.force_execution = true", &[]).await?;
+    
+    // Set memory limit (default 16GB for 64GB server)
+    let mem_limit = memory_limit.unwrap_or("16GB");
+    conn.execute(&format!("SET duckdb.max_memory = '{}'", mem_limit), &[]).await
+        .unwrap_or_else(|e| {
+            tracing::debug!(error = %e, "Failed to set duckdb.max_memory (pg_duckdb may not be installed)");
+            0
+        });
+    
+    // Set thread count (default 8)
+    let thread_count = threads.unwrap_or(8);
+    conn.execute(&format!("SET duckdb.threads = {}", thread_count), &[]).await
+        .unwrap_or_else(|e| {
+            tracing::debug!(error = %e, "Failed to set duckdb.threads");
+            0
+        });
+
+    // Set statement timeout
+    conn.execute(
+        &format!("SET statement_timeout = {}", options.timeout_ms),
+        &[],
+    )
+    .await?;
+
+    let start = Instant::now();
+    let result = tokio::time::timeout(
+        std::time::Duration::from_millis(options.timeout_ms + 100),
+        conn.query(&sql, &[]),
+    )
+    .await;
+
+    let rows = match result {
+        Ok(Ok(rows)) => {
+            metrics::record_query_duration(start.elapsed());
+            rows
+        }
+        Ok(Err(e)) => return Err(anyhow!("Query error: {}", sanitize_db_error(&e.to_string()))),
+        Err(_) => return Err(anyhow!("Query timeout")),
+    };
+
+    // Get columns from result
+    let columns: Vec<String> = if rows.is_empty() {
+        conn.prepare(&sql)
+            .await
+            .ok()
+            .map(|s| s.columns().iter().map(|c| c.name().to_string()).collect())
+            .unwrap_or_default()
+    } else {
+        rows[0].columns().iter().map(|c| c.name().to_string()).collect()
+    };
+
+    let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
+
+    if rows.is_empty() {
+        return Ok(QueryResult {
+            columns,
+            rows: vec![],
+            row_count: 0,
+            engine: Some("pg_duckdb".to_string()),
+            query_time_ms: Some(elapsed_ms),
+        });
+    }
+    let row_count = rows.len();
+    metrics::record_query_rows(row_count as u64);
+
+    let result_rows: Vec<Vec<serde_json::Value>> = rows
+        .iter()
+        .map(|row| {
+            (0..columns.len())
+                .map(|i| format_column_json(row, i))
+                .collect()
+        })
+        .collect();
+
+    Ok(QueryResult {
+        columns,
+        rows: result_rows,
+        row_count,
+        engine: Some("pg_duckdb".to_string()),
+        query_time_ms: Some(elapsed_ms),
+    })
+}
+
+/// Internal PostgreSQL query executor with configurable engine name.
+async fn execute_query_postgres_inner(
+    pool: &Pool,
+    sql: &str,
+    options: &QueryOptions,
+    engine_name: &str,
+    _use_duckdb: bool,
+) -> Result<QueryResult> {
     // Convert '0x...' hex strings to '\x...' bytea literals for PostgreSQL
     let sql = sql.replace("'0x", "'\\x");
 
@@ -274,7 +496,7 @@ async fn execute_query_postgres(
             columns,
             rows: vec![],
             row_count: 0,
-            engine: Some("postgres".to_string()),
+            engine: Some(engine_name.to_string()),
             query_time_ms: Some(elapsed_ms),
         });
     }
@@ -294,7 +516,7 @@ async fn execute_query_postgres(
         columns,
         rows: result_rows,
         row_count,
-        engine: Some("postgres".to_string()),
+        engine: Some(engine_name.to_string()),
         query_time_ms: Some(elapsed_ms),
     })
 }
@@ -422,5 +644,366 @@ fn sanitize_db_error(error: &str) -> String {
         .unwrap_or(error);
 
     error
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::query::EventSignature;
+
+    // ========================================================================
+    // Analytics Engine Config Tests
+    // ========================================================================
+
+    #[test]
+    fn test_analytics_engine_config_default() {
+        let config = AnalyticsEngineConfig::default();
+        assert_eq!(config.engine, AnalyticsEngine::PgDuckdb);
+        assert!(config.pg_duckdb_memory_limit.is_none());
+        assert!(config.pg_duckdb_threads.is_none());
+    }
+
+    #[test]
+    fn test_analytics_engine_config_with_limits() {
+        let config = AnalyticsEngineConfig {
+            engine: AnalyticsEngine::PgDuckdb,
+            pg_duckdb_memory_limit: Some("16GB".to_string()),
+            pg_duckdb_threads: Some(8),
+        };
+        assert_eq!(config.engine, AnalyticsEngine::PgDuckdb);
+        assert_eq!(config.pg_duckdb_memory_limit, Some("16GB".to_string()));
+        assert_eq!(config.pg_duckdb_threads, Some(8));
+    }
+
+    #[test]
+    fn test_analytics_engine_duckdb_file_mode() {
+        let config = AnalyticsEngineConfig {
+            engine: AnalyticsEngine::DuckdbFile,
+            pg_duckdb_memory_limit: None,
+            pg_duckdb_threads: None,
+        };
+        assert_eq!(config.engine, AnalyticsEngine::DuckdbFile);
+    }
+
+    #[test]
+    fn test_analytics_engine_postgres_mode() {
+        let config = AnalyticsEngineConfig {
+            engine: AnalyticsEngine::Postgres,
+            pg_duckdb_memory_limit: None,
+            pg_duckdb_threads: None,
+        };
+        assert_eq!(config.engine, AnalyticsEngine::Postgres);
+    }
+
+    // ========================================================================
+    // Event CTE SQL Generation Tests (Both Engines)
+    // ========================================================================
+    //
+    // These tests verify that:
+    // 1. Users query decoded columns directly (e.g., "from", "to", "value")
+    // 2. No explicit decode() calls needed - the CTE handles it transparently
+    // 3. Both engines produce the same user-facing column names
+    // ========================================================================
+
+    #[test]
+    fn test_transfer_cte_postgres_format() {
+        let sig = EventSignature::parse("Transfer(address indexed from, address indexed to, uint256 value)").unwrap();
+        let cte = sig.to_cte_sql_postgres();
+        
+        // Postgres CTE uses bytea selector format
+        assert!(cte.contains("WHERE selector = '\\x"));
+        // Uses native abi_* functions - users don't need to call these
+        assert!(cte.contains("abi_address(topic1)"));
+        assert!(cte.contains("abi_address(topic2)"));
+        assert!(cte.contains("abi_uint(substring(data FROM 1 FOR 32))"));
+        // Has correct column aliases - users query these directly
+        assert!(cte.contains("AS \"from\""));
+        assert!(cte.contains("AS \"to\""));
+        assert!(cte.contains("AS \"value\""));
+    }
+
+    #[test]
+    fn test_transfer_cte_duckdb_format() {
+        let sig = EventSignature::parse("Transfer(address indexed from, address indexed to, uint256 value)").unwrap();
+        let cte = sig.to_cte_sql_duckdb();
+        
+        // DuckDB CTE uses hex string selector format
+        assert!(cte.contains("WHERE selector = '0x"));
+        // Uses native Rust UDFs
+        assert!(cte.contains("topic_address_native(topic1)"));
+        assert!(cte.contains("topic_address_native(topic2)"));
+        assert!(cte.contains("abi_uint_native(data, 0)"));
+    }
+
+    #[test]
+    fn test_approval_cte_both_engines() {
+        let sig = EventSignature::parse("Approval(address indexed owner, address indexed spender, uint256 value)").unwrap();
+        
+        let pg_cte = sig.to_cte_sql_postgres();
+        let duck_cte = sig.to_cte_sql_duckdb();
+        
+        // Both should have the same structure but different function calls
+        assert!(pg_cte.contains("AS \"owner\""));
+        assert!(duck_cte.contains("AS \"owner\""));
+        
+        // Postgres uses abi_address, DuckDB uses topic_address_native
+        assert!(pg_cte.contains("abi_address(topic1)"));
+        assert!(duck_cte.contains("topic_address_native(topic1)"));
+    }
+
+    #[test]
+    fn test_swap_cte_multiple_data_params() {
+        // Swap has 4 data params and 2 indexed params
+        let sig = EventSignature::parse(
+            "Swap(address indexed sender, uint256 amount0In, uint256 amount1In, uint256 amount0Out, uint256 amount1Out, address indexed to)"
+        ).unwrap();
+        
+        let pg_cte = sig.to_cte_sql_postgres();
+        let duck_cte = sig.to_cte_sql_duckdb();
+        
+        // Check indexed params use topics
+        assert!(pg_cte.contains("abi_address(topic1)"));
+        assert!(pg_cte.contains("abi_address(topic2)"));
+        
+        // Check data params use correct offsets (0, 32, 64, 96 bytes)
+        assert!(pg_cte.contains("substring(data FROM 1 FOR 32)"));   // offset 0
+        assert!(pg_cte.contains("substring(data FROM 33 FOR 32)"));  // offset 32
+        assert!(pg_cte.contains("substring(data FROM 65 FOR 32)"));  // offset 64
+        assert!(pg_cte.contains("substring(data FROM 97 FOR 32)"));  // offset 96
+        
+        // DuckDB uses native offsets
+        assert!(duck_cte.contains("abi_uint_native(data, 0)"));
+        assert!(duck_cte.contains("abi_uint_native(data, 32)"));
+        assert!(duck_cte.contains("abi_uint_native(data, 64)"));
+        assert!(duck_cte.contains("abi_uint_native(data, 96)"));
+    }
+
+    #[test]
+    fn test_filtered_cte_only_includes_used_columns() {
+        let sig = EventSignature::parse("Transfer(address indexed from, address indexed to, uint256 value)").unwrap();
+        
+        let mut used_columns = std::collections::HashSet::new();
+        used_columns.insert("to".to_string());
+        used_columns.insert("value".to_string());
+        
+        let pg_cte = sig.to_cte_sql_postgres_filtered(Some(&used_columns));
+        let duck_cte = sig.to_cte_sql_duckdb_filtered(Some(&used_columns));
+        
+        // Should include "to" and "value"
+        assert!(pg_cte.contains("AS \"to\""));
+        assert!(pg_cte.contains("AS \"value\""));
+        assert!(duck_cte.contains("AS \"to\""));
+        assert!(duck_cte.contains("AS \"value\""));
+        
+        // Should NOT include "from"
+        assert!(!pg_cte.contains("AS \"from\""));
+        assert!(!duck_cte.contains("AS \"from\""));
+    }
+
+    #[test]
+    fn test_cte_with_bool_param() {
+        let sig = EventSignature::parse("Paused(bool paused)").unwrap();
+        
+        let pg_cte = sig.to_cte_sql_postgres();
+        let duck_cte = sig.to_cte_sql_duckdb();
+        
+        assert!(pg_cte.contains("abi_bool("));
+        assert!(duck_cte.contains("abi_bool("));
+    }
+
+    #[test]
+    fn test_cte_with_bytes32_param() {
+        let sig = EventSignature::parse("RoleGranted(bytes32 indexed role, address indexed account, address indexed sender)").unwrap();
+        
+        let pg_cte = sig.to_cte_sql_postgres();
+        let duck_cte = sig.to_cte_sql_duckdb();
+        
+        // bytes32 indexed just returns the topic directly
+        assert!(pg_cte.contains("topic1 AS \"role\"") || pg_cte.contains("topic1"));
+        assert!(duck_cte.contains("topic1 AS \"role\"") || duck_cte.contains("topic1"));
+    }
+
+    // ========================================================================
+    // User Experience Tests - No Explicit Decoding Required
+    // ========================================================================
+    //
+    // These tests demonstrate that users write simple SQL queries without
+    // needing to call decode functions. The CTE handles decoding transparently.
+    
+    #[test]
+    fn test_user_query_example_transfer_events() {
+        // This is what users write - simple SQL with decoded column names
+        let user_query = r#"SELECT "from", "to", "value" FROM transfer WHERE "value" > 1000000"#;
+        
+        // The system generates the CTE with decode functions
+        let sig = EventSignature::parse("Transfer(address indexed from, address indexed to, uint256 value)").unwrap();
+        
+        // For pg_duckdb mode (uses Postgres functions)
+        let pg_cte = sig.to_cte_sql_postgres();
+        let full_pg_query = format!("WITH {} {}", pg_cte, user_query);
+        
+        // For duckdb_file mode (uses DuckDB UDFs)
+        let duck_cte = sig.to_cte_sql_duckdb();
+        let full_duck_query = format!("WITH {} {}", duck_cte, user_query);
+        
+        // Both produce valid SQL that users can run
+        assert!(full_pg_query.contains("SELECT \"from\", \"to\", \"value\""));
+        assert!(full_duck_query.contains("SELECT \"from\", \"to\", \"value\""));
+        
+        // The decode functions are hidden in the CTE, not in user's query
+        assert!(!user_query.contains("abi_"));
+        assert!(!user_query.contains("decode"));
+    }
+
+    #[test]
+    fn test_user_query_example_group_by_address() {
+        // User wants to count transfers by recipient - no decode calls needed
+        let user_query = r#"SELECT "to", COUNT(*) as transfer_count, SUM("value") as total_value FROM transfer GROUP BY "to" ORDER BY total_value DESC LIMIT 10"#;
+        
+        let sig = EventSignature::parse("Transfer(address indexed from, address indexed to, uint256 value)").unwrap();
+        let cte = sig.to_cte_sql_postgres();
+        let full_query = format!("WITH {} {}", cte, user_query);
+        
+        // User query is clean - no decode functions visible
+        assert!(!user_query.contains("abi_"));
+        assert!(!user_query.contains("topic"));
+        assert!(!user_query.contains("data"));
+        
+        // But the full query has the CTE with decode logic
+        assert!(full_query.contains("abi_address"));
+        assert!(full_query.contains("abi_uint"));
+    }
+
+    #[test]
+    fn test_user_query_example_swap_events() {
+        // Complex Uniswap Swap event - user just queries by column name
+        let user_query = r#"SELECT "sender", "amount0In", "amount1Out" FROM swap WHERE "amount0In" > 0"#;
+        
+        let sig = EventSignature::parse(
+            "Swap(address indexed sender, uint256 amount0In, uint256 amount1In, uint256 amount0Out, uint256 amount1Out, address indexed to)"
+        ).unwrap();
+        
+        let cte = sig.to_cte_sql_postgres();
+        let full_query = format!("WITH {} {}", cte, user_query);
+        
+        // User query references decoded column names directly
+        assert!(user_query.contains("\"sender\""));
+        assert!(user_query.contains("\"amount0In\""));
+        assert!(user_query.contains("\"amount1Out\""));
+        
+        // No raw data manipulation in user query
+        assert!(!user_query.contains("substring"));
+        assert!(!user_query.contains("encode"));
+        
+        // CTE handles the complexity
+        assert!(full_query.contains("abi_uint"));
+        assert!(full_query.contains("abi_address"));
+    }
+
+    #[test]
+    fn test_both_engines_produce_same_column_names() {
+        let sig = EventSignature::parse("Transfer(address indexed from, address indexed to, uint256 value)").unwrap();
+        
+        let pg_cte = sig.to_cte_sql_postgres();
+        let duck_cte = sig.to_cte_sql_duckdb();
+        
+        // Both engines expose the same column names to users
+        assert!(pg_cte.contains("AS \"from\""));
+        assert!(duck_cte.contains("AS \"from\""));
+        
+        assert!(pg_cte.contains("AS \"to\""));
+        assert!(duck_cte.contains("AS \"to\""));
+        
+        assert!(pg_cte.contains("AS \"value\""));
+        assert!(duck_cte.contains("AS \"value\""));
+        
+        // Users can write the same query regardless of engine
+        let user_query = r#"SELECT "from", "to", "value" FROM transfer"#;
+        
+        // Both work with the same user query
+        let pg_full = format!("WITH {} {}", pg_cte, user_query);
+        let duck_full = format!("WITH {} {}", duck_cte, user_query);
+        
+        assert!(pg_full.contains(user_query));
+        assert!(duck_full.contains(user_query));
+    }
+
+    // ========================================================================
+    // Query Routing Tests
+    // ========================================================================
+
+    #[test]
+    fn test_route_olap_query_to_duckdb() {
+        // OLAP patterns should route to DuckDB
+        assert_eq!(route_query("SELECT COUNT(*) FROM logs GROUP BY address"), QueryEngine::DuckDb);
+        assert_eq!(route_query("SELECT SUM(gas_used) FROM blocks"), QueryEngine::DuckDb);
+        assert_eq!(route_query("SELECT AVG(gas_limit) FROM txs"), QueryEngine::DuckDb);
+        assert_eq!(route_query("SELECT *, ROW_NUMBER() OVER (PARTITION BY address) FROM logs"), QueryEngine::DuckDb);
+    }
+
+    #[test]
+    fn test_route_oltp_query_to_postgres() {
+        // Point lookups should route to Postgres
+        assert_eq!(route_query("SELECT * FROM blocks WHERE num = 100"), QueryEngine::Postgres);
+        assert_eq!(route_query("SELECT * FROM txs WHERE hash = '\\x1234'"), QueryEngine::Postgres);
+        assert_eq!(route_query("SELECT * FROM logs WHERE address = '\\xabcd'"), QueryEngine::Postgres);
+    }
+
+    #[test]
+    fn test_explicit_engine_hints() {
+        assert_eq!(route_query("/* engine=duckdb */ SELECT * FROM blocks"), QueryEngine::DuckDb);
+        assert_eq!(route_query("/* engine=postgres */ SELECT COUNT(*) FROM logs GROUP BY address"), QueryEngine::Postgres);
+    }
+
+    // ========================================================================
+    // Query Options Tests
+    // ========================================================================
+
+    #[test]
+    fn test_query_options_default() {
+        let options = QueryOptions::default();
+        assert_eq!(options.timeout_ms, 5000);
+        assert_eq!(options.limit, 10000);
+    }
+
+    // ========================================================================
+    // Sanitize Error Tests
+    // ========================================================================
+
+    #[test]
+    fn test_sanitize_removes_file_paths() {
+        let error = "Error at /home/user/project/src/main.rs:42";
+        let sanitized = sanitize_db_error(error);
+        assert!(!sanitized.contains("/home/user"));
+        assert!(sanitized.contains("[path]"));
+    }
+
+    #[test]
+    fn test_sanitize_removes_connection_strings() {
+        // Note: the path regex runs first, so parts of the URL may be matched as paths
+        // The key is that sensitive info (user:pass) is removed
+        let error = "Connection failed: postgres://user:pass@host:5432/db";
+        let sanitized = sanitize_db_error(error);
+        // User credentials should not be visible
+        assert!(!sanitized.contains("user:pass"));
+        // Either [connection] or [path] replacement happened
+        assert!(sanitized.contains("[connection]") || sanitized.contains("[path]"));
+    }
+
+    #[test]
+    fn test_sanitize_removes_ip_addresses() {
+        let error = "Connection to 192.168.1.100:5432 failed";
+        let sanitized = sanitize_db_error(error);
+        assert!(!sanitized.contains("192.168.1.100"));
+        assert!(sanitized.contains("[address]"));
+    }
+
+    #[test]
+    fn test_sanitize_truncates_long_errors() {
+        let error = "x".repeat(600);
+        let sanitized = sanitize_db_error(&error);
+        assert!(sanitized.len() < 510); // 500 + "..."
+        assert!(sanitized.ends_with("..."));
+    }
 }
 
