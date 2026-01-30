@@ -200,6 +200,7 @@ async fn initialize_chain(
             throttled_pool.pool.clone(),
             10_000,
             chain.chain_id,
+            chain.duckdb_batch_sizes.clone(),
         );
         tokio::spawn(replicator.run());
 
