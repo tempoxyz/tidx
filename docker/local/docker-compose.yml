@@ -14,6 +14,8 @@ services:
     command:
       - postgres
       - -c
+      - shared_preload_libraries=pg_parquet
+      - -c
       - max_wal_size=4GB
       - -c
       - checkpoint_timeout=30min
