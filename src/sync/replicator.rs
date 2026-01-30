@@ -148,8 +148,8 @@ impl Replicator {
             }));
         }
 
-        // 4 workers for logs (the bottleneck) - each handles different block ranges
-        for worker_id in 0..4u8 {
+        // 2 workers for logs - reduced from 4 to limit PostgreSQL temp file usage
+        for worker_id in 0..2u8 {
             let duckdb = duckdb.clone();
             let pg_pool = pg_pool.clone();
             let batch_sizes = batch_sizes.clone();

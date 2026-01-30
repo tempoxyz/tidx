@@ -200,18 +200,18 @@ pub struct DuckDbBatchSizes {
 impl Default for DuckDbBatchSizes {
     fn default() -> Self {
         Self {
-            blocks: 50_000,
-            txs: 50_000,
-            logs: 20_000,
-            receipts: 50_000,
+            blocks: 10_000,
+            txs: 10_000,
+            logs: 5_000,
+            receipts: 10_000,
         }
     }
 }
 
-fn default_blocks_batch() -> i64 { 50_000 }
-fn default_txs_batch() -> i64 { 50_000 }
-fn default_logs_batch() -> i64 { 20_000 }
-fn default_receipts_batch() -> i64 { 50_000 }
+fn default_blocks_batch() -> i64 { 10_000 }
+fn default_txs_batch() -> i64 { 10_000 }
+fn default_logs_batch() -> i64 { 5_000 }
+fn default_receipts_batch() -> i64 { 10_000 }
 
 fn default_backfill() -> bool {
     true
