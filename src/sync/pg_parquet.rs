@@ -168,15 +168,17 @@ pub async fn copy_table_via_pg_parquet(
             r#"COPY (
                 SELECT 
                     block_num,
+                    to_char(block_timestamp, 'YYYY-MM-DD"T"HH24:MI:SS"Z"') as block_timestamp,
                     tx_idx,
                     '0x' || encode(tx_hash, 'hex') as tx_hash,
-                    success,
+                    '0x' || encode("from", 'hex') as "from",
+                    CASE WHEN "to" IS NOT NULL THEN '0x' || encode("to", 'hex') ELSE NULL END as "to",
+                    CASE WHEN contract_address IS NOT NULL THEN '0x' || encode(contract_address, 'hex') ELSE NULL END as contract_address,
                     gas_used,
+                    cumulative_gas_used,
                     effective_gas_price,
-                    l1_fee,
-                    l1_gas_price,
-                    l1_gas_used,
-                    l1_fee_scalar
+                    status,
+                    CASE WHEN fee_payer IS NOT NULL THEN '0x' || encode(fee_payer, 'hex') ELSE NULL END as fee_payer
                 FROM receipts 
                 WHERE block_num >= {} AND block_num <= {} 
                 ORDER BY block_num, tx_idx
