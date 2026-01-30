@@ -34,7 +34,8 @@ pub struct Replicator {
     chain_id: u64,
     /// Flag set when channel receives data, signals to poll immediately
     needs_sync: Arc<AtomicBool>,
-
+    /// Configurable batch sizes for gap-fill
+    batch_sizes: crate::config::DuckDbBatchSizes,
 }
 
 /// Handle for sending hints to the replicator.
@@ -97,6 +98,7 @@ impl Replicator {
         pg_pool: Pool,
         buffer_size: usize,
         chain_id: u64,
+        batch_sizes: Option<crate::config::DuckDbBatchSizes>,
     ) -> (Self, ReplicatorHandle) {
         let (tx, rx) = mpsc::channel(buffer_size);
         let needs_sync = Arc::new(AtomicBool::new(false));
@@ -107,6 +109,7 @@ impl Replicator {
                 rx,
                 chain_id,
                 needs_sync: needs_sync.clone(),
+                batch_sizes: batch_sizes.unwrap_or_default(),
             },
             ReplicatorHandle { tx, needs_sync, duckdb },
         )
@@ -128,6 +131,7 @@ impl Replicator {
         let duckdb = self.duckdb.clone();
         let pg_pool = self.pg_pool.clone();
         let chain_id = self.chain_id;
+        let batch_sizes = Arc::new(self.batch_sizes.clone());
 
         // Spawn independent gap-fill tasks per table
         // Logs get extra workers since they're the bottleneck
@@ -138,8 +142,9 @@ impl Replicator {
         for table in [TableKind::Blocks, TableKind::Txs, TableKind::Receipts] {
             let duckdb = duckdb.clone();
             let pg_pool = pg_pool.clone();
+            let batch_sizes = batch_sizes.clone();
             gap_fill_handles.push(tokio::spawn(async move {
-                Self::run_table_gap_fill_task(duckdb, pg_pool, chain_id, table, 0).await
+                Self::run_table_gap_fill_task(duckdb, pg_pool, chain_id, table, 0, batch_sizes).await
             }));
         }
 
@@ -147,8 +152,9 @@ impl Replicator {
         for worker_id in 0..4u8 {
             let duckdb = duckdb.clone();
             let pg_pool = pg_pool.clone();
+            let batch_sizes = batch_sizes.clone();
             gap_fill_handles.push(tokio::spawn(async move {
-                Self::run_table_gap_fill_task(duckdb, pg_pool, chain_id, TableKind::Logs, worker_id).await
+                Self::run_table_gap_fill_task(duckdb, pg_pool, chain_id, TableKind::Logs, worker_id, batch_sizes).await
             }));
         }
 
@@ -256,6 +262,7 @@ impl Replicator {
         chain_id: u64,
         table: super::pg_parquet::TableKind,
         worker_id: u8,
+        batch_sizes: Arc<crate::config::DuckDbBatchSizes>,
     ) -> Result<()> {
         use super::pg_parquet::TableKind;
         use super::pg_parquet::copy_table_via_pg_parquet;
@@ -272,7 +279,7 @@ impl Replicator {
         let worker_suffix = if worker_id > 0 { format!("/{}", worker_id) } else { String::new() };
         tracing::info!(chain_id, table = format!("{}{}", table.name(), worker_suffix), "Per-table gap-fill started");
 
-        let batch_size = table.batch_size();
+        let batch_size = table.batch_size(Some(&batch_sizes));
         let mut last_log = Instant::now();
         let mut total_rows: i64 = 0;
 
@@ -1380,7 +1387,7 @@ mod tests {
     async fn test_non_blocking_send_sets_needs_sync_flag() {
         let duckdb = Arc::new(DuckDbPool::in_memory().unwrap());
         let pg_pool = create_test_pg_pool();
-        let (replicator, handle) = Replicator::new(duckdb.clone(), pg_pool, 2, 1);
+        let (replicator, handle) = Replicator::new(duckdb.clone(), pg_pool, 2, 1, None);
 
         // Initially needs_sync should be false
         assert!(!replicator.needs_sync.load(Ordering::Relaxed));
@@ -1408,7 +1415,7 @@ mod tests {
         let duckdb = Arc::new(DuckDbPool::in_memory().unwrap());
         let pg_pool = create_test_pg_pool();
         // Create a tiny buffer of 2
-        let (replicator, handle) = Replicator::new(duckdb.clone(), pg_pool, 2, 1);
+        let (replicator, handle) = Replicator::new(duckdb.clone(), pg_pool, 2, 1, None);
 
         // Don't start the replicator - channel will fill up
         let _replicator = replicator;

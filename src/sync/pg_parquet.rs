@@ -47,14 +47,27 @@ impl TableKind {
         }
     }
 
-    /// Recommended batch size (block range) for gap-fill.
-    /// Aggressive sizing for servers with 64GB+ RAM.
-    pub fn batch_size(&self) -> i64 {
+    /// Default batch size (block range) for gap-fill.
+    /// Can be overridden via config.
+    pub fn default_batch_size(&self) -> i64 {
         match self {
-            TableKind::Blocks => 50_000,   // Very lightweight
-            TableKind::Txs => 50_000,      // ~25M rows/batch
-            TableKind::Logs => 20_000,     // ~10M rows/batch (heaviest)
-            TableKind::Receipts => 50_000, // ~25M rows/batch
+            TableKind::Blocks => 50_000,
+            TableKind::Txs => 50_000,
+            TableKind::Logs => 20_000,
+            TableKind::Receipts => 50_000,
+        }
+    }
+
+    /// Get batch size from config or use default.
+    pub fn batch_size(&self, config: Option<&crate::config::DuckDbBatchSizes>) -> i64 {
+        match config {
+            Some(c) => match self {
+                TableKind::Blocks => c.blocks,
+                TableKind::Txs => c.txs,
+                TableKind::Logs => c.logs,
+                TableKind::Receipts => c.receipts,
+            },
+            None => self.default_batch_size(),
         }
     }
 }

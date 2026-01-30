@@ -173,7 +173,45 @@ pub struct ChainConfig {
     /// Use for chains with frequent shallow reorgs where RPC is authoritative.
     #[serde(default)]
     pub trust_rpc: bool,
+
+    /// DuckDB gap-fill batch sizes (blocks per batch, optional)
+    #[serde(default)]
+    pub duckdb_batch_sizes: Option<DuckDbBatchSizes>,
 }
+
+/// DuckDB gap-fill batch sizes per table type.
+/// Larger batches = faster backfill but more memory.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DuckDbBatchSizes {
+    /// Blocks table batch size (default: 50000)
+    #[serde(default = "default_blocks_batch")]
+    pub blocks: i64,
+    /// Transactions table batch size (default: 50000)
+    #[serde(default = "default_txs_batch")]
+    pub txs: i64,
+    /// Logs table batch size (default: 20000)
+    #[serde(default = "default_logs_batch")]
+    pub logs: i64,
+    /// Receipts table batch size (default: 50000)
+    #[serde(default = "default_receipts_batch")]
+    pub receipts: i64,
+}
+
+impl Default for DuckDbBatchSizes {
+    fn default() -> Self {
+        Self {
+            blocks: 50_000,
+            txs: 50_000,
+            logs: 20_000,
+            receipts: 50_000,
+        }
+    }
+}
+
+fn default_blocks_batch() -> i64 { 50_000 }
+fn default_txs_batch() -> i64 { 50_000 }
+fn default_logs_batch() -> i64 { 20_000 }
+fn default_receipts_batch() -> i64 { 50_000 }
 
 fn default_backfill() -> bool {
     true
