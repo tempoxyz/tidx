@@ -48,13 +48,14 @@ impl TableKind {
     }
 
     /// Default batch size (block range) for gap-fill.
-    /// Can be overridden via config.
+    /// Conservative defaults to limit PostgreSQL temp file usage.
+    /// Can be overridden via config for servers with more disk space.
     pub fn default_batch_size(&self) -> i64 {
         match self {
-            TableKind::Blocks => 50_000,
-            TableKind::Txs => 50_000,
-            TableKind::Logs => 20_000,
-            TableKind::Receipts => 50_000,
+            TableKind::Blocks => 10_000,
+            TableKind::Txs => 10_000,
+            TableKind::Logs => 5_000,
+            TableKind::Receipts => 10_000,
         }
     }
 
@@ -258,10 +259,10 @@ pub async fn copy_table_via_pg_parquet(
                 [],
             )?;
 
-            // Insert from Parquet
+            // Insert from Parquet (OR REPLACE to handle race with tail sync)
             conn.execute(
                 &format!(
-                    "INSERT INTO {} SELECT * FROM read_parquet('{}')",
+                    "INSERT OR REPLACE INTO {} SELECT * FROM read_parquet('{}')",
                     table_name,
                     parquet_path_str.replace('\'', "''")
                 ),
