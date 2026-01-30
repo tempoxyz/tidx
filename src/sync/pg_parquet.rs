@@ -258,10 +258,10 @@ pub async fn copy_table_via_pg_parquet(
                 [],
             )?;
 
-            // Insert from Parquet
+            // Insert from Parquet (OR REPLACE to handle race with tail sync)
             conn.execute(
                 &format!(
-                    "INSERT INTO {} SELECT * FROM read_parquet('{}')",
+                    "INSERT OR REPLACE INTO {} SELECT * FROM read_parquet('{}')",
                     table_name,
                     parquet_path_str.replace('\'', "''")
                 ),
