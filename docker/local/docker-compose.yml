@@ -1,9 +1,6 @@
 services:
   postgres:
-    build:
-      context: ../postgres
-      args:
-        PG_MAJOR: "16"
+    image: ghcr.io/tempoxyz/postgres-parquet:16
     environment:
       POSTGRES_USER: tidx
       POSTGRES_PASSWORD: tidx
