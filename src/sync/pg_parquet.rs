@@ -20,6 +20,45 @@ use futures::StreamExt;
 
 use crate::db::{DuckDbPool, Pool};
 
+/// Table kind for per-table gap-fill operations.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TableKind {
+    Blocks,
+    Txs,
+    Logs,
+    Receipts,
+}
+
+impl TableKind {
+    pub fn name(&self) -> &'static str {
+        match self {
+            TableKind::Blocks => "blocks",
+            TableKind::Txs => "txs",
+            TableKind::Logs => "logs",
+            TableKind::Receipts => "receipts",
+        }
+    }
+
+    /// Block column name for DELETE/range queries
+    pub fn block_column(&self) -> &'static str {
+        match self {
+            TableKind::Blocks => "num",
+            _ => "block_num",
+        }
+    }
+
+    /// Recommended batch size (block range) for gap-fill.
+    /// Tuned per table: logs are heavy, blocks are light.
+    pub fn batch_size(&self) -> i64 {
+        match self {
+            TableKind::Blocks => 10_000,   // Very lightweight
+            TableKind::Txs => 2_000,       // Medium weight
+            TableKind::Logs => 2_000,      // Heavy but batched for throughput
+            TableKind::Receipts => 2_000,  // Medium weight
+        }
+    }
+}
+
 /// Temporary directory for Parquet files
 fn temp_dir() -> PathBuf {
     std::env::temp_dir().join("tidx_parquet")
@@ -42,11 +81,10 @@ fn ensure_temp_dir() -> Result<PathBuf> {
 pub async fn copy_table_via_pg_parquet(
     pg_pool: &Pool,
     duckdb: &Arc<DuckDbPool>,
-    table: super::parquet::TableKind,
+    table: TableKind,
     start: i64,
     end: i64,
 ) -> Result<i64> {
-    use super::parquet::TableKind;
     
     let temp_dir = ensure_temp_dir()?;
     let batch_id = format!("{}_{}_{}_{}", table.name(), start, end, std::process::id());
@@ -233,8 +271,6 @@ pub async fn copy_range_via_pg_parquet(
     start: i64,
     end: i64,
 ) -> Result<i64> {
-    use super::parquet::TableKind;
-
     // Run all 4 tables in parallel
     let (blocks, txs, logs, receipts) = tokio::try_join!(
         copy_table_via_pg_parquet(pg_pool, duckdb, TableKind::Blocks, start, end),

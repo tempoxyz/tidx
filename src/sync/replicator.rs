@@ -131,7 +131,7 @@ impl Replicator {
 
         // Spawn independent gap-fill tasks per table
         // Logs get extra workers since they're the bottleneck
-        use super::parquet::TableKind;
+        use super::pg_parquet::TableKind;
         let mut gap_fill_handles = Vec::with_capacity(7);
 
         // 1 worker each for blocks, txs, receipts
@@ -254,10 +254,10 @@ impl Replicator {
         duckdb: Arc<DuckDbPool>,
         pg_pool: Pool,
         chain_id: u64,
-        table: super::parquet::TableKind,
+        table: super::pg_parquet::TableKind,
         worker_id: u8,
     ) -> Result<()> {
-        use super::parquet::TableKind;
+        use super::pg_parquet::TableKind;
         use super::pg_parquet::copy_table_via_pg_parquet;
 
         // Stagger startup to avoid thundering herd on DuckDB
@@ -437,7 +437,7 @@ impl Replicator {
     /// Get the min and max block numbers for a table in DuckDB.
     async fn get_table_block_range(
         duckdb: &Arc<DuckDbPool>,
-        table: super::parquet::TableKind,
+        table: super::pg_parquet::TableKind,
     ) -> Option<(i64, i64)> {
         let table_name = table.name().to_string();
         let block_col = table.block_column().to_string();
