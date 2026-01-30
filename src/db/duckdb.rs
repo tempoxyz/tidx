@@ -97,11 +97,10 @@ impl DuckDbPool {
                 };
 
                 // Performance tuning for larger-than-memory workloads
-                // - memory_limit: Buffer manager limit (12GB per instance)
+                // - memory_limit: 80% of available RAM, allows spilling to disk
                 // - temp_directory: Enable spilling to disk for blocking operators
                 // - threads: Limit parallelism to reduce peak memory
                 // - preserve_insertion_order: false allows reordering to reduce memory
-                // - max_temp_directory_size: Limit temp disk usage
                 let temp_dir = if path_for_thread == ":memory:" {
                     ".tmp".to_string()
                 } else {
@@ -109,9 +108,9 @@ impl DuckDbPool {
                 };
                 let config_sql = format!(
                     r#"
-                    SET memory_limit = '10GB';
+                    SET memory_limit = '50GB';
                     SET temp_directory = '{}';
-                    SET max_temp_directory_size = '50GB';
+                    SET max_temp_directory_size = '100GB';
                     SET threads = 4;
                     SET checkpoint_threshold = '100MB';
                     SET preserve_insertion_order = false;
