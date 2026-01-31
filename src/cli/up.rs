@@ -208,8 +208,31 @@ fn spawn_sync_engine(
 
     let backfill_first = chain.backfill_first;
     let trust_rpc = chain.trust_rpc;
+    let compress_config = chain.compress.clone();
+    let chain_id = chain.chain_id;
+    let pool_for_compress = throttled_pool.pool.clone();
+    let compress_shutdown = shutdown_rx.resubscribe();
 
     tokio::spawn(async move {
+        // Spawn Parquet compression task if enabled
+        if let Some(ref config) = compress_config {
+            if config.enabled {
+                let config = config.clone();
+                tokio::spawn(async move {
+                    if let Err(e) = tidx::sync::compress::run_compress_loop(
+                        pool_for_compress,
+                        chain_id,
+                        config,
+                        compress_shutdown,
+                    )
+                    .await
+                    {
+                        error!(error = %e, chain_id = chain_id, "Parquet compression loop failed");
+                    }
+                });
+            }
+        }
+
         // Create sync engine with throttled pool
         let mut engine = match SyncEngine::new(throttled_pool, &chain.rpc_url).await {
             Ok(e) => e
