@@ -27,10 +27,10 @@ RUN cargo build --release
 
 # Clone extension-ci-tools for metadata script
 ARG DUCKDB_VERSION
-RUN git clone --depth 1 --branch ${DUCKDB_VERSION} https://github.com/duckdb/duckdb.git /duckdb
+RUN git clone --depth 1 --branch ${DUCKDB_VERSION} https://github.com/duckdb/extension-ci-tools.git /extension-ci-tools
 
 # Append DuckDB extension metadata (534-byte footer required for loading)
-RUN python3 /duckdb/scripts/append_extension_metadata.py \
+RUN python3 /extension-ci-tools/scripts/append_extension_metadata.py \
     --extension-name tidx_abi \
     --duckdb-platform linux_amd64_gcc4 \
     --extension-version "0.1.0" \
