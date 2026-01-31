@@ -573,3 +573,90 @@ pub async fn get_max_parquet_block(pool: &Pool, chain_id: u64) -> Result<Option<
         None => Ok(None),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_table_type_as_str() {
+        assert_eq!(TableType::Blocks.as_str(), "blocks");
+        assert_eq!(TableType::Txs.as_str(), "txs");
+        assert_eq!(TableType::Receipts.as_str(), "receipts");
+        assert_eq!(TableType::Logs.as_str(), "logs");
+    }
+
+    #[test]
+    fn test_table_type_all() {
+        let all = TableType::all();
+        assert_eq!(all.len(), 4);
+        assert!(all.contains(&TableType::Blocks));
+        assert!(all.contains(&TableType::Txs));
+        assert!(all.contains(&TableType::Receipts));
+        assert!(all.contains(&TableType::Logs));
+    }
+
+    #[test]
+    fn test_get_table_select_query_blocks() {
+        let query = get_table_select_query(TableType::Blocks, 100, 200);
+        assert!(query.contains("FROM pg.public.blocks"));
+        assert!(query.contains("num >= 100"));
+        assert!(query.contains("num <= 200"));
+        assert!(query.contains("ORDER BY num"));
+    }
+
+    #[test]
+    fn test_get_table_select_query_txs() {
+        let query = get_table_select_query(TableType::Txs, 100, 200);
+        assert!(query.contains("FROM pg.public.txs"));
+        assert!(query.contains("block_num >= 100"));
+        assert!(query.contains("block_num <= 200"));
+        assert!(query.contains("ORDER BY block_num, idx"));
+    }
+
+    #[test]
+    fn test_get_table_select_query_receipts() {
+        let query = get_table_select_query(TableType::Receipts, 100, 200);
+        assert!(query.contains("FROM pg.public.receipts"));
+        assert!(query.contains("block_num >= 100"));
+        assert!(query.contains("block_num <= 200"));
+        assert!(query.contains("ORDER BY block_num, tx_idx"));
+    }
+
+    #[test]
+    fn test_get_table_select_query_logs() {
+        let query = get_table_select_query(TableType::Logs, 100, 200);
+        assert!(query.contains("FROM pg.public.logs"));
+        assert!(query.contains("block_num >= 100"));
+        assert!(query.contains("block_num <= 200"));
+        assert!(query.contains("ORDER BY block_num, log_idx"));
+    }
+
+    #[test]
+    fn test_convert_pg_url_to_duckdb() {
+        let url = "postgres://user:pass@localhost:5432/mydb";
+        let result = convert_pg_url_to_duckdb(url);
+        assert!(result.contains("user=user"));
+        assert!(result.contains("password=pass"));
+        assert!(result.contains("host=localhost"));
+        assert!(result.contains("port=5432"));
+        assert!(result.contains("dbname=mydb"));
+    }
+
+    #[test]
+    fn test_convert_pg_url_to_duckdb_no_port() {
+        let url = "postgres://user:pass@localhost/mydb";
+        let result = convert_pg_url_to_duckdb(url);
+        assert!(result.contains("user=user"));
+        assert!(result.contains("host=localhost"));
+        assert!(result.contains("dbname=mydb"));
+    }
+
+    #[test]
+    fn test_convert_pg_url_postgresql_scheme() {
+        let url = "postgresql://user:pass@localhost:5432/mydb";
+        let result = convert_pg_url_to_duckdb(url);
+        assert!(result.contains("user=user"));
+        assert!(result.contains("host=localhost"));
+    }
+}
