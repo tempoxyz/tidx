@@ -54,8 +54,8 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
-  postgres-parquet:
-    name: Build PostgreSQL + pg_parquet
+  postgres-pgduckdb-tidx:
+    name: Build PostgreSQL + pg_duckdb + tidx_abi
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -78,21 +78,18 @@ jobs:
         id: meta
         uses: docker/metadata-action@v5
         with:
-          images: ghcr.io/${{ github.repository_owner }}/postgres-parquet
+          images: ghcr.io/${{ github.repository_owner }}/postgres-pgduckdb-tidx
           tags: |
-            type=raw,value=16,enable={{is_default_branch}}
             type=raw,value=latest,enable={{is_default_branch}}
-            type=sha,prefix=16-
+            type=sha,prefix=
 
       - name: Build and push
         uses: docker/build-push-action@v6
         with:
-          context: docker/postgres
+          context: docker/postgres-pgduckdb
           platforms: linux/amd64
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
-          cache-from: type=gha,scope=postgres-parquet
-          cache-to: type=gha,mode=max,scope=postgres-parquet
-          build-args: |
-            PG_MAJOR=16
+          cache-from: type=gha,scope=postgres-pgduckdb-tidx
+          cache-to: type=gha,mode=max,scope=postgres-pgduckdb-tidx
