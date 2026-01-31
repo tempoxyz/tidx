@@ -98,14 +98,6 @@ harness = false
 name = "sync_bench"
 harness = false
 
-[[bench]]
-name = "engine_bench"
-harness = false
-
-[[bench]]
-name = "scale_bench"
-harness = false
-
 [profile.bench]
 debug = true
 
