@@ -19,11 +19,21 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     python3-venv \
     && rm -rf /var/lib/apt/lists/*
 
-# Clone and build tidx_abi extension
+# Copy extension source
 WORKDIR /build
-RUN git clone --recurse-submodules https://github.com/tempoxyz/tidx-duckdb-ext.git . \
-    && make configure \
-    && make release
+COPY tidx-abi/src ./src
+COPY tidx-abi/Cargo.toml tidx-abi/Makefile ./
+
+# Initialize git for extension-ci-tools (requires git repo)
+RUN git config --global user.email "build@tidx" && \
+    git config --global user.name "build" && \
+    git init && git add -A && git commit -m "init"
+
+# Clone extension-ci-tools submodule
+RUN git clone --depth 1 https://github.com/duckdb/extension-ci-tools.git
+
+# Build the extension
+RUN make configure && make release
 
 # =============================================================================
 # Stage 2: Final image with pg_duckdb + tidx_abi
