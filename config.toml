@@ -18,13 +18,7 @@ backfill = true
 batch_size = 500
 concurrency = 8
 
-# Analytics engine for OLAP queries:
-# - "pg_duckdb" (default): Query PostgreSQL using DuckDB engine - no replication needed
-# - "duckdb_file": Replicate to DuckDB file via pg_parquet (legacy)
-# - "postgres": Use PostgreSQL only (no DuckDB acceleration)
-analytics_engine = "pg_duckdb"
-
-# pg_duckdb settings (only used when analytics_engine = "pg_duckdb")
+# pg_duckdb settings for OLAP queries
 pg_duckdb_memory_limit = "16GB"
 pg_duckdb_threads = 8
 
@@ -36,6 +30,5 @@ pg_url = "postgres://tidx:tidx@postgres:5432/tidx_mainnet"
 backfill = true
 batch_size = 500
 concurrency = 8
-analytics_engine = "pg_duckdb"
 pg_duckdb_memory_limit = "16GB"
 pg_duckdb_threads = 8
