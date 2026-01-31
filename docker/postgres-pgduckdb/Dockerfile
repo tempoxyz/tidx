@@ -2,6 +2,7 @@
 # This enables DuckDB's columnar analytical engine with native log decoding
 
 ARG PGDUCKDB_VERSION=16-v0.3.1
+ARG DUCKDB_VERSION=v1.2.0
 
 # =============================================================================
 # Stage 1: Build tidx_abi DuckDB extension
@@ -12,6 +13,8 @@ FROM rust:1.87 AS builder
 RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
     cmake \
+    python3 \
+    git \
     && rm -rf /var/lib/apt/lists/*
 
 # Copy extension source
@@ -22,6 +25,18 @@ COPY tidx-abi/Cargo.toml tidx-abi/Cargo.lock* ./
 # Build the extension
 RUN cargo build --release
 
+# Clone extension-ci-tools for metadata script
+ARG DUCKDB_VERSION
+RUN git clone --depth 1 --branch ${DUCKDB_VERSION} https://github.com/duckdb/duckdb.git /duckdb
+
+# Append DuckDB extension metadata (534-byte footer required for loading)
+RUN python3 /duckdb/scripts/append_extension_metadata.py \
+    --extension-name tidx_abi \
+    --duckdb-platform linux_amd64_gcc4 \
+    --extension-version "0.1.0" \
+    --duckdb-version "${DUCKDB_VERSION}" \
+    target/release/libtidx_abi.so
+
 # =============================================================================
 # Stage 2: Final image with pg_duckdb + tidx_abi
 # =============================================================================
@@ -30,7 +45,7 @@ FROM pgduckdb/pgduckdb:${PGDUCKDB_VERSION}
 # Create extensions directory
 RUN mkdir -p /usr/share/duckdb/extensions
 
-# Copy the built extension from builder stage (Linux .so)
+# Copy the built extension from builder stage (Linux .so with metadata)
 COPY --from=builder /build/target/release/libtidx_abi.so /usr/share/duckdb/extensions/tidx_abi.duckdb_extension
 
 # Create init script to load extension
