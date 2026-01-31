@@ -946,25 +946,68 @@ async fn tick_gapfill_parallel(
                 );
             }
             Err(e) => {
-                error!(
-                    from = start,
-                    to = end,
-                    error = %e,
-                    "Gap sync: batch failed, will retry"
-                );
-                // Re-queue the failed batch
-                let pool = pool.clone();
-                let rpc = rpc.clone();
-                let sem = backfill_semaphore.clone();
-                join_set.spawn(async move {
-                    tokio::time::sleep(Duration::from_millis(500)).await;
-                    let _permit = match sem.acquire().await {
-                        Ok(p) => p,
-                        Err(_) => return (start, end, Err(anyhow::anyhow!("Backfill semaphore closed"))),
-                    };
-                    let result = sync_range_standalone(&pool, &rpc, start, end).await;
-                    (start, end, result)
-                });
+                let error_str = e.to_string();
+                let is_batch_too_large = error_str.contains("too large") 
+                    || error_str.contains("response size exceeded");
+                
+                // If batch is too large and we can split it, do so
+                if is_batch_too_large && end > start {
+                    let mid = start + (end - start) / 2;
+                    info!(
+                        from = start,
+                        to = end,
+                        mid = mid,
+                        "Gap sync: batch too large, splitting"
+                    );
+                    
+                    // Queue first half
+                    let pool1 = pool.clone();
+                    let rpc1 = rpc.clone();
+                    let sem1 = backfill_semaphore.clone();
+                    join_set.spawn(async move {
+                        tokio::time::sleep(Duration::from_millis(100)).await;
+                        let _permit = match sem1.acquire().await {
+                            Ok(p) => p,
+                            Err(_) => return (start, mid, Err(anyhow::anyhow!("Backfill semaphore closed"))),
+                        };
+                        let result = sync_range_standalone(&pool1, &rpc1, start, mid).await;
+                        (start, mid, result)
+                    });
+                    
+                    // Queue second half
+                    let pool2 = pool.clone();
+                    let rpc2 = rpc.clone();
+                    let sem2 = backfill_semaphore.clone();
+                    join_set.spawn(async move {
+                        tokio::time::sleep(Duration::from_millis(100)).await;
+                        let _permit = match sem2.acquire().await {
+                            Ok(p) => p,
+                            Err(_) => return (mid + 1, end, Err(anyhow::anyhow!("Backfill semaphore closed"))),
+                        };
+                        let result = sync_range_standalone(&pool2, &rpc2, mid + 1, end).await;
+                        (mid + 1, end, result)
+                    });
+                } else {
+                    error!(
+                        from = start,
+                        to = end,
+                        error = %e,
+                        "Gap sync: batch failed, will retry"
+                    );
+                    // Re-queue the failed batch
+                    let pool = pool.clone();
+                    let rpc = rpc.clone();
+                    let sem = backfill_semaphore.clone();
+                    join_set.spawn(async move {
+                        tokio::time::sleep(Duration::from_millis(500)).await;
+                        let _permit = match sem.acquire().await {
+                            Ok(p) => p,
+                            Err(_) => return (start, end, Err(anyhow::anyhow!("Backfill semaphore closed"))),
+                        };
+                        let result = sync_range_standalone(&pool, &rpc, start, end).await;
+                        (start, end, result)
+                    });
+                }
                 continue;
             }
         }
@@ -1101,19 +1144,52 @@ async fn tick_gapfill_parallel_no_throttle(
                 );
             }
             Err(e) => {
-                error!(
-                    from = start,
-                    to = end,
-                    error = %e,
-                    "Backfill: batch failed, will retry"
-                );
-                let pool = pool.clone();
-                let rpc = rpc.clone();
-                join_set.spawn(async move {
-                    tokio::time::sleep(Duration::from_millis(500)).await;
-                    let result = sync_range_standalone(&pool, &rpc, start, end).await;
-                    (start, end, result)
-                });
+                let error_str = e.to_string();
+                let is_batch_too_large = error_str.contains("too large") 
+                    || error_str.contains("response size exceeded");
+                
+                // If batch is too large and we can split it, do so
+                if is_batch_too_large && end > start {
+                    let mid = start + (end - start) / 2;
+                    info!(
+                        from = start,
+                        to = end,
+                        mid = mid,
+                        "Backfill: batch too large, splitting"
+                    );
+                    
+                    // Queue first half
+                    let pool1 = pool.clone();
+                    let rpc1 = rpc.clone();
+                    join_set.spawn(async move {
+                        tokio::time::sleep(Duration::from_millis(100)).await;
+                        let result = sync_range_standalone(&pool1, &rpc1, start, mid).await;
+                        (start, mid, result)
+                    });
+                    
+                    // Queue second half
+                    let pool2 = pool.clone();
+                    let rpc2 = rpc.clone();
+                    join_set.spawn(async move {
+                        tokio::time::sleep(Duration::from_millis(100)).await;
+                        let result = sync_range_standalone(&pool2, &rpc2, mid + 1, end).await;
+                        (mid + 1, end, result)
+                    });
+                } else {
+                    error!(
+                        from = start,
+                        to = end,
+                        error = %e,
+                        "Backfill: batch failed, will retry"
+                    );
+                    let pool = pool.clone();
+                    let rpc = rpc.clone();
+                    join_set.spawn(async move {
+                        tokio::time::sleep(Duration::from_millis(500)).await;
+                        let result = sync_range_standalone(&pool, &rpc, start, end).await;
+                        (start, end, result)
+                    });
+                }
                 continue;
             }
         }
