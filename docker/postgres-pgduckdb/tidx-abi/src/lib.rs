@@ -15,11 +15,11 @@
 use alloy_primitives::{Address, FixedBytes, U256};
 use duckdb::{
     core::{DataChunkHandle, Inserter, LogicalTypeHandle, LogicalTypeId},
-    duckdb_entrypoint_c_api,
     vscalar::{ScalarFunctionSignature, VScalar},
     vtab::arrow::WritableVector,
     Connection, Result,
 };
+use duckdb_loadable_macros::duckdb_entrypoint_c_api;
 use libduckdb_sys::duckdb_string_t;
 use std::error::Error;
 
@@ -442,7 +442,7 @@ unsafe fn get_blob_data(ptr: &duckdb_string_t) -> &[u8] {
 // ============================================================================
 
 #[duckdb_entrypoint_c_api()]
-pub unsafe fn extension_entrypoint(con: Connection) -> Result<(), Box<dyn Error>> {
+fn tidx_abi_init(con: Connection) -> Result<(), Box<dyn Error>> {
     con.register_scalar_function::<AbiAddress>("abi_address")?;
     con.register_scalar_function::<AbiUint>("abi_uint")?;
     con.register_scalar_function::<AbiUint256>("abi_uint256")?;
