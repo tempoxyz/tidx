@@ -222,6 +222,19 @@ pub async fn execute_query_pg_duckdb(
             0
         });
 
+    // Set scan parallelism for reading from PostgreSQL tables
+    // These control how many PostgreSQL workers scan the table in parallel
+    conn.execute(&format!("SET duckdb.max_workers_per_postgres_scan = {}", thread_count), &[]).await
+        .unwrap_or_else(|e| {
+            tracing::debug!(error = %e, "Failed to set duckdb.max_workers_per_postgres_scan");
+            0
+        });
+    conn.execute(&format!("SET duckdb.threads_for_postgres_scan = {}", thread_count), &[]).await
+        .unwrap_or_else(|e| {
+            tracing::debug!(error = %e, "Failed to set duckdb.threads_for_postgres_scan");
+            0
+        });
+
     // Set statement timeout
     conn.execute(
         &format!("SET statement_timeout = {}", options.timeout_ms),
