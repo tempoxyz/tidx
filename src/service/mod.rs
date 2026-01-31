@@ -327,6 +327,28 @@ pub async fn execute_query_pg_duckdb(
             0
         });
 
+    // Set scan parallelism for reading from PostgreSQL tables
+    // These control how many PostgreSQL workers scan the table in parallel
+    conn.execute(&format!("SET duckdb.max_workers_per_postgres_scan = {}", thread_count), &[]).await
+        .unwrap_or_else(|e| {
+            tracing::debug!(error = %e, "Failed to set duckdb.max_workers_per_postgres_scan");
+            0
+        });
+    conn.execute(&format!("SET duckdb.threads_for_postgres_scan = {}", thread_count), &[]).await
+        .unwrap_or_else(|e| {
+            tracing::debug!(error = %e, "Failed to set duckdb.threads_for_postgres_scan");
+            0
+        });
+
+    // Load tidx_abi extension for ABI decoding functions (abi_address, abi_uint, etc.)
+    // This is needed when querying Parquet files that contain raw encoded event data
+    if let Err(e) = conn.execute(
+        "SELECT duckdb.raw_query($$ LOAD '/usr/share/duckdb/extensions/tidx_abi.duckdb_extension' $$)",
+        &[],
+    ).await {
+        tracing::debug!(error = %e, "Failed to load tidx_abi extension (may not be installed)");
+    }
+
     // Set statement timeout
     conn.execute(
         &format!("SET statement_timeout = {}", options.timeout_ms),
@@ -617,10 +639,10 @@ mod tests {
         
         // DuckDB CTE uses hex string selector format
         assert!(cte.contains("WHERE selector = '0x"));
-        // Uses native Rust UDFs
-        assert!(cte.contains("topic_address_native(topic1)"));
-        assert!(cte.contains("topic_address_native(topic2)"));
-        assert!(cte.contains("abi_uint_native(data, 0)"));
+        // Uses tidx_abi extension functions
+        assert!(cte.contains("abi_address(topic1)"));
+        assert!(cte.contains("abi_address(topic2)"));
+        assert!(cte.contains("abi_uint(data, 0)"));
     }
 
     #[test]
@@ -634,9 +656,9 @@ mod tests {
         assert!(pg_cte.contains("AS \"owner\""));
         assert!(duck_cte.contains("AS \"owner\""));
         
-        // Postgres uses abi_address, DuckDB uses topic_address_native
+        // Both use abi_address, Postgres uses it on bytea, DuckDB on BLOB
         assert!(pg_cte.contains("abi_address(topic1)"));
-        assert!(duck_cte.contains("topic_address_native(topic1)"));
+        assert!(duck_cte.contains("abi_address(topic1)"));
     }
 
     #[test]
@@ -659,11 +681,11 @@ mod tests {
         assert!(pg_cte.contains("substring(data FROM 65 FOR 32)"));  // offset 64
         assert!(pg_cte.contains("substring(data FROM 97 FOR 32)"));  // offset 96
         
-        // DuckDB uses native offsets
-        assert!(duck_cte.contains("abi_uint_native(data, 0)"));
-        assert!(duck_cte.contains("abi_uint_native(data, 32)"));
-        assert!(duck_cte.contains("abi_uint_native(data, 64)"));
-        assert!(duck_cte.contains("abi_uint_native(data, 96)"));
+        // DuckDB uses tidx_abi extension functions with byte offsets
+        assert!(duck_cte.contains("abi_uint(data, 0)"));
+        assert!(duck_cte.contains("abi_uint(data, 32)"));
+        assert!(duck_cte.contains("abi_uint(data, 64)"));
+        assert!(duck_cte.contains("abi_uint(data, 96)"));
     }
 
     #[test]

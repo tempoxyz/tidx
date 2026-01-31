@@ -443,25 +443,25 @@ impl AbiType {
         }
     }
 
-    // DuckDB decode functions (use native Rust UDFs for performance)
+    // DuckDB decode functions (use tidx_abi extension functions)
 
     pub fn topic_decode_sql_duckdb(&self, topic_idx: usize) -> String {
         // topic_idx is 1-based from the signature parser, maps to topic0, topic1, etc.
         let col = format!("topic{}", topic_idx.saturating_sub(1));
         match self {
-            AbiType::Address => format!("topic_address_native({col})"),
-            AbiType::Uint(_) | AbiType::Int(_) => format!("topic_uint_native({col})"),
-            AbiType::Bool => format!("{col} != '0x0000000000000000000000000000000000000000000000000000000000000000'"),
-            AbiType::Bytes(Some(_) | None) => col,
+            AbiType::Address => format!("abi_address({col})"),
+            AbiType::Uint(_) | AbiType::Int(_) => format!("abi_uint({col})"),
+            AbiType::Bool => format!("abi_bool({col})"),
+            AbiType::Bytes(Some(_) | None) => format!("abi_bytes32({col})"),
             _ => col,
         }
     }
 
     pub fn data_decode_sql_duckdb(&self, offset: usize) -> String {
         match self {
-            AbiType::Address => format!("abi_address_native(data, {offset})"),
-            AbiType::Uint(_) => format!("abi_uint_native(data, {offset})"),
-            AbiType::Int(_) => format!("abi_uint_native(data, {offset})"), // TODO: proper signed handling
+            AbiType::Address => format!("abi_address(data, {offset})"),
+            AbiType::Uint(_) => format!("abi_uint(data, {offset})"),
+            AbiType::Int(_) => format!("abi_uint(data, {offset})"), // TODO: proper signed handling
             AbiType::Bool => format!("abi_bool(data, {offset})"),
             AbiType::Bytes(Some(_) | None) => format!("abi_bytes32(data, {offset})"),
             AbiType::String => format!("abi_bytes32(data, {offset})"), // TODO: dynamic string support
@@ -564,9 +564,9 @@ mod tests {
         .unwrap();
         let cte = sig.to_cte_sql_duckdb();
         assert!(cte.contains("transfer AS"));
-        assert!(cte.contains("topic_address_native(topic1)"));
-        assert!(cte.contains("topic_address_native(topic2)"));
-        assert!(cte.contains("abi_uint_native(data, 0)"));
+        assert!(cte.contains("abi_address(topic1)"));
+        assert!(cte.contains("abi_address(topic2)"));
+        assert!(cte.contains("abi_uint(data, 0)"));
         // DuckDB uses '0x...' format and filters by full 32-byte selector (topic0)
         assert!(cte.contains("selector = '0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef'"));
     }
@@ -601,7 +601,7 @@ mod tests {
         let cte = sig.to_cte_sql_duckdb_filtered(Some(&used_cols));
         
         // Should include "to" but not "from" or "value"
-        assert!(cte.contains("topic_address_native(topic2) AS \"to\""));
+        assert!(cte.contains("abi_address(topic2) AS \"to\""));
         assert!(!cte.contains("\"from\""));
         assert!(!cte.contains("\"value\""));
     }
@@ -617,8 +617,8 @@ mod tests {
         let cte = sig.to_cte_sql_duckdb_filtered(Some(&used_cols));
         
         // Should include "from" and "value" but not "to"
-        assert!(cte.contains("topic_address_native(topic1) AS \"from\""));
-        assert!(cte.contains("abi_uint_native(data, 0) AS \"value\""));
+        assert!(cte.contains("abi_address(topic1) AS \"from\""));
+        assert!(cte.contains("abi_uint(data, 0) AS \"value\""));
         assert!(!cte.contains("\"to\""));
     }
 
@@ -665,8 +665,8 @@ mod tests {
         let cte = sig.to_cte_sql_duckdb_filtered(Some(&used_cols));
         
         // "to" is the second indexed param, so it should still be topic2
-        assert!(cte.contains("topic_address_native(topic2) AS \"to\""));
+        assert!(cte.contains("abi_address(topic2) AS \"to\""));
         // "value" is the first data param, so it should still be offset 0
-        assert!(cte.contains("abi_uint_native(data, 0) AS \"value\""));
+        assert!(cte.contains("abi_uint(data, 0) AS \"value\""));
     }
 }

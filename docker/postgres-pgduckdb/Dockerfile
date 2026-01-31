@@ -1,40 +1,40 @@
-# PostgreSQL with pg_duckdb extension for analytical queries
-# This enables DuckDB's columnar analytical engine directly within PostgreSQL
-# No data replication needed - queries run directly on PostgreSQL tables
+# PostgreSQL with pg_duckdb extension and tidx_abi for Ethereum ABI decoding
+# This enables DuckDB's columnar analytical engine with native log decoding
 
-ARG PG_MAJOR=16
-FROM postgres:${PG_MAJOR}
+ARG PGDUCKDB_VERSION=16-v0.3.1
 
-ARG PG_MAJOR=16
+# =============================================================================
+# Stage 1: Build tidx_abi DuckDB extension
+# =============================================================================
+FROM rust:1.87 AS builder
 
 # Install build dependencies
 RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
-    ca-certificates \
     cmake \
-    curl \
     git \
-    libclang-dev \
     ninja-build \
-    pkg-config \
-    postgresql-server-dev-${PG_MAJOR} \
     python3 \
+    python3-pip \
+    python3-venv \
     && rm -rf /var/lib/apt/lists/*
 
-# Clone and build pg_duckdb
-WORKDIR /tmp/pg_duckdb
-RUN git clone --depth 1 https://github.com/duckdb/pg_duckdb.git . \
-    && make -j$(nproc) \
-    && make install
+# Clone and build tidx_abi extension
+WORKDIR /build
+RUN git clone --recurse-submodules https://github.com/tempoxyz/tidx-duckdb-ext.git . \
+    && make configure \
+    && make release
 
-# Cleanup to reduce image size
-RUN rm -rf /tmp/pg_duckdb \
-    && apt-get purge -y build-essential git curl cmake ninja-build pkg-config libclang-dev python3 \
-    && apt-get autoremove -y \
-    && rm -rf /var/lib/apt/lists/*
+# =============================================================================
+# Stage 2: Final image with pg_duckdb + tidx_abi
+# =============================================================================
+FROM pgduckdb/pgduckdb:${PGDUCKDB_VERSION}
 
-# Add pg_duckdb to shared_preload_libraries
-RUN echo "shared_preload_libraries = 'pg_duckdb'" >> /usr/share/postgresql/postgresql.conf.sample
+# Create extensions directory
+RUN mkdir -p /usr/share/duckdb/extensions
 
-# Create extension on database initialization
+# Copy the built extension from builder stage
+COPY --from=builder /build/build/release/tidx_abi.duckdb_extension /usr/share/duckdb/extensions/
+
+# Create init script to load extension
 COPY init-pg-duckdb.sql /docker-entrypoint-initdb.d/
