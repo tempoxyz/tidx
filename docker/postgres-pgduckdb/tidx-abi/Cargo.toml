@@ -14,4 +14,4 @@ strip = true
 [dependencies]
 duckdb = { version = "=1.4.4", features = ["loadable-extension", "vtab", "vscalar"] }
 libduckdb-sys = "=1.4.4"
-hex = "0.4"
+alloy-primitives = "1"
