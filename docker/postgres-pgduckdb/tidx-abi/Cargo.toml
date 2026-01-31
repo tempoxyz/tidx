@@ -1,0 +1,17 @@
+[package]
+name = "tidx_abi"
+version = "0.1.0"
+edition = "2021"
+description = "DuckDB extension for Ethereum ABI decoding - decode event logs from Parquet files"
+
+[lib]
+crate-type = ["cdylib"]
+
+[profile.release]
+lto = true
+strip = true
+
+[dependencies]
+duckdb = { version = "=1.4.4", features = ["loadable-extension", "vtab", "vscalar"] }
+libduckdb-sys = "=1.4.4"
+hex = "0.4"
