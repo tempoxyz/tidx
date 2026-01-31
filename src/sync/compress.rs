@@ -140,22 +140,11 @@ async fn tick_compress(
         }
     };
 
-    // Get existing export ranges to find gaps
-    let (lowest_exported, highest_exported) = get_export_bounds(pool, chain_id).await?;
+    // Find the highest block already exported
+    let last_exported = get_last_exported_block(pool, chain_id).await?;
 
-    // Try to export from tip backwards first (prioritize recent data)
-    // Then fill in from genesis forwards
-    let range = if highest_exported.is_none() || highest_exported.unwrap() < tip_num as u64 {
-        // Export recent blocks first (from highest_exported or tip down)
-        let end = tip_num as u64;
-        let start_from = highest_exported.map(|h| h + 1).unwrap_or(0);
-        find_contiguous_range_backwards(pool, chain_id, start_from, end, config.threshold_blocks).await?
-    } else if lowest_exported.is_some() && lowest_exported.unwrap() > 0 {
-        // Fill in from genesis forwards
-        find_contiguous_range(pool, chain_id, 0, lowest_exported.unwrap() - 1).await?
-    } else {
-        None
-    };
+    // Find contiguous range from last_exported to tip
+    let range = find_contiguous_range(pool, chain_id, last_exported, tip_num as u64).await?;
 
     let (start_block, end_block) = match range {
         Some((s, e)) if e - s + 1 >= config.threshold_blocks => (s, e),
@@ -166,12 +155,12 @@ async fn tick_compress(
                 end = e,
                 blocks = e - s + 1,
                 threshold = config.threshold_blocks,
-                "Range too small for export"
+                "Range too small for compression"
             );
             return Ok(());
         }
         None => {
-            debug!(chain_id = chain_id, "No contiguous range found for export");
+            debug!(chain_id = chain_id, "No contiguous range found for compression");
             return Ok(());
         }
     };
@@ -214,23 +203,19 @@ async fn tick_compress(
     Ok(())
 }
 
-/// Get the lowest and highest block numbers already exported to Parquet
-async fn get_export_bounds(pool: &Pool, chain_id: u64) -> Result<(Option<u64>, Option<u64>)> {
+/// Get the highest block number already exported to Parquet
+async fn get_last_exported_block(pool: &Pool, chain_id: u64) -> Result<u64> {
     let conn = pool.get().await?;
     let row = conn
         .query_opt(
-            "SELECT MIN(start_block), MAX(end_block) FROM parquet_ranges WHERE chain_id = $1",
+            "SELECT COALESCE(MAX(end_block), 0) FROM parquet_ranges WHERE chain_id = $1",
             &[&(chain_id as i64)],
         )
         .await?;
 
     match row {
-        Some(r) => {
-            let min: Option<i64> = r.get(0);
-            let max: Option<i64> = r.get(1);
-            Ok((min.map(|v| v as u64), max.map(|v| v as u64)))
-        }
-        None => Ok((None, None)),
+        Some(r) => Ok(r.get::<_, i64>(0) as u64),
+        None => Ok(0),
     }
 }
 
@@ -297,73 +282,6 @@ async fn find_contiguous_range(
     }
 
     Ok(Some((start, end_block)))
-}
-
-/// Find a contiguous range of blocks working backwards from end towards start
-/// Returns the largest contiguous range of at least threshold_blocks size
-async fn find_contiguous_range_backwards(
-    pool: &Pool,
-    _chain_id: u64,
-    start: u64,
-    end: u64,
-    threshold_blocks: u64,
-) -> Result<Option<(u64, u64)>> {
-    let conn = pool.get().await?;
-
-    if end < start || end - start + 1 < threshold_blocks {
-        return Ok(None);
-    }
-
-    // Find the last gap working backwards from end
-    let gap_row = conn
-        .query_opt(
-            r#"
-            WITH expected AS (
-                SELECT generate_series($1::bigint, $2::bigint) AS num
-            ),
-            existing AS (
-                SELECT DISTINCT num FROM blocks 
-                WHERE num >= $1 AND num <= $2
-            )
-            SELECT MAX(e.num) as last_gap
-            FROM expected e
-            LEFT JOIN existing b ON e.num = b.num
-            WHERE b.num IS NULL
-            "#,
-            &[&(start as i64), &(end as i64)],
-        )
-        .await?;
-
-    let start_block = match gap_row {
-        Some(row) => {
-            let last_gap: Option<i64> = row.get(0);
-            match last_gap {
-                Some(gap) if gap < end as i64 => (gap + 1) as u64, // Range starts after gap
-                Some(_) => return Ok(None),                         // Gap at end
-                None => start,                                       // No gaps, full range available
-            }
-        }
-        None => start,
-    };
-
-    // Verify we actually have the end block
-    let has_end = conn
-        .query_one(
-            "SELECT EXISTS(SELECT 1 FROM blocks WHERE num = $1)",
-            &[&(end as i64)],
-        )
-        .await?;
-
-    if !has_end.get::<_, bool>(0) {
-        return Ok(None);
-    }
-
-    // Ensure range is large enough
-    if end - start_block + 1 < threshold_blocks {
-        return Ok(None);
-    }
-
-    Ok(Some((start_block, end)))
 }
 
 /// Export logs from PostgreSQL to Parquet using COPY
