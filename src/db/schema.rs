@@ -36,9 +36,9 @@ pub async fn run_migrations(pool: &Pool) -> Result<()> {
     conn.batch_execute(include_str!("../../db/sync_state.sql")).await?;
     conn.batch_execute(include_str!("../../db/functions.sql")).await?;
 
-    // Enable pg_parquet extension (required for DuckDB replication)
+    // Enable extensions (pg_duckdb for analytics, etc.)
     conn.batch_execute(include_str!("../../db/extensions.sql")).await?;
-    info!("pg_parquet extension enabled");
+    info!("Database extensions enabled");
 
     Ok(())
 }

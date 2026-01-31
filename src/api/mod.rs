@@ -25,13 +25,12 @@ use tower_http::trace::TraceLayer;
 
 use crate::broadcast::Broadcaster;
 use crate::config::{AnalyticsEngine, HttpConfig, SharedHttpConfig};
-use crate::db::{DuckDbPool, Pool};
+use crate::db::Pool;
 use crate::service::{QueryOptions, QueryResult, SyncStatus};
 
 pub use rate_limit::{RateLimiter, SseConnectionGuard};
 
 pub type SharedPools = Arc<RwLock<HashMap<u64, Pool>>>;
-pub type SharedDuckDbPools = Arc<RwLock<HashMap<u64, Arc<DuckDbPool>>>>;
 
 /// Per-chain analytics configuration for pg_duckdb.
 #[derive(Clone, Debug, Default)]
@@ -50,8 +49,6 @@ pub struct AppState {
     /// Default chain_id (first chain)
     pub default_chain_id: u64,
     pub broadcaster: Arc<Broadcaster>,
-    /// Per-chain DuckDB pools for analytical queries (hot-reloadable, only for duckdb_file mode)
-    pub duckdb_pools: SharedDuckDbPools,
     /// Per-chain analytics configuration (hot-reloadable)
     pub analytics_configs: SharedAnalyticsConfigs,
     /// Rate limiter for request throttling
@@ -62,11 +59,6 @@ impl AppState {
     async fn get_pool(&self, chain_id: Option<u64>) -> Option<Pool> {
         let id = chain_id.unwrap_or(self.default_chain_id);
         self.pools.read().await.get(&id).cloned()
-    }
-
-    async fn get_duckdb_pool(&self, chain_id: Option<u64>) -> Option<Arc<DuckDbPool>> {
-        let id = chain_id.unwrap_or(self.default_chain_id);
-        self.duckdb_pools.read().await.get(&id).cloned()
     }
 
     async fn get_analytics_config(&self, chain_id: Option<u64>) -> AnalyticsConfig {
@@ -81,14 +73,13 @@ impl AppState {
 }
 
 pub fn router(pools: HashMap<u64, Pool>, default_chain_id: u64, broadcaster: Arc<Broadcaster>) -> Router<()> {
-    router_with_options(pools, default_chain_id, broadcaster, HashMap::new(), HashMap::new(), &HttpConfig::default())
+    router_with_options(pools, default_chain_id, broadcaster, HashMap::new(), &HttpConfig::default())
 }
 
 pub fn router_with_options(
     pools: HashMap<u64, Pool>,
     default_chain_id: u64,
     broadcaster: Arc<Broadcaster>,
-    duckdb_pools: HashMap<u64, Arc<DuckDbPool>>,
     analytics_configs: HashMap<u64, AnalyticsConfig>,
     http_config: &HttpConfig,
 ) -> Router<()> {
@@ -103,7 +94,6 @@ pub fn router_with_options(
         pools: Arc::new(RwLock::new(pools)),
         default_chain_id,
         broadcaster,
-        duckdb_pools: Arc::new(RwLock::new(duckdb_pools)),
         analytics_configs: Arc::new(RwLock::new(analytics_configs)),
         rate_limiter: rate_limiter.clone(),
     };
@@ -115,7 +105,6 @@ pub fn router_shared(
     pools: SharedPools,
     default_chain_id: u64,
     broadcaster: Arc<Broadcaster>,
-    duckdb_pools: SharedDuckDbPools,
     analytics_configs: SharedAnalyticsConfigs,
     http_config: SharedHttpConfig,
 ) -> Router<()> {
@@ -127,7 +116,6 @@ pub fn router_shared(
         pools,
         default_chain_id,
         broadcaster,
-        duckdb_pools,
         analytics_configs,
         rate_limiter: rate_limiter.clone(),
     };
@@ -170,50 +158,6 @@ async fn handle_status(State(state): State<AppState>) -> Result<Json<StatusRespo
     for pool in pools.values() {
         if let Ok(chains) = crate::service::get_all_status(pool).await {
             all_chains.extend(chains);
-        }
-    }
-    drop(pools);
-
-    let duckdb_pools = state.duckdb_pools.read().await;
-    
-    for chain in &mut all_chains {
-        let chain_id = chain.chain_id as u64;
-        
-        if let Some(duckdb_pool) = duckdb_pools.get(&chain_id) {
-            // Get DuckDB range
-            if let Ok((duck_min, duck_max)) = duckdb_pool.block_range().await {
-                let duck_min = duck_min.unwrap_or(0);
-                let duck_max = duck_max.unwrap_or(0);
-                
-                chain.duckdb_min = Some(duck_min);
-                chain.duckdb_max = Some(duck_max);
-                chain.duckdb_tip_lag = Some(chain.tip_num - duck_max);
-                
-                // Backfill remaining = blocks below duck_min that PG has
-                if duck_min > 0 {
-                    // Get PG min for this chain
-                    let pools = state.pools.read().await;
-                    if let Some(pool) = pools.get(&chain_id) {
-                        if let Ok(conn) = pool.get().await {
-                            if let Ok(row) = conn.query_one("SELECT COALESCE(MIN(num), 0) FROM blocks", &[]).await {
-                                let pg_min: i64 = row.get(0);
-                                chain.duckdb_backfill_remaining = Some((duck_min - pg_min).max(0));
-                            }
-                        }
-                    }
-                }
-            }
-            
-            // Get gap info
-            if let Ok(duck_status) = crate::sync::get_sync_status(&duckdb_pool).await {
-                chain.duckdb_internal_gaps = Some(duck_status.gap_blocks);
-                chain.duckdb_gaps = duck_status.gaps;
-                
-                // Deprecated fields for backwards compatibility
-                chain.duckdb_synced_num = Some(duck_status.latest_block);
-                chain.duckdb_lag = Some(chain.tip_num - duck_status.latest_block);
-                chain.duckdb_gap_blocks = Some(duck_status.gap_blocks);
-            }
         }
     }
 
@@ -292,7 +236,6 @@ async fn handle_query_once(
         limit: params.limit.clamp(1, 100000),
     };
 
-    let duckdb_pool = state.get_duckdb_pool(Some(params.chain_id)).await;
     let analytics_config = state.get_analytics_config(Some(params.chain_id)).await;
     
     // Convert API analytics config to service config
@@ -304,7 +247,6 @@ async fn handle_query_once(
     
     let result = crate::service::execute_query_with_analytics(
         &pool,
-        duckdb_pool.as_ref(),
         &params.sql,
         params.signature.as_deref(),
         &options,
@@ -373,7 +315,6 @@ async fn handle_query_live(
         }
     };
 
-    let duckdb_pool = state.get_duckdb_pool(Some(params.chain_id)).await;
     let analytics_config = state.get_analytics_config(Some(params.chain_id)).await;
     
     // Convert to service config
@@ -401,7 +342,7 @@ async fn handle_query_live(
         let mut last_block_num: u64 = 0;
 
         // Execute initial query
-        match crate::service::execute_query_with_analytics(&pool, duckdb_pool.as_ref(), &sql, signature.as_deref(), &options, &service_analytics_config, engine.as_deref()).await {
+        match crate::service::execute_query_with_analytics(&pool, &sql, signature.as_deref(), &options, &service_analytics_config, engine.as_deref()).await {
             Ok(result) => {
                 yield Ok(SseEvent::default()
                     .event("result")
@@ -451,7 +392,7 @@ async fn handle_query_live(
                     // For OLAP queries, re-execute the full query once per update (not per-block)
                     // For OLTP queries, filter by each block
                     if is_olap {
-                        match crate::service::execute_query_with_analytics(&pool, duckdb_pool.as_ref(), &sql, signature.as_deref(), &options, &service_analytics_config, engine.as_deref()).await {
+                        match crate::service::execute_query_with_analytics(&pool, &sql, signature.as_deref(), &options, &service_analytics_config, engine.as_deref()).await {
                             Ok(result) => {
                                 yield Ok(SseEvent::default()
                                     .event("result")
@@ -470,7 +411,7 @@ async fn handle_query_live(
                         let catch_up_start = last_block_num + 1;
                         for block_num in catch_up_start..=end {
                             let filtered_sql = inject_block_filter(&sql, block_num);
-                            match crate::service::execute_query_with_analytics(&pool, duckdb_pool.as_ref(), &filtered_sql, signature.as_deref(), &options, &service_analytics_config, engine.as_deref()).await {
+                            match crate::service::execute_query_with_analytics(&pool, &filtered_sql, signature.as_deref(), &options, &service_analytics_config, engine.as_deref()).await {
                                 Ok(result) => {
                                     yield Ok(SseEvent::default()
                                         .event("result")

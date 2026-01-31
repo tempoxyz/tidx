@@ -13,7 +13,6 @@ use crate::types::SyncState;
 
 use super::decoder::{decode_block, decode_log, decode_receipt, decode_transaction, timestamp_from_secs};
 use super::fetcher::RpcClient;
-use super::replicator::ReplicatorHandle;
 use super::writer::{
     delete_blocks_from, detect_all_gaps, detect_blocks_missing_receipts, find_fork_point,
     get_block_hash, load_sync_state, save_sync_state, update_sync_rate, update_synced_num,
@@ -33,7 +32,6 @@ pub struct SyncEngine {
     backfill_rpc: RpcClient,
     chain_id: u64,
     broadcaster: Option<Arc<Broadcaster>>,
-    replicator: Option<ReplicatorHandle>,
     batch_size: u64,
     concurrency: usize,
     backfill_first: bool,
@@ -62,7 +60,6 @@ impl SyncEngine {
             backfill_rpc,
             chain_id,
             broadcaster: None,
-            replicator: None,
             batch_size: 100,
             concurrency: 4,
             backfill_first: false,
@@ -82,11 +79,6 @@ impl SyncEngine {
 
     pub fn with_broadcaster(mut self, broadcaster: Arc<Broadcaster>) -> Self {
         self.broadcaster = Some(broadcaster);
-        self
-    }
-
-    pub fn with_replicator(mut self, replicator: ReplicatorHandle) -> Self {
-        self.replicator = Some(replicator);
         self
     }
 
@@ -175,7 +167,6 @@ impl SyncEngine {
                 self.chain_id,
                 self.batch_size,
                 self.concurrency,
-                &self.replicator,
                 &mut progress,
             )
             .await
@@ -231,7 +222,6 @@ impl SyncEngine {
         let gapfill_chain_id = self.chain_id;
         let gapfill_batch_size = self.batch_size;
         let gapfill_concurrency = self.concurrency;
-        let gapfill_replicator = self.replicator.clone();
         let gapfill_handle = tokio::spawn(async move {
             run_gapfill_loop(
                 gapfill_pool,
@@ -240,7 +230,6 @@ impl SyncEngine {
                 gapfill_chain_id,
                 gapfill_batch_size,
                 gapfill_concurrency,
-                gapfill_replicator,
                 gapfill_shutdown,
             )
             .await
@@ -251,13 +240,11 @@ impl SyncEngine {
         let receipt_pool = self.pool().clone();
         let receipt_rpc = self.backfill_rpc.clone();
         let receipt_chain_id = self.chain_id;
-        let receipt_replicator = self.replicator.clone();
         let receipt_handle = tokio::spawn(async move {
             run_receipt_backfill_loop(
                 receipt_pool,
                 receipt_rpc,
                 receipt_chain_id,
-                receipt_replicator,
                 receipt_shutdown,
             )
             .await
@@ -353,21 +340,12 @@ impl SyncEngine {
                 None
             };
 
-            let replicator = self.replicator.clone();
-            let block_rows_clone = block_rows.clone();
-            let all_txs_clone = all_txs.clone();
             let pool = self.pool().clone();
             let write_future = async move {
                 let write_start = std::time::Instant::now();
                 write_blocks(&pool, &block_rows).await?;
                 write_txs(&pool, &all_txs).await?;
                 let write_ms = write_start.elapsed().as_millis();
-
-                if let Some(ref rep) = replicator {
-                    rep.send_blocks(block_rows_clone);
-                    rep.send_txs(all_txs_clone);
-                }
-
                 Ok::<_, anyhow::Error>(write_ms)
             };
 
@@ -500,16 +478,6 @@ impl SyncEngine {
 
                 // Delete orphaned blocks from PostgreSQL
                 let deleted = delete_blocks_from(self.pool(), delete_from).await?;
-
-                // Delete orphaned blocks from DuckDB (if replicator is configured)
-                if let Some(ref replicator) = self.replicator {
-                    let duckdb_deleted = replicator.delete_blocks_from(delete_from).await?;
-                    debug!(
-                        chain_id = self.chain_id,
-                        duckdb_deleted,
-                        "Deleted orphaned blocks from DuckDB"
-                    );
-                }
 
                 info!(
                     chain_id = self.chain_id,
@@ -809,7 +777,6 @@ async fn run_gapfill_loop(
     chain_id: u64,
     batch_size: u64,
     concurrency: usize,
-    replicator: Option<ReplicatorHandle>,
     mut shutdown: broadcast::Receiver<()>,
 ) -> Result<()> {
     let state = load_sync_state(&pool, chain_id).await?.unwrap_or_default();
@@ -820,7 +787,6 @@ async fn run_gapfill_loop(
         batch_size = batch_size,
         concurrency = concurrency,
         backfill_limit = backfill_semaphore.available_permits(),
-        duckdb = replicator.is_some(),
         "Gap-fill: starting with parallel workers (throttled)"
     );
 
@@ -832,7 +798,7 @@ async fn run_gapfill_loop(
                 info!("Gap-fill: shutting down");
                 break;
             }
-            result = tick_gapfill_parallel(&pool, &backfill_semaphore, &rpc, chain_id, batch_size, concurrency, &replicator, &mut progress) => {
+            result = tick_gapfill_parallel(&pool, &backfill_semaphore, &rpc, chain_id, batch_size, concurrency, &mut progress) => {
                 if let Err(e) = result {
                     error!(error = %e, "Gap-fill sync tick failed");
                     tokio::time::sleep(Duration::from_secs(1)).await;
@@ -854,7 +820,6 @@ async fn tick_gapfill_parallel(
     chain_id: u64,
     batch_size: u64,
     concurrency: usize,
-    replicator: &Option<ReplicatorHandle>,
     progress: &mut SyncProgress,
 ) -> Result<()> {
     let state = load_sync_state(pool, chain_id).await?.unwrap_or_default();
@@ -929,7 +894,6 @@ async fn tick_gapfill_parallel(
         if let Some((start, end)) = batch_iter.next() {
             let pool = pool.clone();
             let rpc = rpc.clone();
-            let rep = replicator.clone();
             let sem = backfill_semaphore.clone();
             join_set.spawn(async move {
                 // Acquire semaphore permit before doing work (throttles backfill)
@@ -937,7 +901,7 @@ async fn tick_gapfill_parallel(
                     Ok(p) => p,
                     Err(_) => return (start, end, Err(anyhow::anyhow!("Backfill semaphore closed"))),
                 };
-                let result = sync_range_standalone(&pool, &rpc, start, end, rep.as_ref()).await;
+                let result = sync_range_standalone(&pool, &rpc, start, end).await;
                 (start, end, result)
             });
         }
@@ -991,7 +955,6 @@ async fn tick_gapfill_parallel(
                 // Re-queue the failed batch
                 let pool = pool.clone();
                 let rpc = rpc.clone();
-                let rep = replicator.clone();
                 let sem = backfill_semaphore.clone();
                 join_set.spawn(async move {
                     tokio::time::sleep(Duration::from_millis(500)).await;
@@ -999,7 +962,7 @@ async fn tick_gapfill_parallel(
                         Ok(p) => p,
                         Err(_) => return (start, end, Err(anyhow::anyhow!("Backfill semaphore closed"))),
                     };
-                    let result = sync_range_standalone(&pool, &rpc, start, end, rep.as_ref()).await;
+                    let result = sync_range_standalone(&pool, &rpc, start, end).await;
                     (start, end, result)
                 });
                 continue;
@@ -1010,14 +973,13 @@ async fn tick_gapfill_parallel(
         if let Some((start, end)) = batch_iter.next() {
             let pool = pool.clone();
             let rpc = rpc.clone();
-            let rep = replicator.clone();
             let sem = backfill_semaphore.clone();
             join_set.spawn(async move {
                 let _permit = match sem.acquire().await {
                     Ok(p) => p,
                     Err(_) => return (start, end, Err(anyhow::anyhow!("Backfill semaphore closed"))),
                 };
-                let result = sync_range_standalone(&pool, &rpc, start, end, rep.as_ref()).await;
+                let result = sync_range_standalone(&pool, &rpc, start, end).await;
                 (start, end, result)
             });
         }
@@ -1060,7 +1022,6 @@ async fn tick_gapfill_parallel_no_throttle(
     chain_id: u64,
     batch_size: u64,
     concurrency: usize,
-    replicator: &Option<ReplicatorHandle>,
     progress: &mut SyncProgress,
 ) -> Result<()> {
     let state = load_sync_state(pool, chain_id).await?.unwrap_or_default();
@@ -1114,9 +1075,8 @@ async fn tick_gapfill_parallel_no_throttle(
         if let Some((start, end)) = batch_iter.next() {
             let pool = pool.clone();
             let rpc = rpc.clone();
-            let rep = replicator.clone();
             join_set.spawn(async move {
-                let result = sync_range_standalone(&pool, &rpc, start, end, rep.as_ref()).await;
+                let result = sync_range_standalone(&pool, &rpc, start, end).await;
                 (start, end, result)
             });
         }
@@ -1149,10 +1109,9 @@ async fn tick_gapfill_parallel_no_throttle(
                 );
                 let pool = pool.clone();
                 let rpc = rpc.clone();
-                let rep = replicator.clone();
                 join_set.spawn(async move {
                     tokio::time::sleep(Duration::from_millis(500)).await;
-                    let result = sync_range_standalone(&pool, &rpc, start, end, rep.as_ref()).await;
+                    let result = sync_range_standalone(&pool, &rpc, start, end).await;
                     (start, end, result)
                 });
                 continue;
@@ -1163,9 +1122,8 @@ async fn tick_gapfill_parallel_no_throttle(
         if let Some((start, end)) = batch_iter.next() {
             let pool = pool.clone();
             let rpc = rpc.clone();
-            let rep = replicator.clone();
             join_set.spawn(async move {
-                let result = sync_range_standalone(&pool, &rpc, start, end, rep.as_ref()).await;
+                let result = sync_range_standalone(&pool, &rpc, start, end).await;
                 (start, end, result)
             });
         }
@@ -1214,7 +1172,6 @@ async fn sync_range_standalone(
     rpc: &RpcClient,
     from: u64,
     to: u64,
-    replicator: Option<&ReplicatorHandle>,
 ) -> Result<()> {
     use alloy::network::ReceiptResponse;
     use super::decoder::{decode_block, decode_log, decode_receipt, decode_transaction, timestamp_from_secs};
@@ -1269,13 +1226,6 @@ async fn sync_range_standalone(
     write_logs(pool, &all_logs).await?;
     write_receipts(pool, &all_receipts).await?;
 
-    if let Some(rep) = replicator {
-        rep.send_blocks(block_rows);
-        rep.send_txs(all_txs);
-        rep.send_logs(all_logs);
-        rep.send_receipts(all_receipts);
-    }
-
     Ok(())
 }
 
@@ -1287,7 +1237,6 @@ async fn run_receipt_backfill_loop(
     pool: Pool,
     rpc: RpcClient,
     chain_id: u64,
-    replicator: Option<ReplicatorHandle>,
     mut shutdown: broadcast::Receiver<()>,
 ) -> Result<()> {
     info!(chain_id, "Receipt backfill: starting");
@@ -1300,7 +1249,7 @@ async fn run_receipt_backfill_loop(
                 info!(chain_id, "Receipt backfill: shutting down");
                 break;
             }
-            result = tick_receipt_backfill(&pool, &rpc, chain_id, &replicator) => {
+            result = tick_receipt_backfill(&pool, &rpc, chain_id) => {
                 if let Err(e) = result {
                     error!(chain_id, error = %e, "Receipt backfill tick failed");
                     tokio::time::sleep(Duration::from_secs(1)).await;
@@ -1317,7 +1266,6 @@ async fn tick_receipt_backfill(
     pool: &Pool,
     rpc: &RpcClient,
     chain_id: u64,
-    replicator: &Option<ReplicatorHandle>,
 ) -> Result<()> {
     use alloy::network::ReceiptResponse;
     use super::decoder::{decode_log, decode_receipt};
@@ -1401,12 +1349,6 @@ async fn tick_receipt_backfill(
         // Write to DB
         write_logs(pool, &all_logs).await?;
         write_receipts(pool, &all_receipts).await?;
-
-        // Signal replicator
-        if let Some(rep) = replicator {
-            rep.send_logs(all_logs);
-            rep.send_receipts(all_receipts);
-        }
 
         metrics::record_logs_indexed(chain_id, log_count as u64);
 

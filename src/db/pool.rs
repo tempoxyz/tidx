@@ -52,7 +52,7 @@ pub struct ThrottledPool {
 
 impl ThrottledPool {
     pub async fn new(database_url: &str) -> Result<Self> {
-        // Keep headroom: pool 20, backfill 10 (leaves 10 for realtime/API/replicator)
+        // Keep headroom: pool 20, backfill 10 (leaves 10 for realtime/API)
         Self::with_limits(database_url, 20, 10).await
     }
 

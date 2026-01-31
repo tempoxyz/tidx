@@ -4,7 +4,7 @@ use std::path::PathBuf;
 
 use tidx::config::Config;
 use tidx::db;
-use tidx::service::{self, execute_query_with_engine, QueryOptions};
+use tidx::service::{self, execute_query_with_analytics, AnalyticsEngineConfig, QueryOptions};
 
 #[derive(ClapArgs)]
 pub struct Args {
@@ -72,12 +72,13 @@ pub async fn run(args: Args) -> Result<()> {
         limit: args.limit,
     };
 
-    let result = execute_query_with_engine(
+    let analytics_config = AnalyticsEngineConfig::default();
+    let result = execute_query_with_analytics(
         &pool,
-        None, // DuckDB pool not available in CLI yet
         &args.sql,
         args.signature.as_deref(),
         &options,
+        &analytics_config,
         args.engine.as_deref(),
     )
     .await?;

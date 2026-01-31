@@ -1,10 +1,9 @@
 use anyhow::{anyhow, Result};
 use chrono::{DateTime, Utc};
 use serde::Serialize;
-use std::sync::Arc;
 use std::time::Instant;
 
-use crate::db::{DuckDbPool, Pool};
+use crate::db::Pool;
 use crate::metrics;
 use crate::query::{extract_column_references, route_query, validate_query, EventSignature, QueryEngine};
 
@@ -24,25 +23,6 @@ pub struct SyncStatus {
     pub sync_rate: Option<f64>,
     pub eta_secs: Option<f64>,
     pub updated_at: DateTime<Utc>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub duckdb_min: Option<i64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub duckdb_max: Option<i64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub duckdb_tip_lag: Option<i64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub duckdb_backfill_remaining: Option<i64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub duckdb_internal_gaps: Option<i64>,
-    // Deprecated: use duckdb_max instead
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub duckdb_synced_num: Option<i64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub duckdb_lag: Option<i64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub duckdb_gap_blocks: Option<i64>,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    pub duckdb_gaps: Vec<(i64, i64)>,
 }
 
 pub async fn get_all_status(pool: &Pool) -> Result<Vec<SyncStatus>> {
@@ -103,15 +83,6 @@ pub async fn get_all_status(pool: &Pool) -> Result<Vec<SyncStatus>> {
                 sync_rate,
                 eta_secs,
                 updated_at: row.get(6),
-                duckdb_min: None,
-                duckdb_max: None,
-                duckdb_tip_lag: None,
-                duckdb_backfill_remaining: None,
-                duckdb_internal_gaps: None,
-                duckdb_synced_num: None,
-                duckdb_lag: None,
-                duckdb_gap_blocks: None,
-                duckdb_gaps: Vec::new(),
             }
         })
         .collect())
@@ -153,25 +124,10 @@ pub struct AnalyticsEngineConfig {
     pub pg_duckdb_threads: Option<u32>,
 }
 
-/// Execute a query, automatically routing to DuckDB or PostgreSQL based on query patterns.
-///
-/// If `force_engine` is provided, it overrides the automatic routing decision.
-/// Valid values: "postgres", "duckdb"
-pub async fn execute_query(
-    pg_pool: &Pool,
-    duckdb_pool: Option<&Arc<DuckDbPool>>,
-    sql: &str,
-    signature: Option<&str>,
-    options: &QueryOptions,
-) -> Result<QueryResult> {
-    execute_query_with_engine(pg_pool, duckdb_pool, sql, signature, options, None).await
-}
-
 /// Execute a query with analytics engine configuration.
 /// This is the primary entry point for queries with pg_duckdb support.
 pub async fn execute_query_with_analytics(
     pg_pool: &Pool,
-    duckdb_pool: Option<&Arc<DuckDbPool>>,
     sql: &str,
     signature: Option<&str>,
     options: &QueryOptions,
@@ -189,31 +145,13 @@ pub async fn execute_query_with_analytics(
     };
 
     // Decide which backend to use based on config and routing
-    let (effective_engine, use_pg_duckdb) = match analytics_config.engine {
-        AnalyticsEngine::PgDuckdb => {
-            // Use pg_duckdb for OLAP queries, plain Postgres for OLTP
-            if routed_engine == QueryEngine::DuckDb {
-                (QueryEngine::DuckDb, true) // DuckDB via pg_duckdb
-            } else {
-                (QueryEngine::Postgres, false) // Plain Postgres
-            }
-        }
-        AnalyticsEngine::DuckdbFile => {
-            // Legacy: use DuckDB file if available, else Postgres
-            if routed_engine == QueryEngine::DuckDb && duckdb_pool.is_some() {
-                (QueryEngine::DuckDb, false) // DuckDB file
-            } else {
-                (QueryEngine::Postgres, false)
-            }
-        }
-        AnalyticsEngine::Postgres => {
-            // Always use Postgres
-            (QueryEngine::Postgres, false)
-        }
+    let use_pg_duckdb = match analytics_config.engine {
+        AnalyticsEngine::PgDuckdb => routed_engine == QueryEngine::DuckDb,
+        AnalyticsEngine::Postgres => false,
     };
 
     // Generate CTE SQL if a signature is provided
-    // For pg_duckdb, use Postgres-style CTEs (they use native abi_* functions)
+    // Always use Postgres-style CTEs (pg_duckdb uses native abi_* functions)
     let sql = if let Some(sig_str) = signature {
         let sig = EventSignature::parse(sig_str)?;
         let used_columns = extract_column_references(sql);
@@ -222,17 +160,7 @@ pub async fn execute_query_with_analytics(
         } else {
             Some(&used_columns)
         };
-        
-        // pg_duckdb uses Postgres CTEs (with native abi_* functions)
-        // DuckDB file uses DuckDB CTEs (with Rust UDFs)
-        let cte = if use_pg_duckdb {
-            sig.to_cte_sql_postgres_filtered(filter)
-        } else {
-            match effective_engine {
-                QueryEngine::DuckDb => sig.to_cte_sql_duckdb_filtered(filter),
-                QueryEngine::Postgres => sig.to_cte_sql_postgres_filtered(filter),
-            }
-        };
+        let cte = sig.to_cte_sql_postgres_filtered(filter);
         format!("WITH {cte} {sql}")
     } else {
         sql.to_string()
@@ -257,78 +185,7 @@ pub async fn execute_query_with_analytics(
         )
         .await
     } else {
-        match effective_engine {
-            QueryEngine::DuckDb => {
-                execute_query_duckdb(duckdb_pool.unwrap(), &sql, options).await
-            }
-            QueryEngine::Postgres => {
-                execute_query_postgres(pg_pool, &sql, options).await
-            }
-        }
-    }
-}
-
-/// Execute a query with optional engine override.
-pub async fn execute_query_with_engine(
-    pg_pool: &Pool,
-    duckdb_pool: Option<&Arc<DuckDbPool>>,
-    sql: &str,
-    signature: Option<&str>,
-    options: &QueryOptions,
-    force_engine: Option<&str>,
-) -> Result<QueryResult> {
-    // Validate query using proper SQL parsing (prevents V1 comment bypass, V2/V13 dangerous functions)
-    validate_query(sql)?;
-
-    // Determine which engine to use (forced or auto-detected)
-    let engine = match force_engine {
-        Some("postgres") | Some("pg") => QueryEngine::Postgres,
-        Some("duckdb") | Some("duck") => QueryEngine::DuckDb,
-        _ => route_query(sql),
-    };
-
-    // For DuckDB queries without a DuckDB pool, fall back to Postgres
-    let engine = if engine == QueryEngine::DuckDb && duckdb_pool.is_none() {
-        QueryEngine::Postgres
-    } else {
-        engine
-    };
-
-    // Generate engine-specific CTE SQL if a signature is provided
-    // Smart CTE: only decode columns that are actually used in the query
-    let sql = if let Some(sig_str) = signature {
-        let sig = EventSignature::parse(sig_str)?;
-        let used_columns = extract_column_references(sql);
-        // If empty (e.g., SELECT *), include all decoded columns
-        let filter = if used_columns.is_empty() {
-            None
-        } else {
-            Some(&used_columns)
-        };
-        let cte = match engine {
-            QueryEngine::DuckDb => sig.to_cte_sql_duckdb_filtered(filter),
-            QueryEngine::Postgres => sig.to_cte_sql_postgres_filtered(filter),
-        };
-        format!("WITH {cte} {sql}")
-    } else {
-        sql.to_string()
-    };
-
-    // Add LIMIT if not present
-    let sql_upper = sql.to_uppercase();
-    let sql = if !sql_upper.contains("LIMIT") {
-        format!("{} LIMIT {}", sql, options.limit)
-    } else {
-        sql
-    };
-
-    match engine {
-        QueryEngine::DuckDb => {
-            execute_query_duckdb(duckdb_pool.unwrap(), &sql, options).await
-        }
-        QueryEngine::Postgres => {
-            execute_query_postgres(pg_pool, &sql, options).await
-        }
+        execute_query_postgres(pg_pool, &sql, options).await
     }
 }
 
@@ -338,7 +195,7 @@ async fn execute_query_postgres(
     sql: &str,
     options: &QueryOptions,
 ) -> Result<QueryResult> {
-    execute_query_postgres_inner(pool, sql, options, "postgres", false).await
+    execute_query_postgres_inner(pool, sql, options, "postgres").await
 }
 
 /// Execute a query on PostgreSQL with pg_duckdb extension.
@@ -447,7 +304,6 @@ async fn execute_query_postgres_inner(
     sql: &str,
     options: &QueryOptions,
     engine_name: &str,
-    _use_duckdb: bool,
 ) -> Result<QueryResult> {
     // Convert '0x...' hex strings to '\x...' bytea literals for PostgreSQL
     let sql = sql.replace("'0x", "'\\x");
@@ -519,46 +375,6 @@ async fn execute_query_postgres_inner(
         engine: Some(engine_name.to_string()),
         query_time_ms: Some(elapsed_ms),
     })
-}
-
-/// Execute a query on DuckDB.
-///
-/// Runs in a blocking thread pool to avoid blocking the async runtime.
-/// Uses DuckDB's query timeout setting for actual cancellation.
-async fn execute_query_duckdb(
-    pool: &Arc<DuckDbPool>,
-    sql: &str,
-    options: &QueryOptions,
-) -> Result<QueryResult> {
-    let start = Instant::now();
-    let sql = sql.to_string();
-
-    // Run DuckDB query using dedicated query method (opens read-only connection)
-    // This avoids blocking on write operations (gap-fill, tail sync)
-    let result = tokio::time::timeout(
-        std::time::Duration::from_millis(options.timeout_ms + 500),
-        pool.query(&sql),
-    )
-    .await;
-
-    match result {
-        Ok(Ok((columns, rows))) => {
-            let elapsed = start.elapsed();
-            metrics::record_query_duration(elapsed);
-            let row_count = rows.len();
-            metrics::record_query_rows(row_count as u64);
-
-            Ok(QueryResult {
-                columns,
-                rows,
-                row_count,
-                engine: Some("duckdb".to_string()),
-                query_time_ms: Some(elapsed.as_secs_f64() * 1000.0),
-            })
-        }
-        Ok(Err(e)) => Err(anyhow!("DuckDB query error: {}", sanitize_db_error(&e.to_string()))),
-        Err(_) => Err(anyhow!("Query timeout")),
-    }
 }
 
 pub fn format_column_json(row: &tokio_postgres::Row, idx: usize) -> serde_json::Value {
@@ -673,16 +489,6 @@ mod tests {
         assert_eq!(config.engine, AnalyticsEngine::PgDuckdb);
         assert_eq!(config.pg_duckdb_memory_limit, Some("16GB".to_string()));
         assert_eq!(config.pg_duckdb_threads, Some(8));
-    }
-
-    #[test]
-    fn test_analytics_engine_duckdb_file_mode() {
-        let config = AnalyticsEngineConfig {
-            engine: AnalyticsEngine::DuckdbFile,
-            pg_duckdb_memory_limit: None,
-            pg_duckdb_threads: None,
-        };
-        assert_eq!(config.engine, AnalyticsEngine::DuckdbFile);
     }
 
     #[test]
@@ -842,7 +648,7 @@ mod tests {
         let pg_cte = sig.to_cte_sql_postgres();
         let full_pg_query = format!("WITH {} {}", pg_cte, user_query);
         
-        // For duckdb_file mode (uses DuckDB UDFs)
+        // For native DuckDB mode (uses DuckDB UDFs)
         let duck_cte = sig.to_cte_sql_duckdb();
         let full_duck_query = format!("WITH {} {}", duck_cte, user_query);
         

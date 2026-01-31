@@ -9,12 +9,11 @@ use metrics_exporter_prometheus::PrometheusBuilder;
 use tokio::sync::RwLock;
 use tracing::{error, info};
 
-use tidx::api::{self, AnalyticsConfig, SharedAnalyticsConfigs, SharedDuckDbPools, SharedPools};
+use tidx::api::{self, AnalyticsConfig, SharedAnalyticsConfigs, SharedPools};
 use tidx::broadcast::Broadcaster;
-use tidx::config::{AnalyticsEngine, ChainConfig, Config, ConfigWatcher, NewChainEvent};
-use tidx::db::{self, DuckDbPool, ThrottledPool};
+use tidx::config::{ChainConfig, Config, ConfigWatcher, NewChainEvent};
+use tidx::db::{self, ThrottledPool};
 use tidx::sync::engine::SyncEngine;
-use tidx::sync::{Replicator, ReplicatorHandle};
 
 #[derive(ClapArgs)]
 pub struct Args {
@@ -30,12 +29,7 @@ pub struct Args {
 pub async fn run(args: Args) -> Result<()> {
     let config = Config::load(&args.config)?;
 
-    let duckdb_count = config.chains.iter().filter(|c| c.duckdb_path.is_some()).count();
-    info!(
-        chains = config.chains.len(),
-        duckdb_chains = duckdb_count,
-        "Loaded config"
-    );
+    info!(chains = config.chains.len(), "Loaded config");
 
     if config.prometheus.enabled {
         let metrics_addr: SocketAddr =
@@ -59,14 +53,12 @@ pub async fn run(args: Args) -> Result<()> {
     });
 
     let pools: SharedPools = Arc::new(RwLock::new(HashMap::new()));
-    let duckdb_pools: SharedDuckDbPools = Arc::new(RwLock::new(HashMap::new()));
     let analytics_configs: SharedAnalyticsConfigs = Arc::new(RwLock::new(HashMap::new()));
     let mut default_chain_id = 0u64;
 
     for chain in &config.chains {
-        let (throttled_pool, replicator_handle) = initialize_chain(
+        let throttled_pool = initialize_chain(
             chain,
-            Arc::clone(&duckdb_pools),
             Arc::clone(&analytics_configs),
         ).await?;
 
@@ -80,7 +72,6 @@ pub async fn run(args: Args) -> Result<()> {
         spawn_sync_engine(
             chain.clone(),
             throttled_pool,
-            replicator_handle,
             broadcaster.clone(),
             shutdown_tx.subscribe(),
         );
@@ -99,7 +90,6 @@ pub async fn run(args: Args) -> Result<()> {
                 Arc::clone(&pools),
                 default_chain_id,
                 broadcaster.clone(),
-                Arc::clone(&duckdb_pools),
                 Arc::clone(&analytics_configs),
                 http_config,
             );
@@ -123,21 +113,19 @@ pub async fn run(args: Args) -> Result<()> {
         }
 
         let pools_for_watcher = Arc::clone(&pools);
-        let duckdb_pools_for_watcher = Arc::clone(&duckdb_pools);
         let analytics_configs_for_watcher = Arc::clone(&analytics_configs);
         let broadcaster_for_watcher = broadcaster.clone();
         let shutdown_tx_for_watcher = shutdown_tx.clone();
 
         tokio::spawn(async move {
             while let Some(event) = chain_rx.recv().await {
-                match initialize_chain(&event.chain, Arc::clone(&duckdb_pools_for_watcher), Arc::clone(&analytics_configs_for_watcher)).await {
-                    Ok((throttled_pool, replicator_handle)) => {
+                match initialize_chain(&event.chain, Arc::clone(&analytics_configs_for_watcher)).await {
+                    Ok(throttled_pool) => {
                         pools_for_watcher.write().await.insert(event.chain.chain_id, throttled_pool.pool.clone());
 
                         spawn_sync_engine(
                             event.chain,
                             throttled_pool,
-                            replicator_handle,
                             broadcaster_for_watcher.clone(),
                             shutdown_tx_for_watcher.subscribe(),
                         );
@@ -154,7 +142,6 @@ pub async fn run(args: Args) -> Result<()> {
             pools.read().await.clone(),
             default_chain_id,
             broadcaster.clone(),
-            duckdb_pools.read().await.clone(),
             analytics_configs.read().await.clone(),
             &config.http,
         );
@@ -185,9 +172,8 @@ pub async fn run(args: Args) -> Result<()> {
 
 async fn initialize_chain(
     chain: &ChainConfig,
-    duckdb_pools: SharedDuckDbPools,
     analytics_configs: SharedAnalyticsConfigs,
-) -> Result<(ThrottledPool, Option<ReplicatorHandle>)> {
+) -> Result<ThrottledPool> {
     info!(chain = %chain.name, db = %chain.pg_url, "Connecting to database with throttled pool...");
     let throttled_pool = ThrottledPool::new(&chain.pg_url).await?;
 
@@ -202,51 +188,21 @@ async fn initialize_chain(
     };
     analytics_configs.write().await.insert(chain.chain_id, analytics_config);
 
-    // Only initialize DuckDB replicator for duckdb_file mode
-    let replicator_handle = match chain.analytics_engine {
-        AnalyticsEngine::DuckdbFile => {
-            if let Some(ref duckdb_path) = chain.duckdb_path {
-                info!(chain = %chain.name, path = %duckdb_path, "Initializing DuckDB (duckdb_file mode)");
-                
-                // Single DuckDB pool - Parquet is the intermediate format for data transfer
-                let duckdb = Arc::new(DuckDbPool::new(duckdb_path)?);
-
-                // Replicator syncs from Postgres via Parquet
-                let (replicator, handle) = Replicator::new(
-                    duckdb.clone(),
-                    throttled_pool.pool.clone(),
-                    10_000,
-                    chain.chain_id,
-                    chain.duckdb_batch_sizes.clone(),
-                );
-                tokio::spawn(replicator.run());
-
-                // Store pool for API queries
-                duckdb_pools.write().await.insert(chain.chain_id, duckdb);
-                
-                Some(handle)
-            } else {
-                info!(chain = %chain.name, "DuckDB file mode enabled but no duckdb_path configured, falling back to pg_duckdb");
-                None
-            }
+    match chain.analytics_engine {
+        tidx::config::AnalyticsEngine::PgDuckdb => {
+            info!(chain = %chain.name, "Using pg_duckdb for analytical queries");
         }
-        AnalyticsEngine::PgDuckdb => {
-            info!(chain = %chain.name, "Using pg_duckdb for analytical queries (no replication needed)");
-            None
-        }
-        AnalyticsEngine::Postgres => {
+        tidx::config::AnalyticsEngine::Postgres => {
             info!(chain = %chain.name, "Using PostgreSQL only for all queries");
-            None
         }
     };
 
-    Ok((throttled_pool, replicator_handle))
+    Ok(throttled_pool)
 }
 
 fn spawn_sync_engine(
     chain: ChainConfig,
     throttled_pool: ThrottledPool,
-    replicator_handle: Option<ReplicatorHandle>,
     broadcaster: Arc<Broadcaster>,
     shutdown_rx: tokio::sync::broadcast::Receiver<()>,
 ) {
@@ -254,7 +210,6 @@ fn spawn_sync_engine(
         chain = %chain.name,
         chain_id = chain.chain_id,
         rpc = %chain.rpc_url,
-        duckdb = replicator_handle.is_some(),
         backfill_limit = throttled_pool.backfill_semaphore.available_permits(),
         "Starting sync for chain (throttled pool: 16 connections, backfill limited)"
     );
@@ -276,10 +231,6 @@ fn spawn_sync_engine(
                 return;
             }
         };
-
-        if let Some(handle) = replicator_handle {
-            engine = engine.with_replicator(handle);
-        }
 
         // Run the sync engine - handles both realtime sync and gap sync
         // Gap sync fills ALL gaps from most recent to earliest (replaces backfill)
