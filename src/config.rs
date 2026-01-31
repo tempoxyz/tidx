@@ -178,6 +178,62 @@ pub struct ChainConfig {
     /// pg_duckdb thread count
     #[serde(default)]
     pub pg_duckdb_threads: Option<u32>,
+
+    /// Parquet compression/export settings
+    #[serde(default)]
+    pub compress: Option<CompressConfig>,
+}
+
+/// Configuration for Parquet export/compression of old data
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CompressConfig {
+    /// Enable Parquet export (default: false)
+    #[serde(default)]
+    pub enabled: bool,
+
+    /// Export when this many contiguous blocks are ready (default: 100000)
+    #[serde(default = "default_threshold_blocks")]
+    pub threshold_blocks: u64,
+
+    /// Keep this many recent blocks in PostgreSQL (default: 10000)
+    #[serde(default = "default_retention_blocks")]
+    pub retention_blocks: u64,
+
+    /// Check interval in seconds (default: 600 = 10 minutes)
+    #[serde(default = "default_check_interval")]
+    pub check_interval_secs: u64,
+
+    /// Directory to store Parquet files (default: /data)
+    #[serde(default = "default_data_dir")]
+    pub data_dir: String,
+}
+
+impl Default for CompressConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            threshold_blocks: 100_000,
+            retention_blocks: 10_000,
+            check_interval_secs: 600,
+            data_dir: "/data".to_string(),
+        }
+    }
+}
+
+fn default_threshold_blocks() -> u64 {
+    100_000
+}
+
+fn default_retention_blocks() -> u64 {
+    10_000
+}
+
+fn default_check_interval() -> u64 {
+    600
+}
+
+fn default_data_dir() -> String {
+    "/data".to_string()
 }
 
 fn default_backfill() -> bool {
