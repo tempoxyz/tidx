@@ -53,10 +53,9 @@ pub async fn run_compress_loop(
     info!(
         chain_id = chain_id,
         threshold = config.threshold_blocks,
-        retention = config.retention_blocks,
         interval_secs = config.check_interval_secs,
         data_dir = %chain_dir.display(),
-        "Starting Parquet compression loop"
+        "Starting Parquet export loop"
     );
 
     // Ensure parquet_ranges table exists
@@ -141,24 +140,11 @@ async fn tick_compress(
         }
     };
 
-    // Calculate cutoff: we don't export blocks within retention_blocks of tip
-    let cutoff = (tip_num as u64).saturating_sub(config.retention_blocks);
-
-    if cutoff == 0 {
-        debug!(
-            chain_id = chain_id,
-            tip = tip_num,
-            retention = config.retention_blocks,
-            "Not enough blocks for compression yet"
-        );
-        return Ok(());
-    }
-
     // Find the highest block already exported
     let last_exported = get_last_exported_block(pool, chain_id).await?;
 
-    // Find contiguous range from last_exported to cutoff
-    let range = find_contiguous_range(pool, chain_id, last_exported, cutoff).await?;
+    // Find contiguous range from last_exported to tip
+    let range = find_contiguous_range(pool, chain_id, last_exported, tip_num as u64).await?;
 
     let (start_block, end_block) = match range {
         Some((s, e)) if e - s + 1 >= config.threshold_blocks => (s, e),
@@ -203,9 +189,6 @@ async fn tick_compress(
         file_size,
     )
     .await?;
-
-    // Delete exported logs from PostgreSQL
-    delete_exported_logs(pool, chain_id, start_block, end_block).await?;
 
     info!(
         chain_id = chain_id,
@@ -424,47 +407,6 @@ async fn record_parquet_range(
     .await?;
 
     Ok(())
-}
-
-/// Delete exported logs from PostgreSQL to reclaim space
-async fn delete_exported_logs(
-    pool: &Pool,
-    _chain_id: u64,
-    start_block: u64,
-    end_block: u64,
-) -> Result<u64> {
-    let conn = pool.get().await?;
-
-    // Delete in batches to avoid long locks
-    let batch_size = 10_000i64;
-    let mut total_deleted = 0u64;
-    let mut current = start_block as i64;
-
-    while current <= end_block as i64 {
-        let batch_end = (current + batch_size - 1).min(end_block as i64);
-
-        let deleted = conn
-            .execute(
-                "DELETE FROM logs WHERE block_num >= $1 AND block_num <= $2",
-                &[&current, &batch_end],
-            )
-            .await?;
-
-        total_deleted += deleted;
-        current = batch_end + 1;
-
-        // Yield to other tasks between batches
-        tokio::task::yield_now().await;
-    }
-
-    info!(
-        start = start_block,
-        end = end_block,
-        deleted = total_deleted,
-        "Deleted exported logs from PostgreSQL"
-    );
-
-    Ok(total_deleted)
 }
 
 /// Get all Parquet ranges for a chain (for query layer)

@@ -195,10 +195,6 @@ pub struct ParquetExportConfig {
     #[serde(default = "default_threshold_blocks")]
     pub threshold_blocks: u64,
 
-    /// Keep this many recent blocks in PostgreSQL (default: 10000)
-    #[serde(default = "default_retention_blocks")]
-    pub retention_blocks: u64,
-
     /// Check interval in seconds (default: 600 = 10 minutes)
     #[serde(default = "default_check_interval")]
     pub check_interval_secs: u64,
@@ -213,7 +209,6 @@ impl Default for ParquetExportConfig {
         Self {
             enabled: false,
             threshold_blocks: 10_000,
-            retention_blocks: 10_000,
             check_interval_secs: 600,
             data_dir: "/data".to_string(),
         }
@@ -221,10 +216,6 @@ impl Default for ParquetExportConfig {
 }
 
 fn default_threshold_blocks() -> u64 {
-    10_000
-}
-
-fn default_retention_blocks() -> u64 {
     10_000
 }
 
