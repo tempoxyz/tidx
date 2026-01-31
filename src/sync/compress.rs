@@ -14,7 +14,7 @@ use std::time::Duration;
 use tokio::sync::broadcast;
 use tracing::{debug, error, info, warn};
 
-use crate::config::CompressConfig;
+use crate::config::ParquetExportConfig;
 use crate::db::Pool;
 
 /// Tracks exported Parquet file ranges
@@ -32,7 +32,7 @@ pub struct ParquetRange {
 pub async fn run_compress_loop(
     pool: Pool,
     chain_id: u64,
-    config: CompressConfig,
+    config: ParquetExportConfig,
     mut shutdown: broadcast::Receiver<()>,
 ) -> Result<()> {
     if !config.enabled {
@@ -120,7 +120,7 @@ async fn create_parquet_ranges_table(pool: &Pool) -> Result<()> {
 async fn tick_compress(
     pool: &Pool,
     chain_id: u64,
-    config: &CompressConfig,
+    config: &ParquetExportConfig,
     data_dir: &PathBuf,
 ) -> Result<()> {
     let conn = pool.get().await?;

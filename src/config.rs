@@ -179,19 +179,19 @@ pub struct ChainConfig {
     #[serde(default)]
     pub pg_duckdb_threads: Option<u32>,
 
-    /// Parquet compression/export settings
-    #[serde(default)]
-    pub compress: Option<CompressConfig>,
+    /// Parquet export settings (for archiving old logs to columnar format)
+    #[serde(default, alias = "compress")]
+    pub parquet: Option<ParquetExportConfig>,
 }
 
-/// Configuration for Parquet export/compression of old data
+/// Configuration for Parquet export of old log data
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct CompressConfig {
+pub struct ParquetExportConfig {
     /// Enable Parquet export (default: false)
     #[serde(default)]
     pub enabled: bool,
 
-    /// Export when this many contiguous blocks are ready (default: 100000)
+    /// Export when this many contiguous blocks are ready (default: 10000)
     #[serde(default = "default_threshold_blocks")]
     pub threshold_blocks: u64,
 
@@ -208,11 +208,11 @@ pub struct CompressConfig {
     pub data_dir: String,
 }
 
-impl Default for CompressConfig {
+impl Default for ParquetExportConfig {
     fn default() -> Self {
         Self {
             enabled: false,
-            threshold_blocks: 100_000,
+            threshold_blocks: 10_000,
             retention_blocks: 10_000,
             check_interval_secs: 600,
             data_dir: "/data".to_string(),
@@ -221,7 +221,7 @@ impl Default for CompressConfig {
 }
 
 fn default_threshold_blocks() -> u64 {
-    100_000
+    10_000
 }
 
 fn default_retention_blocks() -> u64 {

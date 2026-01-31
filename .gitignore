@@ -21,3 +21,4 @@ Thumbs.db
 
 # Seeds
 *.dump
+docker/postgres-pgduckdb/tidx-abi/target/

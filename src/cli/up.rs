@@ -193,11 +193,11 @@ async fn initialize_chain(
     };
     pg_duckdb_configs.write().await.insert(chain.chain_id, pg_duckdb_config);
 
-    // Store Parquet config for this chain (if compression is enabled)
-    if let Some(ref compress) = chain.compress {
+    // Store Parquet config for this chain (if enabled)
+    if let Some(ref parquet) = chain.parquet {
         let parquet_config = ChainParquetConfig {
-            enabled: compress.enabled,
-            data_dir: compress.data_dir.clone(),
+            enabled: parquet.enabled,
+            data_dir: parquet.data_dir.clone(),
         };
         parquet_configs.write().await.insert(chain.chain_id, parquet_config);
     }
@@ -223,26 +223,26 @@ fn spawn_sync_engine(
 
     let backfill_first = chain.backfill_first;
     let trust_rpc = chain.trust_rpc;
-    let compress_config = chain.compress.clone();
+    let parquet_export_config = chain.parquet.clone();
     let chain_id = chain.chain_id;
-    let pool_for_compress = throttled_pool.pool.clone();
-    let compress_shutdown = shutdown_rx.resubscribe();
+    let pool_for_parquet = throttled_pool.pool.clone();
+    let parquet_shutdown = shutdown_rx.resubscribe();
 
     tokio::spawn(async move {
-        // Spawn Parquet compression task if enabled
-        if let Some(ref config) = compress_config {
+        // Spawn Parquet export task if enabled
+        if let Some(ref config) = parquet_export_config {
             if config.enabled {
                 let config = config.clone();
                 tokio::spawn(async move {
                     if let Err(e) = tidx::sync::compress::run_compress_loop(
-                        pool_for_compress,
+                        pool_for_parquet,
                         chain_id,
                         config,
-                        compress_shutdown,
+                        parquet_shutdown,
                     )
                     .await
                     {
-                        error!(error = %e, chain_id = chain_id, "Parquet compression loop failed");
+                        error!(error = %e, chain_id = chain_id, "Parquet export loop failed");
                     }
                 });
             }
