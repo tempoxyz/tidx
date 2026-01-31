@@ -31,11 +31,11 @@ RUN git clone --depth 1 --branch ${DUCKDB_VERSION} https://github.com/duckdb/ext
 
 # Append DuckDB extension metadata (534-byte footer required for loading)
 RUN python3 /extension-ci-tools/scripts/append_extension_metadata.py \
+    --library-file target/release/libtidx_abi.so \
     --extension-name tidx_abi \
     --duckdb-platform linux_amd64_gcc4 \
     --extension-version "0.1.0" \
-    --duckdb-version "${DUCKDB_VERSION}" \
-    target/release/libtidx_abi.so
+    --duckdb-version "${DUCKDB_VERSION}"
 
 # =============================================================================
 # Stage 2: Final image with pg_duckdb + tidx_abi
@@ -45,8 +45,8 @@ FROM pgduckdb/pgduckdb:${PGDUCKDB_VERSION}
 # Create extensions directory
 RUN mkdir -p /usr/share/duckdb/extensions
 
-# Copy the built extension from builder stage (Linux .so with metadata)
-COPY --from=builder /build/target/release/libtidx_abi.so /usr/share/duckdb/extensions/tidx_abi.duckdb_extension
+# Copy the built extension from builder stage (with metadata appended)
+COPY --from=builder /build/tidx_abi.duckdb_extension /usr/share/duckdb/extensions/
 
 # Create init script to load extension
 COPY init-pg-duckdb.sql /docker-entrypoint-initdb.d/
