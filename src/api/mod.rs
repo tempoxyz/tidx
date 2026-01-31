@@ -26,7 +26,8 @@ use tower_http::trace::TraceLayer;
 use crate::broadcast::Broadcaster;
 use crate::config::{HttpConfig, SharedHttpConfig};
 use crate::db::Pool;
-use crate::service::{QueryOptions, QueryResult, SyncStatus};
+use crate::service::{ParquetConfig, QueryOptions, QueryResult, SyncStatus};
+use crate::sync::compress::get_max_parquet_block;
 
 pub use rate_limit::{RateLimiter, SseConnectionGuard};
 
@@ -41,6 +42,15 @@ pub struct PgDuckdbConfig {
 
 pub type SharedPgDuckdbConfigs = Arc<RwLock<HashMap<u64, PgDuckdbConfig>>>;
 
+/// Per-chain Parquet configuration (static parts from config).
+#[derive(Clone, Debug, Default)]
+pub struct ChainParquetConfig {
+    pub enabled: bool,
+    pub data_dir: String,
+}
+
+pub type SharedParquetConfigs = Arc<RwLock<HashMap<u64, ChainParquetConfig>>>;
+
 #[derive(Clone)]
 pub struct AppState {
     /// Map of chain_id -> pool (hot-reloadable)
@@ -50,6 +60,8 @@ pub struct AppState {
     pub broadcaster: Arc<Broadcaster>,
     /// Per-chain pg_duckdb configuration (hot-reloadable)
     pub pg_duckdb_configs: SharedPgDuckdbConfigs,
+    /// Per-chain Parquet configuration (hot-reloadable)
+    pub parquet_configs: SharedParquetConfigs,
     /// Rate limiter for request throttling
     pub rate_limiter: RateLimiter,
 }
@@ -69,10 +81,30 @@ impl AppState {
             .cloned()
             .unwrap_or_default()
     }
+
+    /// Get ParquetConfig for a chain, dynamically fetching max_parquet_block from DB.
+    async fn get_parquet_config(&self, chain_id: Option<u64>) -> Option<ParquetConfig> {
+        let id = chain_id.unwrap_or(self.default_chain_id);
+        let static_config = self.parquet_configs.read().await.get(&id).cloned()?;
+
+        if !static_config.enabled {
+            return None;
+        }
+
+        let pool = self.get_pool(Some(id)).await?;
+        let max_block = get_max_parquet_block(&pool, id).await.ok().flatten();
+
+        Some(ParquetConfig {
+            enabled: true,
+            data_dir: Some(static_config.data_dir),
+            chain_id: Some(id),
+            max_parquet_block: max_block,
+        })
+    }
 }
 
 pub fn router(pools: HashMap<u64, Pool>, default_chain_id: u64, broadcaster: Arc<Broadcaster>) -> Router<()> {
-    router_with_options(pools, default_chain_id, broadcaster, HashMap::new(), &HttpConfig::default())
+    router_with_options(pools, default_chain_id, broadcaster, HashMap::new(), HashMap::new(), &HttpConfig::default())
 }
 
 pub fn router_with_options(
@@ -80,6 +112,7 @@ pub fn router_with_options(
     default_chain_id: u64,
     broadcaster: Arc<Broadcaster>,
     pg_duckdb_configs: HashMap<u64, PgDuckdbConfig>,
+    parquet_configs: HashMap<u64, ChainParquetConfig>,
     http_config: &HttpConfig,
 ) -> Router<()> {
     let rate_limiter = RateLimiter::new(
@@ -94,6 +127,7 @@ pub fn router_with_options(
         default_chain_id,
         broadcaster,
         pg_duckdb_configs: Arc::new(RwLock::new(pg_duckdb_configs)),
+        parquet_configs: Arc::new(RwLock::new(parquet_configs)),
         rate_limiter: rate_limiter.clone(),
     };
 
@@ -105,6 +139,7 @@ pub fn router_shared(
     default_chain_id: u64,
     broadcaster: Arc<Broadcaster>,
     pg_duckdb_configs: SharedPgDuckdbConfigs,
+    parquet_configs: SharedParquetConfigs,
     http_config: SharedHttpConfig,
 ) -> Router<()> {
     let rate_limiter = RateLimiter::new_shared(http_config);
@@ -116,6 +151,7 @@ pub fn router_shared(
         default_chain_id,
         broadcaster,
         pg_duckdb_configs,
+        parquet_configs,
         rate_limiter: rate_limiter.clone(),
     };
 
@@ -240,14 +276,17 @@ async fn handle_query_once(
         memory_limit: pg_duckdb_config.memory_limit,
         threads: pg_duckdb_config.threads,
     };
+
+    let parquet_config = state.get_parquet_config(Some(params.chain_id)).await;
     
-    let result = crate::service::execute_query(
+    let result = crate::service::execute_query_with_parquet(
         &pool,
         &params.sql,
         params.signature.as_deref(),
         &options,
         &service_config,
         params.engine.as_deref(),
+        parquet_config.as_ref(),
     )
     .await
     .map_err(|e| {
@@ -316,6 +355,7 @@ async fn handle_query_live(
         memory_limit: pg_duckdb_config.memory_limit,
         threads: pg_duckdb_config.threads,
     };
+    let parquet_config = state.get_parquet_config(Some(params.chain_id)).await;
 
     let mut rx = state.broadcaster.subscribe();
     let sql = params.sql;
@@ -335,7 +375,7 @@ async fn handle_query_live(
         let mut last_block_num: u64 = 0;
 
         // Execute initial query
-        match crate::service::execute_query(&pool, &sql, signature.as_deref(), &options, &service_config, engine.as_deref()).await {
+        match crate::service::execute_query_with_parquet(&pool, &sql, signature.as_deref(), &options, &service_config, engine.as_deref(), parquet_config.as_ref()).await {
             Ok(result) => {
                 yield Ok(SseEvent::default()
                     .event("result")
@@ -385,7 +425,7 @@ async fn handle_query_live(
                     // For OLAP queries, re-execute the full query once per update (not per-block)
                     // For OLTP queries, filter by each block
                     if is_olap {
-                        match crate::service::execute_query(&pool, &sql, signature.as_deref(), &options, &service_config, engine.as_deref()).await {
+                        match crate::service::execute_query_with_parquet(&pool, &sql, signature.as_deref(), &options, &service_config, engine.as_deref(), parquet_config.as_ref()).await {
                             Ok(result) => {
                                 yield Ok(SseEvent::default()
                                     .event("result")
@@ -404,7 +444,7 @@ async fn handle_query_live(
                         let catch_up_start = last_block_num + 1;
                         for block_num in catch_up_start..=end {
                             let filtered_sql = inject_block_filter(&sql, block_num);
-                            match crate::service::execute_query(&pool, &filtered_sql, signature.as_deref(), &options, &service_config, engine.as_deref()).await {
+                            match crate::service::execute_query_with_parquet(&pool, &filtered_sql, signature.as_deref(), &options, &service_config, engine.as_deref(), parquet_config.as_ref()).await {
                                 Ok(result) => {
                                     yield Ok(SseEvent::default()
                                         .event("result")

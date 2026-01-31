@@ -9,7 +9,7 @@ use metrics_exporter_prometheus::PrometheusBuilder;
 use tokio::sync::RwLock;
 use tracing::{error, info};
 
-use tidx::api::{self, PgDuckdbConfig, SharedPgDuckdbConfigs, SharedPools};
+use tidx::api::{self, ChainParquetConfig, PgDuckdbConfig, SharedParquetConfigs, SharedPgDuckdbConfigs, SharedPools};
 use tidx::broadcast::Broadcaster;
 use tidx::config::{ChainConfig, Config, ConfigWatcher, NewChainEvent};
 use tidx::db::{self, ThrottledPool};
@@ -54,12 +54,14 @@ pub async fn run(args: Args) -> Result<()> {
 
     let pools: SharedPools = Arc::new(RwLock::new(HashMap::new()));
     let pg_duckdb_configs: SharedPgDuckdbConfigs = Arc::new(RwLock::new(HashMap::new()));
+    let parquet_configs: SharedParquetConfigs = Arc::new(RwLock::new(HashMap::new()));
     let mut default_chain_id = 0u64;
 
     for chain in &config.chains {
         let throttled_pool = initialize_chain(
             chain,
             Arc::clone(&pg_duckdb_configs),
+            Arc::clone(&parquet_configs),
         ).await?;
 
         if default_chain_id == 0 {
@@ -91,6 +93,7 @@ pub async fn run(args: Args) -> Result<()> {
                 default_chain_id,
                 broadcaster.clone(),
                 Arc::clone(&pg_duckdb_configs),
+                Arc::clone(&parquet_configs),
                 http_config,
             );
 
@@ -114,12 +117,13 @@ pub async fn run(args: Args) -> Result<()> {
 
         let pools_for_watcher = Arc::clone(&pools);
         let pg_duckdb_configs_for_watcher = Arc::clone(&pg_duckdb_configs);
+        let parquet_configs_for_watcher = Arc::clone(&parquet_configs);
         let broadcaster_for_watcher = broadcaster.clone();
         let shutdown_tx_for_watcher = shutdown_tx.clone();
 
         tokio::spawn(async move {
             while let Some(event) = chain_rx.recv().await {
-                match initialize_chain(&event.chain, Arc::clone(&pg_duckdb_configs_for_watcher)).await {
+                match initialize_chain(&event.chain, Arc::clone(&pg_duckdb_configs_for_watcher), Arc::clone(&parquet_configs_for_watcher)).await {
                     Ok(throttled_pool) => {
                         pools_for_watcher.write().await.insert(event.chain.chain_id, throttled_pool.pool.clone());
 
@@ -143,6 +147,7 @@ pub async fn run(args: Args) -> Result<()> {
             default_chain_id,
             broadcaster.clone(),
             pg_duckdb_configs.read().await.clone(),
+            parquet_configs.read().await.clone(),
             &config.http,
         );
 
@@ -173,6 +178,7 @@ pub async fn run(args: Args) -> Result<()> {
 async fn initialize_chain(
     chain: &ChainConfig,
     pg_duckdb_configs: SharedPgDuckdbConfigs,
+    parquet_configs: SharedParquetConfigs,
 ) -> Result<ThrottledPool> {
     info!(chain = %chain.name, db = %chain.pg_url, "Connecting to database with throttled pool...");
     let throttled_pool = ThrottledPool::new(&chain.pg_url).await?;
@@ -186,6 +192,15 @@ async fn initialize_chain(
         threads: chain.pg_duckdb_threads,
     };
     pg_duckdb_configs.write().await.insert(chain.chain_id, pg_duckdb_config);
+
+    // Store Parquet config for this chain (if compression is enabled)
+    if let Some(ref compress) = chain.compress {
+        let parquet_config = ChainParquetConfig {
+            enabled: compress.enabled,
+            data_dir: compress.data_dir.clone(),
+        };
+        parquet_configs.write().await.insert(chain.chain_id, parquet_config);
+    }
 
     info!(chain = %chain.name, "Using pg_duckdb for analytical queries");
 
