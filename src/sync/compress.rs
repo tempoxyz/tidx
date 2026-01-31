@@ -263,8 +263,8 @@ async fn find_contiguous_range(
 ) -> Result<Option<(u64, u64)>> {
     let conn = pool.get().await?;
 
-    // Start from after_block + 1 (or 0 if no prior exports)
-    let start = if after_block == 0 { 0 } else { after_block + 1 };
+    // Start from after_block + 1 (or 1 if no prior exports, since block 0 doesn't exist)
+    let start = if after_block == 0 { 1 } else { after_block + 1 };
 
     if start >= cutoff {
         return Ok(None);
