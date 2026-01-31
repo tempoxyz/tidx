@@ -121,8 +121,23 @@ pub struct PgDuckdbConfig {
     pub threads: Option<u32>,
 }
 
+/// Parquet configuration for hybrid queries (PG heap + Parquet files)
+#[derive(Clone, Debug, Default)]
+pub struct ParquetConfig {
+    /// Whether Parquet querying is enabled
+    pub enabled: bool,
+    /// Directory containing Parquet files for this chain
+    pub data_dir: Option<String>,
+    /// Chain ID (for file path construction)
+    pub chain_id: Option<u64>,
+    /// Maximum block number in Parquet files (blocks > this are in PG)
+    pub max_parquet_block: Option<u64>,
+}
+
 /// Execute a query with pg_duckdb support.
 /// Routes OLAP queries to pg_duckdb, OLTP queries to Postgres.
+/// If parquet_config is provided and the query touches the logs table,
+/// automatically combines Parquet files with PostgreSQL data.
 pub async fn execute_query(
     pg_pool: &Pool,
     sql: &str,
@@ -130,6 +145,30 @@ pub async fn execute_query(
     options: &QueryOptions,
     pg_duckdb_config: &PgDuckdbConfig,
     force_engine: Option<&str>,
+) -> Result<QueryResult> {
+    execute_query_with_parquet(
+        pg_pool,
+        sql,
+        signature,
+        options,
+        pg_duckdb_config,
+        force_engine,
+        None, // No Parquet config by default
+    )
+    .await
+}
+
+/// Execute a query with optional Parquet source integration.
+/// When parquet_config is provided and the query references the logs table,
+/// the query is rewritten to combine Parquet files with PostgreSQL data.
+pub async fn execute_query_with_parquet(
+    pg_pool: &Pool,
+    sql: &str,
+    signature: Option<&str>,
+    options: &QueryOptions,
+    pg_duckdb_config: &PgDuckdbConfig,
+    force_engine: Option<&str>,
+    parquet_config: Option<&ParquetConfig>,
 ) -> Result<QueryResult> {
     // Validate query
     validate_query(sql)?;
@@ -140,6 +179,11 @@ pub async fn execute_query(
         Some("duckdb") | Some("duck") | Some("pg_duckdb") => true,
         _ => route_query(sql) == QueryEngine::DuckDb,
     };
+
+    // Check if we should use Parquet sources
+    let use_parquet = parquet_config
+        .map(|c| c.enabled && c.max_parquet_block.is_some())
+        .unwrap_or(false);
 
     // Generate CTE SQL if a signature is provided
     let sql = if let Some(sig_str) = signature {
@@ -154,6 +198,13 @@ pub async fn execute_query(
         format!("WITH {cte} {sql}")
     } else {
         sql.to_string()
+    };
+
+    // Rewrite query to use Parquet sources if enabled and query touches logs
+    let sql = if use_parquet && query_references_logs(&sql) {
+        rewrite_query_for_parquet(&sql, parquet_config.unwrap())?
+    } else {
+        sql
     };
 
     // Add LIMIT if not present
@@ -177,6 +228,60 @@ pub async fn execute_query(
     } else {
         execute_query_postgres(pg_pool, &sql, options).await
     }
+}
+
+/// Check if a query references the logs table
+fn query_references_logs(sql: &str) -> bool {
+    let sql_upper = sql.to_uppercase();
+    // Check for FROM logs or JOIN logs patterns
+    sql_upper.contains("FROM LOGS") || sql_upper.contains("JOIN LOGS")
+}
+
+/// Rewrite a query to use UNION ALL with Parquet and PostgreSQL sources
+fn rewrite_query_for_parquet(sql: &str, config: &ParquetConfig) -> Result<String> {
+    let max_block = config.max_parquet_block.unwrap_or(0);
+    let chain_id = config.chain_id.unwrap_or(0);
+    let data_dir = config.data_dir.as_deref().unwrap_or("/data");
+
+    // Build the Parquet file glob pattern
+    let parquet_glob = format!("{}/{}/logs_*.parquet", data_dir, chain_id);
+
+    // Create a CTE that combines both sources
+    let hybrid_cte = format!(
+        r#"logs_hybrid AS (
+    -- Recent logs from PostgreSQL heap
+    SELECT * FROM logs WHERE block_num > {}
+    UNION ALL
+    -- Historical logs from Parquet files
+    SELECT * FROM read_parquet('{}')
+)"#,
+        max_block, parquet_glob
+    );
+
+    // Check if query already has WITH clause
+    let sql_upper = sql.to_uppercase();
+    let modified_sql = if sql_upper.starts_with("WITH ") {
+        // Append to existing WITH clause
+        let with_end = sql.find(|c: char| !c.is_whitespace() && c != 'W' && c != 'I' && c != 'T' && c != 'H')
+            .unwrap_or(4);
+        format!(
+            "WITH {}, {}",
+            hybrid_cte,
+            &sql[with_end..]
+        )
+    } else {
+        // Add new WITH clause
+        format!("WITH {} {}", hybrid_cte, sql)
+    };
+
+    // Replace references to 'logs' table with 'logs_hybrid'
+    // This is a simple replacement - for production, use SQL parser
+    let modified_sql = modified_sql
+        .replace("FROM logs", "FROM logs_hybrid")
+        .replace("FROM LOGS", "FROM logs_hybrid")
+        .replace("from logs", "FROM logs_hybrid");
+
+    Ok(modified_sql)
 }
 
 /// Execute a query on PostgreSQL.
@@ -800,6 +905,73 @@ mod tests {
         let sanitized = sanitize_db_error(&error);
         assert!(sanitized.len() < 510); // 500 + "..."
         assert!(sanitized.ends_with("..."));
+    }
+
+    // ========================================================================
+    // Parquet Query Rewriting Tests
+    // ========================================================================
+
+    #[test]
+    fn test_query_references_logs_positive() {
+        assert!(query_references_logs("SELECT * FROM logs WHERE block_num > 100"));
+        assert!(query_references_logs("SELECT * from logs"));
+        assert!(query_references_logs("SELECT * FROM LOGS"));
+        assert!(query_references_logs("SELECT * FROM blocks JOIN logs ON blocks.num = logs.block_num"));
+    }
+
+    #[test]
+    fn test_query_references_logs_negative() {
+        assert!(!query_references_logs("SELECT * FROM blocks WHERE num > 100"));
+        assert!(!query_references_logs("SELECT * FROM transactions"));
+        assert!(!query_references_logs("SELECT 'logs' as table_name"));
+    }
+
+    #[test]
+    fn test_rewrite_query_for_parquet_simple() {
+        let config = ParquetConfig {
+            enabled: true,
+            data_dir: Some("/data".to_string()),
+            chain_id: Some(42431),
+            max_parquet_block: Some(1000000),
+        };
+
+        let sql = "SELECT * FROM logs WHERE block_num > 500000";
+        let rewritten = rewrite_query_for_parquet(sql, &config).unwrap();
+
+        // Should have logs_hybrid CTE
+        assert!(rewritten.contains("logs_hybrid AS"), "Missing logs_hybrid CTE: {}", rewritten);
+        // Should reference both sources - the CTE has the block filter
+        assert!(rewritten.contains("block_num > 1000000"), "Missing block filter: {}", rewritten);
+        assert!(rewritten.contains("read_parquet('/data/42431/logs_*.parquet')"), "Missing parquet path: {}", rewritten);
+        // Should use logs_hybrid instead of logs in user query
+        assert!(rewritten.contains("FROM logs_hybrid"), "Not using logs_hybrid: {}", rewritten);
+    }
+
+    #[test]
+    fn test_rewrite_query_for_parquet_with_existing_cte() {
+        let config = ParquetConfig {
+            enabled: true,
+            data_dir: Some("/data".to_string()),
+            chain_id: Some(1),
+            max_parquet_block: Some(5000000),
+        };
+
+        let sql = "WITH transfer AS (SELECT * FROM logs WHERE selector = '\\x1234') SELECT * FROM transfer";
+        let rewritten = rewrite_query_for_parquet(sql, &config).unwrap();
+
+        // Should combine CTEs
+        assert!(rewritten.starts_with("WITH logs_hybrid AS"));
+        // Original query logic should be preserved
+        assert!(rewritten.contains("transfer"));
+    }
+
+    #[test]
+    fn test_parquet_config_default() {
+        let config = ParquetConfig::default();
+        assert!(!config.enabled);
+        assert!(config.data_dir.is_none());
+        assert!(config.chain_id.is_none());
+        assert!(config.max_parquet_block.is_none());
     }
 }
 
