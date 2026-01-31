@@ -114,44 +114,34 @@ impl Default for QueryOptions {
     }
 }
 
-use crate::config::AnalyticsEngine;
-
-/// Analytics engine configuration for query execution.
+/// pg_duckdb configuration for query execution.
 #[derive(Clone, Debug, Default)]
-pub struct AnalyticsEngineConfig {
-    pub engine: AnalyticsEngine,
-    pub pg_duckdb_memory_limit: Option<String>,
-    pub pg_duckdb_threads: Option<u32>,
+pub struct PgDuckdbConfig {
+    pub memory_limit: Option<String>,
+    pub threads: Option<u32>,
 }
 
-/// Execute a query with analytics engine configuration.
-/// This is the primary entry point for queries with pg_duckdb support.
-pub async fn execute_query_with_analytics(
+/// Execute a query with pg_duckdb support.
+/// Routes OLAP queries to pg_duckdb, OLTP queries to Postgres.
+pub async fn execute_query(
     pg_pool: &Pool,
     sql: &str,
     signature: Option<&str>,
     options: &QueryOptions,
-    analytics_config: &AnalyticsEngineConfig,
+    pg_duckdb_config: &PgDuckdbConfig,
     force_engine: Option<&str>,
 ) -> Result<QueryResult> {
     // Validate query
     validate_query(sql)?;
 
     // Determine which engine to use (forced or auto-detected)
-    let routed_engine = match force_engine {
-        Some("postgres") | Some("pg") => QueryEngine::Postgres,
-        Some("duckdb") | Some("duck") | Some("pg_duckdb") => QueryEngine::DuckDb,
-        _ => route_query(sql),
-    };
-
-    // Decide which backend to use based on config and routing
-    let use_pg_duckdb = match analytics_config.engine {
-        AnalyticsEngine::PgDuckdb => routed_engine == QueryEngine::DuckDb,
-        AnalyticsEngine::Postgres => false,
+    let use_pg_duckdb = match force_engine {
+        Some("postgres") | Some("pg") => false,
+        Some("duckdb") | Some("duck") | Some("pg_duckdb") => true,
+        _ => route_query(sql) == QueryEngine::DuckDb,
     };
 
     // Generate CTE SQL if a signature is provided
-    // Always use Postgres-style CTEs (pg_duckdb uses native abi_* functions)
     let sql = if let Some(sig_str) = signature {
         let sig = EventSignature::parse(sig_str)?;
         let used_columns = extract_column_references(sql);
@@ -180,8 +170,8 @@ pub async fn execute_query_with_analytics(
             pg_pool,
             &sql,
             options,
-            analytics_config.pg_duckdb_memory_limit.as_deref(),
-            analytics_config.pg_duckdb_threads,
+            pg_duckdb_config.memory_limit.as_deref(),
+            pg_duckdb_config.threads,
         )
         .await
     } else {
@@ -468,37 +458,24 @@ mod tests {
     use crate::query::EventSignature;
 
     // ========================================================================
-    // Analytics Engine Config Tests
+    // PgDuckdbConfig Tests
     // ========================================================================
 
     #[test]
-    fn test_analytics_engine_config_default() {
-        let config = AnalyticsEngineConfig::default();
-        assert_eq!(config.engine, AnalyticsEngine::PgDuckdb);
-        assert!(config.pg_duckdb_memory_limit.is_none());
-        assert!(config.pg_duckdb_threads.is_none());
+    fn test_pg_duckdb_config_default() {
+        let config = PgDuckdbConfig::default();
+        assert!(config.memory_limit.is_none());
+        assert!(config.threads.is_none());
     }
 
     #[test]
-    fn test_analytics_engine_config_with_limits() {
-        let config = AnalyticsEngineConfig {
-            engine: AnalyticsEngine::PgDuckdb,
-            pg_duckdb_memory_limit: Some("16GB".to_string()),
-            pg_duckdb_threads: Some(8),
+    fn test_pg_duckdb_config_with_limits() {
+        let config = PgDuckdbConfig {
+            memory_limit: Some("16GB".to_string()),
+            threads: Some(8),
         };
-        assert_eq!(config.engine, AnalyticsEngine::PgDuckdb);
-        assert_eq!(config.pg_duckdb_memory_limit, Some("16GB".to_string()));
-        assert_eq!(config.pg_duckdb_threads, Some(8));
-    }
-
-    #[test]
-    fn test_analytics_engine_postgres_mode() {
-        let config = AnalyticsEngineConfig {
-            engine: AnalyticsEngine::Postgres,
-            pg_duckdb_memory_limit: None,
-            pg_duckdb_threads: None,
-        };
-        assert_eq!(config.engine, AnalyticsEngine::Postgres);
+        assert_eq!(config.memory_limit, Some("16GB".to_string()));
+        assert_eq!(config.threads, Some(8));
     }
 
     // ========================================================================

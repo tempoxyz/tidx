@@ -133,17 +133,6 @@ fn default_metrics_port() -> u16 {
     9090
 }
 
-/// Analytics engine to use for OLAP queries.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum AnalyticsEngine {
-    /// Use pg_duckdb extension for direct PostgreSQL queries (recommended)
-    #[default]
-    PgDuckdb,
-    /// Use PostgreSQL only (no DuckDB acceleration)
-    Postgres,
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChainConfig {
     /// Chain name (for display/logging)
@@ -157,12 +146,6 @@ pub struct ChainConfig {
 
     /// Database connection URL for this chain
     pub pg_url: String,
-
-    /// Analytics engine for OLAP queries (default: "pg_duckdb")
-    /// - "pg_duckdb": Query PostgreSQL using DuckDB engine (no replication needed)
-    /// - "postgres": Use PostgreSQL only (no DuckDB acceleration)
-    #[serde(default)]
-    pub analytics_engine: AnalyticsEngine,
 
     /// Enable backfill to genesis (default: true)
     #[serde(default = "default_backfill")]
@@ -188,11 +171,11 @@ pub struct ChainConfig {
     #[serde(default)]
     pub trust_rpc: bool,
 
-    /// pg_duckdb memory limit (e.g., "16GB", only used with analytics_engine = "pg_duckdb")
+    /// pg_duckdb memory limit (e.g., "16GB")
     #[serde(default)]
     pub pg_duckdb_memory_limit: Option<String>,
 
-    /// pg_duckdb thread count (only used with analytics_engine = "pg_duckdb")
+    /// pg_duckdb thread count
     #[serde(default)]
     pub pg_duckdb_threads: Option<u32>,
 }
@@ -230,53 +213,24 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_analytics_engine_default_is_pg_duckdb() {
-        assert_eq!(AnalyticsEngine::default(), AnalyticsEngine::PgDuckdb);
-    }
-
-    #[test]
-    fn test_analytics_engine_serialization() {
-        // Test pg_duckdb
-        let engine = AnalyticsEngine::PgDuckdb;
-        let json = serde_json::to_string(&engine).unwrap();
-        assert_eq!(json, "\"pg_duckdb\"");
-        
-        // Test postgres
-        let engine = AnalyticsEngine::Postgres;
-        let json = serde_json::to_string(&engine).unwrap();
-        assert_eq!(json, "\"postgres\"");
-    }
-
-    #[test]
-    fn test_analytics_engine_deserialization() {
-        let engine: AnalyticsEngine = serde_json::from_str("\"pg_duckdb\"").unwrap();
-        assert_eq!(engine, AnalyticsEngine::PgDuckdb);
-        
-        let engine: AnalyticsEngine = serde_json::from_str("\"postgres\"").unwrap();
-        assert_eq!(engine, AnalyticsEngine::Postgres);
-    }
-
-    #[test]
-    fn test_chain_config_with_pg_duckdb() {
+    fn test_chain_config_with_pg_duckdb_settings() {
         let toml_str = r#"
             name = "test"
             chain_id = 1
             rpc_url = "http://localhost:8545"
             pg_url = "postgres://localhost/test"
-            analytics_engine = "pg_duckdb"
             pg_duckdb_memory_limit = "16GB"
             pg_duckdb_threads = 8
         "#;
         
         let config: ChainConfig = toml::from_str(toml_str).unwrap();
         
-        assert_eq!(config.analytics_engine, AnalyticsEngine::PgDuckdb);
         assert_eq!(config.pg_duckdb_memory_limit, Some("16GB".to_string()));
         assert_eq!(config.pg_duckdb_threads, Some(8));
     }
 
     #[test]
-    fn test_chain_config_defaults_to_pg_duckdb() {
+    fn test_chain_config_defaults() {
         let toml_str = r#"
             name = "test"
             chain_id = 1
@@ -286,23 +240,9 @@ mod tests {
         
         let config: ChainConfig = toml::from_str(toml_str).unwrap();
         
-        // Default should be pg_duckdb
-        assert_eq!(config.analytics_engine, AnalyticsEngine::PgDuckdb);
-    }
-
-    #[test]
-    fn test_chain_config_with_postgres_only() {
-        let toml_str = r#"
-            name = "test"
-            chain_id = 1
-            rpc_url = "http://localhost:8545"
-            pg_url = "postgres://localhost/test"
-            analytics_engine = "postgres"
-        "#;
-        
-        let config: ChainConfig = toml::from_str(toml_str).unwrap();
-        
-        assert_eq!(config.analytics_engine, AnalyticsEngine::Postgres);
+        assert!(config.backfill);
+        assert_eq!(config.batch_size, 100);
+        assert_eq!(config.concurrency, 4);
     }
 
     #[test]
@@ -321,7 +261,6 @@ mod tests {
             chain_id = 1
             rpc_url = "http://localhost:8545"
             pg_url = "postgres://localhost/chain1"
-            analytics_engine = "pg_duckdb"
             pg_duckdb_memory_limit = "8GB"
             
             [[chains]]
@@ -329,17 +268,13 @@ mod tests {
             chain_id = 2
             rpc_url = "http://localhost:8546"
             pg_url = "postgres://localhost/chain2"
-            analytics_engine = "postgres"
         "#;
         
         let config: Config = toml::from_str(toml_str).unwrap();
         
         assert_eq!(config.chains.len(), 2);
-        
-        assert_eq!(config.chains[0].analytics_engine, AnalyticsEngine::PgDuckdb);
         assert_eq!(config.chains[0].pg_duckdb_memory_limit, Some("8GB".to_string()));
-        
-        assert_eq!(config.chains[1].analytics_engine, AnalyticsEngine::Postgres);
+        assert_eq!(config.chains[1].pg_duckdb_memory_limit, None);
     }
 
     #[test]

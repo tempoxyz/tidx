@@ -24,7 +24,7 @@ use tower_http::cors::CorsLayer;
 use tower_http::trace::TraceLayer;
 
 use crate::broadcast::Broadcaster;
-use crate::config::{AnalyticsEngine, HttpConfig, SharedHttpConfig};
+use crate::config::{HttpConfig, SharedHttpConfig};
 use crate::db::Pool;
 use crate::service::{QueryOptions, QueryResult, SyncStatus};
 
@@ -32,15 +32,14 @@ pub use rate_limit::{RateLimiter, SseConnectionGuard};
 
 pub type SharedPools = Arc<RwLock<HashMap<u64, Pool>>>;
 
-/// Per-chain analytics configuration for pg_duckdb.
+/// Per-chain pg_duckdb configuration.
 #[derive(Clone, Debug, Default)]
-pub struct AnalyticsConfig {
-    pub engine: AnalyticsEngine,
-    pub pg_duckdb_memory_limit: Option<String>,
-    pub pg_duckdb_threads: Option<u32>,
+pub struct PgDuckdbConfig {
+    pub memory_limit: Option<String>,
+    pub threads: Option<u32>,
 }
 
-pub type SharedAnalyticsConfigs = Arc<RwLock<HashMap<u64, AnalyticsConfig>>>;
+pub type SharedPgDuckdbConfigs = Arc<RwLock<HashMap<u64, PgDuckdbConfig>>>;
 
 #[derive(Clone)]
 pub struct AppState {
@@ -49,8 +48,8 @@ pub struct AppState {
     /// Default chain_id (first chain)
     pub default_chain_id: u64,
     pub broadcaster: Arc<Broadcaster>,
-    /// Per-chain analytics configuration (hot-reloadable)
-    pub analytics_configs: SharedAnalyticsConfigs,
+    /// Per-chain pg_duckdb configuration (hot-reloadable)
+    pub pg_duckdb_configs: SharedPgDuckdbConfigs,
     /// Rate limiter for request throttling
     pub rate_limiter: RateLimiter,
 }
@@ -61,9 +60,9 @@ impl AppState {
         self.pools.read().await.get(&id).cloned()
     }
 
-    async fn get_analytics_config(&self, chain_id: Option<u64>) -> AnalyticsConfig {
+    async fn get_pg_duckdb_config(&self, chain_id: Option<u64>) -> PgDuckdbConfig {
         let id = chain_id.unwrap_or(self.default_chain_id);
-        self.analytics_configs
+        self.pg_duckdb_configs
             .read()
             .await
             .get(&id)
@@ -80,7 +79,7 @@ pub fn router_with_options(
     pools: HashMap<u64, Pool>,
     default_chain_id: u64,
     broadcaster: Arc<Broadcaster>,
-    analytics_configs: HashMap<u64, AnalyticsConfig>,
+    pg_duckdb_configs: HashMap<u64, PgDuckdbConfig>,
     http_config: &HttpConfig,
 ) -> Router<()> {
     let rate_limiter = RateLimiter::new(
@@ -94,7 +93,7 @@ pub fn router_with_options(
         pools: Arc::new(RwLock::new(pools)),
         default_chain_id,
         broadcaster,
-        analytics_configs: Arc::new(RwLock::new(analytics_configs)),
+        pg_duckdb_configs: Arc::new(RwLock::new(pg_duckdb_configs)),
         rate_limiter: rate_limiter.clone(),
     };
 
@@ -105,7 +104,7 @@ pub fn router_shared(
     pools: SharedPools,
     default_chain_id: u64,
     broadcaster: Arc<Broadcaster>,
-    analytics_configs: SharedAnalyticsConfigs,
+    pg_duckdb_configs: SharedPgDuckdbConfigs,
     http_config: SharedHttpConfig,
 ) -> Router<()> {
     let rate_limiter = RateLimiter::new_shared(http_config);
@@ -116,7 +115,7 @@ pub fn router_shared(
         pools,
         default_chain_id,
         broadcaster,
-        analytics_configs,
+        pg_duckdb_configs,
         rate_limiter: rate_limiter.clone(),
     };
 
@@ -236,21 +235,18 @@ async fn handle_query_once(
         limit: params.limit.clamp(1, 100000),
     };
 
-    let analytics_config = state.get_analytics_config(Some(params.chain_id)).await;
-    
-    // Convert API analytics config to service config
-    let service_analytics_config = crate::service::AnalyticsEngineConfig {
-        engine: analytics_config.engine,
-        pg_duckdb_memory_limit: analytics_config.pg_duckdb_memory_limit,
-        pg_duckdb_threads: analytics_config.pg_duckdb_threads,
+    let pg_duckdb_config = state.get_pg_duckdb_config(Some(params.chain_id)).await;
+    let service_config = crate::service::PgDuckdbConfig {
+        memory_limit: pg_duckdb_config.memory_limit,
+        threads: pg_duckdb_config.threads,
     };
     
-    let result = crate::service::execute_query_with_analytics(
+    let result = crate::service::execute_query(
         &pool,
         &params.sql,
         params.signature.as_deref(),
         &options,
-        &service_analytics_config,
+        &service_config,
         params.engine.as_deref(),
     )
     .await
@@ -315,13 +311,10 @@ async fn handle_query_live(
         }
     };
 
-    let analytics_config = state.get_analytics_config(Some(params.chain_id)).await;
-    
-    // Convert to service config
-    let service_analytics_config = crate::service::AnalyticsEngineConfig {
-        engine: analytics_config.engine,
-        pg_duckdb_memory_limit: analytics_config.pg_duckdb_memory_limit,
-        pg_duckdb_threads: analytics_config.pg_duckdb_threads,
+    let pg_duckdb_config = state.get_pg_duckdb_config(Some(params.chain_id)).await;
+    let service_config = crate::service::PgDuckdbConfig {
+        memory_limit: pg_duckdb_config.memory_limit,
+        threads: pg_duckdb_config.threads,
     };
 
     let mut rx = state.broadcaster.subscribe();
@@ -342,7 +335,7 @@ async fn handle_query_live(
         let mut last_block_num: u64 = 0;
 
         // Execute initial query
-        match crate::service::execute_query_with_analytics(&pool, &sql, signature.as_deref(), &options, &service_analytics_config, engine.as_deref()).await {
+        match crate::service::execute_query(&pool, &sql, signature.as_deref(), &options, &service_config, engine.as_deref()).await {
             Ok(result) => {
                 yield Ok(SseEvent::default()
                     .event("result")
@@ -392,7 +385,7 @@ async fn handle_query_live(
                     // For OLAP queries, re-execute the full query once per update (not per-block)
                     // For OLTP queries, filter by each block
                     if is_olap {
-                        match crate::service::execute_query_with_analytics(&pool, &sql, signature.as_deref(), &options, &service_analytics_config, engine.as_deref()).await {
+                        match crate::service::execute_query(&pool, &sql, signature.as_deref(), &options, &service_config, engine.as_deref()).await {
                             Ok(result) => {
                                 yield Ok(SseEvent::default()
                                     .event("result")
@@ -411,7 +404,7 @@ async fn handle_query_live(
                         let catch_up_start = last_block_num + 1;
                         for block_num in catch_up_start..=end {
                             let filtered_sql = inject_block_filter(&sql, block_num);
-                            match crate::service::execute_query_with_analytics(&pool, &filtered_sql, signature.as_deref(), &options, &service_analytics_config, engine.as_deref()).await {
+                            match crate::service::execute_query(&pool, &filtered_sql, signature.as_deref(), &options, &service_config, engine.as_deref()).await {
                                 Ok(result) => {
                                     yield Ok(SseEvent::default()
                                         .event("result")

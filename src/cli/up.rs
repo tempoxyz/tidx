@@ -9,7 +9,7 @@ use metrics_exporter_prometheus::PrometheusBuilder;
 use tokio::sync::RwLock;
 use tracing::{error, info};
 
-use tidx::api::{self, AnalyticsConfig, SharedAnalyticsConfigs, SharedPools};
+use tidx::api::{self, PgDuckdbConfig, SharedPgDuckdbConfigs, SharedPools};
 use tidx::broadcast::Broadcaster;
 use tidx::config::{ChainConfig, Config, ConfigWatcher, NewChainEvent};
 use tidx::db::{self, ThrottledPool};
@@ -53,13 +53,13 @@ pub async fn run(args: Args) -> Result<()> {
     });
 
     let pools: SharedPools = Arc::new(RwLock::new(HashMap::new()));
-    let analytics_configs: SharedAnalyticsConfigs = Arc::new(RwLock::new(HashMap::new()));
+    let pg_duckdb_configs: SharedPgDuckdbConfigs = Arc::new(RwLock::new(HashMap::new()));
     let mut default_chain_id = 0u64;
 
     for chain in &config.chains {
         let throttled_pool = initialize_chain(
             chain,
-            Arc::clone(&analytics_configs),
+            Arc::clone(&pg_duckdb_configs),
         ).await?;
 
         if default_chain_id == 0 {
@@ -90,7 +90,7 @@ pub async fn run(args: Args) -> Result<()> {
                 Arc::clone(&pools),
                 default_chain_id,
                 broadcaster.clone(),
-                Arc::clone(&analytics_configs),
+                Arc::clone(&pg_duckdb_configs),
                 http_config,
             );
 
@@ -113,13 +113,13 @@ pub async fn run(args: Args) -> Result<()> {
         }
 
         let pools_for_watcher = Arc::clone(&pools);
-        let analytics_configs_for_watcher = Arc::clone(&analytics_configs);
+        let pg_duckdb_configs_for_watcher = Arc::clone(&pg_duckdb_configs);
         let broadcaster_for_watcher = broadcaster.clone();
         let shutdown_tx_for_watcher = shutdown_tx.clone();
 
         tokio::spawn(async move {
             while let Some(event) = chain_rx.recv().await {
-                match initialize_chain(&event.chain, Arc::clone(&analytics_configs_for_watcher)).await {
+                match initialize_chain(&event.chain, Arc::clone(&pg_duckdb_configs_for_watcher)).await {
                     Ok(throttled_pool) => {
                         pools_for_watcher.write().await.insert(event.chain.chain_id, throttled_pool.pool.clone());
 
@@ -142,7 +142,7 @@ pub async fn run(args: Args) -> Result<()> {
             pools.read().await.clone(),
             default_chain_id,
             broadcaster.clone(),
-            analytics_configs.read().await.clone(),
+            pg_duckdb_configs.read().await.clone(),
             &config.http,
         );
 
@@ -172,7 +172,7 @@ pub async fn run(args: Args) -> Result<()> {
 
 async fn initialize_chain(
     chain: &ChainConfig,
-    analytics_configs: SharedAnalyticsConfigs,
+    pg_duckdb_configs: SharedPgDuckdbConfigs,
 ) -> Result<ThrottledPool> {
     info!(chain = %chain.name, db = %chain.pg_url, "Connecting to database with throttled pool...");
     let throttled_pool = ThrottledPool::new(&chain.pg_url).await?;
@@ -180,22 +180,14 @@ async fn initialize_chain(
     info!(chain = %chain.name, "Running migrations...");
     db::run_migrations(&throttled_pool.pool).await?;
 
-    // Store analytics config for this chain
-    let analytics_config = AnalyticsConfig {
-        engine: chain.analytics_engine,
-        pg_duckdb_memory_limit: chain.pg_duckdb_memory_limit.clone(),
-        pg_duckdb_threads: chain.pg_duckdb_threads,
+    // Store pg_duckdb config for this chain
+    let pg_duckdb_config = PgDuckdbConfig {
+        memory_limit: chain.pg_duckdb_memory_limit.clone(),
+        threads: chain.pg_duckdb_threads,
     };
-    analytics_configs.write().await.insert(chain.chain_id, analytics_config);
+    pg_duckdb_configs.write().await.insert(chain.chain_id, pg_duckdb_config);
 
-    match chain.analytics_engine {
-        tidx::config::AnalyticsEngine::PgDuckdb => {
-            info!(chain = %chain.name, "Using pg_duckdb for analytical queries");
-        }
-        tidx::config::AnalyticsEngine::Postgres => {
-            info!(chain = %chain.name, "Using PostgreSQL only for all queries");
-        }
-    };
+    info!(chain = %chain.name, "Using pg_duckdb for analytical queries");
 
     Ok(throttled_pool)
 }
