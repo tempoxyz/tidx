@@ -702,4 +702,55 @@ mod tests {
         let engine3 = registry.get_or_create(42).unwrap();
         assert!(!Arc::ptr_eq(&engine1, &engine3));
     }
+    
+    #[test]
+    fn test_abi_address_with_offset() {
+        let temp_dir = TempDir::new().unwrap();
+        let engine = DuckDbEngine::new(temp_dir.path().to_path_buf(), 1).unwrap();
+        
+        // Test with offset - 64 bytes with address at offset 32
+        let result = engine.query(
+            "SELECT abi_address(unhex('00000000000000000000000000000000000000000000000000000000000000000000000000000000000000001234567890abcdef1234567890abcdef12345678'), 32) as addr",
+            None
+        );
+        assert!(result.is_ok(), "Query failed: {:?}", result.err());
+        
+        let result = result.unwrap();
+        // Address should be extracted from bytes 44-64 (offset 32 + 12 leading zeros + 20 bytes)
+        assert_eq!(result.rows[0][0], serde_json::json!("0x1234567890AbcdEF1234567890aBcdef12345678"));
+    }
+    
+    #[test]
+    fn test_abi_bool_udf() {
+        let temp_dir = TempDir::new().unwrap();
+        let engine = DuckDbEngine::new(temp_dir.path().to_path_buf(), 1).unwrap();
+        
+        // Test true
+        let result = engine.query(
+            "SELECT abi_bool(unhex('0000000000000000000000000000000000000000000000000000000000000001')) as val",
+            None
+        ).unwrap();
+        assert_eq!(result.rows[0][0], serde_json::json!(true));
+        
+        // Test false
+        let result = engine.query(
+            "SELECT abi_bool(unhex('0000000000000000000000000000000000000000000000000000000000000000')) as val",
+            None
+        ).unwrap();
+        assert_eq!(result.rows[0][0], serde_json::json!(false));
+    }
+    
+    #[test]
+    fn test_abi_bytes32_udf() {
+        let temp_dir = TempDir::new().unwrap();
+        let engine = DuckDbEngine::new(temp_dir.path().to_path_buf(), 1).unwrap();
+        
+        let result = engine.query(
+            "SELECT abi_bytes32(unhex('ddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef')) as topic",
+            None
+        ).unwrap();
+        
+        // Should return the full bytes32 as hex
+        assert_eq!(result.rows[0][0], serde_json::json!("0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef"));
+    }
 }
