@@ -1010,6 +1010,34 @@ mod tests {
     }
 
     #[test]
+    fn test_rewrite_query_for_parquet_has_alias() {
+        // pg_duckdb requires an alias on read_parquet() to access columns normally
+        // Without it, you get: "column X does not exist, use r['column'] syntax"
+        let config = ParquetConfig {
+            enabled: true,
+            data_dir: Some("/data".to_string()),
+            chain_id: Some(4217),
+            max_parquet_block: Some(1000000),
+        };
+
+        let sql = "SELECT address, COUNT(*) as cnt FROM logs GROUP BY address";
+        let rewritten = rewrite_query_for_parquet(sql, &config).unwrap();
+
+        // Must have "AS r" alias for pg_duckdb compatibility
+        assert!(
+            rewritten.contains("read_parquet('/data/4217/logs_*.parquet') AS r"),
+            "Missing 'AS r' alias - pg_duckdb requires this for column access: {}",
+            rewritten
+        );
+        // Must select from the aliased table
+        assert!(
+            rewritten.contains("SELECT r.*"),
+            "Must use 'SELECT r.*' to expose columns: {}",
+            rewritten
+        );
+    }
+
+    #[test]
     fn test_rewrite_query_for_parquet_with_existing_cte() {
         let config = ParquetConfig {
             enabled: true,
