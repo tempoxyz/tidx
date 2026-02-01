@@ -1087,6 +1087,130 @@ mod tests {
     }
 
     #[test]
+    fn test_rewrite_query_for_parquet_table_alias() {
+        // Table aliases should be preserved after replacement
+        let config = ParquetConfig {
+            enabled: true,
+            data_dir: Some("/data".to_string()),
+            chain_id: Some(1),
+            max_parquet_block: Some(1000000),
+        };
+
+        let sql = "SELECT l.address, l.block_num FROM logs l WHERE l.block_num > 100";
+        let rewritten = rewrite_query_for_parquet(sql, &config).unwrap();
+
+        // Alias 'l' should be preserved
+        assert!(rewritten.contains("read_parquet('/data/1/logs_*.parquet') l"), 
+            "Table alias not preserved: {}", rewritten);
+        assert!(rewritten.contains("l.address"), "Column reference should remain: {}", rewritten);
+    }
+
+    #[test]
+    fn test_rewrite_query_for_parquet_subquery() {
+        // Subqueries should work - inner FROM logs gets replaced
+        let config = ParquetConfig {
+            enabled: true,
+            data_dir: Some("/data".to_string()),
+            chain_id: Some(42431),
+            max_parquet_block: Some(1000000),
+        };
+
+        let sql = "SELECT * FROM (SELECT address, COUNT(*) as cnt FROM logs GROUP BY address) sub WHERE cnt > 10";
+        let rewritten = rewrite_query_for_parquet(sql, &config).unwrap();
+
+        assert!(rewritten.contains("FROM read_parquet('/data/42431/logs_*.parquet')"), 
+            "Subquery FROM logs not replaced: {}", rewritten);
+        assert!(rewritten.contains("sub WHERE cnt"), "Outer query structure preserved: {}", rewritten);
+    }
+
+    #[test]
+    fn test_rewrite_query_for_parquet_multiple_joins() {
+        // Multiple JOINs should all be replaced
+        let config = ParquetConfig {
+            enabled: true,
+            data_dir: Some("/data".to_string()),
+            chain_id: Some(4217),
+            max_parquet_block: Some(1000000),
+        };
+
+        let sql = "SELECT b.num, t.hash, r.gas_used, l.address \
+                   FROM blocks b \
+                   JOIN txs t ON b.num = t.block_num \
+                   JOIN receipts r ON t.hash = r.tx_hash \
+                   JOIN logs l ON r.tx_hash = l.tx_hash";
+        let rewritten = rewrite_query_for_parquet(sql, &config).unwrap();
+
+        assert!(rewritten.contains("read_parquet('/data/4217/blocks_*.parquet')"), 
+            "blocks not replaced: {}", rewritten);
+        assert!(rewritten.contains("read_parquet('/data/4217/txs_*.parquet')"), 
+            "txs not replaced: {}", rewritten);
+        assert!(rewritten.contains("read_parquet('/data/4217/receipts_*.parquet')"), 
+            "receipts not replaced: {}", rewritten);
+        assert!(rewritten.contains("read_parquet('/data/4217/logs_*.parquet')"), 
+            "logs not replaced: {}", rewritten);
+    }
+
+    #[test]
+    fn test_rewrite_query_for_parquet_left_join() {
+        // LEFT JOIN should be replaced
+        let config = ParquetConfig {
+            enabled: true,
+            data_dir: Some("/data".to_string()),
+            chain_id: Some(1),
+            max_parquet_block: Some(1000000),
+        };
+
+        let sql = "SELECT b.num, t.hash FROM blocks b LEFT JOIN txs t ON b.num = t.block_num";
+        let rewritten = rewrite_query_for_parquet(sql, &config).unwrap();
+
+        // LEFT JOIN contains "JOIN" so it should match
+        assert!(rewritten.contains("LEFT JOIN read_parquet('/data/1/txs_*.parquet')"), 
+            "LEFT JOIN not replaced: {}", rewritten);
+    }
+
+    #[test]
+    fn test_rewrite_query_for_parquet_nested_cte() {
+        // Nested CTEs should work
+        let config = ParquetConfig {
+            enabled: true,
+            data_dir: Some("/data".to_string()),
+            chain_id: Some(42431),
+            max_parquet_block: Some(1000000),
+        };
+
+        let sql = "WITH transfers AS (SELECT * FROM logs WHERE selector = '\\xddf252ad'), \
+                   large_transfers AS (SELECT * FROM transfers WHERE block_num > 1000000) \
+                   SELECT address, COUNT(*) FROM large_transfers GROUP BY address";
+        let rewritten = rewrite_query_for_parquet(sql, &config).unwrap();
+
+        // The FROM logs in first CTE should be replaced
+        assert!(rewritten.contains("FROM read_parquet('/data/42431/logs_*.parquet')"), 
+            "CTE FROM logs not replaced: {}", rewritten);
+        // The second CTE references 'transfers', not a table, so it stays
+        assert!(rewritten.contains("FROM transfers"), "CTE reference should remain: {}", rewritten);
+    }
+
+    #[test]
+    fn test_rewrite_query_for_parquet_union() {
+        // UNION queries should have both sides replaced
+        let config = ParquetConfig {
+            enabled: true,
+            data_dir: Some("/data".to_string()),
+            chain_id: Some(1),
+            max_parquet_block: Some(1000000),
+        };
+
+        let sql = "SELECT address FROM logs WHERE block_num < 1000 \
+                   UNION ALL \
+                   SELECT address FROM logs WHERE block_num >= 1000";
+        let rewritten = rewrite_query_for_parquet(sql, &config).unwrap();
+
+        // Count occurrences of read_parquet - should be 2
+        let count = rewritten.matches("read_parquet('/data/1/logs_*.parquet')").count();
+        assert_eq!(count, 2, "Both UNION sides should be replaced: {}", rewritten);
+    }
+
+    #[test]
     fn test_parquet_config_default() {
         let config = ParquetConfig::default();
         assert!(!config.enabled);
