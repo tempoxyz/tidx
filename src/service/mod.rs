@@ -413,6 +413,10 @@ pub async fn execute_query_pg_duckdb(
     )
     .await;
 
+    // Always reset force_execution to prevent polluting pooled connections
+    // This ensures other queries (like gap detection with generate_series) run on Postgres
+    conn.execute("SET duckdb.force_execution = false", &[]).await.ok();
+
     let rows = match result {
         Ok(Ok(rows)) => {
             metrics::record_query_duration(start.elapsed());
