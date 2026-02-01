@@ -26,6 +26,7 @@ use tower_http::trace::TraceLayer;
 use crate::broadcast::Broadcaster;
 use crate::config::{HttpConfig, SharedHttpConfig};
 use crate::db::Pool;
+use crate::duckdb::DuckDbEngineRegistry;
 use crate::service::{ParquetConfig, QueryOptions, QueryResult, SyncStatus};
 use crate::sync::compress::get_max_parquet_block;
 
@@ -64,6 +65,8 @@ pub struct AppState {
     pub parquet_configs: SharedParquetConfigs,
     /// Rate limiter for request throttling
     pub rate_limiter: RateLimiter,
+    /// Native DuckDB engine registry for parquet queries
+    pub duckdb_registry: Option<Arc<DuckDbEngineRegistry>>,
 }
 
 impl AppState {
@@ -122,6 +125,14 @@ pub fn router_with_options(
 
     rate_limit::spawn_cleanup_task(rate_limiter.clone());
 
+    // Create DuckDB registry from parquet configs if any chain has parquet enabled
+    let duckdb_registry = parquet_configs.values()
+        .find(|c| c.enabled)
+        .map(|c| {
+            let data_dir = std::path::PathBuf::from(&c.data_dir);
+            Arc::new(DuckDbEngineRegistry::new(data_dir))
+        });
+
     let state = AppState {
         pools: Arc::new(RwLock::new(pools)),
         default_chain_id,
@@ -129,6 +140,7 @@ pub fn router_with_options(
         pg_duckdb_configs: Arc::new(RwLock::new(pg_duckdb_configs)),
         parquet_configs: Arc::new(RwLock::new(parquet_configs)),
         rate_limiter: rate_limiter.clone(),
+        duckdb_registry,
     };
 
     build_router(state, rate_limiter)
@@ -141,6 +153,7 @@ pub fn router_shared(
     pg_duckdb_configs: SharedPgDuckdbConfigs,
     parquet_configs: SharedParquetConfigs,
     http_config: SharedHttpConfig,
+    duckdb_registry: Option<Arc<DuckDbEngineRegistry>>,
 ) -> Router<()> {
     let rate_limiter = RateLimiter::new_shared(http_config);
 
@@ -153,6 +166,7 @@ pub fn router_shared(
         pg_duckdb_configs,
         parquet_configs,
         rate_limiter: rate_limiter.clone(),
+        duckdb_registry,
     };
 
     build_router(state, rate_limiter)
@@ -270,6 +284,32 @@ async fn handle_query_once(
         timeout_ms: params.timeout_ms.clamp(100, 30000),
         limit: params.limit.clamp(1, 100000),
     };
+
+    // Check if native DuckDB engine is explicitly requested
+    if params.engine.as_deref() == Some("duckdb-native") {
+        let registry = state.duckdb_registry.as_ref()
+            .ok_or_else(|| ApiError::BadRequest("Native DuckDB engine not configured (no parquet enabled)".to_string()))?;
+        
+        let engine = registry.get_or_create(params.chain_id)
+            .map_err(|e| ApiError::QueryError(e.to_string()))?;
+        
+        let result = crate::service::execute_query_native_duckdb(
+            &engine,
+            &params.sql,
+            params.signature.as_deref(),
+            &options,
+        )
+        .map_err(|e| {
+            let msg = e.to_string();
+            if msg.contains("forbidden") || msg.contains("Only SELECT") {
+                ApiError::BadRequest(msg)
+            } else {
+                ApiError::QueryError(msg)
+            }
+        })?;
+        
+        return Ok(Json(QueryResponse { result, ok: true }));
+    }
 
     let pg_duckdb_config = state.get_pg_duckdb_config(Some(params.chain_id)).await;
     let service_config = crate::service::PgDuckdbConfig {

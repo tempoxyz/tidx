@@ -10,6 +10,7 @@ use tokio::sync::RwLock;
 use tracing::{error, info};
 
 use tidx::api::{self, ChainParquetConfig, PgDuckdbConfig, SharedParquetConfigs, SharedPgDuckdbConfigs, SharedPools};
+use tidx::duckdb::DuckDbEngineRegistry;
 use tidx::broadcast::Broadcaster;
 use tidx::config::{ChainConfig, Config, ConfigWatcher, NewChainEvent};
 use tidx::db::{self, ThrottledPool};
@@ -88,6 +89,15 @@ pub async fn run(args: Args) -> Result<()> {
 
         if config.http.enabled && default_chain_id != 0 {
             let addr: SocketAddr = format!("{}:{}", config.http.bind, config.http.port).parse()?;
+            
+            // Create DuckDB registry from parquet config if any chain has parquet enabled
+            let duckdb_registry = {
+                let configs = parquet_configs.read().await;
+                configs.values()
+                    .find(|c| c.enabled)
+                    .map(|c| Arc::new(DuckDbEngineRegistry::new(PathBuf::from(&c.data_dir))))
+            };
+            
             let router = api::router_shared(
                 Arc::clone(&pools),
                 default_chain_id,
@@ -95,6 +105,7 @@ pub async fn run(args: Args) -> Result<()> {
                 Arc::clone(&pg_duckdb_configs),
                 Arc::clone(&parquet_configs),
                 http_config,
+                duckdb_registry,
             );
 
             info!(addr = %addr, "Starting HTTP API server (hot-reload enabled)");
