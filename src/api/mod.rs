@@ -1,4 +1,5 @@
 mod rate_limit;
+mod views;
 
 use std::collections::HashMap;
 use std::convert::Infallible;
@@ -126,7 +127,7 @@ pub fn router_shared(
 
 fn build_router(state: AppState, rate_limiter: RateLimiter) -> Router<()> {
     let cors = CorsLayer::new()
-        .allow_methods([Method::GET, Method::OPTIONS])
+        .allow_methods([Method::GET, Method::POST, Method::DELETE, Method::OPTIONS])
         .allow_headers([header::CONTENT_TYPE, header::AUTHORIZATION])
         .allow_origin(tower_http::cors::Any);
 
@@ -134,6 +135,8 @@ fn build_router(state: AppState, rate_limiter: RateLimiter) -> Router<()> {
         .route("/health", get(handle_health))
         .route("/status", get(handle_status))
         .route("/query", get(handle_query))
+        .route("/views", get(views::list_views).post(views::create_view))
+        .route("/views/{name}", get(views::get_view).delete(views::delete_view))
         .layer(middleware::from_fn_with_state(
             rate_limiter,
             rate_limit::rate_limit_middleware,
@@ -535,6 +538,8 @@ pub enum ApiError {
     QueryError(String),
     #[allow(dead_code)]
     Internal(String),
+    Forbidden(String),
+    NotFound(String),
 }
 
 impl IntoResponse for ApiError {
@@ -544,6 +549,8 @@ impl IntoResponse for ApiError {
             ApiError::Timeout => (StatusCode::REQUEST_TIMEOUT, "Query timeout".to_string()),
             ApiError::QueryError(msg) => (StatusCode::UNPROCESSABLE_ENTITY, msg),
             ApiError::Internal(msg) => (StatusCode::INTERNAL_SERVER_ERROR, msg),
+            ApiError::Forbidden(msg) => (StatusCode::FORBIDDEN, msg),
+            ApiError::NotFound(msg) => (StatusCode::NOT_FOUND, msg),
         };
 
         let body = serde_json::json!({
