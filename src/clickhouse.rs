@@ -18,8 +18,8 @@ use crate::query::EventSignature;
 pub struct ClickHouseEngine {
     /// Client without database set (for DDL operations)
     admin_client: Client,
-    /// Client with database set (for queries after replication is set up)
-    query_client: Client,
+    /// Pooled HTTP client for queries (reuses connections)
+    http_client: reqwest::Client,
     /// ClickHouse HTTP URL
     url: String,
     /// Database name for this chain (e.g., "tidx_4217" for chain 4217)
@@ -37,23 +37,24 @@ impl ClickHouseEngine {
         let admin_client = Client::default()
             .with_url(&config.url);
         
-        // Query client with database set (for data queries after replication is set up)
-        let query_client = Client::default()
-            .with_url(&config.url)
-            .with_database(&database);
+        // Pooled HTTP client for queries (connection pooling, keep-alive)
+        let http_client = reqwest::Client::builder()
+            .pool_max_idle_per_host(4)
+            .build()
+            .map_err(|e| anyhow!("Failed to create HTTP client: {e}"))?;
         
         Ok(Self {
             admin_client,
-            query_client,
+            http_client,
             url: config.url.clone(),
             database,
             chain_id,
         })
     }
     
-    /// Get the ClickHouse client for direct queries.
-    pub fn client(&self) -> &Client {
-        &self.query_client
+    /// Get the admin client for DDL operations.
+    pub fn admin_client(&self) -> &Client {
+        &self.admin_client
     }
     
     /// Get the database name.
@@ -78,45 +79,27 @@ impl ClickHouseEngine {
         
         let start = std::time::Instant::now();
         
-        // Use FORMAT JSON to get structured results with column metadata
-        let sql_with_format = format!("{sql} FORMAT JSON");
+        // Query ClickHouse via HTTP with JSON format (connection pooled)
+        let url = format!(
+            "{}/?database={}&default_format=JSON",
+            self.url.trim_end_matches('/'),
+            self.database
+        );
         
-        // Fetch raw bytes and parse as JSON
-        let bytes = self.query_client
-            .query(&sql_with_format)
-            .fetch_all::<String>()
-            .await;
+        let resp = self.http_client
+            .post(&url)
+            .body(sql.clone())
+            .send()
+            .await
+            .map_err(|e| anyhow!("ClickHouse HTTP request failed: {e}"))?;
         
-        // If fetch_all fails, try using HTTP directly
-        let json_response = match bytes {
-            Ok(rows) if !rows.is_empty() => {
-                // Rows came back as strings, join them
-                rows.join("")
-            }
-            _ => {
-                // Fallback: use reqwest to query ClickHouse HTTP interface directly
-                let url = format!(
-                    "{}/?database={}&default_format=JSON",
-                    self.url.trim_end_matches('/'),
-                    self.database
-                );
-                
-                let client = reqwest::Client::new();
-                let resp = client
-                    .post(&url)
-                    .body(sql.clone())
-                    .send()
-                    .await
-                    .map_err(|e| anyhow!("ClickHouse HTTP request failed: {e}"))?;
-                
-                if !resp.status().is_success() {
-                    let error_text = resp.text().await.unwrap_or_default();
-                    return Err(anyhow!("ClickHouse query failed: {error_text}"));
-                }
-                
-                resp.text().await.map_err(|e| anyhow!("Failed to read response: {e}"))?
-            }
-        };
+        if !resp.status().is_success() {
+            let error_text = resp.text().await.unwrap_or_default();
+            return Err(anyhow!("ClickHouse query failed: {error_text}"));
+        }
+        
+        let json_response = resp.text().await
+            .map_err(|e| anyhow!("Failed to read response: {e}"))?;
         
         // Parse the JSON response
         let parsed: serde_json::Value = serde_json::from_str(&json_response)
