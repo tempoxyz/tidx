@@ -256,7 +256,10 @@ async fn handle_query_once(
                 params.chain_id
             )))?;
 
-        clickhouse.query(&params.sql, params.signature.as_deref())
+        // Rewrite analytics table references to include chain-specific database
+        let sql = rewrite_analytics_tables(&params.sql, params.chain_id);
+
+        clickhouse.query(&sql, params.signature.as_deref())
             .await
             .map(|r| QueryResult {
                 columns: r.columns,
@@ -499,6 +502,32 @@ pub fn inject_block_filter(sql: &str, block_num: u64) -> String {
     }
 }
 
+/// Rewrite analytics table references to include chain-specific database prefix.
+/// Transforms `FROM token_holders` to `FROM analytics_42431.token_holders`.
+/// Only rewrites known analytics tables, leaves other table references unchanged.
+fn rewrite_analytics_tables(sql: &str, chain_id: u64) -> String {
+    // Known analytics tables that should be prefixed
+    let analytics_tables = ["token_holders", "token_balances"];
+    
+    let mut result = sql.to_string();
+    for table in analytics_tables {
+        // Simple case-insensitive replacement for FROM/JOIN table_name
+        // Handles: FROM token_holders, JOIN token_holders
+        for keyword in ["FROM ", "JOIN "] {
+            let search_lower = format!("{keyword}{table}");
+            let search_upper = format!("{}{}", keyword.to_uppercase(), table);
+            let replacement = format!("{keyword}analytics_{chain_id}.{table}");
+            
+            // Replace lowercase
+            result = result.replace(&search_lower, &replacement);
+            // Replace uppercase keyword
+            result = result.replace(&search_upper, &replacement);
+        }
+    }
+    
+    result
+}
+
 #[derive(Debug)]
 pub enum ApiError {
     BadRequest(String),
@@ -523,5 +552,43 @@ impl IntoResponse for ApiError {
         });
 
         (status, Json(body)).into_response()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_rewrite_analytics_tables() {
+        // Basic FROM rewrite
+        assert_eq!(
+            rewrite_analytics_tables("SELECT * FROM token_holders", 42431),
+            "SELECT * FROM analytics_42431.token_holders"
+        );
+
+        // WITH uppercase FROM
+        assert_eq!(
+            rewrite_analytics_tables("SELECT * FROM token_balances WHERE token = '0x123'", 4217),
+            "SELECT * FROM analytics_4217.token_balances WHERE token = '0x123'"
+        );
+
+        // Already prefixed - should not double-prefix
+        assert_eq!(
+            rewrite_analytics_tables("SELECT * FROM analytics_42431.token_holders", 42431),
+            "SELECT * FROM analytics_42431.token_holders"
+        );
+
+        // Non-analytics table - should not rewrite
+        assert_eq!(
+            rewrite_analytics_tables("SELECT * FROM logs", 42431),
+            "SELECT * FROM logs"
+        );
+
+        // JOIN rewrite
+        assert_eq!(
+            rewrite_analytics_tables("SELECT * FROM logs JOIN token_holders ON 1=1", 42431),
+            "SELECT * FROM logs JOIN analytics_42431.token_holders ON 1=1"
+        );
     }
 }
