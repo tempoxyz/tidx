@@ -9,13 +9,13 @@ use tokio::sync::RwLock;
 
 use axum::{
     extract::{ConnectInfo, Query, State},
-    http::{header, Method, StatusCode},
+    http::{header, HeaderMap, Method, StatusCode},
     middleware,
     response::{
         sse::{Event as SseEvent, KeepAlive, KeepAliveStream},
         IntoResponse, Response, Sse,
     },
-    routing::get,
+    routing::{get, post},
     Json, Router,
 };
 use futures::Stream;
@@ -126,7 +126,7 @@ pub fn router_shared(
 
 fn build_router(state: AppState, rate_limiter: RateLimiter) -> Router<()> {
     let cors = CorsLayer::new()
-        .allow_methods([Method::GET, Method::OPTIONS])
+        .allow_methods([Method::GET, Method::POST, Method::OPTIONS])
         .allow_headers([header::CONTENT_TYPE, header::AUTHORIZATION])
         .allow_origin(tower_http::cors::Any);
 
@@ -134,6 +134,7 @@ fn build_router(state: AppState, rate_limiter: RateLimiter) -> Router<()> {
         .route("/health", get(handle_health))
         .route("/status", get(handle_status))
         .route("/query", get(handle_query))
+        .route("/views", post(handle_create_view))
         .layer(middleware::from_fn_with_state(
             rate_limiter,
             rate_limit::rate_limit_middleware,
@@ -504,6 +505,7 @@ pub enum ApiError {
     BadRequest(String),
     Timeout,
     QueryError(String),
+    Unauthorized(String),
     #[allow(dead_code)]
     Internal(String),
 }
@@ -514,6 +516,7 @@ impl IntoResponse for ApiError {
             ApiError::BadRequest(msg) => (StatusCode::BAD_REQUEST, msg),
             ApiError::Timeout => (StatusCode::REQUEST_TIMEOUT, "Query timeout".to_string()),
             ApiError::QueryError(msg) => (StatusCode::UNPROCESSABLE_ENTITY, msg),
+            ApiError::Unauthorized(msg) => (StatusCode::UNAUTHORIZED, msg),
             ApiError::Internal(msg) => (StatusCode::INTERNAL_SERVER_ERROR, msg),
         };
 
@@ -524,4 +527,124 @@ impl IntoResponse for ApiError {
 
         (status, Json(body)).into_response()
     }
+}
+
+// ============================================================================
+// Views Endpoint
+// ============================================================================
+
+#[derive(Deserialize)]
+struct CreateViewParams {
+    #[serde(alias = "chain_id")]
+    #[serde(rename = "chainId")]
+    chain_id: u64,
+}
+
+#[derive(Serialize)]
+struct CreateViewResponse {
+    ok: bool,
+    view_name: String,
+    database: String,
+}
+
+/// Create a materialized view in ClickHouse.
+/// Requires API key authorization.
+/// Only CREATE MATERIALIZED VIEW statements are allowed.
+/// View names are forced into the tidx_views database.
+async fn handle_create_view(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(params): Query<CreateViewParams>,
+    body: String,
+) -> Result<Json<CreateViewResponse>, ApiError> {
+    // Require API key
+    if !state.rate_limiter.has_valid_api_key(&headers).await {
+        return Err(ApiError::Unauthorized("API key required for creating views".to_string()));
+    }
+    
+    // Get ClickHouse engine
+    let clickhouse = state.get_clickhouse(Some(params.chain_id)).await
+        .ok_or_else(|| ApiError::BadRequest(format!(
+            "ClickHouse not configured for chain_id: {}",
+            params.chain_id
+        )))?;
+    
+    // Parse and validate the SQL
+    let sql = body.trim();
+    let sql_upper = sql.to_uppercase();
+    
+    // Must start with CREATE MATERIALIZED VIEW
+    if !sql_upper.starts_with("CREATE MATERIALIZED VIEW") {
+        return Err(ApiError::BadRequest(
+            "Only CREATE MATERIALIZED VIEW statements are allowed".to_string()
+        ));
+    }
+    
+    // Extract view name and rewrite to tidx_views database
+    let (view_name, rewritten_sql) = rewrite_view_sql(sql, params.chain_id)?;
+    
+    // Execute the DDL
+    clickhouse.admin_client()
+        .query(&rewritten_sql)
+        .execute()
+        .await
+        .map_err(|e| ApiError::QueryError(format!("Failed to create view: {e}")))?;
+    
+    Ok(Json(CreateViewResponse {
+        ok: true,
+        view_name,
+        database: format!("tidx_views_{}", params.chain_id),
+    }))
+}
+
+/// Rewrite CREATE MATERIALIZED VIEW to use tidx_views_{chain_id} database.
+/// Returns (view_name, rewritten_sql).
+fn rewrite_view_sql(sql: &str, chain_id: u64) -> Result<(String, String), ApiError> {
+    let database = format!("tidx_views_{chain_id}");
+    let source_db = format!("tidx_{chain_id}");
+    
+    // Find view name: CREATE MATERIALIZED VIEW [IF NOT EXISTS] <name>
+    let sql_upper = sql.to_uppercase();
+    let start_idx = if sql_upper.contains("IF NOT EXISTS") {
+        sql_upper.find("IF NOT EXISTS").unwrap() + "IF NOT EXISTS".len()
+    } else {
+        "CREATE MATERIALIZED VIEW".len()
+    };
+    
+    // Find the end of the view name (next whitespace or newline)
+    let rest = sql[start_idx..].trim_start();
+    let name_end = rest.find(|c: char| c.is_whitespace() || c == '(')
+        .unwrap_or(rest.len());
+    let view_name = rest[..name_end].trim();
+    
+    // Validate view name (alphanumeric + underscore only)
+    if !view_name.chars().all(|c| c.is_alphanumeric() || c == '_') {
+        return Err(ApiError::BadRequest(format!(
+            "Invalid view name: '{}'. Only alphanumeric and underscore allowed.",
+            view_name
+        )));
+    }
+    
+    // Build rewritten SQL
+    // 1. Ensure tidx_views database exists
+    // 2. Prefix view name with database
+    // 3. Prefix table references with source database
+    
+    let qualified_view = format!("{database}.{view_name}");
+    let rewritten = sql.replacen(view_name, &qualified_view, 1);
+    
+    // Also ensure table references use the correct source database
+    // Replace common patterns like "FROM logs" with "FROM tidx_{chain_id}.logs"
+    let rewritten = rewritten
+        .replace("FROM logs", &format!("FROM {source_db}.logs"))
+        .replace("FROM txs", &format!("FROM {source_db}.txs"))
+        .replace("FROM blocks", &format!("FROM {source_db}.blocks"))
+        .replace("FROM receipts", &format!("FROM {source_db}.receipts"));
+    
+    // Prepend database creation
+    let full_sql = format!(
+        "CREATE DATABASE IF NOT EXISTS {database};\n{rewritten}"
+    );
+    
+    Ok((view_name.to_string(), full_sql))
 }
