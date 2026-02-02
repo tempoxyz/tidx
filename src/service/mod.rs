@@ -341,12 +341,11 @@ mod tests {
         let sig = EventSignature::parse("Transfer(address indexed from, address indexed to, uint256 value)").unwrap();
         let cte = sig.to_cte_sql_clickhouse();
         
-        // ClickHouse CTE uses logs_decoded view with pre-decoded '0x...' columns
-        assert!(cte.contains("FROM logs_decoded"));
-        assert!(cte.contains("WHERE selector = '0x"));
+        // ClickHouse CTE uses string comparison for selector (MaterializedPostgreSQL format)
+        assert!(cte.contains(r"WHERE selector = '\\x"));
         // Uses substring to extract address from hex string (last 40 chars)
-        assert!(cte.contains("concat('0x', substring(topic1, 27))"));
-        assert!(cte.contains("concat('0x', substring(topic2, 27))"));
+        assert!(cte.contains("concat('0x', lower(substring(topic1, 27)))"));
+        assert!(cte.contains("concat('0x', lower(substring(topic2, 27)))"));
         // Uses unhex + reinterpret for uint decoding
         assert!(cte.contains("reinterpretAsUInt256(reverse(unhex(substring(data"));
     }
@@ -387,12 +386,11 @@ mod tests {
         assert!(pg_cte.contains("substring(data FROM 65 FOR 32)"));  // offset 64
         assert!(pg_cte.contains("substring(data FROM 97 FOR 32)"));  // offset 96
         
-        // ClickHouse uses hex-based offsets: hex_start = 1 + offset*2, and 64 chars for 32 bytes
-        // (logs_decoded strips the \x prefix, so data is just hex string)
-        assert!(ch_cte.contains("substring(data, 1, 64)"));    // offset 0: 1 + 0*2 = 1
-        assert!(ch_cte.contains("substring(data, 65, 64)"));   // offset 32: 1 + 32*2 = 65
-        assert!(ch_cte.contains("substring(data, 129, 64)"));  // offset 64: 1 + 64*2 = 129
-        assert!(ch_cte.contains("substring(data, 193, 64)"));  // offset 96: 1 + 96*2 = 193
+        // ClickHouse uses hex-based offsets: hex_start = 3 + offset*2, and 64 chars for 32 bytes
+        assert!(ch_cte.contains("substring(data, 3, 64)"));    // offset 0: 3 + 0*2 = 3
+        assert!(ch_cte.contains("substring(data, 67, 64)"));   // offset 32: 3 + 32*2 = 67
+        assert!(ch_cte.contains("substring(data, 131, 64)"));  // offset 64: 3 + 64*2 = 131
+        assert!(ch_cte.contains("substring(data, 195, 64)"));  // offset 96: 3 + 96*2 = 195
     }
 
     #[test]

@@ -203,11 +203,6 @@ SETTINGS materialized_postgresql_tables_list = 'logs,blocks,txs,receipts'"#,
                 if let Err(e) = add_bloom_indexes(&client, &database).await {
                     warn!(error = %e, "Failed to add bloom filter indexes (non-fatal)");
                 }
-                
-                // Create materialized view with pre-decoded columns
-                if let Err(e) = create_logs_decoded_view(&client, &database).await {
-                    warn!(error = %e, "Failed to create logs_decoded view (non-fatal)");
-                }
             }
         });
         
@@ -266,41 +261,6 @@ async fn add_bloom_indexes(client: &Client, database: &str) -> Result<()> {
         } else {
             info!(index = name, "Added bloom filter index on logs.{column}");
         }
-    }
-    
-    Ok(())
-}
-
-/// Create materialized view with pre-decoded hex columns for faster queries.
-/// Converts '\x...' bytea format to '0x...' hex strings at insert time.
-async fn create_logs_decoded_view(client: &Client, database: &str) -> Result<()> {
-    // Helper to convert '\x...' to '0x...' (strip \x prefix, add 0x)
-    // For addresses: take last 40 hex chars (20 bytes)
-    // For topics/hashes: take all 64 hex chars (32 bytes)
-    let sql = format!(
-        r#"CREATE MATERIALIZED VIEW IF NOT EXISTS {database}.logs_decoded
-ENGINE = MergeTree()
-ORDER BY (block_num, log_idx)
-POPULATE
-AS SELECT
-    block_num,
-    block_timestamp,
-    log_idx,
-    tx_idx,
-    concat('0x', lower(substring(tx_hash, 3))) AS tx_hash,
-    concat('0x', lower(substring(address, 3))) AS address,
-    concat('0x', lower(substring(selector, 3))) AS selector,
-    concat('0x', lower(substring(topic1, 3))) AS topic1,
-    concat('0x', lower(substring(topic2, 3))) AS topic2,
-    concat('0x', lower(substring(topic3, 3))) AS topic3,
-    substring(data, 3) AS data
-FROM {database}.logs"#
-    );
-    
-    if let Err(e) = client.query(&sql).execute().await {
-        debug!(error = %e, "Failed to create logs_decoded view (may already exist)");
-    } else {
-        info!(database = %database, "Created logs_decoded materialized view");
     }
     
     Ok(())

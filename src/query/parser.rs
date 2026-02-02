@@ -107,8 +107,8 @@ impl EventSignature {
 
     /// Generate ClickHouse-compatible CTE SQL, only including columns used in the query.
     /// 
-    /// Uses `logs_decoded` materialized view where hex columns are pre-decoded to '0x...' format.
-    /// Topics are stored as '0x' + 64 hex chars, addresses as '0x' + 40 hex chars.
+    /// Note: MaterializedPostgreSQL stores PostgreSQL bytea as '\x'-prefixed hex strings.
+    /// We use substring(..., 3) to strip the '\x' prefix before unhex().
     pub fn to_cte_sql_clickhouse_filtered(&self, used_columns: Option<&HashSet<String>>) -> String {
         let selects = self.build_select_expressions_clickhouse(used_columns);
 
@@ -118,14 +118,38 @@ impl EventSignature {
             format!(", {}", selects.join(", "))
         };
 
-        // logs_decoded has pre-decoded columns: tx_hash, address, selector, topic1-3 are already '0x...'
+        // Convert tx_hash/address from '\x...' format to '0x...' format
+        let include_tx_hash = used_columns
+            .map(|cols| cols.contains("tx_hash"))
+            .unwrap_or(true);
+        let include_address = used_columns
+            .map(|cols| cols.contains("address"))
+            .unwrap_or(true);
+
+        // tx_hash/address are stored as '\xABCD...' - replace '\x' with '0x'
+        let tx_hash_col = if include_tx_hash {
+            "concat('0x', lower(substring(tx_hash, 3))) AS tx_hash"
+        } else {
+            "tx_hash"
+        };
+        let address_col = if include_address {
+            "concat('0x', lower(substring(address, 3))) AS address"
+        } else {
+            "address"
+        };
+
+        // selector is stored as '\xABCD...' string, compare directly
         format!(
             r#"{name} AS (
-    SELECT block_num, block_timestamp, log_idx, tx_idx, tx_hash, address{select_clause}
-    FROM logs_decoded
-    WHERE selector = '0x{topic0}'
+    SELECT block_num, block_timestamp, log_idx, tx_idx, 
+           {tx_hash_col},
+           {address_col}{select_clause}
+    FROM logs
+    WHERE selector = '\\x{topic0}'
 )"#,
             name = self.name.to_lowercase(),
+            tx_hash_col = tx_hash_col,
+            address_col = address_col,
             select_clause = select_clause,
             topic0 = self.topic0_hex(),
         )
@@ -646,42 +670,43 @@ impl AbiType {
         }
     }
 
-    // ClickHouse decode functions for logs_decoded materialized view
+    // ClickHouse decode functions for MaterializedPostgreSQL data
     // 
-    // logs_decoded pre-decodes hex columns at insert time:
-    // - topic1/2/3: '0x' + 64 hex chars (32 bytes)
-    // - address: '0x' + 40 hex chars (20 bytes)  
-    // - data: just hex string (no prefix)
-    // 
-    // This avoids runtime string manipulation on every row.
+    // IMPORTANT: PostgreSQL bytea columns are stored as '\x'-prefixed hex strings.
+    // e.g., topic1 = '\x000000000000000000000000a975ba910c2ee169956f3df99ee2ece79d3887cf'
+    // We need to:
+    // 1. Strip the '\x' prefix with substring(..., 3)
+    // 2. Work with hex string (64 chars = 32 bytes) using substring on the hex
+    // 3. unhex() only when we need actual bytes for reinterpret functions
 
     pub fn topic_decode_sql_clickhouse(&self, topic_idx: usize) -> String {
         // topic_idx is 1-based from the signature parser, maps to topic0, topic1, etc.
         let col = format!("topic{}", topic_idx.saturating_sub(1));
-        // Topics are pre-decoded as '0x' + 64 hex chars
+        // Strip '\x' prefix: substring(col, 3) gives us the 64-char hex string
         match self {
-            // Address: extract last 40 hex chars (skip '0x' prefix + 24 padding chars)
-            AbiType::Address => format!("concat('0x', substring({col}, 27))"),
-            // Uint: unhex the 64 chars (skip '0x'), reverse for big-endian, reinterpret
+            // Address: last 20 bytes = last 40 hex chars, add 0x prefix
+            AbiType::Address => format!("concat('0x', lower(substring({col}, 27)))"),
+            // Uint: unhex the full 64 chars, reverse for big-endian, reinterpret
             AbiType::Uint(_) | AbiType::Int(_) => {
                 format!("reinterpretAsUInt256(reverse(unhex(substring({col}, 3))))")
             }
-            // Bool: check last byte (last 2 hex chars, position 65-66 after '0x')
+            // Bool: check last byte (last 2 hex chars)
             AbiType::Bool => format!("unhex(substring({col}, 67, 2)) != unhex('00')"),
-            // Bytes32: already '0x'-prefixed
-            AbiType::Bytes(Some(_) | None) => col,
-            _ => col,
+            // Bytes32: just format as 0x-prefixed, already lowercase
+            AbiType::Bytes(Some(_) | None) => format!("concat('0x', substring({col}, 3))"),
+            _ => format!("concat('0x', substring({col}, 3))"),
         }
     }
 
     pub fn data_decode_sql_clickhouse(&self, offset: usize) -> String {
-        // data is stored as hex string (no prefix) in logs_decoded
-        // offset is in bytes, convert to hex position (2 chars per byte)
-        let hex_start = 1 + offset * 2;
+        // data is stored as '\x' + hex string
+        // offset is in bytes, but we're working with hex (2 chars per byte)
+        // +3 to skip '\x' prefix, then offset*2 for hex position
+        let hex_start = 3 + offset * 2;
         match self {
             // Address: skip first 12 bytes (24 hex chars) of 32-byte word, take 20 bytes (40 hex chars)
             AbiType::Address => {
-                format!("concat('0x', substring(data, {}, 40))", hex_start + 24)
+                format!("concat('0x', lower(substring(data, {}, 40)))", hex_start + 24)
             }
             // Uint: unhex 32 bytes (64 hex chars), reverse, reinterpret
             AbiType::Uint(_) => {
@@ -696,13 +721,13 @@ impl AbiType {
             }
             // Bytes32: take 64 hex chars, format with 0x prefix
             AbiType::Bytes(Some(_) | None) => {
-                format!("concat('0x', substring(data, {hex_start}, 64))")
+                format!("concat('0x', lower(substring(data, {hex_start}, 64)))")
             }
             // String: dynamic, not fully supported yet
             AbiType::String => {
-                format!("concat('0x', substring(data, {hex_start}, 64))")
+                format!("concat('0x', lower(substring(data, {hex_start}, 64)))")
             }
-            _ => format!("concat('0x', substring(data, {hex_start}, 64))"),
+            _ => format!("concat('0x', lower(substring(data, {hex_start}, 64)))"),
         }
     }
 }
@@ -801,15 +826,15 @@ mod tests {
         .unwrap();
         let cte = sig.to_cte_sql_clickhouse();
         assert!(cte.contains("transfer AS"));
-        // Uses logs_decoded materialized view with pre-decoded '0x...' columns
-        assert!(cte.contains("FROM logs_decoded"));
-        // Addresses from topics: extract last 40 hex chars (topics are '0x' + 64 chars)
-        assert!(cte.contains("concat('0x', substring(topic1, 27))"));
-        assert!(cte.contains("concat('0x', substring(topic2, 27))"));
-        // uint256 from data uses unhex then reinterpret
+        // ClickHouse: addresses from topics use substring to get last 40 hex chars
+        // topic1 = '\x000...address' -> substring(topic1, 27) gets last 40 chars
+        assert!(cte.contains("concat('0x', lower(substring(topic1, 27)))"));
+        assert!(cte.contains("concat('0x', lower(substring(topic2, 27)))"));
+        // ClickHouse: uint256 from data uses unhex then reinterpret
         assert!(cte.contains("reinterpretAsUInt256(reverse(unhex(substring(data"));
-        // selector comparison uses '0x' prefix (logs_decoded pre-decodes it)
-        assert!(cte.contains("selector = '0x"));
+        // ClickHouse: selector comparison uses string match with '\x' prefix
+        // Note: \\x in the output because we're generating SQL with escaped backslash
+        assert!(cte.contains(r"selector = '\\x"));
     }
 
     #[test]
@@ -908,9 +933,8 @@ mod tests {
         // "to" is the second indexed param, so it should still be topic2
         assert!(cte.contains("topic2"));
         assert!(cte.contains("AS \"to\""));
-        // "value" is the first data param: hex_start = 1 + 0*2 = 1, so substring(data, 1, 64)
-        // (logs_decoded strips the \x prefix, so data is just hex string)
-        assert!(cte.contains("substring(data, 1, 64)"));
+        // "value" is the first data param: hex_start = 3 + 0*2 = 3, so substring(data, 3, 64)
+        assert!(cte.contains("substring(data, 3, 64)"));
         assert!(cte.contains("AS \"value\""));
     }
 
