@@ -5,7 +5,6 @@
 
 use anyhow::{anyhow, Result};
 use clickhouse::Client;
-use serde::Deserialize;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::Mutex;
@@ -21,6 +20,8 @@ pub struct ClickHouseEngine {
     admin_client: Client,
     /// Client with database set (for queries after replication is set up)
     query_client: Client,
+    /// ClickHouse HTTP URL
+    url: String,
     /// Database name for this chain (e.g., "tidx_4217" for chain 4217)
     database: String,
     /// Chain ID
@@ -44,6 +45,7 @@ impl ClickHouseEngine {
         Ok(Self {
             admin_client,
             query_client,
+            url: config.url.clone(),
             database,
             chain_id,
         })
@@ -76,26 +78,73 @@ impl ClickHouseEngine {
         
         let start = std::time::Instant::now();
         
-        // Execute query using JSONEachRow format for flexible result handling
-        let query = self.query_client.query(&sql);
-        let mut cursor = query.fetch::<JsonRow>()?;
+        // Use FORMAT JSON to get structured results with column metadata
+        let sql_with_format = format!("{sql} FORMAT JSON");
         
-        let mut rows = Vec::new();
-        let mut columns = Vec::new();
-        let mut first_row = true;
+        // Fetch raw bytes and parse as JSON
+        let bytes = self.query_client
+            .query(&sql_with_format)
+            .fetch_all::<String>()
+            .await;
         
-        while let Some(row) = cursor.next().await? {
-            if first_row {
-                columns = row.0.keys().cloned().collect();
-                first_row = false;
+        // If fetch_all fails, try using HTTP directly
+        let json_response = match bytes {
+            Ok(rows) if !rows.is_empty() => {
+                // Rows came back as strings, join them
+                rows.join("")
             }
-            
-            let values: Vec<serde_json::Value> = columns
-                .iter()
-                .map(|col| row.0.get(col).cloned().unwrap_or(serde_json::Value::Null))
-                .collect();
-            rows.push(values);
-        }
+            _ => {
+                // Fallback: use reqwest to query ClickHouse HTTP interface directly
+                let url = format!(
+                    "{}/?database={}&default_format=JSON",
+                    self.url.trim_end_matches('/'),
+                    self.database
+                );
+                
+                let client = reqwest::Client::new();
+                let resp = client
+                    .post(&url)
+                    .body(sql.clone())
+                    .send()
+                    .await
+                    .map_err(|e| anyhow!("ClickHouse HTTP request failed: {e}"))?;
+                
+                if !resp.status().is_success() {
+                    let error_text = resp.text().await.unwrap_or_default();
+                    return Err(anyhow!("ClickHouse query failed: {error_text}"));
+                }
+                
+                resp.text().await.map_err(|e| anyhow!("Failed to read response: {e}"))?
+            }
+        };
+        
+        // Parse the JSON response
+        let parsed: serde_json::Value = serde_json::from_str(&json_response)
+            .map_err(|e| anyhow!("Failed to parse ClickHouse JSON response: {e}"))?;
+        
+        let meta = parsed.get("meta").and_then(|m| m.as_array());
+        let data = parsed.get("data").and_then(|d| d.as_array());
+        
+        let columns: Vec<String> = meta
+            .map(|m| {
+                m.iter()
+                    .filter_map(|col| col.get("name").and_then(|n| n.as_str()).map(String::from))
+                    .collect()
+            })
+            .unwrap_or_default();
+        
+        let rows: Vec<Vec<serde_json::Value>> = data
+            .map(|d| {
+                d.iter()
+                    .map(|row| {
+                        columns
+                            .iter()
+                            .map(|col| row.get(col).cloned().unwrap_or(serde_json::Value::Null))
+                            .collect()
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
         
         let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
         let row_count = rows.len();
@@ -186,14 +235,6 @@ pub struct QueryResult {
     pub row_count: usize,
     pub engine: Option<String>,
     pub query_time_ms: Option<f64>,
-}
-
-/// Wrapper for deserializing JSON rows from ClickHouse.
-#[derive(Debug, Deserialize)]
-struct JsonRow(HashMap<String, serde_json::Value>);
-
-impl clickhouse::Row for JsonRow {
-    const COLUMN_NAMES: &'static [&'static str] = &[];
 }
 
 /// Parsed PostgreSQL connection URL.
