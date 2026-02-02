@@ -17,7 +17,10 @@ use crate::query::EventSignature;
 /// ClickHouse engine for OLAP queries.
 /// Uses MaterializedPostgreSQL for real-time replication from PostgreSQL.
 pub struct ClickHouseEngine {
-    client: Client,
+    /// Client without database set (for DDL operations)
+    admin_client: Client,
+    /// Client with database set (for queries after replication is set up)
+    query_client: Client,
     /// Database name for this chain (e.g., "tidx_4217" for chain 4217)
     database: String,
     /// Chain ID
@@ -29,12 +32,18 @@ impl ClickHouseEngine {
     pub fn new(config: &ClickHouseConfig, chain_id: u64, _pg_url: &str) -> Result<Self> {
         let database = format!("tidx_{chain_id}");
         
-        let client = Client::default()
+        // Admin client without database (for CREATE DATABASE and other DDL)
+        let admin_client = Client::default()
+            .with_url(&config.url);
+        
+        // Query client with database set (for data queries after replication is set up)
+        let query_client = Client::default()
             .with_url(&config.url)
             .with_database(&database);
         
         Ok(Self {
-            client,
+            admin_client,
+            query_client,
             database,
             chain_id,
         })
@@ -42,7 +51,7 @@ impl ClickHouseEngine {
     
     /// Get the ClickHouse client for direct queries.
     pub fn client(&self) -> &Client {
-        &self.client
+        &self.query_client
     }
     
     /// Get the database name.
@@ -68,7 +77,7 @@ impl ClickHouseEngine {
         let start = std::time::Instant::now();
         
         // Execute query using JSONEachRow format for flexible result handling
-        let query = self.client.query(&sql);
+        let query = self.query_client.query(&sql);
         let mut cursor = query.fetch::<JsonRow>()?;
         
         let mut rows = Vec::new();
@@ -106,8 +115,8 @@ impl ClickHouseEngine {
         // Parse PostgreSQL URL to extract components
         let pg = parse_pg_url(pg_url)?;
         
-        // Check if database exists
-        let exists: u8 = self.client
+        // Check if database exists (use admin client - no database context needed)
+        let exists: u8 = self.admin_client
             .query("SELECT count() FROM system.databases WHERE name = ?")
             .bind(&self.database)
             .fetch_one()
@@ -143,7 +152,7 @@ SETTINGS materialized_postgresql_tables_list = 'logs,blocks,txs,receipts'"#,
             password = pg.password,
         );
         
-        self.client.query(&create_sql).execute().await?;
+        self.admin_client.query(&create_sql).execute().await?;
         
         info!(
             database = %self.database,
@@ -153,7 +162,7 @@ SETTINGS materialized_postgresql_tables_list = 'logs,blocks,txs,receipts'"#,
         // Add bloom filter indexes for common query patterns
         // Note: This needs to be done after replication starts and tables exist
         tokio::spawn({
-            let client = self.client.clone();
+            let client = self.admin_client.clone();
             let database = self.database.clone();
             async move {
                 // Wait for tables to be created by replication
