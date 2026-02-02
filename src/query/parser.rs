@@ -584,48 +584,53 @@ pub fn rewrite_for_late_decode(
     let event_name = sig.name.to_lowercase();
     let raw_name = format!("{}_raw", event_name);
     
-    // Build column replacement map: decoded_name -> raw_column
-    let mut replacements: HashMap<String, String> = HashMap::new();
-    for mapping in &mappings {
-        replacements.insert(
-            mapping.decoded_name.to_lowercase(),
-            mapping.raw_column.clone(),
-        );
-    }
-    
     // Rewrite the SQL to use raw columns in GROUP BY/ORDER BY
     // This is a simple string replacement - works for most cases
     let mut rewritten_sql = sql.replace(&event_name, &raw_name);
     
-    // Replace decoded column names with raw columns in GROUP BY/ORDER BY context
-    // We do case-insensitive replacement for the column names
+    // Track which decoded columns were replaced so we can decode them in outer SELECT
+    let mut replaced_columns: Vec<&ColumnMapping> = Vec::new();
+    
+    // Replace decoded column names with raw columns
     for mapping in &mappings {
         let decoded = &mapping.decoded_name;
         let raw = &mapping.raw_column;
         
-        // Replace quoted versions: "from" -> topic1
-        rewritten_sql = rewritten_sql.replace(&format!("\"{decoded}\""), raw);
-        // Replace unquoted (case variations)
-        rewritten_sql = rewritten_sql.replace(&format!(" {decoded} "), &format!(" {raw} "));
-        rewritten_sql = rewritten_sql.replace(&format!(" {decoded},"), &format!(" {raw},"));
-        rewritten_sql = rewritten_sql.replace(&format!(",{decoded} "), &format!(",{raw} "));
-        rewritten_sql = rewritten_sql.replace(&format!(",{decoded},"), &format!(",{raw},"));
+        // Check if this column is used in GROUP BY or ORDER BY
+        let in_group_by = group_by_cols.contains(&decoded.to_lowercase());
+        let in_order_by = order_by_cols.contains(&decoded.to_lowercase());
+        
+        if in_group_by || in_order_by {
+            replaced_columns.push(mapping);
+            
+            // Replace quoted versions: "from" -> topic1
+            rewritten_sql = rewritten_sql.replace(&format!("\"{decoded}\""), raw);
+            // Replace unquoted (case variations)
+            rewritten_sql = rewritten_sql.replace(&format!(" {decoded} "), &format!(" {raw} "));
+            rewritten_sql = rewritten_sql.replace(&format!(" {decoded},"), &format!(" {raw},"));
+            rewritten_sql = rewritten_sql.replace(&format!(",{decoded} "), &format!(",{raw} "));
+            rewritten_sql = rewritten_sql.replace(&format!(",{decoded},"), &format!(",{raw},"));
+        }
     }
     
-    // Build the decode wrapper for SELECT columns
-    // We need to decode the columns that appear in SELECT but keep aggregates as-is
-    let mut decode_selects = Vec::new();
-    for mapping in &mappings {
-        decode_selects.push(format!(
+    // Build outer SELECT that decodes the replaced columns
+    // Format: SELECT decode(raw_col) AS "decoded_name", other_col, ... FROM (inner_query)
+    let mut outer_selects = Vec::new();
+    for mapping in &replaced_columns {
+        outer_selects.push(format!(
             "{} AS \"{}\"",
             mapping.decode_expr, mapping.decoded_name
         ));
     }
     
-    // Wrap the query to decode final results
-    // Replace SELECT columns with decoded versions where applicable
+    // Add * to capture other columns (aggregates, etc.) that weren't replaced
+    // We use a subquery alias to reference non-replaced columns
+    outer_selects.push("*".to_string());
+    
+    // Build the final SQL with decode wrapper
+    let outer_select = outer_selects.join(", ");
     let final_sql = format!(
-        "WITH {raw_cte} {rewritten_sql}"
+        "WITH {raw_cte} SELECT {outer_select} FROM ({rewritten_sql}) AS _inner"
     );
     
     LateDecodeRewrite {
@@ -1263,6 +1268,13 @@ mod tests {
         assert!(rewrite.sql.contains("transfer_raw AS"));
         // Should replace "to" with topic2 in GROUP BY
         assert!(rewrite.sql.contains("GROUP BY topic2"));
+        // Should wrap in outer SELECT with decode
+        assert!(rewrite.sql.contains("SELECT abi_address(topic2) AS \"to\""));
+        // Should include * to pass through other columns (cnt)
+        assert!(rewrite.sql.contains(", *"));
+        // Should wrap inner query as subquery
+        assert!(rewrite.sql.contains("FROM ("));
+        assert!(rewrite.sql.contains(") AS _inner"));
     }
 
     #[test]
