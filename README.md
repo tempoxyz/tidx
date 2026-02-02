@@ -290,6 +290,91 @@ GET /query                                               Execute SQL query (auto
 GET /metrics                                             Prometheus metrics
 ```
 
+### Views API
+
+Manage ClickHouse materialized views for pre-computed analytics. Views are stored in `analytics_{chainId}` database and auto-update on new data.
+
+**Note:** POST and DELETE require connection from Tailscale IP (100.x.x.x) for security.
+
+#### List Views
+
+```bash
+curl "http://localhost:8080/views?chainId=42431"
+```
+
+```json
+{
+  "ok": true,
+  "views": [
+    {"name": "token_holders", "engine": "MaterializedView", "database": "analytics_42431"},
+    {"name": "token_balances", "engine": "SummingMergeTree", "database": "analytics_42431"}
+  ]
+}
+```
+
+#### Create View (Tailscale only)
+
+```bash
+curl -X POST "http://100.127.112.88:8080/views" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "chainId": 42431,
+    "name": "token_holders",
+    "sql": "SELECT token, holder, sum(balance) AS balance FROM token_balances GROUP BY token, holder HAVING balance > 0",
+    "orderBy": ["token", "holder"]
+  }'
+```
+
+| Field | Required | Description |
+|-------|----------|-------------|
+| `chainId` | yes | Target chain ID |
+| `name` | yes | View name (alphanumeric + underscore) |
+| `sql` | yes | SELECT statement for the view |
+| `orderBy` | yes | Primary key columns for table sorting |
+| `engine` | no | ClickHouse engine (default: `SummingMergeTree()`) |
+
+This creates:
+1. Target table `analytics_{chainId}.{name}` with inferred schema
+2. Materialized view `analytics_{chainId}.{name}_mv` that auto-populates on inserts
+3. Backfills existing data from the source query
+
+#### Get View Details
+
+```bash
+curl "http://localhost:8080/views/token_holders?chainId=42431"
+```
+
+```json
+{
+  "ok": true,
+  "view": {"name": "token_holders", "engine": "View", "database": "analytics_42431"},
+  "definition": "CREATE VIEW analytics_42431.token_holders AS SELECT ...",
+  "row_count": 1234567
+}
+```
+
+#### Delete View (Tailscale only)
+
+```bash
+curl -X DELETE "http://100.127.112.88:8080/views/token_holders?chainId=42431"
+```
+
+```json
+{
+  "ok": true,
+  "deleted": ["token_holders_mv", "token_holders"]
+}
+```
+
+#### Query Views
+
+Views are auto-prefixed with `analytics_{chainId}` when using `engine=clickhouse`:
+
+```bash
+# Query the view (auto-prefixed)
+curl "http://localhost:8080/query?chainId=42431&engine=clickhouse&sql=SELECT * FROM token_holders WHERE token = '0x...' ORDER BY balance DESC LIMIT 10"
+```
+
 ## Schemas
 
 All tables use composite primary keys with timestamps for efficient range queries:
