@@ -8,7 +8,7 @@ use metrics_exporter_prometheus::PrometheusBuilder;
 use tokio::sync::RwLock;
 use tracing::{error, info};
 
-use tidx::api::{self, ChainClickHouseConfig, SharedClickHouseConfigs, SharedPools};
+use tidx::api::{self, ChainClickHouseConfig, SharedClickHouseConfigs, SharedClickHouseEngines, SharedPools};
 use tidx::clickhouse::ClickHouseEngine;
 use tidx::broadcast::Broadcaster;
 use tidx::config::{ChainConfig, Config, ConfigWatcher, NewChainEvent};
@@ -56,10 +56,8 @@ pub async fn run(args: Args) -> Result<()> {
 
     let pools: SharedPools = Arc::new(RwLock::new(HashMap::new()));
     let clickhouse_configs: SharedClickHouseConfigs = Arc::new(RwLock::new(HashMap::new()));
+    let clickhouse_engines: SharedClickHouseEngines = Arc::new(RwLock::new(HashMap::new()));
     let mut default_chain_id = 0u64;
-
-    // Track ClickHouse engine for OLAP queries
-    let mut clickhouse_engine: Option<Arc<ClickHouseEngine>> = None;
 
     for chain in &config.chains {
         let throttled_pool = initialize_chain(
@@ -71,9 +69,9 @@ pub async fn run(args: Args) -> Result<()> {
             default_chain_id = chain.chain_id;
         }
 
-        // Initialize ClickHouse if configured
+        // Initialize ClickHouse if configured (for each chain)
         if let Some(ref ch_config) = chain.clickhouse {
-            if ch_config.enabled && clickhouse_engine.is_none() {
+            if ch_config.enabled {
                 match ClickHouseEngine::new(ch_config, chain.chain_id, &chain.pg_url) {
                     Ok(engine) => {
                         let engine = Arc::new(engine);
@@ -81,14 +79,15 @@ pub async fn run(args: Args) -> Result<()> {
                         // Ensure replication is set up
                         let pg_url = chain.pg_url.clone();
                         let engine_clone = Arc::clone(&engine);
+                        let chain_name = chain.name.clone();
                         tokio::spawn(async move {
                             if let Err(e) = engine_clone.ensure_replication(&pg_url).await {
-                                error!(error = %e, "Failed to set up ClickHouse replication");
+                                error!(error = %e, chain = %chain_name, "Failed to set up ClickHouse replication");
                             }
                         });
                         
-                        clickhouse_engine = Some(engine);
-                        info!(chain = %chain.name, "ClickHouse OLAP engine initialized");
+                        clickhouse_engines.write().await.insert(chain.chain_id, engine);
+                        info!(chain = %chain.name, chain_id = chain.chain_id, "ClickHouse OLAP engine initialized");
                     }
                     Err(e) => {
                         error!(error = %e, chain = %chain.name, "Failed to create ClickHouse engine");
@@ -124,7 +123,7 @@ pub async fn run(args: Args) -> Result<()> {
                 broadcaster.clone(),
                 Arc::clone(&clickhouse_configs),
                 http_config,
-                clickhouse_engine.clone(),
+                Arc::clone(&clickhouse_engines),
             );
 
             info!(addr = %addr, "Starting HTTP API server (hot-reload enabled)");

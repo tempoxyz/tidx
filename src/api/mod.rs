@@ -32,6 +32,7 @@ use crate::service::{QueryOptions, QueryResult, SyncStatus};
 pub use rate_limit::{RateLimiter, SseConnectionGuard};
 
 pub type SharedPools = Arc<RwLock<HashMap<u64, Pool>>>;
+pub type SharedClickHouseEngines = Arc<RwLock<HashMap<u64, Arc<ClickHouseEngine>>>>;
 
 /// Per-chain ClickHouse configuration.
 #[derive(Clone, Debug, Default)]
@@ -53,14 +54,19 @@ pub struct AppState {
     pub clickhouse_configs: SharedClickHouseConfigs,
     /// Rate limiter for request throttling
     pub rate_limiter: RateLimiter,
-    /// ClickHouse engine for OLAP queries
-    pub clickhouse: Option<Arc<ClickHouseEngine>>,
+    /// ClickHouse engines for OLAP queries (per chain)
+    pub clickhouse_engines: SharedClickHouseEngines,
 }
 
 impl AppState {
     async fn get_pool(&self, chain_id: Option<u64>) -> Option<Pool> {
         let id = chain_id.unwrap_or(self.default_chain_id);
         self.pools.read().await.get(&id).cloned()
+    }
+    
+    async fn get_clickhouse(&self, chain_id: Option<u64>) -> Option<Arc<ClickHouseEngine>> {
+        let id = chain_id.unwrap_or(self.default_chain_id);
+        self.clickhouse_engines.read().await.get(&id).cloned()
     }
 }
 
@@ -88,7 +94,7 @@ pub fn router_with_options(
         broadcaster,
         clickhouse_configs: Arc::new(RwLock::new(clickhouse_configs)),
         rate_limiter: rate_limiter.clone(),
-        clickhouse: None, // Created lazily on first OLAP query
+        clickhouse_engines: Arc::new(RwLock::new(HashMap::new())),
     };
 
     build_router(state, rate_limiter)
@@ -100,7 +106,7 @@ pub fn router_shared(
     broadcaster: Arc<Broadcaster>,
     clickhouse_configs: SharedClickHouseConfigs,
     http_config: SharedHttpConfig,
-    clickhouse: Option<Arc<ClickHouseEngine>>,
+    clickhouse_engines: SharedClickHouseEngines,
 ) -> Router<()> {
     let rate_limiter = RateLimiter::new_shared(http_config);
 
@@ -112,7 +118,7 @@ pub fn router_shared(
         broadcaster,
         clickhouse_configs,
         rate_limiter: rate_limiter.clone(),
-        clickhouse,
+        clickhouse_engines,
     };
 
     build_router(state, rate_limiter)
@@ -239,8 +245,11 @@ async fn handle_query_once(
 
     let result = if use_clickhouse {
         // Use ClickHouse engine for OLAP queries
-        let clickhouse = state.clickhouse.as_ref()
-            .ok_or_else(|| ApiError::BadRequest("ClickHouse not configured".to_string()))?;
+        let clickhouse = state.get_clickhouse(Some(params.chain_id)).await
+            .ok_or_else(|| ApiError::BadRequest(format!(
+                "ClickHouse not configured for chain_id: {}",
+                params.chain_id
+            )))?;
 
         clickhouse.query(&params.sql, params.signature.as_deref())
             .await
