@@ -315,7 +315,7 @@ curl "http://<host>/views?chainId=42431"
 #### Create View (Tailscale only)
 
 ```bash
-curl -X POST "http://<tailscale-ip>/views" \
+curl -X POST "http://<host>/views" \
   -H "Content-Type: application/json" \
   -d '{
     "chainId": 42431,
@@ -356,7 +356,7 @@ curl "http://<host>/views/token_holders?chainId=42431"
 #### Delete View (Tailscale only)
 
 ```bash
-curl -X DELETE "http://<tailscale-ip>/views/token_holders?chainId=42431"
+curl -X DELETE "http://<host>/views/token_holders?chainId=42431"
 ```
 
 ```json
