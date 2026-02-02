@@ -214,6 +214,11 @@ async fn handle_query(
     Query(params): Query<QueryParams>,
 ) -> Response {
     if params.live {
+        if params.engine.as_deref() == Some("clickhouse") {
+            return ApiError::BadRequest(
+                "engine=clickhouse is not supported with live=true (use PostgreSQL for real-time streaming)".to_string()
+            ).into_response();
+        }
         handle_query_live(state, params, addr, headers).await.into_response()
     } else {
         handle_query_once(state, params).await.into_response()
