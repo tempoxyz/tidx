@@ -2,6 +2,7 @@
 
 use axum::{
     extract::{ConnectInfo, Path, Query, State},
+    http::HeaderMap,
     Json,
 };
 use serde::{Deserialize, Serialize};
@@ -9,12 +10,27 @@ use std::net::SocketAddr;
 
 use super::{AppState, ApiError};
 
-/// Check if request comes from Tailscale (100.x.x.x range)
+/// Check if request comes from Tailscale CGNAT range.
+/// IPv4: 100.64.0.0/10 (100.64.0.0 - 100.127.255.255)
+/// IPv6: fd7a:115c:a1e0::/48
 fn is_tailscale_ip(addr: &SocketAddr) -> bool {
     match addr.ip() {
-        std::net::IpAddr::V4(ip) => ip.octets()[0] == 100,
-        _ => false,
+        std::net::IpAddr::V4(ip) => {
+            let octets = ip.octets();
+            // 100.64.0.0/10: first octet = 100, second octet high 2 bits = 01
+            octets[0] == 100 && (octets[1] & 0b11000000) == 64
+        }
+        std::net::IpAddr::V6(ip) => {
+            // fd7a:115c:a1e0::/48
+            let segments = ip.segments();
+            segments[0] == 0xfd7a && segments[1] == 0x115c && segments[2] == 0xa1e0
+        }
     }
+}
+
+/// Check if request has a valid API key for admin operations.
+async fn has_admin_api_key(state: &AppState, headers: &HeaderMap) -> bool {
+    state.rate_limiter.has_valid_api_key(headers).await
 }
 
 /// Validate view name (alphanumeric + underscore only)
@@ -34,9 +50,9 @@ pub struct ChainQuery {
 
 #[derive(Serialize)]
 pub struct ViewInfo {
-    name: String,
-    engine: String,
     database: String,
+    engine: String,
+    name: String,
 }
 
 #[derive(Serialize)]
@@ -85,12 +101,12 @@ pub struct CreateViewRequest {
     #[serde(alias = "chain_id")]
     #[serde(rename = "chainId")]
     chain_id: u64,
-    name: String,
-    sql: String,
     #[serde(default = "default_engine")]
     engine: String,
+    name: String,
     #[serde(rename = "orderBy")]
     order_by: Vec<String>,
+    sql: String,
 }
 
 fn default_engine() -> String {
@@ -99,20 +115,26 @@ fn default_engine() -> String {
 
 #[derive(Serialize)]
 pub struct CreateViewResponse {
+    backfill_rows: u64,
     ok: bool,
     view: ViewInfo,
-    backfill_rows: u64,
 }
 
-/// POST /views - Create a materialized view (Tailscale only)
+/// POST /views - Create a materialized view (Tailscale + API key required)
 pub async fn create_view(
     State(state): State<AppState>,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
     Json(req): Json<CreateViewRequest>,
 ) -> Result<Json<CreateViewResponse>, ApiError> {
     // Check Tailscale access
     if !is_tailscale_ip(&addr) {
         return Err(ApiError::Forbidden("Mutations only allowed via Tailscale".to_string()));
+    }
+
+    // Check API key
+    if !has_admin_api_key(&state, &headers).await {
+        return Err(ApiError::Forbidden("API key required for mutations".to_string()));
     }
 
     // Validate view name
@@ -201,20 +223,26 @@ pub async fn create_view(
 
 #[derive(Serialize)]
 pub struct DeleteViewResponse {
-    ok: bool,
     deleted: Vec<String>,
+    ok: bool,
 }
 
-/// DELETE /views/{name}?chainId=42431 - Delete a view (Tailscale only)
+/// DELETE /views/{name}?chainId=42431 - Delete a view (Tailscale + API key required)
 pub async fn delete_view(
     State(state): State<AppState>,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
     Path(name): Path<String>,
     Query(params): Query<ChainQuery>,
 ) -> Result<Json<DeleteViewResponse>, ApiError> {
     // Check Tailscale access
     if !is_tailscale_ip(&addr) {
         return Err(ApiError::Forbidden("Mutations only allowed via Tailscale".to_string()));
+    }
+
+    // Check API key
+    if !has_admin_api_key(&state, &headers).await {
+        return Err(ApiError::Forbidden("API key required for mutations".to_string()));
     }
 
     // Validate view name
@@ -251,10 +279,10 @@ pub async fn delete_view(
 
 #[derive(Serialize)]
 pub struct GetViewResponse {
-    ok: bool,
-    view: ViewInfo,
     definition: String,
+    ok: bool,
     row_count: u64,
+    view: ViewInfo,
 }
 
 /// GET /views/{name}?chainId=42431 - Get view details
@@ -309,4 +337,68 @@ pub async fn get_view(
         definition,
         row_count,
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+
+    fn addr_v4(a: u8, b: u8, c: u8, d: u8) -> SocketAddr {
+        SocketAddr::new(IpAddr::V4(Ipv4Addr::new(a, b, c, d)), 12345)
+    }
+
+    fn addr_v6(segments: [u16; 8]) -> SocketAddr {
+        SocketAddr::new(IpAddr::V6(Ipv6Addr::new(
+            segments[0], segments[1], segments[2], segments[3],
+            segments[4], segments[5], segments[6], segments[7],
+        )), 12345)
+    }
+
+    #[test]
+    fn test_tailscale_ipv4_valid() {
+        // 100.64.0.0/10 range: 100.64.0.0 - 100.127.255.255
+        assert!(is_tailscale_ip(&addr_v4(100, 64, 0, 1)));
+        assert!(is_tailscale_ip(&addr_v4(100, 100, 50, 25)));
+        assert!(is_tailscale_ip(&addr_v4(100, 127, 255, 255)));
+        assert!(is_tailscale_ip(&addr_v4(100, 127, 112, 88)));
+    }
+
+    #[test]
+    fn test_tailscale_ipv4_invalid() {
+        // Outside 100.64.0.0/10
+        assert!(!is_tailscale_ip(&addr_v4(100, 0, 0, 1)));     // 100.0.x.x
+        assert!(!is_tailscale_ip(&addr_v4(100, 63, 255, 255))); // Just below range
+        assert!(!is_tailscale_ip(&addr_v4(100, 128, 0, 0)));   // Just above range
+        assert!(!is_tailscale_ip(&addr_v4(192, 168, 1, 1)));   // Private
+        assert!(!is_tailscale_ip(&addr_v4(10, 0, 0, 1)));      // Private
+        assert!(!is_tailscale_ip(&addr_v4(8, 8, 8, 8)));       // Public
+    }
+
+    #[test]
+    fn test_tailscale_ipv6_valid() {
+        // fd7a:115c:a1e0::/48
+        assert!(is_tailscale_ip(&addr_v6([0xfd7a, 0x115c, 0xa1e0, 0x0000, 0, 0, 0, 1])));
+        assert!(is_tailscale_ip(&addr_v6([0xfd7a, 0x115c, 0xa1e0, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff])));
+    }
+
+    #[test]
+    fn test_tailscale_ipv6_invalid() {
+        // Different prefix
+        assert!(!is_tailscale_ip(&addr_v6([0xfd7a, 0x115c, 0xa1e1, 0, 0, 0, 0, 1]))); // Wrong 3rd segment
+        assert!(!is_tailscale_ip(&addr_v6([0xfd7a, 0x115d, 0xa1e0, 0, 0, 0, 0, 1]))); // Wrong 2nd segment
+        assert!(!is_tailscale_ip(&addr_v6([0x2001, 0x0db8, 0x0000, 0, 0, 0, 0, 1]))); // Public IPv6
+    }
+
+    #[test]
+    fn test_valid_view_name() {
+        assert!(is_valid_view_name("token_holders"));
+        assert!(is_valid_view_name("my_view_123"));
+        assert!(is_valid_view_name("View1"));
+        
+        assert!(!is_valid_view_name(""));
+        assert!(!is_valid_view_name("123view")); // Starts with number
+        assert!(!is_valid_view_name("my-view")); // Has hyphen
+        assert!(!is_valid_view_name("my view")); // Has space
+    }
 }

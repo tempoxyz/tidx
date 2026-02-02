@@ -8,6 +8,10 @@ pub struct Args {
     #[arg(long, env = "TIDX_URL")]
     pub url: String,
 
+    /// API key for mutations (create/delete)
+    #[arg(long, env = "TIDX_API_KEY")]
+    pub api_key: Option<String>,
+
     #[command(subcommand)]
     pub command: ViewsCommand,
 }
@@ -60,60 +64,60 @@ pub enum ViewsCommand {
 struct CreateViewRequest {
     #[serde(rename = "chainId")]
     chain_id: u64,
+    engine: String,
     name: String,
-    sql: String,
     #[serde(rename = "orderBy")]
     order_by: Vec<String>,
-    engine: String,
+    sql: String,
 }
 
 #[derive(Deserialize)]
 struct ViewInfo {
-    name: String,
-    engine: String,
     database: String,
+    engine: String,
+    name: String,
 }
 
 #[derive(Deserialize)]
 struct ListViewsResponse {
-    ok: bool,
-    views: Vec<ViewInfo>,
     #[serde(default)]
     error: Option<String>,
+    ok: bool,
+    views: Vec<ViewInfo>,
 }
 
 #[derive(Deserialize)]
 #[allow(dead_code)]
 struct CreateViewResponse {
-    ok: bool,
-    #[serde(default)]
-    view: Option<ViewInfo>,
     #[serde(default)]
     backfill_rows: Option<u64>,
     #[serde(default)]
     error: Option<String>,
+    ok: bool,
+    #[serde(default)]
+    view: Option<ViewInfo>,
 }
 
 #[derive(Deserialize)]
 struct GetViewResponse {
-    ok: bool,
-    #[serde(default)]
-    view: Option<ViewInfo>,
     #[serde(default)]
     definition: Option<String>,
     #[serde(default)]
+    error: Option<String>,
+    ok: bool,
+    #[serde(default)]
     row_count: Option<u64>,
     #[serde(default)]
-    error: Option<String>,
+    view: Option<ViewInfo>,
 }
 
 #[derive(Deserialize)]
 struct DeleteViewResponse {
-    ok: bool,
     #[serde(default)]
     deleted: Vec<String>,
     #[serde(default)]
     error: Option<String>,
+    ok: bool,
 }
 
 pub async fn run(args: Args) -> Result<()> {
@@ -161,6 +165,9 @@ pub async fn run(args: Args) -> Result<()> {
         }
 
         ViewsCommand::Create { chain_id, name, sql, order_by, engine } => {
+            let api_key = args.api_key.as_ref()
+                .ok_or_else(|| anyhow::anyhow!("--api-key required for create"))?;
+
             let url = format!("{}/views", base_url);
             let req = CreateViewRequest {
                 chain_id,
@@ -172,6 +179,7 @@ pub async fn run(args: Args) -> Result<()> {
 
             let resp: CreateViewResponse = client
                 .post(&url)
+                .header("Authorization", format!("Bearer {}", api_key))
                 .json(&req)
                 .send()
                 .await?
@@ -189,8 +197,17 @@ pub async fn run(args: Args) -> Result<()> {
         }
 
         ViewsCommand::Delete { chain_id, name } => {
+            let api_key = args.api_key.as_ref()
+                .ok_or_else(|| anyhow::anyhow!("--api-key required for delete"))?;
+
             let url = format!("{}/views/{}?chainId={}", base_url, name, chain_id);
-            let resp: DeleteViewResponse = client.delete(&url).send().await?.json().await?;
+            let resp: DeleteViewResponse = client
+                .delete(&url)
+                .header("Authorization", format!("Bearer {}", api_key))
+                .send()
+                .await?
+                .json()
+                .await?;
 
             if !resp.ok {
                 anyhow::bail!("{}", resp.error.unwrap_or_else(|| "Unknown error".to_string()));
