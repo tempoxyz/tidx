@@ -2,6 +2,7 @@ pub mod init;
 pub mod query;
 pub mod status;
 pub mod up;
+pub mod views;
 
 use clap::{Parser, Subcommand};
 
@@ -23,4 +24,6 @@ pub enum Commands {
     Status(status::Args),
     /// Run a SQL query (use --signature to decode event logs)
     Query(query::Args),
+    /// Manage ClickHouse materialized views
+    Views(views::Args),
 }
