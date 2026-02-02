@@ -299,7 +299,7 @@ Manage ClickHouse materialized views for pre-computed analytics. Views are store
 #### List Views
 
 ```bash
-curl "http://localhost:8080/views?chainId=42431"
+curl "http://<host>:8080/views?chainId=42431"
 ```
 
 ```json
@@ -315,7 +315,7 @@ curl "http://localhost:8080/views?chainId=42431"
 #### Create View (Tailscale only)
 
 ```bash
-curl -X POST "http://100.127.112.88:8080/views" \
+curl -X POST "http://<tailscale-ip>:8080/views" \
   -H "Content-Type: application/json" \
   -d '{
     "chainId": 42431,
@@ -341,7 +341,7 @@ This creates:
 #### Get View Details
 
 ```bash
-curl "http://localhost:8080/views/token_holders?chainId=42431"
+curl "http://<host>:8080/views/token_holders?chainId=42431"
 ```
 
 ```json
@@ -356,7 +356,7 @@ curl "http://localhost:8080/views/token_holders?chainId=42431"
 #### Delete View (Tailscale only)
 
 ```bash
-curl -X DELETE "http://100.127.112.88:8080/views/token_holders?chainId=42431"
+curl -X DELETE "http://<tailscale-ip>:8080/views/token_holders?chainId=42431"
 ```
 
 ```json
@@ -372,7 +372,7 @@ Views are auto-prefixed with `analytics_{chainId}` when using `engine=clickhouse
 
 ```bash
 # Query the view (auto-prefixed)
-curl "http://localhost:8080/query?chainId=42431&engine=clickhouse&sql=SELECT * FROM token_holders WHERE token = '0x...' ORDER BY balance DESC LIMIT 10"
+curl "http://<host>:8080/query?chainId=42431&engine=clickhouse&sql=SELECT * FROM token_holders WHERE token = '0x...' ORDER BY balance DESC LIMIT 10"
 ```
 
 ## Schemas
