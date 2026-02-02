@@ -3,8 +3,8 @@ use std::fmt;
 /// The database engine to route a query to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum QueryEngine {
-    /// DuckDB for analytical queries (OLAP)
-    DuckDb,
+    /// ClickHouse for analytical queries (OLAP)
+    ClickHouse,
     /// PostgreSQL for transactional queries (OLTP)
     Postgres,
 }
@@ -12,7 +12,7 @@ pub enum QueryEngine {
 impl fmt::Display for QueryEngine {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::DuckDb => write!(f, "duckdb"),
+            Self::ClickHouse => write!(f, "clickhouse"),
             Self::Postgres => write!(f, "postgres"),
         }
     }
@@ -24,7 +24,7 @@ impl fmt::Display for QueryEngine {
 /// large joins) vs OLTP patterns (point lookups on indexed keys).
 ///
 /// Supports explicit hints via SQL comments:
-/// - `/* engine=duckdb */` - force DuckDB
+/// - `/* engine=clickhouse */` - force ClickHouse
 /// - `/* engine=postgres */` - force PostgreSQL
 pub fn route_query(sql: &str) -> QueryEngine {
     // Check for explicit hints first
@@ -34,9 +34,9 @@ pub fn route_query(sql: &str) -> QueryEngine {
 
     let upper = sql.to_uppercase();
 
-    // OLAP patterns → DuckDB
+    // OLAP patterns → ClickHouse
     if has_olap_patterns(&upper) {
-        return QueryEngine::DuckDb;
+        return QueryEngine::ClickHouse;
     }
 
     // Point lookups on indexed keys → Postgres
@@ -44,10 +44,10 @@ pub fn route_query(sql: &str) -> QueryEngine {
         return QueryEngine::Postgres;
     }
 
-    // Multi-join queries without selective predicates → DuckDB
+    // Multi-join queries without selective predicates → ClickHouse
     let join_count = upper.matches(" JOIN ").count();
     if join_count >= 2 {
-        return QueryEngine::DuckDb;
+        return QueryEngine::ClickHouse;
     }
 
     // Default to Postgres for simple queries
@@ -58,8 +58,8 @@ pub fn route_query(sql: &str) -> QueryEngine {
 fn parse_engine_hint(sql: &str) -> Option<QueryEngine> {
     let lower = sql.to_lowercase();
 
-    if lower.contains("/* engine=duckdb */") || lower.contains("/*engine=duckdb*/") {
-        return Some(QueryEngine::DuckDb);
+    if lower.contains("/* engine=clickhouse */") || lower.contains("/*engine=clickhouse*/") {
+        return Some(QueryEngine::ClickHouse);
     }
 
     if lower.contains("/* engine=postgres */") || lower.contains("/*engine=postgres*/") {
@@ -155,8 +155,8 @@ mod tests {
     #[test]
     fn test_explicit_hints() {
         assert_eq!(
-            route_query("/* engine=duckdb */ SELECT * FROM logs"),
-            QueryEngine::DuckDb
+            route_query("/* engine=clickhouse */ SELECT * FROM logs"),
+            QueryEngine::ClickHouse
         );
         assert_eq!(
             route_query("/* engine=postgres */ SELECT COUNT(*) FROM logs GROUP BY address"),
@@ -165,30 +165,30 @@ mod tests {
     }
 
     #[test]
-    fn test_group_by_routes_to_duckdb() {
+    fn test_group_by_routes_to_clickhouse() {
         assert_eq!(
             route_query("SELECT address, COUNT(*) FROM logs GROUP BY address"),
-            QueryEngine::DuckDb
+            QueryEngine::ClickHouse
         );
     }
 
     #[test]
-    fn test_window_function_routes_to_duckdb() {
+    fn test_window_function_routes_to_clickhouse() {
         assert_eq!(
             route_query("SELECT *, ROW_NUMBER() OVER (PARTITION BY address) FROM txs"),
-            QueryEngine::DuckDb
+            QueryEngine::ClickHouse
         );
     }
 
     #[test]
-    fn test_aggregates_route_to_duckdb() {
+    fn test_aggregates_route_to_clickhouse() {
         assert_eq!(
             route_query("SELECT SUM(gas_used) FROM blocks"),
-            QueryEngine::DuckDb
+            QueryEngine::ClickHouse
         );
         assert_eq!(
             route_query("SELECT AVG(gas_limit) FROM blocks"),
-            QueryEngine::DuckDb
+            QueryEngine::ClickHouse
         );
     }
 
@@ -217,20 +217,20 @@ mod tests {
     }
 
     #[test]
-    fn test_multi_join_routes_to_duckdb() {
+    fn test_multi_join_routes_to_clickhouse() {
         assert_eq!(
             route_query(
                 "SELECT * FROM blocks b JOIN txs t ON b.num = t.block_num JOIN logs l ON t.hash = l.tx_hash"
             ),
-            QueryEngine::DuckDb
+            QueryEngine::ClickHouse
         );
     }
 
     #[test]
-    fn test_union_routes_to_duckdb() {
+    fn test_union_routes_to_clickhouse() {
         assert_eq!(
             route_query("SELECT address FROM logs UNION SELECT \"from\" FROM txs"),
-            QueryEngine::DuckDb
+            QueryEngine::ClickHouse
         );
     }
 
@@ -238,7 +238,7 @@ mod tests {
     fn test_lowercase_keywords() {
         assert_eq!(
             route_query("select count(*) from logs group by address"),
-            QueryEngine::DuckDb
+            QueryEngine::ClickHouse
         );
         assert_eq!(
             route_query("select * from txs where hash = '0x...'"),
@@ -246,7 +246,7 @@ mod tests {
         );
         assert_eq!(
             route_query("select sum(gas_used), avg(gas_limit) from blocks"),
-            QueryEngine::DuckDb
+            QueryEngine::ClickHouse
         );
     }
 }

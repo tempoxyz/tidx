@@ -104,7 +104,7 @@ fn validate_table_factor(factor: &TableFactor) -> Result<()> {
         }
         TableFactor::Derived { subquery, .. } => validate_query_ast(subquery),
         TableFactor::TableFunction { expr, .. } => {
-            // Block DuckDB table functions that can read filesystem
+            // Block table functions that can read filesystem
             if let Expr::Function(func) = expr {
                 let func_name = func.name.to_string().to_lowercase();
                 if is_dangerous_table_function(&func_name) {
@@ -250,8 +250,14 @@ fn is_dangerous_function(name: &str) -> bool {
         "lo_export",
         // PostgreSQL command execution
         "pg_execute_server_program",
-        // DuckDB file access (covered by table functions too)
-        "read_text",
+        // ClickHouse system functions
+        "system.flush_logs",
+        "system.reload_config",
+        "system.shutdown",
+        "system.kill_query",
+        "system.drop_dns_cache",
+        "system.drop_mark_cache",
+        "system.drop_uncompressed_cache",
     ];
 
     DANGEROUS.iter().any(|&d| name == d || name.ends_with(&format!(".{d}")))
@@ -260,31 +266,28 @@ fn is_dangerous_function(name: &str) -> bool {
 /// Check if a table function is dangerous (filesystem access).
 fn is_dangerous_table_function(name: &str) -> bool {
     const DANGEROUS: &[&str] = &[
-        // DuckDB file readers
-        "read_csv",
-        "read_csv_auto",
-        "read_parquet",
-        "read_json",
-        "read_json_auto",
-        "read_json_objects",
-        "read_json_objects_auto",
-        "read_ndjson",
-        "read_ndjson_auto",
-        "read_ndjson_objects",
-        "parquet_scan",
-        "parquet_metadata",
-        "parquet_schema",
-        "csv_scan",
-        "json_scan",
-        // DuckDB HTTP
-        "read_parquet_http",
-        "httpfs_download",
-        // DuckDB extensions
-        "load_extension",
-        "install_extension",
-        // Glob/directory
-        "glob",
-        "read_blob",
+        // ClickHouse file/URL table functions
+        "file",
+        "url",
+        "s3",
+        "gcs",
+        "hdfs",
+        "remote",
+        "remoteSecure",
+        "cluster",
+        "clusterAllReplicas",
+        // ClickHouse input formats
+        "input",
+        "format",
+        // ClickHouse system access
+        "system",
+        "numbers",
+        "zeros",
+        "generateRandom",
+        // ClickHouse dictionary access (could leak data)
+        "dictGet",
+        "dictGetOrDefault",
+        "dictHas",
     ];
 
     DANGEROUS.iter().any(|&d| name == d || name.contains(&format!("{d}(")))
@@ -355,13 +358,18 @@ mod tests {
     }
 
     #[test]
-    fn test_rejects_read_csv() {
-        assert!(validate_query("SELECT * FROM read_csv('/etc/passwd')").is_err());
+    fn test_rejects_file_table_function() {
+        assert!(validate_query("SELECT * FROM file('/etc/passwd')").is_err());
     }
 
     #[test]
-    fn test_rejects_read_parquet() {
-        assert!(validate_query("SELECT * FROM read_parquet('/data/file.parquet')").is_err());
+    fn test_rejects_url_table_function() {
+        assert!(validate_query("SELECT * FROM url('http://example.com/data.csv')").is_err());
+    }
+
+    #[test]
+    fn test_rejects_s3_table_function() {
+        assert!(validate_query("SELECT * FROM s3('s3://bucket/file.parquet')").is_err());
     }
 
     #[test]

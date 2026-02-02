@@ -273,7 +273,7 @@ async fn test_query_chain_id_param() {
     let (pools, chain_id) = make_pools(db.pool.clone());
     let mut app = make_test_service(pools, chain_id, broadcaster).await;
 
-    // Query with explicit chainId (use point lookup to route to Postgres, not DuckDB)
+    // Query with explicit chainId (use point lookup to route to Postgres)
     let response = app
         .call(
             Request::builder()

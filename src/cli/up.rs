@@ -1,6 +1,5 @@
 use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::Result;
@@ -9,8 +8,8 @@ use metrics_exporter_prometheus::PrometheusBuilder;
 use tokio::sync::RwLock;
 use tracing::{error, info};
 
-use tidx::api::{self, ChainParquetConfig, SharedParquetConfigs, SharedPools};
-use tidx::duckdb::DuckDbEngineRegistry;
+use tidx::api::{self, ChainClickHouseConfig, SharedClickHouseConfigs, SharedPools};
+use tidx::clickhouse::ClickHouseEngine;
 use tidx::broadcast::Broadcaster;
 use tidx::config::{ChainConfig, Config, ConfigWatcher, NewChainEvent};
 use tidx::db::{self, ThrottledPool};
@@ -26,6 +25,8 @@ pub struct Args {
     #[arg(long)]
     pub no_watch: bool,
 }
+
+use std::path::PathBuf;
 
 pub async fn run(args: Args) -> Result<()> {
     let config = Config::load(&args.config)?;
@@ -54,17 +55,46 @@ pub async fn run(args: Args) -> Result<()> {
     });
 
     let pools: SharedPools = Arc::new(RwLock::new(HashMap::new()));
-    let parquet_configs: SharedParquetConfigs = Arc::new(RwLock::new(HashMap::new()));
+    let clickhouse_configs: SharedClickHouseConfigs = Arc::new(RwLock::new(HashMap::new()));
     let mut default_chain_id = 0u64;
+
+    // Track ClickHouse engine for OLAP queries
+    let mut clickhouse_engine: Option<Arc<ClickHouseEngine>> = None;
 
     for chain in &config.chains {
         let throttled_pool = initialize_chain(
             chain,
-            Arc::clone(&parquet_configs),
+            Arc::clone(&clickhouse_configs),
         ).await?;
 
         if default_chain_id == 0 {
             default_chain_id = chain.chain_id;
+        }
+
+        // Initialize ClickHouse if configured
+        if let Some(ref ch_config) = chain.clickhouse {
+            if ch_config.enabled && clickhouse_engine.is_none() {
+                match ClickHouseEngine::new(ch_config, chain.chain_id, &chain.pg_url) {
+                    Ok(engine) => {
+                        let engine = Arc::new(engine);
+                        
+                        // Ensure replication is set up
+                        let pg_url = chain.pg_url.clone();
+                        let engine_clone = Arc::clone(&engine);
+                        tokio::spawn(async move {
+                            if let Err(e) = engine_clone.ensure_replication(&pg_url).await {
+                                error!(error = %e, "Failed to set up ClickHouse replication");
+                            }
+                        });
+                        
+                        clickhouse_engine = Some(engine);
+                        info!(chain = %chain.name, "ClickHouse OLAP engine initialized");
+                    }
+                    Err(e) => {
+                        error!(error = %e, chain = %chain.name, "Failed to create ClickHouse engine");
+                    }
+                }
+            }
         }
 
         // API uses the shared pool (backfill is throttled, so API isn't starved)
@@ -88,21 +118,13 @@ pub async fn run(args: Args) -> Result<()> {
         if config.http.enabled && default_chain_id != 0 {
             let addr: SocketAddr = format!("{}:{}", config.http.bind, config.http.port).parse()?;
             
-            // Create DuckDB registry from parquet config if any chain has parquet enabled
-            let duckdb_registry = {
-                let configs = parquet_configs.read().await;
-                configs.values()
-                    .find(|c| c.enabled)
-                    .map(|c| Arc::new(DuckDbEngineRegistry::new(PathBuf::from(&c.data_dir))))
-            };
-            
             let router = api::router_shared(
                 Arc::clone(&pools),
                 default_chain_id,
                 broadcaster.clone(),
-                Arc::clone(&parquet_configs),
+                Arc::clone(&clickhouse_configs),
                 http_config,
-                duckdb_registry,
+                clickhouse_engine.clone(),
             );
 
             info!(addr = %addr, "Starting HTTP API server (hot-reload enabled)");
@@ -124,13 +146,13 @@ pub async fn run(args: Args) -> Result<()> {
         }
 
         let pools_for_watcher = Arc::clone(&pools);
-        let parquet_configs_for_watcher = Arc::clone(&parquet_configs);
+        let clickhouse_configs_for_watcher = Arc::clone(&clickhouse_configs);
         let broadcaster_for_watcher = broadcaster.clone();
         let shutdown_tx_for_watcher = shutdown_tx.clone();
 
         tokio::spawn(async move {
             while let Some(event) = chain_rx.recv().await {
-                match initialize_chain(&event.chain, Arc::clone(&parquet_configs_for_watcher)).await {
+                match initialize_chain(&event.chain, Arc::clone(&clickhouse_configs_for_watcher)).await {
                     Ok(throttled_pool) => {
                         pools_for_watcher.write().await.insert(event.chain.chain_id, throttled_pool.pool.clone());
 
@@ -153,7 +175,7 @@ pub async fn run(args: Args) -> Result<()> {
             pools.read().await.clone(),
             default_chain_id,
             broadcaster.clone(),
-            parquet_configs.read().await.clone(),
+            clickhouse_configs.read().await.clone(),
             &config.http,
         );
 
@@ -183,7 +205,7 @@ pub async fn run(args: Args) -> Result<()> {
 
 async fn initialize_chain(
     chain: &ChainConfig,
-    parquet_configs: SharedParquetConfigs,
+    clickhouse_configs: SharedClickHouseConfigs,
 ) -> Result<ThrottledPool> {
     info!(chain = %chain.name, db = %chain.pg_url, "Connecting to database with throttled pool...");
     let throttled_pool = ThrottledPool::new(&chain.pg_url).await?;
@@ -191,14 +213,14 @@ async fn initialize_chain(
     info!(chain = %chain.name, "Running migrations...");
     db::run_migrations(&throttled_pool.pool).await?;
 
-    // Store Parquet config for this chain (if enabled)
-    if let Some(ref parquet) = chain.parquet {
-        let parquet_config = ChainParquetConfig {
-            enabled: parquet.enabled,
-            data_dir: parquet.data_dir.clone(),
+    // Store ClickHouse config for this chain (if enabled)
+    if let Some(ref ch_config) = chain.clickhouse {
+        let config = ChainClickHouseConfig {
+            enabled: ch_config.enabled,
+            url: ch_config.url.clone(),
         };
-        parquet_configs.write().await.insert(chain.chain_id, parquet_config);
-        info!(chain = %chain.name, "Parquet export enabled, native DuckDB engine available");
+        clickhouse_configs.write().await.insert(chain.chain_id, config);
+        info!(chain = %chain.name, "ClickHouse OLAP engine configured");
     }
 
     Ok(throttled_pool)
@@ -220,33 +242,8 @@ fn spawn_sync_engine(
 
     let backfill_first = chain.backfill_first;
     let trust_rpc = chain.trust_rpc;
-    let parquet_export_config = chain.parquet.clone();
-    let chain_id = chain.chain_id;
-    let pool_for_parquet = throttled_pool.pool.clone();
-    let parquet_shutdown = shutdown_rx.resubscribe();
-    let block_updates = broadcaster.subscribe();
 
     tokio::spawn(async move {
-        // Spawn Parquet export task if enabled
-        if let Some(ref config) = parquet_export_config {
-            if config.enabled {
-                let config = config.clone();
-                tokio::spawn(async move {
-                    if let Err(e) = tidx::sync::compress::run_compress_loop(
-                        pool_for_parquet,
-                        chain_id,
-                        config,
-                        parquet_shutdown,
-                        block_updates,
-                    )
-                    .await
-                    {
-                        error!(error = %e, chain_id = chain_id, "Parquet export loop failed");
-                    }
-                });
-            }
-        }
-
         // Create sync engine with throttled pool
         let mut engine = match SyncEngine::new(throttled_pool, &chain.rpc_url).await {
             Ok(e) => e

@@ -17,13 +17,13 @@
 
 ---
 
-**tidx** indexes [Tempo](https://tempo.xyz) chain data into a hybrid PostgreSQL + DuckDB architecture for fast point lookups (OLTP) and lightning-fast analytics (OLAP). 
+**tidx** indexes [Tempo](https://tempo.xyz) chain data into a hybrid PostgreSQL + ClickHouse architecture for fast point lookups (OLTP) and lightning-fast analytics (OLAP). 
 
 ## Features
 
-- **Hybrid Query Routing** — Automatic routing to DuckDB for analytics, PostgreSQL for point lookups
-- **Dual Storage** — PostgreSQL for OLTP + DuckDB columnar for OLAP
-- **Columnar Analytics** — Automatic sync to columnar storage for fast aggregations
+- **Hybrid Query Routing** — Automatic routing to ClickHouse for analytics, PostgreSQL for point lookups
+- **Dual Storage** — PostgreSQL for OLTP + ClickHouse columnar for OLAP
+- **Real-time Replication** — ClickHouse syncs via MaterializedPostgreSQL (WAL streaming)
 - **Event/Function Decoding** — Query decoded events or function calldata by ABI signature (no pre-registration)
 - **HTTP API + CLI** — Query data via REST, SQL, or command line
 
@@ -50,7 +50,7 @@ curl -L https://tidx.vercel.app/docker | bash
 
 ## Overview
 
-tidx uses a hybrid PostgreSQL + DuckDB architecture that automatically routes queries to the optimal engine:
+tidx uses a hybrid PostgreSQL + ClickHouse architecture that automatically routes queries to the optimal engine:
 
 ```
                            ┌─────────────────┐
@@ -63,15 +63,15 @@ tidx uses a hybrid PostgreSQL + DuckDB architecture that automatically routes qu
          │ WHERE block_num = 123                COUNT(*), SUM()│
          ▼                                                     ▼
 ┌─────────────────────┐                         ┌─────────────────────┐
-│    PostgreSQL       │          sync           │      DuckDB         │
+│    PostgreSQL       │       WAL stream        │     ClickHouse      │
 │    (OLTP)           │ ─────────────────────►  │      (OLAP)         │
-└─────────────────────┘                         └─────────────────────┘
+└─────────────────────┘   MaterializedPG        └─────────────────────┘
 ```
 
 | Engine | Use Case | Example |
 |--------|----------|---------|
 | **PostgreSQL** | Point lookups, recent data | `WHERE hash = '0x...'` |
-| **DuckDB** | Aggregations, scans, analytics | `GROUP BY`, `COUNT(*)`, `SUM()` |
+| **ClickHouse** | Aggregations, scans, analytics | `GROUP BY`, `COUNT(*)`, `SUM()` |
 
 ## Installation
 
@@ -120,15 +120,18 @@ name = "mainnet"
 chain_id = 4217
 rpc_url = "https://rpc.tempo.xyz"
 pg_url = "postgres://user:pass@localhost:5432/tidx_mainnet"
-duckdb_path = "/data/mainnet.duckdb"  # Optional: enables OLAP queries
 batch_size = 100
+
+# Optional: ClickHouse for OLAP queries (uses MaterializedPostgreSQL)
+[chains.clickhouse]
+enabled = true
+url = "http://clickhouse:8123"
 
 [[chains]]
 name = "moderato"
 chain_id = 42431
 rpc_url = "https://rpc.moderato.tempo.xyz"
 pg_url = "postgres://user:pass@localhost:5432/tidx_moderato"
-duckdb_path = "/data/moderato.duckdb"
 ```
 
 ### Reference
@@ -154,8 +157,10 @@ duckdb_path = "/data/moderato.duckdb"
 ├── chain_id                u64       (required)     Chain ID
 ├── rpc_url                 string    (required)     JSON-RPC endpoint URL
 ├── pg_url                  string    (required)     PostgreSQL connection string
-├── duckdb_path             string                   Path to DuckDB file (enables OLAP)
-└── batch_size              u64       = 100          Blocks per RPC batch request
+├── batch_size              u64       = 100          Blocks per RPC batch request
+└── [clickhouse]                                     ClickHouse OLAP settings
+    ├── enabled             bool      = false        Enable ClickHouse OLAP queries
+    └── url                 string    = "http://clickhouse:8123"  ClickHouse HTTP URL
 ```
 
 ## CLI
@@ -262,25 +267,25 @@ tidx exposes a HTTP API for querying the indexer.
 curl "http://localhost:8080/query?chainId=4217&sql=SELECT * FROM blocks WHERE num = 12345"
 > {"columns":["num","hash","timestamp"],"rows":[[12345,"0xabc...","2024-01-01T00:00:00Z"]],"row_count":1,"engine":"postgres","ok":true}
 
-# Aggregation (auto-routed to DuckDB)
+# Aggregation (auto-routed to ClickHouse)
 curl "http://localhost:8080/query?chainId=4217&sql=SELECT type, COUNT(*) FROM txs GROUP BY type"
-> {"columns":["type","count"],"rows":[[0,50000],[2,120000]],"row_count":2,"engine":"duckdb","ok":true}
+> {"columns":["type","count"],"rows":[[0,50000],[2,120000]],"row_count":2,"engine":"clickhouse","ok":true}
 
 # Status
 curl http://localhost:8080/status
-> {"ok":true,"chains":[{"chain_id":4217,"synced_num":567890,"head_num":567890,"lag":0,"duckdb_synced_num":567840,"duckdb_lag":50}]}
+> {"ok":true,"chains":[{"chain_id":4217,"synced_num":567890,"head_num":567890,"lag":0}]}
 ```
 
 ### Reference
 
 ```
 GET /health                                              Health check
-GET /status                                              Sync status for all chains + DuckDB
+GET /status                                              Sync status for all chains
 GET /query                                               Execute SQL query (auto-routed)
     ?sql                    string    (required)         SQL query (SELECT only)
     ?chainId                number    (required)         Chain ID to query
     ?signature              string                       Event signature for CTE generation
-    ?engine                 string    = (auto)           Force engine: postgres or duckdb
+    ?engine                 string    = (auto)           Force engine: postgres or clickhouse
     ?live                   bool      = false            Enable SSE streaming on new blocks
 GET /metrics                                             Prometheus metrics
 ```

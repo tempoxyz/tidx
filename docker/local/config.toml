@@ -14,6 +14,10 @@ name = "dev"
 chain_id = 1337
 rpc_url = "http://tempo:8545"
 pg_url = "postgres://tidx:tidx@postgres:5432/tidx"
-duckdb_path = "/data/dev.duckdb"
 backfill = true
 batch_size = 100
+
+# ClickHouse OLAP engine (optional, disabled for local dev)
+# [chains.clickhouse]
+# enabled = true
+# url = "http://clickhouse:8123"

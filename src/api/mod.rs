@@ -24,23 +24,23 @@ use tower_http::cors::CorsLayer;
 use tower_http::trace::TraceLayer;
 
 use crate::broadcast::Broadcaster;
+use crate::clickhouse::ClickHouseEngine;
 use crate::config::{HttpConfig, SharedHttpConfig};
 use crate::db::Pool;
-use crate::duckdb::DuckDbEngineRegistry;
 use crate::service::{QueryOptions, QueryResult, SyncStatus};
 
 pub use rate_limit::{RateLimiter, SseConnectionGuard};
 
 pub type SharedPools = Arc<RwLock<HashMap<u64, Pool>>>;
 
-/// Per-chain Parquet configuration (static parts from config).
+/// Per-chain ClickHouse configuration.
 #[derive(Clone, Debug, Default)]
-pub struct ChainParquetConfig {
+pub struct ChainClickHouseConfig {
     pub enabled: bool,
-    pub data_dir: String,
+    pub url: String,
 }
 
-pub type SharedParquetConfigs = Arc<RwLock<HashMap<u64, ChainParquetConfig>>>;
+pub type SharedClickHouseConfigs = Arc<RwLock<HashMap<u64, ChainClickHouseConfig>>>;
 
 #[derive(Clone)]
 pub struct AppState {
@@ -49,12 +49,12 @@ pub struct AppState {
     /// Default chain_id (first chain)
     pub default_chain_id: u64,
     pub broadcaster: Arc<Broadcaster>,
-    /// Per-chain Parquet configuration (hot-reloadable)
-    pub parquet_configs: SharedParquetConfigs,
+    /// Per-chain ClickHouse configuration (hot-reloadable)
+    pub clickhouse_configs: SharedClickHouseConfigs,
     /// Rate limiter for request throttling
     pub rate_limiter: RateLimiter,
-    /// Native DuckDB engine registry for parquet queries
-    pub duckdb_registry: Option<Arc<DuckDbEngineRegistry>>,
+    /// ClickHouse engine for OLAP queries
+    pub clickhouse: Option<Arc<ClickHouseEngine>>,
 }
 
 impl AppState {
@@ -72,7 +72,7 @@ pub fn router_with_options(
     pools: HashMap<u64, Pool>,
     default_chain_id: u64,
     broadcaster: Arc<Broadcaster>,
-    parquet_configs: HashMap<u64, ChainParquetConfig>,
+    clickhouse_configs: HashMap<u64, ChainClickHouseConfig>,
     http_config: &HttpConfig,
 ) -> Router<()> {
     let rate_limiter = RateLimiter::new(
@@ -82,21 +82,13 @@ pub fn router_with_options(
 
     rate_limit::spawn_cleanup_task(rate_limiter.clone());
 
-    // Create DuckDB registry from parquet configs if any chain has parquet enabled
-    let duckdb_registry = parquet_configs.values()
-        .find(|c| c.enabled)
-        .map(|c| {
-            let data_dir = std::path::PathBuf::from(&c.data_dir);
-            Arc::new(DuckDbEngineRegistry::new(data_dir))
-        });
-
     let state = AppState {
         pools: Arc::new(RwLock::new(pools)),
         default_chain_id,
         broadcaster,
-        parquet_configs: Arc::new(RwLock::new(parquet_configs)),
+        clickhouse_configs: Arc::new(RwLock::new(clickhouse_configs)),
         rate_limiter: rate_limiter.clone(),
-        duckdb_registry,
+        clickhouse: None, // Created lazily on first OLAP query
     };
 
     build_router(state, rate_limiter)
@@ -106,9 +98,9 @@ pub fn router_shared(
     pools: SharedPools,
     default_chain_id: u64,
     broadcaster: Arc<Broadcaster>,
-    parquet_configs: SharedParquetConfigs,
+    clickhouse_configs: SharedClickHouseConfigs,
     http_config: SharedHttpConfig,
-    duckdb_registry: Option<Arc<DuckDbEngineRegistry>>,
+    clickhouse: Option<Arc<ClickHouseEngine>>,
 ) -> Router<()> {
     let rate_limiter = RateLimiter::new_shared(http_config);
 
@@ -118,9 +110,9 @@ pub fn router_shared(
         pools,
         default_chain_id,
         broadcaster,
-        parquet_configs,
+        clickhouse_configs,
         rate_limiter: rate_limiter.clone(),
-        duckdb_registry,
+        clickhouse,
     };
 
     build_router(state, rate_limiter)
@@ -190,7 +182,7 @@ pub struct QueryParams {
     /// Maximum rows to return
     #[serde(default = "default_limit")]
     limit: i64,
-    /// Force a specific engine: "postgres" or "duckdb"
+    /// Force a specific engine: "postgres" or "clickhouse"
     #[serde(default)]
     engine: Option<String>,
 }
@@ -240,52 +232,37 @@ async fn handle_query_once(
     };
 
     // Route to appropriate engine
-    let use_duckdb = matches!(
+    let use_clickhouse = matches!(
         params.engine.as_deref(),
-        Some("duckdb") | Some("duckdb-native")
+        Some("clickhouse")
     );
 
-    let result = if use_duckdb {
-        // Use native DuckDB engine for parquet queries
-        let registry = state.duckdb_registry.as_ref()
-            .ok_or_else(|| ApiError::BadRequest("DuckDB engine not configured (no parquet enabled)".to_string()))?;
-        
-        let engine = registry.get_or_create(params.chain_id)
-            .map_err(|e| ApiError::QueryError(e.to_string()))?;
-        
-        crate::service::execute_query_native_duckdb(
-            &engine,
-            &params.sql,
-            params.signature.as_deref(),
-            &options,
-        )
-        .map_err(|e| {
-            let msg = e.to_string();
-            if msg.contains("forbidden") || msg.contains("Only SELECT") {
-                ApiError::BadRequest(msg)
-            } else {
-                ApiError::QueryError(msg)
-            }
-        })?
+    let result = if use_clickhouse {
+        // Use ClickHouse engine for OLAP queries
+        let clickhouse = state.clickhouse.as_ref()
+            .ok_or_else(|| ApiError::BadRequest("ClickHouse not configured".to_string()))?;
+
+        clickhouse.query(&params.sql, params.signature.as_deref())
+            .await
+            .map(|r| QueryResult {
+                columns: r.columns,
+                rows: r.rows,
+                row_count: r.row_count,
+                engine: r.engine,
+                query_time_ms: r.query_time_ms,
+            })
+            .map_err(|e| ApiError::QueryError(e.to_string()))?
     } else {
-        // Use PostgreSQL for all other queries
-        crate::service::execute_query_postgres(
-            &pool,
-            &params.sql,
-            params.signature.as_deref(),
-            &options,
-        )
-        .await
-        .map_err(|e| {
-            let msg = e.to_string();
-            if msg.contains("timeout") {
-                ApiError::Timeout
-            } else if msg.contains("forbidden") || msg.contains("Only SELECT") {
-                ApiError::BadRequest(msg)
-            } else {
-                ApiError::QueryError(msg)
-            }
-        })?
+        // Use PostgreSQL
+        crate::service::execute_query_postgres(&pool, &params.sql, params.signature.as_deref(), &options)
+            .await
+            .map_err(|e| {
+                if e.to_string().contains("timeout") {
+                    ApiError::Timeout
+                } else {
+                    ApiError::QueryError(e.to_string())
+                }
+            })?
     };
 
     Ok(Json(QueryResponse { result, ok: true }))
@@ -347,7 +324,7 @@ async fn handle_query_live(
     };
 
     // Detect if this is an OLAP query (aggregations, etc.)
-    let is_olap = crate::query::route_query(&sql) == crate::query::QueryEngine::DuckDb;
+    let is_olap = crate::query::route_query(&sql) == crate::query::QueryEngine::ClickHouse;
 
     let stream = async_stream::stream! {
         // Keep guard alive for the lifetime of the stream

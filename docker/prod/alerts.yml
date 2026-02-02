@@ -30,55 +30,27 @@ groups:
           summary: "Sync stalled on chain {{ $labels.chain_id }}"
           description: "No blocks synced in 5 minutes, lag is {{ $value }} blocks"
 
-  - name: tidx_duckdb
+  - name: tidx_clickhouse
     rules:
-      # DuckDB lag behind PostgreSQL
-      - alert: TidxDuckDBLagHigh
-        expr: tidx_duckdb_lag_blocks > 100
+      # ClickHouse query errors
+      - alert: TidxClickHouseErrors
+        expr: rate(tidx_clickhouse_queries_total{success="false"}[5m]) > 0
         for: 5m
         labels:
           severity: warning
         annotations:
-          summary: "DuckDB lag on chain {{ $labels.chain_id }}"
-          description: "DuckDB is {{ $value }} blocks behind PostgreSQL"
-
-      - alert: TidxDuckDBLagCritical
-        expr: tidx_duckdb_lag_blocks > 1000
-        for: 10m
-        labels:
-          severity: critical
-        annotations:
-          summary: "DuckDB lag critical on chain {{ $labels.chain_id }}"
-          description: "DuckDB is {{ $value }} blocks behind PostgreSQL"
-
-      # DuckDB has gaps (data consistency issue)
-      - alert: TidxDuckDBGaps
-        expr: tidx_duckdb_gap_count > 0
-        for: 10m
-        labels:
-          severity: warning
-        annotations:
-          summary: "DuckDB has gaps on chain {{ $labels.chain_id }}"
-          description: "{{ $value }} gaps totaling {{ $labels.gap_blocks }} blocks"
-
-      - alert: TidxDuckDBGapsPersistent
-        expr: tidx_duckdb_gap_blocks_total > 0
-        for: 30m
-        labels:
-          severity: critical
-        annotations:
-          summary: "DuckDB gaps not filling on chain {{ $labels.chain_id }}"
-          description: "{{ $value }} blocks missing for 30+ minutes"
-
-      # DuckDB errors
-      - alert: TidxDuckDBErrors
-        expr: rate(tidx_duckdb_errors_total[5m]) > 0
-        for: 5m
-        labels:
-          severity: warning
-        annotations:
-          summary: "DuckDB errors on {{ $labels.type }}"
+          summary: "ClickHouse query errors"
           description: "Error rate: {{ $value | printf \"%.2f\" }}/s"
+
+      # ClickHouse query latency
+      - alert: TidxClickHouseLatencyHigh
+        expr: histogram_quantile(0.99, rate(tidx_clickhouse_query_duration_seconds_bucket[5m])) > 10
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "High ClickHouse query latency"
+          description: "p99 latency is {{ $value | printf \"%.1f\" }}s"
 
   - name: tidx_rpc
     rules:

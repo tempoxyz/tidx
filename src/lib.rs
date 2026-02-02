@@ -1,8 +1,8 @@
 pub mod api;
 pub mod broadcast;
+pub mod clickhouse;
 pub mod config;
 pub mod db;
-pub mod duckdb;
 pub mod metrics;
 pub mod query;
 pub mod service;

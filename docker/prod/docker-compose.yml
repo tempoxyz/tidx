@@ -1,6 +1,6 @@
 services:
   postgres:
-    image: ghcr.io/tempoxyz/postgres-parquet:latest
+    image: postgres:16
     environment:
       POSTGRES_USER: tidx
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-tidx}
@@ -9,7 +9,6 @@ services:
       - "5432:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
-      - parquet_data:/data  # Parquet files for archived logs
     command:
       - postgres
       - -c
@@ -22,8 +21,35 @@ services:
       - shared_buffers=256MB
       - -c
       - work_mem=64MB
+      # Logical replication for ClickHouse MaterializedPostgreSQL
+      - -c
+      - wal_level=logical
+      - -c
+      - max_replication_slots=4
+      - -c
+      - max_wal_senders=4
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U tidx -d tidx"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    restart: unless-stopped
+
+  clickhouse:
+    image: clickhouse/clickhouse-server:latest
+    ports:
+      - "8123:8123"   # HTTP interface
+      - "9000:9000"   # Native interface
+    volumes:
+      - clickhouse_data:/var/lib/clickhouse
+      - ./clickhouse-config.xml:/etc/clickhouse-server/config.d/custom.xml:ro
+    environment:
+      CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: 1
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "clickhouse-client", "--query", "SELECT 1"]
       interval: 5s
       timeout: 5s
       retries: 10
@@ -42,7 +68,6 @@ services:
       - "9090:9090"   # Prometheus metrics
     volumes:
       - ./config.toml:/config.toml:ro
-      - parquet_data:/data  # Shared Parquet storage (tidx writes, native DuckDB reads)
     depends_on:
       postgres:
         condition: service_healthy
@@ -84,6 +109,6 @@ services:
 
 volumes:
   postgres_data:
-  parquet_data:  # Shared volume for Parquet files (tidx compress → DuckDB query)
+  clickhouse_data:
   prometheus_data:
   grafana_data:

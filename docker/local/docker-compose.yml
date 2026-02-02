@@ -1,9 +1,6 @@
 services:
   postgres:
-    build:
-      context: ../postgres-parquet
-      dockerfile: Dockerfile
-    image: ghcr.io/tempoxyz/postgres-parquet:latest
+    image: postgres:16
     environment:
       POSTGRES_USER: tidx
       POSTGRES_PASSWORD: tidx
@@ -13,7 +10,6 @@ services:
       - "5433:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
-      - parquet_data:/data  # Parquet files for archived logs
     command:
       - postgres
       - -c
@@ -22,6 +18,13 @@ services:
       - checkpoint_timeout=30min
       - -c
       - synchronous_commit=off
+      # Logical replication for ClickHouse MaterializedPostgreSQL
+      - -c
+      - wal_level=logical
+      - -c
+      - max_replication_slots=4
+      - -c
+      - max_wal_senders=4
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U tidx -d postgres"]
       interval: 2s
@@ -66,7 +69,6 @@ services:
       - "9090:9090"   # Prometheus metrics
     volumes:
       - ./config.toml:/config.toml:ro
-      - parquet_data:/data  # Shared Parquet storage (tidx writes, native DuckDB reads)
     depends_on:
       postgres:
         condition: service_healthy
@@ -106,4 +108,3 @@ services:
 
 volumes:
   postgres_data:
-  parquet_data:  # Shared volume for Parquet files (tidx compress → DuckDB query)

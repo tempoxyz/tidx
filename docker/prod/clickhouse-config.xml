@@ -1,0 +1,18 @@
+<clickhouse>
+    <!-- Enable MaterializedPostgreSQL engine for real-time WAL replication -->
+    <allow_experimental_materialized_postgresql_table>1</allow_experimental_materialized_postgresql_table>
+    
+    <!-- Allow reading from localhost PostgreSQL -->
+    <postgresql_connection_pool_size>16</postgresql_connection_pool_size>
+    <postgresql_connection_pool_wait_timeout>5000</postgresql_connection_pool_wait_timeout>
+    
+    <!-- Skip checking for user-level settings at top level -->
+    <skip_check_for_incorrect_settings>1</skip_check_for_incorrect_settings>
+    
+    <!-- User profiles -->
+    <profiles>
+        <default>
+            <max_memory_usage>10000000000</max_memory_usage>
+        </default>
+    </profiles>
+</clickhouse>

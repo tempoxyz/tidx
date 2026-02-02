@@ -14,15 +14,23 @@ name = "moderato"
 chain_id = 42431
 rpc_url = "https://eng:aphex-twin-jeff-mills@rpc.moderato.tempo.xyz"
 pg_url = "postgres://tidx:tidx@postgres:5432/tidx_moderato"
-duckdb_path = "/data/moderato.duckdb"
 backfill = true
 batch_size = 100
+
+# ClickHouse OLAP engine (optional)
+[chains.clickhouse]
+enabled = true
+url = "http://clickhouse:8123"
 
 [[chains]]
 name = "mainnet"
 chain_id = 4217
 rpc_url = "https://eng:aphex-twin-jeff-mills@rpc.tempo.xyz"
 pg_url = "postgres://tidx:tidx@postgres:5432/tidx_mainnet"
-duckdb_path = "/data/mainnet.duckdb"
 backfill = true
 batch_size = 100
+
+# ClickHouse OLAP engine (optional)
+[chains.clickhouse]
+enabled = true
+url = "http://clickhouse:8123"

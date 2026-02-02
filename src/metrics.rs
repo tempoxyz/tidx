@@ -158,43 +158,16 @@ impl SyncProgress {
     }
 }
 
-// DuckDB replication metrics
+// ClickHouse OLAP metrics
 
-pub fn set_duckdb_synced_block(chain_id: u64, block_num: i64) {
-    let labels = [("chain_id", chain_id.to_string())];
-    gauge!("tidx_duckdb_synced_block", &labels).set(block_num as f64);
+pub fn record_clickhouse_query(duration: std::time::Duration, success: bool) {
+    let labels = [("success", success.to_string())];
+    counter!("tidx_clickhouse_queries_total", &labels).increment(1);
+    histogram!("tidx_clickhouse_query_duration_seconds", &labels).record(duration.as_secs_f64());
 }
 
-pub fn set_duckdb_lag(chain_id: u64, lag: i64) {
-    let labels = [("chain_id", chain_id.to_string())];
-    gauge!("tidx_duckdb_lag_blocks", &labels).set(lag as f64);
-}
-
-pub fn set_duckdb_gap_count(chain_id: u64, count: usize) {
-    let labels = [("chain_id", chain_id.to_string())];
-    gauge!("tidx_duckdb_gap_count", &labels).set(count as f64);
-}
-
-pub fn set_duckdb_gap_blocks(chain_id: u64, blocks: i64) {
-    let labels = [("chain_id", chain_id.to_string())];
-    gauge!("tidx_duckdb_gap_blocks_total", &labels).set(blocks as f64);
-}
-
-pub fn record_duckdb_batch(batch_type: &str, count: usize, duration: std::time::Duration, success: bool) {
-    let labels = [
-        ("type", batch_type.to_string()),
-        ("success", success.to_string()),
-    ];
-    counter!("tidx_duckdb_batches_total", &labels).increment(1);
-    histogram!("tidx_duckdb_batch_duration_seconds", &labels).record(duration.as_secs_f64());
-    if success {
-        counter!("tidx_duckdb_rows_replicated_total", &[("type", batch_type.to_string())]).increment(count as u64);
-    }
-}
-
-pub fn increment_duckdb_errors(error_type: &str) {
-    let labels = [("type", error_type.to_string())];
-    counter!("tidx_duckdb_errors_total", &labels).increment(1);
+pub fn record_clickhouse_rows(count: u64) {
+    histogram!("tidx_clickhouse_query_rows").record(count as f64);
 }
 
 fn format_eta(secs: f64) -> String {

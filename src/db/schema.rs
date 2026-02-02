@@ -36,9 +36,8 @@ pub async fn run_migrations(pool: &Pool) -> Result<()> {
     conn.batch_execute(include_str!("../../db/sync_state.sql")).await?;
     conn.batch_execute(include_str!("../../db/functions.sql")).await?;
 
-    // Enable extensions (pg_parquet for parquet export)
+    // Load any optional extensions
     conn.batch_execute(include_str!("../../db/extensions.sql")).await?;
-    info!("Database extensions enabled");
 
     Ok(())
 }

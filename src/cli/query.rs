@@ -16,7 +16,7 @@ pub struct Args {
     #[arg(short, long, default_value = "config.toml")]
     pub config: PathBuf,
 
-    /// Force query engine (postgres, duckdb). Auto-routes if not specified.
+    /// Force query engine (postgres, clickhouse). Auto-routes if not specified.
     #[arg(long)]
     pub engine: Option<String>,
 
@@ -73,9 +73,9 @@ pub async fn run(args: Args) -> Result<()> {
     };
 
     // CLI currently only supports PostgreSQL engine
-    // For DuckDB queries on parquet, use the HTTP API with engine=duckdb
-    if args.engine.as_deref() == Some("duckdb") {
-        anyhow::bail!("DuckDB engine not available in CLI. Use HTTP API with engine=duckdb for parquet queries.");
+    // For ClickHouse OLAP queries, use the HTTP API with engine=clickhouse
+    if args.engine.as_deref() == Some("clickhouse") {
+        anyhow::bail!("ClickHouse engine not available in CLI. Use HTTP API with engine=clickhouse for OLAP queries.");
     }
 
     let result = execute_query_postgres(

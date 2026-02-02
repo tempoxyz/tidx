@@ -171,43 +171,34 @@ pub struct ChainConfig {
     #[serde(default)]
     pub trust_rpc: bool,
 
-    /// Parquet export settings (for archiving old logs to columnar format)
-    #[serde(default, alias = "compress")]
-    pub parquet: Option<ParquetExportConfig>,
+    /// ClickHouse OLAP settings (for analytical queries via MaterializedPostgreSQL)
+    #[serde(default)]
+    pub clickhouse: Option<ClickHouseConfig>,
 }
 
-/// Configuration for Parquet export of old log data
+/// Configuration for ClickHouse OLAP engine
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ParquetExportConfig {
-    /// Enable Parquet export (default: false)
+pub struct ClickHouseConfig {
+    /// Enable ClickHouse OLAP queries (default: false)
     #[serde(default)]
     pub enabled: bool,
 
-    /// Export when this many contiguous blocks are ready (default: 10000)
-    #[serde(default = "default_threshold_blocks")]
-    pub threshold_blocks: u64,
-
-    /// Directory to store Parquet files (default: /data)
-    #[serde(default = "default_data_dir")]
-    pub data_dir: String,
+    /// ClickHouse HTTP URL (default: http://clickhouse:8123)
+    #[serde(default = "default_clickhouse_url")]
+    pub url: String,
 }
 
-impl Default for ParquetExportConfig {
+impl Default for ClickHouseConfig {
     fn default() -> Self {
         Self {
             enabled: false,
-            threshold_blocks: 10_000,
-            data_dir: "/data".to_string(),
+            url: "http://clickhouse:8123".to_string(),
         }
     }
 }
 
-fn default_threshold_blocks() -> u64 {
-    10_000
-}
-
-fn default_data_dir() -> String {
-    "/data".to_string()
+fn default_clickhouse_url() -> String {
+    "http://clickhouse:8123".to_string()
 }
 
 fn default_backfill() -> bool {
