@@ -341,13 +341,13 @@ mod tests {
         let sig = EventSignature::parse("Transfer(address indexed from, address indexed to, uint256 value)").unwrap();
         let cte = sig.to_cte_sql_clickhouse();
         
-        // ClickHouse CTE uses unhex() for BLOB selector comparison
-        assert!(cte.contains("WHERE selector = unhex('"));
-        // Uses native ClickHouse functions for address decoding
-        assert!(cte.contains("concat('0x', lower(hex(substring(topic1"));
-        assert!(cte.contains("concat('0x', lower(hex(substring(topic2"));
-        // Uses reinterpretAsUInt256 for uint decoding
-        assert!(cte.contains("reinterpretAsUInt256(reverse(substring(data"));
+        // ClickHouse CTE uses string comparison for selector (MaterializedPostgreSQL format)
+        assert!(cte.contains(r"WHERE selector = '\\x"));
+        // Uses substring to extract address from hex string (last 40 chars)
+        assert!(cte.contains("concat('0x', lower(substring(topic1, 27)))"));
+        assert!(cte.contains("concat('0x', lower(substring(topic2, 27)))"));
+        // Uses unhex + reinterpret for uint decoding
+        assert!(cte.contains("reinterpretAsUInt256(reverse(unhex(substring(data"));
     }
 
     #[test]
@@ -361,9 +361,9 @@ mod tests {
         assert!(pg_cte.contains("AS \"owner\""));
         assert!(ch_cte.contains("AS \"owner\""));
         
-        // Postgres uses abi_address UDFs, ClickHouse uses native functions
+        // Postgres uses abi_address UDFs, ClickHouse uses substring on hex strings
         assert!(pg_cte.contains("abi_address(topic1)"));
-        assert!(ch_cte.contains("hex(substring(topic1"));
+        assert!(ch_cte.contains("substring(topic1, 27)"));
     }
 
     #[test]
@@ -386,11 +386,11 @@ mod tests {
         assert!(pg_cte.contains("substring(data FROM 65 FOR 32)"));  // offset 64
         assert!(pg_cte.contains("substring(data FROM 97 FOR 32)"));  // offset 96
         
-        // ClickHouse uses 1-indexed substring with reinterpretAsUInt256
-        assert!(ch_cte.contains("substring(data, 1, 32)"));   // offset 0
-        assert!(ch_cte.contains("substring(data, 33, 32)"));  // offset 32
-        assert!(ch_cte.contains("substring(data, 65, 32)"));  // offset 64
-        assert!(ch_cte.contains("substring(data, 97, 32)"));  // offset 96
+        // ClickHouse uses hex-based offsets: hex_start = 3 + offset*2, and 64 chars for 32 bytes
+        assert!(ch_cte.contains("substring(data, 3, 64)"));    // offset 0: 3 + 0*2 = 3
+        assert!(ch_cte.contains("substring(data, 67, 64)"));   // offset 32: 3 + 32*2 = 67
+        assert!(ch_cte.contains("substring(data, 131, 64)"));  // offset 64: 3 + 64*2 = 131
+        assert!(ch_cte.contains("substring(data, 195, 64)"));  // offset 96: 3 + 96*2 = 195
     }
 
     #[test]
@@ -424,8 +424,8 @@ mod tests {
         
         // Postgres uses abi_bool UDF
         assert!(pg_cte.contains("abi_bool("));
-        // ClickHouse uses reinterpretAsUInt8 comparison
-        assert!(ch_cte.contains("reinterpretAsUInt8("));
+        // ClickHouse uses unhex comparison on hex string
+        assert!(ch_cte.contains("unhex(") && ch_cte.contains("!= unhex('00')"));
     }
 
     #[test]

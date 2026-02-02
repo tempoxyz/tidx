@@ -106,7 +106,9 @@ impl EventSignature {
     }
 
     /// Generate ClickHouse-compatible CTE SQL, only including columns used in the query.
-    /// Uses native ClickHouse string functions for ABI decoding (no UDFs needed).
+    /// 
+    /// Note: MaterializedPostgreSQL stores PostgreSQL bytea as '\x'-prefixed hex strings.
+    /// We use substring(..., 3) to strip the '\x' prefix before unhex().
     pub fn to_cte_sql_clickhouse_filtered(&self, used_columns: Option<&HashSet<String>>) -> String {
         let selects = self.build_select_expressions_clickhouse(used_columns);
 
@@ -116,7 +118,7 @@ impl EventSignature {
             format!(", {}", selects.join(", "))
         };
 
-        // Convert tx_hash/address to hex strings
+        // Convert tx_hash/address from '\x...' format to '0x...' format
         let include_tx_hash = used_columns
             .map(|cols| cols.contains("tx_hash"))
             .unwrap_or(true);
@@ -124,24 +126,26 @@ impl EventSignature {
             .map(|cols| cols.contains("address"))
             .unwrap_or(true);
 
+        // tx_hash/address are stored as '\xABCD...' - replace '\x' with '0x'
         let tx_hash_col = if include_tx_hash {
-            "concat('0x', lower(hex(tx_hash))) AS tx_hash"
+            "concat('0x', lower(substring(tx_hash, 3))) AS tx_hash"
         } else {
             "tx_hash"
         };
         let address_col = if include_address {
-            "concat('0x', lower(hex(address))) AS address"
+            "concat('0x', lower(substring(address, 3))) AS address"
         } else {
             "address"
         };
 
+        // selector is stored as '\xABCD...' string, compare directly
         format!(
             r#"{name} AS (
     SELECT block_num, block_timestamp, log_idx, tx_idx, 
            {tx_hash_col},
            {address_col}{select_clause}
     FROM logs
-    WHERE selector = unhex('{topic0}')
+    WHERE selector = '\\x{topic0}'
 )"#,
             name = self.name.to_lowercase(),
             tx_hash_col = tx_hash_col,
@@ -666,54 +670,64 @@ impl AbiType {
         }
     }
 
-    // ClickHouse decode functions (use native string functions)
+    // ClickHouse decode functions for MaterializedPostgreSQL data
+    // 
+    // IMPORTANT: PostgreSQL bytea columns are stored as '\x'-prefixed hex strings.
+    // e.g., topic1 = '\x000000000000000000000000a975ba910c2ee169956f3df99ee2ece79d3887cf'
+    // We need to:
+    // 1. Strip the '\x' prefix with substring(..., 3)
+    // 2. Work with hex string (64 chars = 32 bytes) using substring on the hex
+    // 3. unhex() only when we need actual bytes for reinterpret functions
 
     pub fn topic_decode_sql_clickhouse(&self, topic_idx: usize) -> String {
         // topic_idx is 1-based from the signature parser, maps to topic0, topic1, etc.
         let col = format!("topic{}", topic_idx.saturating_sub(1));
+        // Strip '\x' prefix: substring(col, 3) gives us the 64-char hex string
         match self {
-            // Address: take last 20 bytes of 32-byte topic and format as 0x-prefixed hex
-            AbiType::Address => format!("concat('0x', lower(hex(substring({col}, 13, 20))))"),
-            // Uint: reinterpret 32 bytes as big-endian uint256
+            // Address: last 20 bytes = last 40 hex chars, add 0x prefix
+            AbiType::Address => format!("concat('0x', lower(substring({col}, 27)))"),
+            // Uint: unhex the full 64 chars, reverse for big-endian, reinterpret
             AbiType::Uint(_) | AbiType::Int(_) => {
-                format!("reinterpretAsUInt256(reverse({col}))")
+                format!("reinterpretAsUInt256(reverse(unhex(substring({col}, 3))))")
             }
-            // Bool: check if last byte is non-zero
-            AbiType::Bool => format!("reinterpretAsUInt8(substring({col}, 32, 1)) != 0"),
-            // Bytes32: format as 0x-prefixed hex
-            AbiType::Bytes(Some(_) | None) => format!("concat('0x', lower(hex({col})))"),
-            _ => col,
+            // Bool: check last byte (last 2 hex chars)
+            AbiType::Bool => format!("unhex(substring({col}, 67, 2)) != unhex('00')"),
+            // Bytes32: just format as 0x-prefixed, already lowercase
+            AbiType::Bytes(Some(_) | None) => format!("concat('0x', substring({col}, 3))"),
+            _ => format!("concat('0x', substring({col}, 3))"),
         }
     }
 
     pub fn data_decode_sql_clickhouse(&self, offset: usize) -> String {
-        // ClickHouse substring is 1-indexed
-        let start = offset + 1;
+        // data is stored as '\x' + hex string
+        // offset is in bytes, but we're working with hex (2 chars per byte)
+        // +3 to skip '\x' prefix, then offset*2 for hex position
+        let hex_start = 3 + offset * 2;
         match self {
-            // Address: take last 20 bytes of 32-byte word
+            // Address: skip first 12 bytes (24 hex chars) of 32-byte word, take 20 bytes (40 hex chars)
             AbiType::Address => {
-                format!("concat('0x', lower(hex(substring(data, {}, 20))))", start + 12)
+                format!("concat('0x', lower(substring(data, {}, 40)))", hex_start + 24)
             }
-            // Uint: reinterpret 32 bytes as big-endian uint256
+            // Uint: unhex 32 bytes (64 hex chars), reverse, reinterpret
             AbiType::Uint(_) => {
-                format!("reinterpretAsUInt256(reverse(substring(data, {start}, 32)))")
+                format!("reinterpretAsUInt256(reverse(unhex(substring(data, {hex_start}, 64))))")
             }
             AbiType::Int(_) => {
-                format!("reinterpretAsInt256(reverse(substring(data, {start}, 32)))")
+                format!("reinterpretAsInt256(reverse(unhex(substring(data, {hex_start}, 64))))")
             }
-            // Bool: check if last byte is non-zero
+            // Bool: check last byte of 32-byte word (last 2 hex chars of 64)
             AbiType::Bool => {
-                format!("reinterpretAsUInt8(substring(data, {}, 1)) != 0", start + 31)
+                format!("unhex(substring(data, {}, 2)) != unhex('00')", hex_start + 62)
             }
-            // Bytes32: format as 0x-prefixed hex
+            // Bytes32: take 64 hex chars, format with 0x prefix
             AbiType::Bytes(Some(_) | None) => {
-                format!("concat('0x', lower(hex(substring(data, {start}, 32))))")
+                format!("concat('0x', lower(substring(data, {hex_start}, 64)))")
             }
             // String: dynamic, not fully supported yet
             AbiType::String => {
-                format!("concat('0x', lower(hex(substring(data, {start}, 32))))")
+                format!("concat('0x', lower(substring(data, {hex_start}, 64)))")
             }
-            _ => format!("concat('0x', lower(hex(substring(data, {start}, 32))))"),
+            _ => format!("concat('0x', lower(substring(data, {hex_start}, 64)))"),
         }
     }
 }
@@ -812,13 +826,15 @@ mod tests {
         .unwrap();
         let cte = sig.to_cte_sql_clickhouse();
         assert!(cte.contains("transfer AS"));
-        // ClickHouse uses concat('0x', lower(hex(substring(...)))) for address decoding
-        assert!(cte.contains("concat('0x', lower(hex(substring(topic1"));
-        assert!(cte.contains("concat('0x', lower(hex(substring(topic2"));
-        // ClickHouse uses reinterpretAsUInt256 for uint decoding
-        assert!(cte.contains("reinterpretAsUInt256(reverse(substring(data"));
-        // ClickHouse uses unhex() for selector comparison
-        assert!(cte.contains("selector = unhex('ddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef')"));
+        // ClickHouse: addresses from topics use substring to get last 40 hex chars
+        // topic1 = '\x000...address' -> substring(topic1, 27) gets last 40 chars
+        assert!(cte.contains("concat('0x', lower(substring(topic1, 27)))"));
+        assert!(cte.contains("concat('0x', lower(substring(topic2, 27)))"));
+        // ClickHouse: uint256 from data uses unhex then reinterpret
+        assert!(cte.contains("reinterpretAsUInt256(reverse(unhex(substring(data"));
+        // ClickHouse: selector comparison uses string match with '\x' prefix
+        // Note: \\x in the output because we're generating SQL with escaped backslash
+        assert!(cte.contains(r"selector = '\\x"));
     }
 
     #[test]
@@ -905,7 +921,7 @@ mod tests {
 
     #[test]
     fn test_cte_filtered_preserves_offsets() {
-        // When skipping "from", "to" should still use topic2 and "value" should still use data offset 1
+        // When skipping "from", "to" should still use topic2 and "value" should still use data offset 0
         let sig = EventSignature::parse(
             "Transfer(address indexed from, address indexed to, uint256 value)",
         )
@@ -917,8 +933,8 @@ mod tests {
         // "to" is the second indexed param, so it should still be topic2
         assert!(cte.contains("topic2"));
         assert!(cte.contains("AS \"to\""));
-        // "value" is the first data param (ClickHouse uses 1-indexed offsets)
-        assert!(cte.contains("substring(data, 1, 32)"));
+        // "value" is the first data param: hex_start = 3 + 0*2 = 3, so substring(data, 3, 64)
+        assert!(cte.contains("substring(data, 3, 64)"));
         assert!(cte.contains("AS \"value\""));
     }
 
