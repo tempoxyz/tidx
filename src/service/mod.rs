@@ -391,9 +391,9 @@ mod tests {
         let sig = EventSignature::parse("Transfer(address indexed from, address indexed to, uint256 value)").unwrap();
         let cte = sig.to_cte_sql_duckdb();
         
-        // DuckDB CTE uses hex string selector format
-        assert!(cte.contains("WHERE selector = '0x"));
-        // Uses tidx_abi extension functions
+        // DuckDB CTE uses unhex() for BLOB selector comparison
+        assert!(cte.contains("WHERE selector = unhex('"));
+        // Uses native abi UDFs
         assert!(cte.contains("abi_address(topic1)"));
         assert!(cte.contains("abi_address(topic2)"));
         assert!(cte.contains("abi_uint(data, 0)"));

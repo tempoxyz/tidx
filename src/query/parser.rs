@@ -1,9 +1,9 @@
 use anyhow::{anyhow, Result};
 use sha3::{Digest, Keccak256};
-use sqlparser::ast::visit_expressions;
+use sqlparser::ast::{visit_expressions, BinaryOperator, Expr, Value};
 use sqlparser::dialect::GenericDialect;
 use sqlparser::parser::Parser;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::ops::ControlFlow;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -108,6 +108,16 @@ impl EventSignature {
     /// Generate DuckDB-compatible CTE SQL, only including columns used in the query.
     /// If `used_columns` is None, includes all decoded columns.
     pub fn to_cte_sql_duckdb_filtered(&self, used_columns: Option<&HashSet<String>>) -> String {
+        self.to_cte_sql_duckdb_with_pushdown(used_columns, None)
+    }
+
+    /// Generate DuckDB-compatible CTE SQL with filter pushdown.
+    /// `pushdown_filters` maps decoded column names to their filter values.
+    pub fn to_cte_sql_duckdb_with_pushdown(
+        &self,
+        used_columns: Option<&HashSet<String>>,
+        pushdown_filters: Option<&HashMap<String, String>>,
+    ) -> String {
         let selects = self.build_select_expressions(used_columns, true);
 
         let select_clause = if selects.is_empty() {
@@ -116,17 +126,51 @@ impl EventSignature {
             format!(", {}", selects.join(", "))
         };
 
+        // Only convert tx_hash/address to hex strings when actually referenced
+        // This avoids expensive per-row string formatting for unused columns
+        let include_tx_hash = used_columns
+            .map(|cols| cols.contains("tx_hash"))
+            .unwrap_or(true);
+        let include_address = used_columns
+            .map(|cols| cols.contains("address"))
+            .unwrap_or(true);
+
+        let tx_hash_col = if include_tx_hash {
+            "'0x' || lower(hex(tx_hash)) AS tx_hash"
+        } else {
+            "tx_hash"
+        };
+        let address_col = if include_address {
+            "'0x' || lower(hex(address)) AS address"
+        } else {
+            "address"
+        };
+
+        // Build pushdown WHERE clauses
+        let pushdown_clauses = pushdown_filters
+            .map(|filters| self.build_pushdown_filters_duckdb(filters))
+            .unwrap_or_default();
+        
+        let pushdown_sql = if pushdown_clauses.is_empty() {
+            String::new()
+        } else {
+            format!(" AND {}", pushdown_clauses.join(" AND "))
+        };
+
         format!(
             r#"{name} AS (
     SELECT block_num, block_timestamp, log_idx, tx_idx, 
-           '0x' || lower(hex(tx_hash)) AS tx_hash,
-           '0x' || lower(hex(address)) AS address{select_clause}
+           {tx_hash_col},
+           {address_col}{select_clause}
     FROM logs
-    WHERE selector = unhex('{topic0}')
+    WHERE selector = unhex('{topic0}'){pushdown_sql}
 )"#,
             name = self.name.to_lowercase(),
+            tx_hash_col = tx_hash_col,
+            address_col = address_col,
             select_clause = select_clause,
             topic0 = self.topic0_hex(),
+            pushdown_sql = pushdown_sql,
         )
     }
 
@@ -193,6 +237,80 @@ impl EventSignature {
             })
             .collect()
     }
+
+    /// Build pushdown WHERE clauses for equality filters on decoded columns.
+    /// Returns SQL fragments like "AND topic1 = unhex('...')" for DuckDB.
+    pub fn build_pushdown_filters_duckdb(&self, filters: &HashMap<String, String>) -> Vec<String> {
+        let mut clauses = Vec::new();
+        let mut topic_idx = 2; // topic0 is selector, topic1 starts at 2
+        let mut data_offset = 0;
+
+        for (i, param) in self.params.iter().enumerate() {
+            let col_name = param
+                .name
+                .as_deref()
+                .map_or_else(|| format!("arg{i}"), |n| n.to_lowercase());
+
+            // Check if this column has a filter
+            if let Some(filter_value) = filters.get(&col_name) {
+                if param.indexed {
+                    // Indexed param -> compare against topicN
+                    let topic_col = format!("topic{}", topic_idx - 1);
+                    if let Some(encoded) = self.encode_value_for_pushdown(&param.ty, filter_value) {
+                        clauses.push(format!("{topic_col} = unhex('{encoded}')"));
+                    }
+                } else {
+                    // Non-indexed param -> compare against data slice
+                    // For now, only support fixed-size types at specific offsets
+                    if let Some(encoded) = self.encode_value_for_pushdown(&param.ty, filter_value) {
+                        // Compare 32-byte slice of data at offset
+                        clauses.push(format!(
+                            "substring(data, {}, 32) = unhex('{}')",
+                            data_offset + 1, // SQL is 1-indexed
+                            encoded
+                        ));
+                    }
+                }
+            }
+
+            // Update offsets for next param
+            if param.indexed {
+                topic_idx += 1;
+            } else {
+                data_offset += 32;
+            }
+        }
+
+        clauses
+    }
+
+    /// Encode a filter value based on the ABI type.
+    fn encode_value_for_pushdown(&self, ty: &AbiType, value: &str) -> Option<String> {
+        match ty {
+            AbiType::Address => encode_address_for_topic(value),
+            AbiType::Uint(_) | AbiType::Int(_) => encode_uint256_for_topic(value),
+            AbiType::Bool => {
+                let b = value.to_lowercase();
+                if b == "true" || b == "1" {
+                    Some("0000000000000000000000000000000000000000000000000000000000000001".to_string())
+                } else if b == "false" || b == "0" {
+                    Some("0000000000000000000000000000000000000000000000000000000000000000".to_string())
+                } else {
+                    None
+                }
+            }
+            AbiType::Bytes(Some(32)) => {
+                // bytes32 - expect 0x-prefixed hex
+                let hex = value.strip_prefix("0x").unwrap_or(value);
+                if hex.len() == 64 && hex.chars().all(|c| c.is_ascii_hexdigit()) {
+                    Some(hex.to_lowercase())
+                } else {
+                    None
+                }
+            }
+            _ => None, // Dynamic types not supported for pushdown
+        }
+    }
 }
 
 /// Extract all column/identifier references from a SQL query.
@@ -233,6 +351,82 @@ fn extract_idents_from_expr(expr: &sqlparser::ast::Expr, columns: &mut HashSet<S
         }
         _ => {}
     }
+}
+
+/// Extract equality filters from a SQL query.
+/// Returns a map of column name -> value for simple equality comparisons.
+pub fn extract_equality_filters(sql: &str) -> HashMap<String, String> {
+    let mut filters = HashMap::new();
+
+    let dialect = GenericDialect {};
+    let Ok(statements) = Parser::parse_sql(&dialect, sql) else {
+        return filters;
+    };
+
+    for stmt in &statements {
+        let _ = visit_expressions(stmt, |expr| {
+            extract_eq_from_expr(expr, &mut filters);
+            ControlFlow::<()>::Continue(())
+        });
+    }
+
+    filters
+}
+
+/// Extract equality comparisons from an expression.
+fn extract_eq_from_expr(expr: &Expr, filters: &mut HashMap<String, String>) {
+    if let Expr::BinaryOp { left, op: BinaryOperator::Eq, right } = expr {
+        // Check for column = literal patterns
+        if let Some((col, val)) = extract_col_eq_literal(left, right) {
+            filters.insert(col.to_lowercase(), val);
+        } else if let Some((col, val)) = extract_col_eq_literal(right, left) {
+            filters.insert(col.to_lowercase(), val);
+        }
+    }
+}
+
+/// Try to extract column = 'literal' pattern
+fn extract_col_eq_literal(col_expr: &Expr, val_expr: &Expr) -> Option<(String, String)> {
+    let col_name = match col_expr {
+        Expr::Identifier(ident) => ident.value.clone(),
+        Expr::CompoundIdentifier(idents) => idents.last()?.value.clone(),
+        _ => return None,
+    };
+
+    let value = match val_expr {
+        Expr::Value(v) => match &v.value {
+            Value::SingleQuotedString(s) => s.clone(),
+            Value::Number(n, _) => n.clone(),
+            _ => return None,
+        },
+        _ => return None,
+    };
+
+    Some((col_name, value))
+}
+
+/// Encode a hex address string to 32-byte ABI-encoded format for topic comparison.
+/// Input: "0xdAC17F958D2ee523a2206206994597C13D831ec7" (40 hex chars)
+/// Output: "000000000000000000000000dac17f958d2ee523a2206206994597c13d831ec7" (64 hex chars)
+pub fn encode_address_for_topic(addr: &str) -> Option<String> {
+    let addr = addr.strip_prefix("0x").unwrap_or(addr);
+    if addr.len() != 40 {
+        return None;
+    }
+    // Validate it's valid hex
+    if !addr.chars().all(|c| c.is_ascii_hexdigit()) {
+        return None;
+    }
+    // Left-pad with 24 zeros (12 bytes) to make 32 bytes total
+    Some(format!("000000000000000000000000{}", addr.to_lowercase()))
+}
+
+/// Encode a uint256 value to 32-byte ABI-encoded format for topic/data comparison.
+/// Input: "1000000" or decimal number
+/// Output: 64 hex chars, big-endian
+pub fn encode_uint256_for_topic(value: &str) -> Option<String> {
+    let n: u128 = value.parse().ok()?;
+    Some(format!("{:064x}", n))
 }
 
 fn parse_params(params_str: &str) -> Result<Vec<AbiParam>> {
@@ -670,5 +864,96 @@ mod tests {
         assert!(cte.contains("abi_address(topic2) AS \"to\""));
         // "value" is the first data param, so it should still be offset 0
         assert!(cte.contains("abi_uint(data, 0) AS \"value\""));
+    }
+
+    // ========================================================================
+    // Filter Pushdown Tests
+    // ========================================================================
+
+    #[test]
+    fn test_extract_equality_filters() {
+        let filters = extract_equality_filters(
+            "SELECT * FROM transfer WHERE \"from\" = '0xABC123' AND value > 100"
+        );
+        assert_eq!(filters.get("from"), Some(&"0xABC123".to_string()));
+        // value > 100 is not an equality filter
+        assert!(!filters.contains_key("value"));
+    }
+
+    #[test]
+    fn test_extract_equality_filters_multiple() {
+        let filters = extract_equality_filters(
+            "SELECT * FROM transfer WHERE \"from\" = '0xABC' AND \"to\" = '0xDEF'"
+        );
+        assert_eq!(filters.get("from"), Some(&"0xABC".to_string()));
+        assert_eq!(filters.get("to"), Some(&"0xDEF".to_string()));
+    }
+
+    #[test]
+    fn test_encode_address_for_topic() {
+        let encoded = encode_address_for_topic("0xdAC17F958D2ee523a2206206994597C13D831ec7");
+        assert_eq!(
+            encoded,
+            Some("000000000000000000000000dac17f958d2ee523a2206206994597c13d831ec7".to_string())
+        );
+    }
+
+    #[test]
+    fn test_encode_uint256_for_topic() {
+        let encoded = encode_uint256_for_topic("1000000");
+        assert_eq!(
+            encoded,
+            Some("00000000000000000000000000000000000000000000000000000000000f4240".to_string())
+        );
+    }
+
+    #[test]
+    fn test_pushdown_address_filter() {
+        let sig = EventSignature::parse(
+            "Transfer(address indexed from, address indexed to, uint256 value)",
+        )
+        .unwrap();
+        
+        let mut filters = HashMap::new();
+        filters.insert("from".to_string(), "0xdAC17F958D2ee523a2206206994597C13D831ec7".to_string());
+        
+        let cte = sig.to_cte_sql_duckdb_with_pushdown(None, Some(&filters));
+        
+        // Should contain pushdown filter on topic1
+        assert!(cte.contains("topic1 = unhex('000000000000000000000000dac17f958d2ee523a2206206994597c13d831ec7')"));
+    }
+
+    #[test]
+    fn test_pushdown_multiple_filters() {
+        let sig = EventSignature::parse(
+            "Transfer(address indexed from, address indexed to, uint256 value)",
+        )
+        .unwrap();
+        
+        let mut filters = HashMap::new();
+        filters.insert("from".to_string(), "0xAAA0000000000000000000000000000000000001".to_string());
+        filters.insert("to".to_string(), "0xBBB0000000000000000000000000000000000002".to_string());
+        
+        let cte = sig.to_cte_sql_duckdb_with_pushdown(None, Some(&filters));
+        
+        // Should contain pushdown filters on both topic1 and topic2
+        assert!(cte.contains("topic1 = unhex("));
+        assert!(cte.contains("topic2 = unhex("));
+    }
+
+    #[test]
+    fn test_pushdown_data_field_filter() {
+        let sig = EventSignature::parse(
+            "Transfer(address indexed from, address indexed to, uint256 value)",
+        )
+        .unwrap();
+        
+        let mut filters = HashMap::new();
+        filters.insert("value".to_string(), "1000000".to_string());
+        
+        let cte = sig.to_cte_sql_duckdb_with_pushdown(None, Some(&filters));
+        
+        // Should contain pushdown filter on data slice
+        assert!(cte.contains("substring(data, 1, 32) = unhex('00000000000000000000000000000000000000000000000000000000000f4240')"));
     }
 }

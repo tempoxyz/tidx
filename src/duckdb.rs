@@ -15,7 +15,7 @@ use std::error::Error;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
-use crate::query::{extract_column_references, EventSignature};
+use crate::query::{extract_column_references, extract_equality_filters, EventSignature};
 
 /// Native DuckDB engine for parquet queries.
 /// Thread-safe via internal mutex (DuckDB connections are not Send).
@@ -95,12 +95,20 @@ impl DuckDbEngine {
         let sql = if let Some(sig_str) = signature {
             let sig = EventSignature::parse(sig_str)?;
             let used_columns = extract_column_references(sql);
+            let equality_filters = extract_equality_filters(sql);
+            
             let filter = if used_columns.is_empty() {
                 None
             } else {
                 Some(&used_columns)
             };
-            let cte = sig.to_cte_sql_duckdb_filtered(filter);
+            let pushdown = if equality_filters.is_empty() {
+                None
+            } else {
+                Some(&equality_filters)
+            };
+            
+            let cte = sig.to_cte_sql_duckdb_with_pushdown(filter, pushdown);
             format!("WITH {cte} {sql}")
         } else {
             sql.to_string()
@@ -109,23 +117,17 @@ impl DuckDbEngine {
         let start = std::time::Instant::now();
         let mut stmt = conn.prepare(&sql)?;
         
-        // Execute to get column info
-        stmt.execute([])?;
-        
-        // Get column names from statement
-        let columns: Vec<String> = stmt
-            .column_names()
-            .into_iter()
-            .map(String::from)
-            .collect();
-        let column_count = columns.len();
-        
-        // Re-prepare and query for rows (execute consumed the result)
-        let mut stmt = conn.prepare(&sql)?;
+        // Execute query
         let mut result_rows = stmt.query([])?;
         
+        // Collect rows first, then get column info from stmt after iteration
         let mut rows = Vec::new();
+        let mut column_count = 0;
         while let Some(row) = result_rows.next()? {
+            // Get column count from first row's statement
+            if column_count == 0 {
+                column_count = row.as_ref().column_count();
+            }
             let mut values = Vec::with_capacity(column_count);
             for i in 0..column_count {
                 let value = row_to_json_value(&row, i);
@@ -133,6 +135,14 @@ impl DuckDbEngine {
             }
             rows.push(values);
         }
+        
+        // Get column names after iteration (stmt is no longer borrowed by result_rows)
+        drop(result_rows);
+        let columns: Vec<String> = stmt
+            .column_names()
+            .into_iter()
+            .map(String::from)
+            .collect();
         
         let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
         let row_count = rows.len();
