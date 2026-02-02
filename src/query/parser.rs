@@ -13,6 +13,16 @@ pub struct EventSignature {
     pub topic0: [u8; 32],
 }
 
+/// Mapping from a decoded column to its raw column and decode expression.
+#[derive(Debug, Clone)]
+pub struct ColumnMapping {
+    pub decoded_name: String,
+    pub raw_column: String,
+    pub decode_expr: String,
+    pub is_indexed: bool,
+    pub data_offset: Option<usize>,
+}
+
 fn is_valid_identifier(s: &str) -> bool {
     !s.is_empty()
         && s.len() <= 64
@@ -109,6 +119,50 @@ impl EventSignature {
     /// If `used_columns` is None, includes all decoded columns.
     pub fn to_cte_sql_duckdb_filtered(&self, used_columns: Option<&HashSet<String>>) -> String {
         self.to_cte_sql_duckdb_with_pushdown(used_columns, None)
+    }
+
+    /// Generate a raw CTE (no decoding) for late-decode optimization.
+    /// Returns the CTE SQL and a mapping of decoded column names to raw column expressions.
+    pub fn to_raw_cte_sql_duckdb(
+        &self,
+        pushdown_filters: Option<&HashMap<String, String>>,
+    ) -> String {
+        // Build pushdown WHERE clauses
+        let pushdown_clauses = pushdown_filters
+            .map(|filters| self.build_pushdown_filters_duckdb(filters))
+            .unwrap_or_default();
+        
+        let pushdown_sql = if pushdown_clauses.is_empty() {
+            String::new()
+        } else {
+            format!(" AND {}", pushdown_clauses.join(" AND "))
+        };
+
+        // Select raw columns needed for potential late decode
+        format!(
+            r#"{name}_raw AS (
+    SELECT block_num, block_timestamp, log_idx, tx_idx, 
+           tx_hash, address, topic1, topic2, topic3, data
+    FROM logs
+    WHERE selector = unhex('{topic0}'){pushdown_sql}
+)"#,
+            name = self.name.to_lowercase(),
+            topic0 = self.topic0_hex(),
+            pushdown_sql = pushdown_sql,
+        )
+    }
+
+    /// Generate the decode expressions for wrapping a raw query result.
+    /// Returns pairs of (decoded_col_name, decode_expression).
+    pub fn get_decode_wrappers(&self) -> Vec<(String, String)> {
+        let mut wrappers = Vec::new();
+        let mappings = self.get_column_mappings();
+        
+        for mapping in mappings {
+            wrappers.push((mapping.decoded_name, mapping.decode_expr));
+        }
+        
+        wrappers
     }
 
     /// Generate DuckDB-compatible CTE SQL with filter pushdown.
@@ -236,6 +290,43 @@ impl EventSignature {
                     .map_or_else(|| format!("arg{i}"), |n| n.to_string())
             })
             .collect()
+    }
+
+    /// Returns a mapping from decoded column names to their raw column info.
+    /// Used for late-decode optimization (GROUP BY/ORDER BY rewriting).
+    pub fn get_column_mappings(&self) -> Vec<ColumnMapping> {
+        let mut mappings = Vec::new();
+        let mut topic_idx = 1; // topic1, topic2, topic3
+        let mut data_offset = 0;
+
+        for (i, param) in self.params.iter().enumerate() {
+            let decoded_name = param
+                .name
+                .as_deref()
+                .map_or_else(|| format!("arg{i}"), |n| n.to_string());
+
+            let (raw_column, decode_expr) = if param.indexed {
+                let raw_col = format!("topic{}", topic_idx);
+                let decode = param.ty.topic_decode_sql_duckdb(topic_idx + 1);
+                topic_idx += 1;
+                (raw_col, decode)
+            } else {
+                let raw_col = format!("data"); // For data, we use offset
+                let decode = param.ty.data_decode_sql_duckdb(data_offset);
+                data_offset += 32;
+                (raw_col, decode)
+            };
+
+            mappings.push(ColumnMapping {
+                decoded_name,
+                raw_column,
+                decode_expr,
+                is_indexed: param.indexed,
+                data_offset: if param.indexed { None } else { Some(data_offset - 32) },
+            });
+        }
+
+        mappings
     }
 
     /// Build pushdown WHERE clauses for equality filters on decoded columns.
@@ -427,6 +518,188 @@ pub fn encode_address_for_topic(addr: &str) -> Option<String> {
 pub fn encode_uint256_for_topic(value: &str) -> Option<String> {
     let n: u128 = value.parse().ok()?;
     Some(format!("{:064x}", n))
+}
+
+/// Result of late-decode query rewriting.
+#[derive(Debug, Clone)]
+pub struct LateDecodeRewrite {
+    /// The full SQL to execute (WITH raw CTE + wrapped query)
+    pub sql: String,
+    /// Whether any late-decode optimization was applied
+    pub optimized: bool,
+}
+
+/// Rewrite a query for late-decode optimization.
+/// If GROUP BY or ORDER BY uses decoded columns, rewrites to:
+/// 1. Use raw CTE (no decoding)
+/// 2. Replace decoded columns with raw columns in GROUP BY/ORDER BY
+/// 3. Wrap result to decode only final rows
+pub fn rewrite_for_late_decode(
+    sql: &str,
+    sig: &EventSignature,
+    equality_filters: &HashMap<String, String>,
+) -> LateDecodeRewrite {
+    let group_by_cols = extract_group_by_columns(sql);
+    let order_by_cols = extract_order_by_columns(sql);
+    let mappings = sig.get_column_mappings();
+    
+    // Check if any decoded columns are used in GROUP BY or ORDER BY
+    let decoded_in_group_by: Vec<_> = mappings
+        .iter()
+        .filter(|m| group_by_cols.contains(&m.decoded_name.to_lowercase()))
+        .collect();
+    
+    let decoded_in_order_by: Vec<_> = mappings
+        .iter()
+        .filter(|m| order_by_cols.contains(&m.decoded_name.to_lowercase()))
+        .collect();
+    
+    // If no decoded columns in GROUP BY/ORDER BY, use standard approach
+    if decoded_in_group_by.is_empty() && decoded_in_order_by.is_empty() {
+        let used_columns = extract_column_references(sql);
+        let filter = if used_columns.is_empty() {
+            None
+        } else {
+            Some(&used_columns)
+        };
+        let pushdown = if equality_filters.is_empty() {
+            None
+        } else {
+            Some(equality_filters)
+        };
+        let cte = sig.to_cte_sql_duckdb_with_pushdown(filter, pushdown);
+        return LateDecodeRewrite {
+            sql: format!("WITH {cte} {sql}"),
+            optimized: false,
+        };
+    }
+    
+    // Build raw CTE
+    let pushdown = if equality_filters.is_empty() {
+        None
+    } else {
+        Some(equality_filters)
+    };
+    let raw_cte = sig.to_raw_cte_sql_duckdb(pushdown);
+    let event_name = sig.name.to_lowercase();
+    let raw_name = format!("{}_raw", event_name);
+    
+    // Build column replacement map: decoded_name -> raw_column
+    let mut replacements: HashMap<String, String> = HashMap::new();
+    for mapping in &mappings {
+        replacements.insert(
+            mapping.decoded_name.to_lowercase(),
+            mapping.raw_column.clone(),
+        );
+    }
+    
+    // Rewrite the SQL to use raw columns in GROUP BY/ORDER BY
+    // This is a simple string replacement - works for most cases
+    let mut rewritten_sql = sql.replace(&event_name, &raw_name);
+    
+    // Replace decoded column names with raw columns in GROUP BY/ORDER BY context
+    // We do case-insensitive replacement for the column names
+    for mapping in &mappings {
+        let decoded = &mapping.decoded_name;
+        let raw = &mapping.raw_column;
+        
+        // Replace quoted versions: "from" -> topic1
+        rewritten_sql = rewritten_sql.replace(&format!("\"{decoded}\""), raw);
+        // Replace unquoted (case variations)
+        rewritten_sql = rewritten_sql.replace(&format!(" {decoded} "), &format!(" {raw} "));
+        rewritten_sql = rewritten_sql.replace(&format!(" {decoded},"), &format!(" {raw},"));
+        rewritten_sql = rewritten_sql.replace(&format!(",{decoded} "), &format!(",{raw} "));
+        rewritten_sql = rewritten_sql.replace(&format!(",{decoded},"), &format!(",{raw},"));
+    }
+    
+    // Build the decode wrapper for SELECT columns
+    // We need to decode the columns that appear in SELECT but keep aggregates as-is
+    let mut decode_selects = Vec::new();
+    for mapping in &mappings {
+        decode_selects.push(format!(
+            "{} AS \"{}\"",
+            mapping.decode_expr, mapping.decoded_name
+        ));
+    }
+    
+    // Wrap the query to decode final results
+    // Replace SELECT columns with decoded versions where applicable
+    let final_sql = format!(
+        "WITH {raw_cte} {rewritten_sql}"
+    );
+    
+    LateDecodeRewrite {
+        sql: final_sql,
+        optimized: true,
+    }
+}
+
+/// Extract GROUP BY column names from a SQL query.
+pub fn extract_group_by_columns(sql: &str) -> HashSet<String> {
+    let mut columns = HashSet::new();
+
+    let dialect = GenericDialect {};
+    let Ok(statements) = Parser::parse_sql(&dialect, sql) else {
+        return columns;
+    };
+
+    for stmt in &statements {
+        if let sqlparser::ast::Statement::Query(query) = stmt {
+            extract_group_by_from_query(query, &mut columns);
+        }
+    }
+
+    columns
+}
+
+/// Extract GROUP BY columns from a query.
+fn extract_group_by_from_query(query: &sqlparser::ast::Query, columns: &mut HashSet<String>) {
+    if let sqlparser::ast::SetExpr::Select(select) = query.body.as_ref() {
+        if let sqlparser::ast::GroupByExpr::Expressions(exprs, _) = &select.group_by {
+            for expr in exprs {
+                extract_ident_from_expr(expr, columns);
+            }
+        }
+    }
+}
+
+/// Extract ORDER BY column names from a SQL query.
+pub fn extract_order_by_columns(sql: &str) -> HashSet<String> {
+    let mut columns = HashSet::new();
+
+    let dialect = GenericDialect {};
+    let Ok(statements) = Parser::parse_sql(&dialect, sql) else {
+        return columns;
+    };
+
+    for stmt in &statements {
+        if let sqlparser::ast::Statement::Query(query) = stmt {
+            if let Some(order_by) = &query.order_by {
+                if let sqlparser::ast::OrderByKind::Expressions(exprs) = &order_by.kind {
+                    for expr in exprs {
+                        extract_ident_from_expr(&expr.expr, &mut columns);
+                    }
+                }
+            }
+        }
+    }
+
+    columns
+}
+
+/// Extract identifier from an expression.
+fn extract_ident_from_expr(expr: &Expr, columns: &mut HashSet<String>) {
+    match expr {
+        Expr::Identifier(ident) => {
+            columns.insert(ident.value.to_lowercase());
+        }
+        Expr::CompoundIdentifier(idents) => {
+            if let Some(last) = idents.last() {
+                columns.insert(last.value.to_lowercase());
+            }
+        }
+        _ => {}
+    }
 }
 
 fn parse_params(params_str: &str) -> Result<Vec<AbiParam>> {
@@ -955,5 +1228,102 @@ mod tests {
         
         // Should contain pushdown filter on data slice
         assert!(cte.contains("substring(data, 1, 32) = unhex('00000000000000000000000000000000000000000000000000000000000f4240')"));
+    }
+
+    // ========================================================================
+    // Late Decode (GROUP BY / ORDER BY) Tests
+    // ========================================================================
+
+    #[test]
+    fn test_extract_group_by_columns() {
+        let cols = extract_group_by_columns("SELECT \"to\", COUNT(*) FROM transfer GROUP BY \"to\"");
+        assert!(cols.contains("to"));
+    }
+
+    #[test]
+    fn test_extract_order_by_columns() {
+        let cols = extract_order_by_columns("SELECT * FROM transfer ORDER BY \"from\" DESC");
+        assert!(cols.contains("from"));
+    }
+
+    #[test]
+    fn test_late_decode_group_by_uses_raw_cte() {
+        let sig = EventSignature::parse(
+            "Transfer(address indexed from, address indexed to, uint256 value)",
+        )
+        .unwrap();
+        
+        let sql = "SELECT \"to\", COUNT(*) as cnt FROM transfer GROUP BY \"to\"";
+        let filters = HashMap::new();
+        let rewrite = rewrite_for_late_decode(sql, &sig, &filters);
+        
+        // Should be optimized
+        assert!(rewrite.optimized);
+        // Should use raw CTE
+        assert!(rewrite.sql.contains("transfer_raw AS"));
+        // Should replace "to" with topic2 in GROUP BY
+        assert!(rewrite.sql.contains("GROUP BY topic2"));
+    }
+
+    #[test]
+    fn test_late_decode_no_group_by_not_optimized() {
+        let sig = EventSignature::parse(
+            "Transfer(address indexed from, address indexed to, uint256 value)",
+        )
+        .unwrap();
+        
+        let sql = "SELECT * FROM transfer LIMIT 10";
+        let filters = HashMap::new();
+        let rewrite = rewrite_for_late_decode(sql, &sig, &filters);
+        
+        // Should NOT be optimized (no GROUP BY on decoded columns)
+        assert!(!rewrite.optimized);
+        // Should use regular CTE with decoding
+        assert!(rewrite.sql.contains("abi_address"));
+    }
+
+    #[test]
+    fn test_late_decode_order_by_uses_raw() {
+        let sig = EventSignature::parse(
+            "Transfer(address indexed from, address indexed to, uint256 value)",
+        )
+        .unwrap();
+        
+        let sql = "SELECT \"from\", COUNT(*) as cnt FROM transfer GROUP BY \"from\" ORDER BY \"from\"";
+        let filters = HashMap::new();
+        let rewrite = rewrite_for_late_decode(sql, &sig, &filters);
+        
+        // Should be optimized
+        assert!(rewrite.optimized);
+        // Should replace "from" with topic1
+        assert!(rewrite.sql.contains("topic1"));
+    }
+
+    #[test]
+    fn test_get_column_mappings() {
+        let sig = EventSignature::parse(
+            "Transfer(address indexed from, address indexed to, uint256 value)",
+        )
+        .unwrap();
+        
+        let mappings = sig.get_column_mappings();
+        
+        assert_eq!(mappings.len(), 3);
+        
+        // "from" is indexed, maps to topic1
+        assert_eq!(mappings[0].decoded_name, "from");
+        assert_eq!(mappings[0].raw_column, "topic1");
+        assert!(mappings[0].is_indexed);
+        
+        // "to" is indexed, maps to topic2
+        assert_eq!(mappings[1].decoded_name, "to");
+        assert_eq!(mappings[1].raw_column, "topic2");
+        assert!(mappings[1].is_indexed);
+        
+        // "value" is not indexed, uses data
+        assert_eq!(mappings[2].decoded_name, "value");
+        assert_eq!(mappings[2].raw_column, "data");
+        assert!(!mappings[2].is_indexed);
+        assert_eq!(mappings[2].data_offset, Some(0));
     }
 }

@@ -15,7 +15,7 @@ use std::error::Error;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
-use crate::query::{extract_column_references, extract_equality_filters, EventSignature};
+use crate::query::{extract_equality_filters, rewrite_for_late_decode, EventSignature};
 
 /// Native DuckDB engine for parquet queries.
 /// Thread-safe via internal mutex (DuckDB connections are not Send).
@@ -94,22 +94,11 @@ impl DuckDbEngine {
         // Generate CTE if signature provided
         let sql = if let Some(sig_str) = signature {
             let sig = EventSignature::parse(sig_str)?;
-            let used_columns = extract_column_references(sql);
             let equality_filters = extract_equality_filters(sql);
             
-            let filter = if used_columns.is_empty() {
-                None
-            } else {
-                Some(&used_columns)
-            };
-            let pushdown = if equality_filters.is_empty() {
-                None
-            } else {
-                Some(&equality_filters)
-            };
-            
-            let cte = sig.to_cte_sql_duckdb_with_pushdown(filter, pushdown);
-            format!("WITH {cte} {sql}")
+            // Use late-decode optimization for GROUP BY/ORDER BY on decoded columns
+            let rewrite = rewrite_for_late_decode(sql, &sig, &equality_filters);
+            rewrite.sql
         } else {
             sql.to_string()
         };
