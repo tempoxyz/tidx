@@ -20,8 +20,12 @@ pub struct ClickHouseEngine {
     admin_client: Client,
     /// Pooled HTTP client for queries (reuses connections)
     http_client: reqwest::Client,
-    /// ClickHouse HTTP URL
+    /// ClickHouse HTTP URL (without credentials)
     url: String,
+    /// Username for HTTP auth
+    username: String,
+    /// Password for HTTP auth
+    password: String,
     /// Database name for this chain (e.g., "tidx_4217" for chain 4217)
     database: String,
     /// Chain ID
@@ -33,9 +37,27 @@ impl ClickHouseEngine {
     pub fn new(config: &ClickHouseConfig, chain_id: u64, _pg_url: &str) -> Result<Self> {
         let database = format!("tidx_{chain_id}");
         
-        // Admin client without database (for CREATE DATABASE and other DDL)
-        let admin_client = Client::default()
-            .with_url(&config.url);
+        // Parse URL to extract auth credentials
+        let parsed_url = url::Url::parse(&config.url)
+            .map_err(|e| anyhow!("Invalid ClickHouse URL: {e}"))?;
+        let username = if parsed_url.username().is_empty() { 
+            "default".to_string() 
+        } else { 
+            parsed_url.username().to_string() 
+        };
+        let password = parsed_url.password().unwrap_or("").to_string();
+        
+        // Reconstruct URL without credentials for display/logging
+        let mut clean_url = parsed_url.clone();
+        clean_url.set_username("").ok();
+        clean_url.set_password(None).ok();
+        let base_url = clean_url.to_string().trim_end_matches('/').to_string();
+        
+        // Admin client with auth (for CREATE DATABASE and other DDL)
+        let mut admin_client = Client::default().with_url(&config.url);
+        if !password.is_empty() {
+            admin_client = admin_client.with_user(&username).with_password(&password);
+        }
         
         // Pooled HTTP client for queries (connection pooling, keep-alive)
         let http_client = reqwest::Client::builder()
@@ -46,7 +68,9 @@ impl ClickHouseEngine {
         Ok(Self {
             admin_client,
             http_client,
-            url: config.url.clone(),
+            url: base_url,
+            username,
+            password,
             database,
             chain_id,
         })
@@ -86,9 +110,12 @@ impl ClickHouseEngine {
             self.database
         );
         
-        let resp = self.http_client
-            .post(&url)
-            .body(sql.clone())
+        let mut req = self.http_client.post(&url).body(sql.clone());
+        if !self.password.is_empty() {
+            req = req.basic_auth(&self.username, Some(&self.password));
+        }
+        
+        let resp = req
             .send()
             .await
             .map_err(|e| anyhow!("ClickHouse HTTP request failed: {e}"))?;
