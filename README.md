@@ -281,13 +281,47 @@ curl http://localhost:8080/status
 ```
 GET /health                                              Health check
 GET /status                                              Sync status for all chains
-GET /query                                               Execute SQL query (auto-routed)
+GET /query                                               Execute SQL query
     ?sql                    string    (required)         SQL query (SELECT only)
     ?chainId                number    (required)         Chain ID to query
     ?signature              string                       Event signature for CTE generation
-    ?engine                 string    = (auto)           Force engine: postgres or clickhouse
+    ?engine                 string    = postgres         Engine: postgres or clickhouse
     ?live                   bool      = false            Enable SSE streaming on new blocks
+POST /views                                              Create ClickHouse materialized view
+    ?chainId                number    (required)         Chain ID
+    Authorization: Bearer <api_key>  (required)          API key for authentication
+    Body: CREATE MATERIALIZED VIEW ...                   ClickHouse DDL (view name auto-prefixed)
 GET /metrics                                             Prometheus metrics
+```
+
+### Creating Materialized Views
+
+For expensive OLAP queries (e.g., token holder rankings), create a materialized view that pre-aggregates data:
+
+```bash
+curl -X POST "http://localhost:8080/views?chainId=42431" \
+  -H "Authorization: Bearer your-api-key" \
+  -H "Content-Type: text/plain" \
+  -d "CREATE MATERIALIZED VIEW token_balances
+ENGINE = SummingMergeTree()
+ORDER BY (token, holder)
+SETTINGS allow_nullable_key = 1
+AS SELECT 
+    concat('0x', lower(substring(address, 3))) AS token,
+    concat('0x', lower(substring(topic2, 27))) AS holder,
+    reinterpretAsInt256(reverse(unhex(substring(data, 3, 64)))) AS balance
+FROM logs
+WHERE selector = '\\xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef'"
+```
+
+Response:
+```json
+{"ok":true,"view_name":"token_balances","database":"tidx_views_42431"}
+```
+
+Then query the view via the `/query` endpoint:
+```bash
+curl "http://localhost:8080/query?chainId=42431&engine=clickhouse&sql=SELECT holder, sum(balance) as balance FROM tidx_views_42431.token_balances WHERE token = '0x...' GROUP BY holder ORDER BY balance DESC LIMIT 10"
 ```
 
 ## Schemas
