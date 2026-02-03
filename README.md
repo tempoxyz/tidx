@@ -74,7 +74,7 @@ curl "https://tidx.example.com/query \
 
 # ClickHouse (OLAP) - query pre-computed views
 curl "https://tidx.example.com/views?chainId=4217"
-> {"ok":true,"views":[{"name":"top_holders"},{"name":"daily_volume"}]}
+> {"ok":true,"views":[{"name":"top_holders","columns":[{"name":"holder","type":"String"},{"name":"balance","type":"UInt256"}]}]}
 
 curl "https://tidx.example.com/query \
   ?chainId=4217 \
@@ -364,8 +364,15 @@ curl "https://tidx.example.com/views?chainId=42431"
 {
   "ok": true,
   "views": [
-    {"name": "token_holders", "engine": "MaterializedView", "database": "analytics_42431"},
-    {"name": "token_balances", "engine": "SummingMergeTree", "database": "analytics_42431"}
+    {
+      "name": "token_holders",
+      "engine": "MaterializedView",
+      "database": "analytics_42431",
+      "columns": [
+        {"name": "holder", "type": "String"},
+        {"name": "balance", "type": "UInt256"}
+      ]
+    }
   ]
 }
 ```
