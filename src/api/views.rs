@@ -357,6 +357,7 @@ pub async fn get_view(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use insta::assert_snapshot;
 
     #[test]
     fn test_valid_view_name() {
@@ -371,281 +372,148 @@ mod tests {
     }
 
     // ========================================================================
-    // Signature CTE Generation Tests for Views
+    // Helper to generate full SQL from signature + user query
+    // ========================================================================
+    
+    fn generate_view_sql(signature: &str, user_sql: &str) -> String {
+        let sig = EventSignature::parse(signature).unwrap();
+        let sql = sig.rewrite_filters_for_pushdown(user_sql);
+        let cte = sig.to_cte_sql_clickhouse();
+        format!("WITH {} {}", cte, sql)
+    }
+
+    // ========================================================================
+    // Snapshot Tests for CTE Generation
+    // ========================================================================
+
+    // ========================================================================
+    // CTE Snapshot Tests
     // ========================================================================
 
     #[test]
-    fn test_signature_generates_cte_for_transfer() {
-        let sig = EventSignature::parse(
-            "Transfer(address indexed from, address indexed to, uint256 value)"
-        ).unwrap();
-        
-        let user_sql = r#"SELECT "to", SUM("value") as total FROM Transfer GROUP BY "to""#;
-        let cte = sig.to_cte_sql_clickhouse();
-        let full_sql = format!("WITH {} {}", cte, user_sql);
-        
-        // CTE should include decoded columns
-        assert!(full_sql.contains("AS \"from\""));
-        assert!(full_sql.contains("AS \"to\""));
-        assert!(full_sql.contains("AS \"value\""));
-        
-        // CTE should have proper ClickHouse decode functions
-        assert!(full_sql.contains("concat('0x', lower(substring("));  // address decode
-        assert!(full_sql.contains("reinterpretAsUInt256"));           // uint256 decode
-        
-        // User's query is preserved
-        assert!(full_sql.contains(r#"SELECT "to", SUM("value") as total"#));
+    fn test_cte_transfer() {
+        let sql = generate_view_sql(
+            "Transfer(address indexed from, address indexed to, uint256 value)",
+            r#"SELECT "to", SUM("value") as total FROM Transfer GROUP BY "to""#,
+        );
+        assert_snapshot!(sql);
     }
 
     #[test]
-    fn test_signature_generates_cte_for_swap() {
-        let sig = EventSignature::parse(
-            "Swap(address indexed sender, uint256 amount0In, uint256 amount1In, uint256 amount0Out, uint256 amount1Out, address indexed to)"
-        ).unwrap();
-        
-        let cte = sig.to_cte_sql_clickhouse();
-        
-        // Indexed params: sender (topic1), to (topic2)
-        assert!(cte.contains("AS \"sender\""));
-        assert!(cte.contains("AS \"to\""));
-        
-        // Non-indexed data params
-        assert!(cte.contains("AS \"amount0In\""));
-        assert!(cte.contains("AS \"amount1In\""));
-        assert!(cte.contains("AS \"amount0Out\""));
-        assert!(cte.contains("AS \"amount1Out\""));
+    fn test_cte_swap() {
+        let sql = generate_view_sql(
+            "Swap(address indexed sender, uint256 amount0In, uint256 amount1In, uint256 amount0Out, uint256 amount1Out, address indexed to)",
+            r#"SELECT address, "sender", "amount0In" FROM Swap LIMIT 10"#,
+        );
+        assert_snapshot!(sql);
     }
 
     #[test]
-    fn test_signature_with_bool_param() {
+    fn test_cte_bool_param() {
         let sig = EventSignature::parse("Paused(bool paused)").unwrap();
-        let cte = sig.to_cte_sql_clickhouse();
-        
-        // Bool decode uses unhex comparison
-        assert!(cte.contains("unhex("));
-        assert!(cte.contains("!= unhex('00')"));
-        assert!(cte.contains("AS \"paused\""));
+        assert_snapshot!(sig.to_cte_sql_clickhouse());
     }
 
     #[test]
-    fn test_signature_with_bytes32_indexed() {
+    fn test_cte_bytes32_indexed() {
         let sig = EventSignature::parse(
             "RoleGranted(bytes32 indexed role, address indexed account, address indexed sender)"
         ).unwrap();
-        
-        let cte = sig.to_cte_sql_clickhouse();
-        
-        // bytes32 indexed is passed through as hex
-        assert!(cte.contains("AS \"role\""));
-        assert!(cte.contains("AS \"account\""));
-        assert!(cte.contains("AS \"sender\""));
+        assert_snapshot!(sig.to_cte_sql_clickhouse());
     }
 
     #[test]
-    fn test_signature_with_int256() {
+    fn test_cte_int256() {
         let sig = EventSignature::parse("PriceUpdate(int256 price)").unwrap();
-        let cte = sig.to_cte_sql_clickhouse();
-        
-        // int256 uses reinterpretAsInt256
-        assert!(cte.contains("reinterpretAsInt256"));
-        assert!(cte.contains("AS \"price\""));
+        assert_snapshot!(sig.to_cte_sql_clickhouse());
     }
 
     #[test]
-    fn test_signature_predicate_pushdown_in_view() {
-        let sig = EventSignature::parse(
-            "Transfer(address indexed from, address indexed to, uint256 value)"
-        ).unwrap();
-        
-        // User query with filter on decoded column
-        let user_sql = r#"SELECT "value" FROM Transfer WHERE "from" = '0xdAC17F958D2ee523a2206206994597C13D831ec7'"#;
-        
-        // Apply pushdown
-        let rewritten = sig.rewrite_filters_for_pushdown(user_sql);
-        
-        // Should rewrite to topic1 with left-padded address
-        assert!(rewritten.contains("topic1 = '0x000000000000000000000000dac17f958d2ee523a2206206994597c13d831ec7'"));
-        assert!(!rewritten.contains(r#""from" ="#));
-    }
-
-    #[test]
-    fn test_signature_multiple_filters_pushdown() {
-        let sig = EventSignature::parse(
-            "Transfer(address indexed from, address indexed to, uint256 value)"
-        ).unwrap();
-        
-        let user_sql = r#"SELECT "value" FROM Transfer WHERE "from" = '0xdAC17F958D2ee523a2206206994597C13D831ec7' AND "to" = '0xa726a1CD723409074DF9108A2187cfA19899aCF8'"#;
-        let rewritten = sig.rewrite_filters_for_pushdown(user_sql);
-        
-        // Both should be rewritten
-        assert!(rewritten.contains("topic1 = '0x000000000000000000000000dac17f958d2ee523a2206206994597c13d831ec7'"));
-        assert!(rewritten.contains("topic2 = '0x000000000000000000000000a726a1cd723409074df9108a2187cfa19899acf8'"));
-    }
-
-    #[test]
-    fn test_signature_non_indexed_not_pushed_down() {
-        let sig = EventSignature::parse(
-            "Transfer(address indexed from, address indexed to, uint256 value)"
-        ).unwrap();
-        
-        // "value" is not indexed - should not be rewritten
-        let user_sql = r#"SELECT * FROM Transfer WHERE "value" > 1000000"#;
-        let rewritten = sig.rewrite_filters_for_pushdown(user_sql);
-        
-        // Should remain unchanged (no equality filter on value anyway)
-        assert_eq!(user_sql, rewritten);
-    }
-
-    #[test]
-    fn test_signature_invalid_address_not_pushed_down() {
-        let sig = EventSignature::parse(
-            "Transfer(address indexed from, address indexed to, uint256 value)"
-        ).unwrap();
-        
-        // Invalid address (too short) - should not be rewritten
-        let user_sql = r#"SELECT * FROM Transfer WHERE "from" = '0xabc'"#;
-        let rewritten = sig.rewrite_filters_for_pushdown(user_sql);
-        
-        // Should remain unchanged
-        assert_eq!(user_sql, rewritten);
-    }
-
-    #[test]
-    fn test_signature_parse_error() {
-        // Missing closing paren
-        let result = EventSignature::parse("Transfer(address indexed from");
-        assert!(result.is_err());
-        
-        // Empty name
-        let result = EventSignature::parse("(address from)");
-        assert!(result.is_err());
-        
-        // Invalid type
-        let result = EventSignature::parse("Transfer(invalid_type from)");
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_cte_selector_filter() {
-        let sig = EventSignature::parse(
-            "Transfer(address indexed from, address indexed to, uint256 value)"
-        ).unwrap();
-        
-        let cte = sig.to_cte_sql_clickhouse();
-        
-        // CTE should filter by selector (topic0)
-        // Transfer selector: 0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef
-        assert!(cte.contains("selector ="));
-        assert!(cte.contains("ddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef"));
-    }
-
-    #[test]
-    fn test_cte_exposes_raw_columns() {
-        let sig = EventSignature::parse(
-            "Transfer(address indexed from, address indexed to, uint256 value)"
-        ).unwrap();
-        
-        let cte = sig.to_cte_sql_clickhouse();
-        
-        // CTE should expose raw columns for filtering
-        assert!(cte.contains("topic1"));
-        assert!(cte.contains("topic2"));
-        assert!(cte.contains("topic3"));
-        assert!(cte.contains("data"));
-        assert!(cte.contains("selector"));
-    }
-
-    #[test]
-    fn test_full_view_sql_generation() {
-        let sig = EventSignature::parse(
-            "Transfer(address indexed from, address indexed to, uint256 value)"
-        ).unwrap();
-        
-        // Simulate what create_view does
-        let user_sql = r#"SELECT "to", COUNT(*) as cnt, SUM("value") as total FROM Transfer WHERE "from" = '0xdAC17F958D2ee523a2206206994597C13D831ec7' GROUP BY "to""#;
-        
-        // Step 1: Predicate pushdown
-        let sql = sig.rewrite_filters_for_pushdown(user_sql);
-        
-        // Step 2: Add CTE
-        let cte = sig.to_cte_sql_clickhouse();
-        let full_sql = format!("WITH {} {}", cte, sql);
-        
-        // Verify complete SQL has all components
-        assert!(full_sql.starts_with("WITH transfer AS"));
-        assert!(full_sql.contains("topic1 = '0x000000000000000000000000dac17f958d2ee523a2206206994597c13d831ec7'")); // Pushed down filter
-        assert!(full_sql.contains("AS \"to\"")); // Decoded column
-        assert!(full_sql.contains("AS \"value\"")); // Decoded column
-        assert!(full_sql.contains("GROUP BY \"to\"")); // User's GROUP BY preserved
-    }
-
-    #[test]
-    fn test_approval_event_signature() {
+    fn test_cte_approval() {
         let sig = EventSignature::parse(
             "Approval(address indexed owner, address indexed spender, uint256 value)"
         ).unwrap();
-        
-        let cte = sig.to_cte_sql_clickhouse();
-        
-        // Check all params are decoded
-        assert!(cte.contains("AS \"owner\""));
-        assert!(cte.contains("AS \"spender\""));
-        assert!(cte.contains("AS \"value\""));
-        
-        // Check correct topic assignments
-        assert!(cte.contains("topic1")); // owner
-        assert!(cte.contains("topic2")); // spender
+        assert_snapshot!(sig.to_cte_sql_clickhouse());
     }
 
     #[test]
-    fn test_unnamed_params_get_arg_names() {
+    fn test_cte_unnamed_params() {
         let sig = EventSignature::parse(
             "Transfer(address indexed, address indexed, uint256)"
         ).unwrap();
-        
-        let cte = sig.to_cte_sql_clickhouse();
-        
-        // Unnamed params should get arg0, arg1, arg2
-        assert!(cte.contains("AS \"arg0\""));
-        assert!(cte.contains("AS \"arg1\""));
-        assert!(cte.contains("AS \"arg2\""));
+        assert_snapshot!(sig.to_cte_sql_clickhouse());
     }
 
     #[test]
-    fn test_mixed_indexed_and_data_params() {
-        // Deposit(address indexed dst, uint256 wad)
-        // dst is indexed (topic1), wad is in data
+    fn test_cte_deposit() {
         let sig = EventSignature::parse(
             "Deposit(address indexed dst, uint256 wad)"
         ).unwrap();
-        
-        let cte = sig.to_cte_sql_clickhouse();
-        
-        // dst from topic1
-        assert!(cte.contains("topic1"));
-        assert!(cte.contains("AS \"dst\""));
-        
-        // wad from data (first 32 bytes)
-        assert!(cte.contains("AS \"wad\""));
-        assert!(cte.contains("substring(data,")); // Data decode
+        assert_snapshot!(sig.to_cte_sql_clickhouse());
     }
 
     // ========================================================================
-    // Complex Real-World View Tests
+    // Predicate Pushdown Snapshot Tests
     // ========================================================================
 
     #[test]
-    fn test_token_holders_view() {
-        // Token holders view: tracks balance per (token, address)
-        // Needs to sum incoming transfers and subtract outgoing
+    fn test_pushdown_single_address() {
+        let sql = generate_view_sql(
+            "Transfer(address indexed from, address indexed to, uint256 value)",
+            r#"SELECT "value" FROM Transfer WHERE "from" = '0xdAC17F958D2ee523a2206206994597C13D831ec7'"#,
+        );
+        assert_snapshot!(sql);
+    }
+
+    #[test]
+    fn test_pushdown_multiple_addresses() {
+        let sql = generate_view_sql(
+            "Transfer(address indexed from, address indexed to, uint256 value)",
+            r#"SELECT "value" FROM Transfer WHERE "from" = '0xdAC17F958D2ee523a2206206994597C13D831ec7' AND "to" = '0xa726a1CD723409074DF9108A2187cfA19899aCF8'"#,
+        );
+        assert_snapshot!(sql);
+    }
+
+    #[test]
+    fn test_pushdown_non_indexed_unchanged() {
         let sig = EventSignature::parse(
             "Transfer(address indexed from, address indexed to, uint256 value)"
         ).unwrap();
-        
-        // This is a complex query that creates a holder balance view
-        // It unions incoming (+value) and outgoing (-value) transfers
-        let user_sql = r#"
-            SELECT 
+        let user_sql = r#"SELECT * FROM Transfer WHERE "value" > 1000000"#;
+        let rewritten = sig.rewrite_filters_for_pushdown(user_sql);
+        assert_eq!(user_sql, rewritten); // Should be unchanged
+    }
+
+    #[test]
+    fn test_pushdown_invalid_address_unchanged() {
+        let sig = EventSignature::parse(
+            "Transfer(address indexed from, address indexed to, uint256 value)"
+        ).unwrap();
+        let user_sql = r#"SELECT * FROM Transfer WHERE "from" = '0xabc'"#;
+        let rewritten = sig.rewrite_filters_for_pushdown(user_sql);
+        assert_eq!(user_sql, rewritten); // Should be unchanged
+    }
+
+    // ========================================================================
+    // Signature Parse Error Tests
+    // ========================================================================
+
+    #[test]
+    fn test_signature_parse_errors() {
+        assert!(EventSignature::parse("Transfer(address indexed from").is_err());
+        assert!(EventSignature::parse("(address from)").is_err());
+        assert!(EventSignature::parse("Transfer(invalid_type from)").is_err());
+    }
+
+    // ========================================================================
+    // Complex Real-World View Snapshot Tests
+    // ========================================================================
+
+    #[test]
+    fn test_view_token_holders() {
+        let sql = generate_view_sql(
+            "Transfer(address indexed from, address indexed to, uint256 value)",
+            r#"SELECT 
                 address as token,
                 holder,
                 SUM(delta) as balance
@@ -655,34 +523,16 @@ mod tests {
                 SELECT address, "from" as holder, -CAST("value" AS Int256) as delta FROM Transfer
             )
             GROUP BY token, holder
-            HAVING balance > 0
-        "#;
-        
-        let sql = sig.rewrite_filters_for_pushdown(user_sql);
-        let cte = sig.to_cte_sql_clickhouse();
-        let full_sql = format!("WITH {} {}", cte, sql);
-        
-        // Verify CTE has all required decoded columns
-        assert!(full_sql.contains("AS \"from\""));
-        assert!(full_sql.contains("AS \"to\""));
-        assert!(full_sql.contains("AS \"value\""));
-        
-        // Verify user query structure preserved
-        assert!(full_sql.contains("UNION ALL"));
-        assert!(full_sql.contains("GROUP BY token, holder"));
-        assert!(full_sql.contains("HAVING balance > 0"));
+            HAVING balance > 0"#,
+        );
+        assert_snapshot!(sql);
     }
 
     #[test]
-    fn test_token_supply_view() {
-        // Token supply view: tracks total supply per token
-        // Supply = sum of mints (from = 0x0) - sum of burns (to = 0x0)
-        let sig = EventSignature::parse(
-            "Transfer(address indexed from, address indexed to, uint256 value)"
-        ).unwrap();
-        
-        let user_sql = r#"
-            SELECT 
+    fn test_view_token_supply() {
+        let sql = generate_view_sql(
+            "Transfer(address indexed from, address indexed to, uint256 value)",
+            r#"SELECT 
                 address as token,
                 SUM(CASE 
                     WHEN "from" = '0x0000000000000000000000000000000000000000' THEN CAST("value" AS Int256)
@@ -690,199 +540,99 @@ mod tests {
                     ELSE 0
                 END) as supply
             FROM Transfer
-            GROUP BY token
-        "#;
-        
-        let sql = sig.rewrite_filters_for_pushdown(user_sql);
-        let cte = sig.to_cte_sql_clickhouse();
-        let full_sql = format!("WITH {} {}", cte, sql);
-        
-        // Verify structure
-        assert!(full_sql.contains("AS \"from\""));
-        assert!(full_sql.contains("AS \"to\""));
-        assert!(full_sql.contains("AS \"value\""));
-        assert!(full_sql.contains("CASE"));
-        assert!(full_sql.contains("GROUP BY token"));
+            GROUP BY token"#,
+        );
+        assert_snapshot!(sql);
     }
 
     #[test]
-    fn test_transfer_count_per_address_view() {
-        // Count transfers per address (both sent and received)
-        let sig = EventSignature::parse(
-            "Transfer(address indexed from, address indexed to, uint256 value)"
-        ).unwrap();
-        
-        let user_sql = r#"
-            SELECT 
+    fn test_view_transfer_counts() {
+        let sql = generate_view_sql(
+            "Transfer(address indexed from, address indexed to, uint256 value)",
+            r#"SELECT 
                 addr,
                 SUM(sent) as total_sent,
-                SUM(received) as total_received,
-                SUM(sent) + SUM(received) as total_transfers
+                SUM(received) as total_received
             FROM (
                 SELECT "from" as addr, 1 as sent, 0 as received FROM Transfer
                 UNION ALL
                 SELECT "to" as addr, 0 as sent, 1 as received FROM Transfer
             )
-            GROUP BY addr
-            ORDER BY total_transfers DESC
-        "#;
-        
-        let cte = sig.to_cte_sql_clickhouse();
-        let full_sql = format!("WITH {} {}", cte, user_sql);
-        
-        assert!(full_sql.contains("AS \"from\""));
-        assert!(full_sql.contains("AS \"to\""));
-        assert!(full_sql.contains("UNION ALL"));
-        assert!(full_sql.contains("ORDER BY total_transfers DESC"));
+            GROUP BY addr"#,
+        );
+        assert_snapshot!(sql);
     }
 
     #[test]
-    fn test_uniswap_swap_volume_view() {
-        // Uniswap V2 swap volume aggregation
-        let sig = EventSignature::parse(
-            "Swap(address indexed sender, uint256 amount0In, uint256 amount1In, uint256 amount0Out, uint256 amount1Out, address indexed to)"
-        ).unwrap();
-        
-        let user_sql = r#"
-            SELECT 
+    fn test_view_uniswap_volume() {
+        let sql = generate_view_sql(
+            "Swap(address indexed sender, uint256 amount0In, uint256 amount1In, uint256 amount0Out, uint256 amount1Out, address indexed to)",
+            r#"SELECT 
                 address as pair,
                 toStartOfHour(block_timestamp) as hour,
                 COUNT(*) as swap_count,
                 SUM("amount0In") + SUM("amount0Out") as volume0,
                 SUM("amount1In") + SUM("amount1Out") as volume1
             FROM Swap
-            GROUP BY pair, hour
-            ORDER BY hour DESC
-        "#;
-        
-        let cte = sig.to_cte_sql_clickhouse();
-        let full_sql = format!("WITH {} {}", cte, user_sql);
-        
-        // Verify all data params are decoded
-        assert!(full_sql.contains("AS \"sender\""));
-        assert!(full_sql.contains("AS \"amount0In\""));
-        assert!(full_sql.contains("AS \"amount1In\""));
-        assert!(full_sql.contains("AS \"amount0Out\""));
-        assert!(full_sql.contains("AS \"amount1Out\""));
-        assert!(full_sql.contains("AS \"to\""));
-        
-        // Verify aggregation structure
-        assert!(full_sql.contains("toStartOfHour"));
-        assert!(full_sql.contains("GROUP BY pair, hour"));
+            GROUP BY pair, hour"#,
+        );
+        assert_snapshot!(sql);
     }
 
     #[test]
-    fn test_approval_allowances_view() {
-        // Track current allowances from Approval events (last approval wins)
-        let sig = EventSignature::parse(
-            "Approval(address indexed owner, address indexed spender, uint256 value)"
-        ).unwrap();
-        
-        let user_sql = r#"
-            SELECT 
+    fn test_view_approval_allowances() {
+        let sql = generate_view_sql(
+            "Approval(address indexed owner, address indexed spender, uint256 value)",
+            r#"SELECT 
                 address as token,
                 "owner",
                 "spender",
                 argMax("value", block_num) as current_allowance
             FROM Approval
-            GROUP BY token, "owner", "spender"
-        "#;
-        
-        let cte = sig.to_cte_sql_clickhouse();
-        let full_sql = format!("WITH {} {}", cte, user_sql);
-        
-        assert!(full_sql.contains("AS \"owner\""));
-        assert!(full_sql.contains("AS \"spender\""));
-        assert!(full_sql.contains("AS \"value\""));
-        assert!(full_sql.contains("argMax"));
+            GROUP BY token, "owner", "spender""#,
+        );
+        assert_snapshot!(sql);
     }
 
     #[test]
-    fn test_filtered_token_holders_view() {
-        // Token holders for a specific token address
-        let sig = EventSignature::parse(
-            "Transfer(address indexed from, address indexed to, uint256 value)"
-        ).unwrap();
-        
-        // Filter by specific token contract using address column
-        let user_sql = r#"
-            SELECT 
-                "to" as holder,
-                SUM(CAST("value" AS Int256)) as balance
-            FROM Transfer
-            WHERE address = '0xdAC17F958D2ee523a2206206994597C13D831ec7'
-            GROUP BY holder
-            HAVING balance > 0
-        "#;
-        
-        let cte = sig.to_cte_sql_clickhouse();
-        let full_sql = format!("WITH {} {}", cte, user_sql);
-        
-        // Address filter preserved (not a decoded column, no pushdown)
-        assert!(full_sql.contains("address = '0xdAC17F958D2ee523a2206206994597C13D831ec7'"));
-        assert!(full_sql.contains("AS \"to\""));
-        assert!(full_sql.contains("AS \"value\""));
-    }
-
-    #[test]
-    fn test_daily_transfer_stats_view() {
-        // Daily transfer statistics
-        let sig = EventSignature::parse(
-            "Transfer(address indexed from, address indexed to, uint256 value)"
-        ).unwrap();
-        
-        let user_sql = r#"
-            SELECT 
+    fn test_view_daily_stats() {
+        let sql = generate_view_sql(
+            "Transfer(address indexed from, address indexed to, uint256 value)",
+            r#"SELECT 
                 toDate(block_timestamp) as day,
                 address as token,
                 COUNT(*) as transfer_count,
                 COUNT(DISTINCT "from") as unique_senders,
                 COUNT(DISTINCT "to") as unique_receivers,
-                SUM("value") as total_volume,
-                AVG("value") as avg_transfer_size
+                SUM("value") as total_volume
             FROM Transfer
-            GROUP BY day, token
-            ORDER BY day DESC, total_volume DESC
-        "#;
-        
-        let cte = sig.to_cte_sql_clickhouse();
-        let full_sql = format!("WITH {} {}", cte, user_sql);
-        
-        assert!(full_sql.contains("AS \"from\""));
-        assert!(full_sql.contains("AS \"to\""));
-        assert!(full_sql.contains("AS \"value\""));
-        assert!(full_sql.contains("toDate(block_timestamp)"));
-        assert!(full_sql.contains("COUNT(DISTINCT"));
+            GROUP BY day, token"#,
+        );
+        assert_snapshot!(sql);
     }
 
     #[test]
-    fn test_whale_transfers_view() {
-        // Large transfers (whales) - filters on non-indexed value column
-        let sig = EventSignature::parse(
-            "Transfer(address indexed from, address indexed to, uint256 value)"
-        ).unwrap();
-        
-        let user_sql = r#"
-            SELECT 
-                block_num,
-                block_timestamp,
-                address as token,
-                "from",
-                "to",
-                "value"
+    fn test_view_whale_transfers() {
+        let sql = generate_view_sql(
+            "Transfer(address indexed from, address indexed to, uint256 value)",
+            r#"SELECT block_num, "from", "to", "value"
             FROM Transfer
             WHERE "value" > 1000000000000000000000
-            ORDER BY block_num DESC
-        "#;
-        
-        let sql = sig.rewrite_filters_for_pushdown(user_sql);
-        let cte = sig.to_cte_sql_clickhouse();
-        let full_sql = format!("WITH {} {}", cte, sql);
-        
-        // value filter should NOT be pushed down (not indexed, not equality)
-        assert!(full_sql.contains("\"value\" > 1000000000000000000000"));
-        assert!(full_sql.contains("AS \"from\""));
-        assert!(full_sql.contains("AS \"to\""));
-        assert!(full_sql.contains("AS \"value\""));
+            ORDER BY block_num DESC"#,
+        );
+        assert_snapshot!(sql);
+    }
+
+    #[test]
+    fn test_view_filtered_token_holders() {
+        let sql = generate_view_sql(
+            "Transfer(address indexed from, address indexed to, uint256 value)",
+            r#"SELECT "to" as holder, SUM(CAST("value" AS Int256)) as balance
+            FROM Transfer
+            WHERE address = '0xdAC17F958D2ee523a2206206994597C13D831ec7'
+            GROUP BY holder
+            HAVING balance > 0"#,
+        );
+        assert_snapshot!(sql);
     }
 }

@@ -85,6 +85,7 @@ regex-lite = "0.1.8"
 # Testing & Benchmarks
 criterion = { version = "0.5", features = ["async_tokio", "html_reports"] }
 hex-literal = "0.4"
+insta = "1.46.3"
 serial_test = "3"
 tempfile = "3.24.0"
 
