@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.1.1 (2026-02-03)
+
+### Patch Changes
+
+- Fix ClickHouse hex literal handling for MaterializedPostgreSQL.
+**Input**: Use `concat(char(92), 'x...')` instead of `'\x...'` for WHERE clause comparisons because ClickHouse interprets `\x` as an escape sequence.
+**Output**: Convert `\x...` to `0x...` in query results for standard Ethereum hex format, matching PostgreSQL behavior. (by @jxom, [e15afa5](https://github.com/tempoxyz/tidx/commit/e15afa5))
+
 ## 0.1.0 (2026-02-03)
 
 ### Minor Changes
