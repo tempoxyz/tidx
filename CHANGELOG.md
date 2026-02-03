@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.1.3 (2026-02-03)
+
+### Patch Changes
+
+- Trigger release. (by @jxom, [4f89896](https://github.com/tempoxyz/tidx/commit/4f89896))
+
 ## 0.1.2 (2026-02-03)
 
 ### Patch Changes
