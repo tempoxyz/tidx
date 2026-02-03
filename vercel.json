@@ -1,6 +1,11 @@
 {
   "redirects": [
     {
+      "source": "/install",
+      "destination": "/install.sh",
+      "statusCode": 302
+    },
+    {
       "source": "/docker",
       "destination": "/scripts/docker.sh",
       "statusCode": 302
