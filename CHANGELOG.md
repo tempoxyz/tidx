@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.1.2 (2026-02-03)
+
+### Patch Changes
+
+- Fix ClickHouse DDL statement handling. DDL statements like `CREATE DATABASE` and `CREATE TABLE` return empty responses, which previously caused JSON parsing errors. Now handles empty responses gracefully. (by @jxom, [09573e1](https://github.com/tempoxyz/tidx/commit/09573e1))
+
 ## 0.1.1 (2026-02-03)
 
 ### Patch Changes
