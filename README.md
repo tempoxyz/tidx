@@ -53,8 +53,8 @@ tidx uses a hybrid PostgreSQL + ClickHouse architecture. Use the `engine` parame
                                     ┌─────────────────────┐
                                     │      /query         │
                                     │                     │
-                                    │  engine=postgres    │
-                                    │  engine=clickhouse  │
+                                    │  ?signature=...     │◄─── Lazy event decoding
+                                    │  ?engine=...        │     (no pre-registration)
                                     └──────────┬──────────┘
                                                │
                        ┌───────────────────────┴───────────────────────┐
@@ -65,6 +65,14 @@ tidx uses a hybrid PostgreSQL + ClickHouse architecture. Use the `engine` parame
         │    (OLTP)           │ ─────────────────────►  │      (OLAP)         │
         │                     │   MaterializedPG        │                     │
         │  blocks, txs, logs  │                         │  blocks, txs, logs  │
+        │         │           │                         │         │           │
+        │         ▼           │                         │         ▼           │
+        │  ┌─────────────┐    │                         │  ┌─────────────┐    │
+        │  │ Transfer()  │    │                         │  │ Transfer()  │    │
+        │  │ Approval()  │    │                         │  │ Approval()  │    │
+        │  │ ...         │    │                         │  │ ...         │    │
+        │  └─────────────┘    │                         │  └─────────────┘    │
+        │   (lazy decode)     │                         │   (lazy decode)     │
         └─────────────────────┘                         └──────────┬──────────┘
                                                                    │
                                                                    ▼
