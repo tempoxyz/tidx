@@ -50,20 +50,30 @@ curl -L https://tidx.vercel.app/docker | bash
 tidx uses a hybrid PostgreSQL + ClickHouse architecture. Use the `engine` parameter to choose:
 
 ```
-┌─────────────────────┐                         ┌─────────────────────┐
-│    PostgreSQL       │       WAL stream        │     ClickHouse      │
-│    (OLTP)           │ ─────────────────────►  │      (OLAP)         │
-│                     │   MaterializedPG        │                     │
-│  blocks, txs, logs  │                         │  blocks, txs, logs  │
-└─────────────────────┘                         └──────────┬──────────┘
-                                                           │
-                                                           ▼
-                                                ┌─────────────────────┐
-                                                │  Materialized Views │
-                                                │  (auto-updated)     │
-                                                │                     │
-                                                │  top_holders, etc.  │
-                                                └─────────────────────┘
+                                    ┌─────────────────────┐
+                                    │      /query         │
+                                    │                     │
+                                    │  engine=postgres    │
+                                    │  engine=clickhouse  │
+                                    └──────────┬──────────┘
+                                               │
+                       ┌───────────────────────┴───────────────────────┐
+                       │                                               │
+                       ▼                                               ▼
+        ┌─────────────────────┐                         ┌─────────────────────┐
+        │    PostgreSQL       │       WAL stream        │     ClickHouse      │
+        │    (OLTP)           │ ─────────────────────►  │      (OLAP)         │
+        │                     │   MaterializedPG        │                     │
+        │  blocks, txs, logs  │                         │  blocks, txs, logs  │
+        └─────────────────────┘                         └──────────┬──────────┘
+                                                                   │
+                                                                   ▼
+                                                        ┌─────────────────────┐
+                                                        │  Materialized Views │
+                                                        │  (auto-updated)     │
+                                                        │                     │
+                                                        │  top_holders, etc.  │
+                                                        └─────────────────────┘
 ```
 
 ```bash
