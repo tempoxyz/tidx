@@ -54,8 +54,16 @@ tidx uses a hybrid PostgreSQL + ClickHouse architecture. Use the `engine` parame
 │    PostgreSQL       │       WAL stream        │     ClickHouse      │
 │    (OLTP)           │ ─────────────────────►  │      (OLAP)         │
 │                     │   MaterializedPG        │                     │
-│  engine=postgres    │                         │  engine=clickhouse  │
-└─────────────────────┘                         └─────────────────────┘
+│  blocks, txs, logs  │                         │  blocks, txs, logs  │
+└─────────────────────┘                         └──────────┬──────────┘
+                                                           │
+                                                           ▼
+                                                ┌─────────────────────┐
+                                                │  Materialized Views │
+                                                │  (auto-updated)     │
+                                                │                     │
+                                                │  top_holders, etc.  │
+                                                └─────────────────────┘
 ```
 
 ```bash
