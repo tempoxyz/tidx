@@ -1,95 +1,16 @@
-name: Create Release
+name: Release
 
 on:
-  workflow_dispatch:
-    inputs:
-      version:
-        description: "Version bump type"
-        required: true
-        default: patch
-        type: choice
-        options:
-          - patch
-          - minor
-          - major
+  push:
+    branches: [main]
 
 jobs:
-  verify:
-    uses: ./.github/workflows/verify.yml
-
-  calculate-version:
-    needs: [verify]
-    name: Calculate Version
-    runs-on: ubuntu-latest
-    outputs:
-      version: ${{ steps.version.outputs.version }}
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Calculate version
-        id: version
-        run: |
-          CURRENT=$(grep '^version = ' Cargo.toml | head -1 | sed 's/version = "\(.*\)"/\1/')
-          MAJOR=$(echo $CURRENT | cut -d. -f1)
-          MINOR=$(echo $CURRENT | cut -d. -f2)
-          PATCH=$(echo $CURRENT | cut -d. -f3)
-          
-          case "${{ inputs.version }}" in
-            major) NEW="$((MAJOR + 1)).0.0" ;;
-            minor) NEW="$MAJOR.$((MINOR + 1)).0" ;;
-            patch) NEW="$MAJOR.$MINOR.$((PATCH + 1))" ;;
-          esac
-          
-          echo "New version: $NEW"
-          echo "version=$NEW" >> $GITHUB_OUTPUT
-
-  publish-docker:
-    needs: [calculate-version]
-    uses: ./.github/workflows/docker.yml
-    permissions:
-      contents: read
-      packages: write
-    with:
-      version: v${{ needs.calculate-version.outputs.version }}
-
   release:
-    name: Create Release
-    needs: [calculate-version, publish-docker]
     runs-on: ubuntu-latest
-    permissions:
-      contents: write
-
     steps:
       - uses: actions/checkout@v4
-
-      - name: Bump version
-        run: |
-          VERSION="${{ needs.calculate-version.outputs.version }}"
-          CURRENT=$(grep '^version = ' Cargo.toml | head -1 | sed 's/version = "\(.*\)"/\1/')
-          sed -i "s/^version = \"$CURRENT\"/version = \"$VERSION\"/" Cargo.toml
-
-      - name: Commit and tag
-        run: |
-          VERSION="${{ needs.calculate-version.outputs.version }}"
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add Cargo.toml
-          git commit -m "chore: release v$VERSION"
-          git tag -a "v$VERSION" -m "Release v$VERSION"
-          git push
-          git push origin "v$VERSION"
-
-      - name: Create Release
-        uses: softprops/action-gh-release@v2
+      - uses: wevm/changelogs-rs@master
         with:
-          tag_name: v${{ needs.calculate-version.outputs.version }}
-          generate_release_notes: true
-
-  binaries:
-    name: Build Binaries
-    needs: [release, calculate-version]
-    uses: ./.github/workflows/binary.yml
-    permissions:
-      contents: write
-    with:
-      tag: v${{ needs.calculate-version.outputs.version }}
+          conventional-commit: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
