@@ -1,0 +1,9 @@
+---
+source: src/service/mod.rs
+expression: sig.to_cte_sql_postgres()
+---
+swap AS (
+    SELECT block_num, block_timestamp, log_idx, tx_idx, tx_hash, address, selector, topic1, topic2, topic3, data, abi_address(topic1) AS "sender", abi_uint(substring(data FROM 1 FOR 32)) AS "amount0In", abi_uint(substring(data FROM 33 FOR 32)) AS "amount1In", abi_uint(substring(data FROM 65 FOR 32)) AS "amount0Out", abi_uint(substring(data FROM 97 FOR 32)) AS "amount1Out", abi_address(topic2) AS "to"
+    FROM logs
+    WHERE selector = '\xd78ad95fa46c994b6551d0da85fc275fe613ce37657fb8d5e3d130840159d822'
+)

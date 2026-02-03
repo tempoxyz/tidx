@@ -313,241 +313,92 @@ fn sanitize_db_error(error: &str) -> String {
 mod tests {
     use super::*;
     use crate::query::{route_query, EventSignature, QueryEngine};
+    use insta::assert_snapshot;
 
     // ========================================================================
     // Event CTE SQL Generation Tests (Both Engines)
     // ========================================================================
-    //
-    // These tests verify that:
-    // 1. Users query decoded columns directly (e.g., "from", "to", "value")
-    // 2. No explicit decode() calls needed - the CTE handles it transparently
-    // 3. Both engines produce the same user-facing column names
-    // ========================================================================
 
     #[test]
-    fn test_transfer_cte_postgres_format() {
+    fn test_transfer_cte_postgres() {
         let sig = EventSignature::parse("Transfer(address indexed from, address indexed to, uint256 value)").unwrap();
-        let cte = sig.to_cte_sql_postgres();
-        
-        // Postgres CTE uses bytea selector format
-        assert!(cte.contains("WHERE selector = '\\x"));
-        // Uses native abi_* functions - users don't need to call these
-        assert!(cte.contains("abi_address(topic1)"));
-        assert!(cte.contains("abi_address(topic2)"));
-        assert!(cte.contains("abi_uint(substring(data FROM 1 FOR 32))"));
-        // Has correct column aliases - users query these directly
-        assert!(cte.contains("AS \"from\""));
-        assert!(cte.contains("AS \"to\""));
-        assert!(cte.contains("AS \"value\""));
+        assert_snapshot!(sig.to_cte_sql_postgres());
     }
 
     #[test]
-    fn test_transfer_cte_clickhouse_format() {
+    fn test_transfer_cte_clickhouse() {
         let sig = EventSignature::parse("Transfer(address indexed from, address indexed to, uint256 value)").unwrap();
-        let cte = sig.to_cte_sql_clickhouse();
-        
-        // ClickHouse CTE uses string comparison for selector (MaterializedPostgreSQL format)
-        assert!(cte.contains(r"WHERE selector = '\\x"));
-        // Uses substring to extract address from hex string (last 40 chars)
-        assert!(cte.contains("concat('0x', lower(substring(topic1, 27)))"));
-        assert!(cte.contains("concat('0x', lower(substring(topic2, 27)))"));
-        // Uses unhex + reinterpret for uint decoding
-        assert!(cte.contains("reinterpretAsUInt256(reverse(unhex(substring(data"));
+        assert_snapshot!(sig.to_cte_sql_clickhouse());
     }
 
     #[test]
-    fn test_approval_cte_both_engines() {
+    fn test_approval_cte_postgres() {
         let sig = EventSignature::parse("Approval(address indexed owner, address indexed spender, uint256 value)").unwrap();
-        
-        let pg_cte = sig.to_cte_sql_postgres();
-        let ch_cte = sig.to_cte_sql_clickhouse();
-        
-        // Both should have the same structure but different function calls
-        assert!(pg_cte.contains("AS \"owner\""));
-        assert!(ch_cte.contains("AS \"owner\""));
-        
-        // Postgres uses abi_address UDFs, ClickHouse uses substring on hex strings
-        assert!(pg_cte.contains("abi_address(topic1)"));
-        assert!(ch_cte.contains("substring(topic1, 27)"));
+        assert_snapshot!(sig.to_cte_sql_postgres());
     }
 
     #[test]
-    fn test_swap_cte_multiple_data_params() {
-        // Swap has 4 data params and 2 indexed params
+    fn test_approval_cte_clickhouse() {
+        let sig = EventSignature::parse("Approval(address indexed owner, address indexed spender, uint256 value)").unwrap();
+        assert_snapshot!(sig.to_cte_sql_clickhouse());
+    }
+
+    #[test]
+    fn test_swap_cte_postgres() {
         let sig = EventSignature::parse(
             "Swap(address indexed sender, uint256 amount0In, uint256 amount1In, uint256 amount0Out, uint256 amount1Out, address indexed to)"
         ).unwrap();
-        
-        let pg_cte = sig.to_cte_sql_postgres();
-        let ch_cte = sig.to_cte_sql_clickhouse();
-        
-        // Check indexed params use topics
-        assert!(pg_cte.contains("abi_address(topic1)"));
-        assert!(pg_cte.contains("abi_address(topic2)"));
-        
-        // Check data params use correct offsets (0, 32, 64, 96 bytes)
-        assert!(pg_cte.contains("substring(data FROM 1 FOR 32)"));   // offset 0
-        assert!(pg_cte.contains("substring(data FROM 33 FOR 32)"));  // offset 32
-        assert!(pg_cte.contains("substring(data FROM 65 FOR 32)"));  // offset 64
-        assert!(pg_cte.contains("substring(data FROM 97 FOR 32)"));  // offset 96
-        
-        // ClickHouse uses hex-based offsets: hex_start = 3 + offset*2, and 64 chars for 32 bytes
-        assert!(ch_cte.contains("substring(data, 3, 64)"));    // offset 0: 3 + 0*2 = 3
-        assert!(ch_cte.contains("substring(data, 67, 64)"));   // offset 32: 3 + 32*2 = 67
-        assert!(ch_cte.contains("substring(data, 131, 64)"));  // offset 64: 3 + 64*2 = 131
-        assert!(ch_cte.contains("substring(data, 195, 64)"));  // offset 96: 3 + 96*2 = 195
+        assert_snapshot!(sig.to_cte_sql_postgres());
     }
 
     #[test]
-    fn test_filtered_cte_only_includes_used_columns() {
+    fn test_swap_cte_clickhouse() {
+        let sig = EventSignature::parse(
+            "Swap(address indexed sender, uint256 amount0In, uint256 amount1In, uint256 amount0Out, uint256 amount1Out, address indexed to)"
+        ).unwrap();
+        assert_snapshot!(sig.to_cte_sql_clickhouse());
+    }
+
+    #[test]
+    fn test_paused_cte_postgres() {
+        let sig = EventSignature::parse("Paused(bool paused)").unwrap();
+        assert_snapshot!(sig.to_cte_sql_postgres());
+    }
+
+    #[test]
+    fn test_paused_cte_clickhouse() {
+        let sig = EventSignature::parse("Paused(bool paused)").unwrap();
+        assert_snapshot!(sig.to_cte_sql_clickhouse());
+    }
+
+    #[test]
+    fn test_role_granted_cte_postgres() {
+        let sig = EventSignature::parse("RoleGranted(bytes32 indexed role, address indexed account, address indexed sender)").unwrap();
+        assert_snapshot!(sig.to_cte_sql_postgres());
+    }
+
+    #[test]
+    fn test_role_granted_cte_clickhouse() {
+        let sig = EventSignature::parse("RoleGranted(bytes32 indexed role, address indexed account, address indexed sender)").unwrap();
+        assert_snapshot!(sig.to_cte_sql_clickhouse());
+    }
+
+    #[test]
+    fn test_filtered_cte_postgres() {
         let sig = EventSignature::parse("Transfer(address indexed from, address indexed to, uint256 value)").unwrap();
-        
         let mut used_columns = std::collections::HashSet::new();
         used_columns.insert("to".to_string());
         used_columns.insert("value".to_string());
-        
-        let pg_cte = sig.to_cte_sql_postgres_filtered(Some(&used_columns));
-        let ch_cte = sig.to_cte_sql_clickhouse_filtered(Some(&used_columns));
-        
-        // Should include "to" and "value"
-        assert!(pg_cte.contains("AS \"to\""));
-        assert!(pg_cte.contains("AS \"value\""));
-        assert!(ch_cte.contains("AS \"to\""));
-        assert!(ch_cte.contains("AS \"value\""));
-        
-        // Should NOT include "from"
-        assert!(!pg_cte.contains("AS \"from\""));
-        assert!(!ch_cte.contains("AS \"from\""));
+        assert_snapshot!(sig.to_cte_sql_postgres_filtered(Some(&used_columns)));
     }
 
     #[test]
-    fn test_cte_with_bool_param() {
-        let sig = EventSignature::parse("Paused(bool paused)").unwrap();
-        
-        let pg_cte = sig.to_cte_sql_postgres();
-        let ch_cte = sig.to_cte_sql_clickhouse();
-        
-        // Postgres uses abi_bool UDF
-        assert!(pg_cte.contains("abi_bool("));
-        // ClickHouse uses unhex comparison on hex string
-        assert!(ch_cte.contains("unhex(") && ch_cte.contains("!= unhex('00')"));
-    }
-
-    #[test]
-    fn test_cte_with_bytes32_param() {
-        let sig = EventSignature::parse("RoleGranted(bytes32 indexed role, address indexed account, address indexed sender)").unwrap();
-        
-        let pg_cte = sig.to_cte_sql_postgres();
-        let ch_cte = sig.to_cte_sql_clickhouse();
-        
-        // bytes32 indexed returns the topic as hex
-        assert!(pg_cte.contains("topic1"));
-        assert!(ch_cte.contains("topic1"));
-    }
-
-    // ========================================================================
-    // User Experience Tests - No Explicit Decoding Required
-    // ========================================================================
-    //
-    // These tests demonstrate that users write simple SQL queries without
-    // needing to call decode functions. The CTE handles decoding transparently.
-    
-    #[test]
-    fn test_user_query_example_transfer_events() {
-        // This is what users write - simple SQL with decoded column names
-        let user_query = r#"SELECT "from", "to", "value" FROM transfer WHERE "value" > 1000000"#;
-        
-        // The system generates the CTE with decode functions
+    fn test_filtered_cte_clickhouse() {
         let sig = EventSignature::parse("Transfer(address indexed from, address indexed to, uint256 value)").unwrap();
-        
-        // For PostgreSQL mode (uses Postgres functions)
-        let pg_cte = sig.to_cte_sql_postgres();
-        let full_pg_query = format!("WITH {} {}", pg_cte, user_query);
-        
-        // For ClickHouse mode (uses native ClickHouse functions)
-        let ch_cte = sig.to_cte_sql_clickhouse();
-        let full_ch_query = format!("WITH {} {}", ch_cte, user_query);
-        
-        // Both produce valid SQL that users can run
-        assert!(full_pg_query.contains("SELECT \"from\", \"to\", \"value\""));
-        assert!(full_ch_query.contains("SELECT \"from\", \"to\", \"value\""));
-        
-        // The decode functions are hidden in the CTE, not in user's query
-        assert!(!user_query.contains("abi_"));
-        assert!(!user_query.contains("decode"));
-    }
-
-    #[test]
-    fn test_user_query_example_group_by_address() {
-        // User wants to count transfers by recipient - no decode calls needed
-        let user_query = r#"SELECT "to", COUNT(*) as transfer_count, SUM("value") as total_value FROM transfer GROUP BY "to" ORDER BY total_value DESC LIMIT 10"#;
-        
-        let sig = EventSignature::parse("Transfer(address indexed from, address indexed to, uint256 value)").unwrap();
-        let cte = sig.to_cte_sql_postgres();
-        let full_query = format!("WITH {} {}", cte, user_query);
-        
-        // User query is clean - no decode functions visible
-        assert!(!user_query.contains("abi_"));
-        assert!(!user_query.contains("topic"));
-        assert!(!user_query.contains("data"));
-        
-        // But the full query has the CTE with decode logic
-        assert!(full_query.contains("abi_address"));
-        assert!(full_query.contains("abi_uint"));
-    }
-
-    #[test]
-    fn test_user_query_example_swap_events() {
-        // Complex Uniswap Swap event - user just queries by column name
-        let user_query = r#"SELECT "sender", "amount0In", "amount1Out" FROM swap WHERE "amount0In" > 0"#;
-        
-        let sig = EventSignature::parse(
-            "Swap(address indexed sender, uint256 amount0In, uint256 amount1In, uint256 amount0Out, uint256 amount1Out, address indexed to)"
-        ).unwrap();
-        
-        let cte = sig.to_cte_sql_postgres();
-        let full_query = format!("WITH {} {}", cte, user_query);
-        
-        // User query references decoded column names directly
-        assert!(user_query.contains("\"sender\""));
-        assert!(user_query.contains("\"amount0In\""));
-        assert!(user_query.contains("\"amount1Out\""));
-        
-        // No raw data manipulation in user query
-        assert!(!user_query.contains("substring"));
-        assert!(!user_query.contains("encode"));
-        
-        // CTE handles the complexity
-        assert!(full_query.contains("abi_uint"));
-        assert!(full_query.contains("abi_address"));
-    }
-
-    #[test]
-    fn test_both_engines_produce_same_column_names() {
-        let sig = EventSignature::parse("Transfer(address indexed from, address indexed to, uint256 value)").unwrap();
-        
-        let pg_cte = sig.to_cte_sql_postgres();
-        let ch_cte = sig.to_cte_sql_clickhouse();
-        
-        // Both engines expose the same column names to users
-        assert!(pg_cte.contains("AS \"from\""));
-        assert!(ch_cte.contains("AS \"from\""));
-        
-        assert!(pg_cte.contains("AS \"to\""));
-        assert!(ch_cte.contains("AS \"to\""));
-        
-        assert!(pg_cte.contains("AS \"value\""));
-        assert!(ch_cte.contains("AS \"value\""));
-        
-        // Users can write the same query regardless of engine
-        let user_query = r#"SELECT "from", "to", "value" FROM transfer"#;
-        
-        // Both work with the same user query
-        let pg_full = format!("WITH {} {}", pg_cte, user_query);
-        let ch_full = format!("WITH {} {}", ch_cte, user_query);
-        
-        assert!(pg_full.contains(user_query));
-        assert!(ch_full.contains(user_query));
+        let mut used_columns = std::collections::HashSet::new();
+        used_columns.insert("to".to_string());
+        used_columns.insert("value".to_string());
+        assert_snapshot!(sig.to_cte_sql_clickhouse_filtered(Some(&used_columns)));
     }
 
     // ========================================================================

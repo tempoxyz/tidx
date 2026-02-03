@@ -1,0 +1,9 @@
+---
+source: src/service/mod.rs
+expression: sig.to_cte_sql_postgres()
+---
+approval AS (
+    SELECT block_num, block_timestamp, log_idx, tx_idx, tx_hash, address, selector, topic1, topic2, topic3, data, abi_address(topic1) AS "owner", abi_address(topic2) AS "spender", abi_uint(substring(data FROM 1 FOR 32)) AS "value"
+    FROM logs
+    WHERE selector = '\x8c5be1e5ebec7d5bd14f71427d1e84f3dd0314c0f7b2291e5b200ac8c7c3b925'
+)
