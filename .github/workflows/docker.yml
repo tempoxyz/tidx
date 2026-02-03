@@ -2,8 +2,9 @@ name: Publish Docker
 
 on:
   workflow_dispatch:
-  release:
-    types: [published]
+  push:
+    tags:
+      - 'tidx@*'
 
 env:
   CARGO_TERM_COLOR: always
