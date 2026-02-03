@@ -74,12 +74,12 @@ curl "https://tidx.example.com/query \
 
 # ClickHouse (OLAP) - query pre-computed views
 curl "https://tidx.example.com/views?chainId=4217"
-> {"ok":true,"views":[{"name":"top_holders"},{"name":"daily_volume"}]}
+> {"ok":true,"views":[{"name":"top_holders","columns":[{"name":"token","type":"String"},{"name":"holder","type":"String"},{"name":"balance","type":"UInt256"}]}]}
 
 curl "https://tidx.example.com/query \
   ?chainId=4217 \
   &engine=clickhouse \
-  &sql=SELECT * FROM top_holders LIMIT 10"
+  &sql=SELECT * FROM top_holders WHERE token = '0x...' LIMIT 10"
 ```
 
 ## Installation
@@ -364,8 +364,16 @@ curl "https://tidx.example.com/views?chainId=42431"
 {
   "ok": true,
   "views": [
-    {"name": "token_holders", "engine": "MaterializedView", "database": "analytics_42431"},
-    {"name": "token_balances", "engine": "SummingMergeTree", "database": "analytics_42431"}
+    {
+      "name": "token_holders",
+      "engine": "MaterializedView",
+      "database": "analytics_42431",
+      "columns": [
+        {"name": "token", "type": "String"},
+        {"name": "holder", "type": "String"},
+        {"name": "balance", "type": "UInt256"}
+      ]
+    }
   ]
 }
 ```

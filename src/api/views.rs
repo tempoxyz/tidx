@@ -25,10 +25,18 @@ pub struct ChainQuery {
 }
 
 #[derive(Serialize)]
+pub struct ColumnInfo {
+    name: String,
+    #[serde(rename = "type")]
+    col_type: String,
+}
+
+#[derive(Serialize)]
 pub struct ViewInfo {
     database: String,
     engine: String,
     name: String,
+    columns: Vec<ColumnInfo>,
 }
 
 #[derive(Serialize)]
@@ -61,13 +69,33 @@ pub async fn list_views(
     let result = clickhouse.query(&sql, None).await
         .map_err(|e| ApiError::QueryError(e.to_string()))?;
 
-    let views: Vec<ViewInfo> = result.rows.iter().map(|row| {
-        ViewInfo {
-            name: row.get(0).and_then(|v| v.as_str()).unwrap_or("").to_string(),
-            engine: row.get(1).and_then(|v| v.as_str()).unwrap_or("").to_string(),
+    let mut views = Vec::new();
+    for row in &result.rows {
+        let name = row.get(0).and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let engine = row.get(1).and_then(|v| v.as_str()).unwrap_or("").to_string();
+        
+        // Get columns for this view
+        let columns_sql = format!(
+            "SELECT name, type FROM system.columns WHERE database = '{}' AND table = '{}' ORDER BY position",
+            database, name
+        );
+        let columns_result = clickhouse.query(&columns_sql, None).await
+            .map_err(|e| ApiError::QueryError(e.to_string()))?;
+        
+        let columns: Vec<ColumnInfo> = columns_result.rows.iter().map(|col_row| {
+            ColumnInfo {
+                name: col_row.get(0).and_then(|v| v.as_str()).unwrap_or("").to_string(),
+                col_type: col_row.get(1).and_then(|v| v.as_str()).unwrap_or("").to_string(),
+            }
+        }).collect();
+        
+        views.push(ViewInfo {
+            name,
+            engine,
             database: database.clone(),
-        }
-    }).collect();
+            columns,
+        });
+    }
 
     Ok(Json(ListViewsResponse { ok: true, views }))
 }
@@ -186,6 +214,7 @@ pub async fn create_view(
             name: table_name.clone(),
             engine: "MaterializedView".to_string(),
             database,
+            columns: vec![],
         },
         backfill_rows,
     }))
@@ -297,6 +326,7 @@ pub async fn get_view(
             name,
             engine,
             database,
+            columns: vec![],
         },
         definition,
         row_count,
