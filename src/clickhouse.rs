@@ -81,6 +81,9 @@ impl ClickHouseEngine {
             sql.to_string()
         };
         
+        // Convert '0x...' hex strings to '\x...' for ClickHouse (MaterializedPostgreSQL format)
+        let sql = sql.replace("'0x", "'\\x");
+        
         let start = std::time::Instant::now();
         
         // Query ClickHouse via HTTP with JSON format (connection pooled)
