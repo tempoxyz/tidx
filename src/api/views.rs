@@ -188,9 +188,9 @@ pub async fn create_view(
         sql
     };
     
-    // Convert '0x...' hex literals to '\x...' for ClickHouse (MaterializedPostgreSQL format)
-    // Only replace hex values (40+ chars), not short '0x' prefixes used in concat()
-    let sql = crate::query::convert_hex_literals(&sql);
+    // Convert '0x...' hex literals to ClickHouse-compatible format
+    // Uses concat(char(92), 'x...') because ClickHouse interprets '\x' as escape sequence
+    let sql = crate::query::convert_hex_literals_clickhouse(&sql);
 
     // 1. Ensure database exists
     let create_db = format!("CREATE DATABASE IF NOT EXISTS {}", database);
@@ -386,10 +386,10 @@ mod tests {
         format!("WITH {} {}", cte, sql)
     }
     
-    /// Generate runtime SQL with 0x -> \x conversion (what actually gets executed)
+    /// Generate runtime SQL with 0x -> ClickHouse format conversion (what actually gets executed)
     fn generate_runtime_sql(signature: &str, user_sql: &str) -> String {
         let sql = generate_view_sql(signature, user_sql);
-        crate::query::convert_hex_literals(&sql)
+        crate::query::convert_hex_literals_clickhouse(&sql)
     }
 
     // ========================================================================

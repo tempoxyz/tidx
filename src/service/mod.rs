@@ -153,7 +153,7 @@ pub async fn execute_query_postgres(
 
     // Convert '0x...' hex literals to '\x...' bytea literals for PostgreSQL
     // Only replace hex values (40+ chars), not short '0x' prefixes used in concat()
-    let sql = crate::query::convert_hex_literals(&sql);
+    let sql = crate::query::convert_hex_literals_postgres(&sql);
 
     let conn = pool.get().await?;
 

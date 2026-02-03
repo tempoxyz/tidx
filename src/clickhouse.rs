@@ -81,9 +81,9 @@ impl ClickHouseEngine {
             sql.to_string()
         };
         
-        // Convert '0x...' hex literals to '\x...' for ClickHouse (MaterializedPostgreSQL format)
-        // Only replace hex values (40+ chars), not short '0x' prefixes used in concat()
-        let sql = crate::query::convert_hex_literals(&sql);
+        // Convert '0x...' hex literals to ClickHouse-compatible format
+        // Uses concat(char(92), 'x...') because ClickHouse interprets '\x' as escape sequence
+        let sql = crate::query::convert_hex_literals_clickhouse(&sql);
         
         let start = std::time::Instant::now();
         
@@ -130,7 +130,11 @@ impl ClickHouseEngine {
                     .map(|row| {
                         columns
                             .iter()
-                            .map(|col| row.get(col).cloned().unwrap_or(serde_json::Value::Null))
+                            .map(|col| {
+                                let value = row.get(col).cloned().unwrap_or(serde_json::Value::Null);
+                                // Convert '\x...' hex strings to '0x...' format for output
+                                normalize_hex_output(value)
+                            })
                             .collect()
                     })
                     .collect()
@@ -272,6 +276,18 @@ async fn add_bloom_indexes(client: &Client, database: &str) -> Result<()> {
     }
     
     Ok(())
+}
+
+/// Convert '\x...' hex strings to '0x...' format for output.
+/// MaterializedPostgreSQL stores bytea as '\x'-prefixed strings, but we want
+/// standard Ethereum '0x...' format in API responses.
+fn normalize_hex_output(value: serde_json::Value) -> serde_json::Value {
+    match value {
+        serde_json::Value::String(s) if s.starts_with("\\x") => {
+            serde_json::Value::String(format!("0x{}", &s[2..]))
+        }
+        other => other,
+    }
 }
 
 /// Global engine registry for multiple chains.

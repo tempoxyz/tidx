@@ -109,6 +109,10 @@ impl EventSignature {
     /// 
     /// Note: MaterializedPostgreSQL stores PostgreSQL bytea as '\x'-prefixed hex strings.
     /// We use substring(..., 3) to strip the '\x' prefix before unhex().
+    /// 
+    /// For output columns, we convert to '0x...' format for standard Ethereum hex representation.
+    /// For WHERE clause comparisons, we use concat(char(92), 'x...') because ClickHouse 
+    /// interprets '\x' as an escape sequence.
     pub fn to_cte_sql_clickhouse_filtered(&self, used_columns: Option<&HashSet<String>>) -> String {
         let selects = self.build_select_expressions_clickhouse(used_columns);
 
@@ -118,19 +122,19 @@ impl EventSignature {
             format!(", {}", selects.join(", "))
         };
 
-        // Always convert tx_hash/address from '\x...' format to '0x...' format
-        // for consistent output regardless of which decoded columns are requested
-        let tx_hash_col = "concat('0x', lower(substring(tx_hash, 3))) AS tx_hash";
-        let address_col = "concat('0x', lower(substring(address, 3))) AS address";
+        // Output tx_hash/address in '0x...' format for standard Ethereum representation
+        let tx_hash_col = r"concat('0x', lower(substring(tx_hash, 3))) AS tx_hash";
+        let address_col = r"concat('0x', lower(substring(address, 3))) AS address";
 
-        // selector is stored as '\xABCD...' string, compare directly
+        // selector is stored as '\xABCD...' string - use concat(char(92), 'x...') for comparison
+        // because ClickHouse interprets '\x' as an escape sequence
         format!(
             r#"{name} AS (
     SELECT block_num, block_timestamp, log_idx, tx_idx, 
            {tx_hash_col},
            {address_col}, selector, topic1, topic2, topic3, data{select_clause}
     FROM logs
-    WHERE selector = '\\x{topic0}'
+    WHERE selector = concat(char(92), 'x{topic0}')
 )"#,
             name = self.name.to_lowercase(),
             tx_hash_col = tx_hash_col,
