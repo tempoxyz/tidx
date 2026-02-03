@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.1.0 (2026-02-03)
+
+### Minor Changes
+
+- Add predicate pushdown for indexed event parameters.
+- Rewrites SQL filters like `"from" = '0x...'` to `topic1 = '0x000...'` to enable index usage
+- Add `signature` parameter to `/views` API for automatic CTE generation and decoding
+- Support both PostgreSQL and ClickHouse query engines (by @jxom, [0bca021](https://github.com/tempoxyz/tidx/commit/0bca021))
+
+### Patch Changes
+
+- Fix hex literal conversion to preserve `0x` prefix in concat expressions.
+- The naive `replace("'0x", "'\\x")` was incorrectly converting `concat('0x', ...)` to `concat('\x', ...)`, causing addresses to display as `\x...` instead of `0x...`. Now uses regex to only convert hex literals with 40+ characters. (by @jxom, [0bca021](https://github.com/tempoxyz/tidx/commit/0bca021))
+
 ## 0.0.37 (2026-02-03)
 
 ### Patch Changes
