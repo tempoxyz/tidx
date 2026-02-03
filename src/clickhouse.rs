@@ -109,6 +109,17 @@ impl ClickHouseEngine {
         let json_response = resp.text().await
             .map_err(|e| anyhow!("Failed to read response: {e}"))?;
         
+        // Handle empty responses (DDL statements like CREATE/DROP return empty)
+        if json_response.trim().is_empty() {
+            return Ok(QueryResult {
+                columns: vec![],
+                rows: vec![],
+                row_count: 0,
+                engine: Some("clickhouse".to_string()),
+                query_time_ms: Some(start.elapsed().as_secs_f64() * 1000.0),
+            });
+        }
+        
         // Parse the JSON response
         let parsed: serde_json::Value = serde_json::from_str(&json_response)
             .map_err(|e| anyhow!("Failed to parse ClickHouse JSON response: {e}"))?;
