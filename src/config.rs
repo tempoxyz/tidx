@@ -188,9 +188,25 @@ pub struct ClickHouseConfig {
     #[serde(default)]
     pub enabled: bool,
 
-    /// ClickHouse HTTP URL (default: http://clickhouse:8123)
+    /// Primary ClickHouse HTTP URL (default: http://clickhouse:8123)
     #[serde(default = "default_clickhouse_url")]
     pub url: String,
+
+    /// Additional ClickHouse instance URLs for failover.
+    /// Each instance runs its own MaterializedPostgreSQL replication.
+    /// Queries go to the primary `url`; failover instances are tried
+    /// in order if the primary is unavailable.
+    #[serde(default)]
+    pub failover_urls: Vec<String>,
+}
+
+impl ClickHouseConfig {
+    /// Returns all URLs: primary first, then failover instances.
+    pub fn all_urls(&self) -> Vec<&str> {
+        let mut urls = vec![self.url.as_str()];
+        urls.extend(self.failover_urls.iter().map(|u| u.as_str()));
+        urls
+    }
 }
 
 impl Default for ClickHouseConfig {
@@ -198,6 +214,7 @@ impl Default for ClickHouseConfig {
         Self {
             enabled: false,
             url: "http://clickhouse:8123".to_string(),
+            failover_urls: Vec::new(),
         }
     }
 }
