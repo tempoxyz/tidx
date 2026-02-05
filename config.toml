@@ -19,10 +19,13 @@ batch_size = 500
 concurrency = 8
 
 # ClickHouse OLAP engine (optional)
-# Uses MaterializedPostgreSQL for real-time WAL replication
+# Uses MaterializedPostgreSQL for real-time WAL replication.
+# Each instance gets its own replication stream from PostgreSQL.
+# Queries go to the primary; failover instances are tried on connection failure.
 [chains.clickhouse]
 enabled = false
 url = "http://clickhouse:8123"
+# failover_urls = ["http://clickhouse-2:8123"]
 
 [[chains]]
 name = "mainnet"
@@ -37,3 +40,4 @@ concurrency = 8
 [chains.clickhouse]
 enabled = false
 url = "http://clickhouse:8123"
+# failover_urls = ["http://clickhouse-2:8123"]
