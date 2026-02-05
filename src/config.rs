@@ -308,4 +308,54 @@ mod tests {
         assert_eq!(config.window_secs, 60);
         assert_eq!(config.max_sse_connections, 5);
     }
+
+    #[test]
+    fn test_clickhouse_config_with_failover() {
+        let toml_str = r#"
+            name = "test"
+            chain_id = 1
+            rpc_url = "http://localhost:8545"
+            pg_url = "postgres://localhost/test"
+
+            [clickhouse]
+            enabled = true
+            url = "http://clickhouse-1:8123"
+            failover_urls = ["http://clickhouse-2:8123", "http://clickhouse-3:8123"]
+        "#;
+
+        let config: ChainConfig = toml::from_str(toml_str).unwrap();
+        let ch = config.clickhouse.unwrap();
+
+        assert!(ch.enabled);
+        assert_eq!(ch.url, "http://clickhouse-1:8123");
+        assert_eq!(ch.failover_urls.len(), 2);
+        assert_eq!(
+            ch.all_urls(),
+            vec![
+                "http://clickhouse-1:8123",
+                "http://clickhouse-2:8123",
+                "http://clickhouse-3:8123",
+            ]
+        );
+    }
+
+    #[test]
+    fn test_clickhouse_config_without_failover() {
+        let toml_str = r#"
+            name = "test"
+            chain_id = 1
+            rpc_url = "http://localhost:8545"
+            pg_url = "postgres://localhost/test"
+
+            [clickhouse]
+            enabled = true
+            url = "http://clickhouse:8123"
+        "#;
+
+        let config: ChainConfig = toml::from_str(toml_str).unwrap();
+        let ch = config.clickhouse.unwrap();
+
+        assert!(ch.failover_urls.is_empty());
+        assert_eq!(ch.all_urls(), vec!["http://clickhouse:8123"]);
+    }
 }
