@@ -218,6 +218,7 @@ async fn initialize_chain(
         let config = ChainClickHouseConfig {
             enabled: ch_config.enabled,
             url: ch_config.url.clone(),
+            failover_urls: ch_config.failover_urls.clone(),
         };
         clickhouse_configs.write().await.insert(chain.chain_id, config);
         info!(chain = %chain.name, "ClickHouse OLAP engine configured");

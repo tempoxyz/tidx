@@ -40,6 +40,7 @@ pub type SharedClickHouseEngines = Arc<RwLock<HashMap<u64, Arc<ClickHouseEngine>
 pub struct ChainClickHouseConfig {
     pub enabled: bool,
     pub url: String,
+    pub failover_urls: Vec<String>,
 }
 
 pub type SharedClickHouseConfigs = Arc<RwLock<HashMap<u64, ChainClickHouseConfig>>>;
