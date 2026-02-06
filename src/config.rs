@@ -38,7 +38,7 @@ pub struct HttpConfig {
     #[serde(default)]
     pub api_keys: Vec<String>,
 
-    /// Trusted CIDRs for admin operations (e.g., ["100.64.0.0/10"] for Tailscale)
+    /// Trusted CIDRs for admin operations (e.g., `100.64.0.0/10` for Tailscale)
     #[serde(default)]
     pub trusted_cidrs: Vec<String>,
 
@@ -149,8 +149,15 @@ pub struct ChainConfig {
     /// RPC URL
     pub rpc_url: String,
 
-    /// Database connection URL for this chain
+    /// Database connection URL for this chain.
+    /// If `pg_password_env` is set, the password in this URL will be replaced
+    /// with the value from that environment variable.
     pub pg_url: String,
+
+    /// Environment variable name containing the PostgreSQL password.
+    /// When set, the password portion of `pg_url` is replaced with this value.
+    #[serde(default)]
+    pub pg_password_env: Option<String>,
 
     /// Enable backfill to genesis (default: true)
     #[serde(default = "default_backfill")]
@@ -225,6 +232,29 @@ fn default_clickhouse_url() -> String {
 
 fn default_backfill() -> bool {
     true
+}
+
+impl ChainConfig {
+    /// Returns the PostgreSQL connection URL with password resolved from environment if configured.
+    /// If `pg_password_env` is set, replaces the password in `pg_url` with the env var value.
+    pub fn resolved_pg_url(&self) -> Result<String> {
+        match &self.pg_password_env {
+            Some(env_var) => {
+                let password = std::env::var(env_var).with_context(|| {
+                    format!("pg_password_env '{env_var}' is set but environment variable not found")
+                })?;
+                
+                let mut url = url::Url::parse(&self.pg_url)
+                    .with_context(|| format!("Invalid pg_url: {}", self.pg_url))?;
+                
+                url.set_password(Some(&password))
+                    .map_err(|()| anyhow::anyhow!("Failed to set password in pg_url"))?;
+                
+                Ok(url.to_string())
+            }
+            None => Ok(self.pg_url.clone()),
+        }
+    }
 }
 
 fn default_batch_size() -> u64 {
@@ -357,5 +387,66 @@ mod tests {
 
         assert!(ch.failover_urls.is_empty());
         assert_eq!(ch.all_urls(), vec!["http://clickhouse:8123"]);
+    }
+
+    #[test]
+    fn test_resolved_pg_url_without_env() {
+        let config = ChainConfig {
+            name: "test".to_string(),
+            chain_id: 1,
+            rpc_url: "http://localhost:8545".to_string(),
+            pg_url: "postgres://user:pass@localhost/db".to_string(),
+            pg_password_env: None,
+            backfill: true,
+            batch_size: 100,
+            concurrency: 4,
+            backfill_first: false,
+            trust_rpc: false,
+            clickhouse: None,
+        };
+        
+        assert_eq!(config.resolved_pg_url().unwrap(), "postgres://user:pass@localhost/db");
+    }
+
+    #[test]
+    fn test_resolved_pg_url_with_env() {
+        std::env::set_var("TEST_PG_PASSWORD_123", "secret123");
+        
+        let config = ChainConfig {
+            name: "test".to_string(),
+            chain_id: 1,
+            rpc_url: "http://localhost:8545".to_string(),
+            pg_url: "postgres://user:placeholder@localhost/db".to_string(),
+            pg_password_env: Some("TEST_PG_PASSWORD_123".to_string()),
+            backfill: true,
+            batch_size: 100,
+            concurrency: 4,
+            backfill_first: false,
+            trust_rpc: false,
+            clickhouse: None,
+        };
+        
+        assert_eq!(config.resolved_pg_url().unwrap(), "postgres://user:secret123@localhost/db");
+        
+        std::env::remove_var("TEST_PG_PASSWORD_123");
+    }
+
+    #[test]
+    fn test_resolved_pg_url_missing_env() {
+        let config = ChainConfig {
+            name: "test".to_string(),
+            chain_id: 1,
+            rpc_url: "http://localhost:8545".to_string(),
+            pg_url: "postgres://user:placeholder@localhost/db".to_string(),
+            pg_password_env: Some("NONEXISTENT_VAR_XYZ_999".to_string()),
+            backfill: true,
+            batch_size: 100,
+            concurrency: 4,
+            backfill_first: false,
+            trust_rpc: false,
+            clickhouse: None,
+        };
+        
+        assert!(config.resolved_pg_url().is_err());
     }
 }

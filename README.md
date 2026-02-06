@@ -147,7 +147,8 @@ port = 9090
 name = "mainnet"
 chain_id = 4217
 rpc_url = "https://rpc.tempo.xyz"
-pg_url = "postgres://user:pass@tidx.example.com:5432/tidx_mainnet"
+pg_url = "postgres://user@tidx.example.com:5432/tidx_mainnet"
+pg_password_env = "TIDX_PG_PASSWORD"  # Password from environment variable
 batch_size = 100
 
 # Optional: ClickHouse for OLAP queries (uses MaterializedPostgreSQL)
@@ -159,7 +160,8 @@ url = "http://clickhouse:8123"
 name = "moderato"
 chain_id = 42431
 rpc_url = "https://rpc.moderato.tempo.xyz"
-pg_url = "postgres://user:pass@tidx.example.com:5432/tidx_moderato"
+pg_url = "postgres://user@tidx.example.com:5432/tidx_moderato"
+pg_password_env = "TIDX_PG_PASSWORD"
 ```
 
 ### Reference
@@ -186,6 +188,7 @@ pg_url = "postgres://user:pass@tidx.example.com:5432/tidx_moderato"
 ├── chain_id                u64       (required)     Chain ID
 ├── rpc_url                 string    (required)     JSON-RPC endpoint URL
 ├── pg_url                  string    (required)     PostgreSQL connection string
+├── pg_password_env         string    (optional)     Env var name for PostgreSQL password
 ├── batch_size              u64       = 100          Blocks per RPC batch request
 └── [clickhouse]                                     ClickHouse OLAP settings
     ├── enabled             bool      = false        Enable ClickHouse OLAP queries
