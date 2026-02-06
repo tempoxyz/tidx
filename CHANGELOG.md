@@ -4,6 +4,17 @@
 
 ### Minor Changes
 
+- Support PostgreSQL password via environment variable. Add `pg_password_env` config option to inject the password from an env var into `pg_url` at runtime, avoiding plaintext passwords in config files. Existing configs without `pg_password_env` work unchanged. (by @GeorgiosKonstantopoulos, [#72](https://github.com/tempoxyz/tidx/pull/72))
+- Add ClickHouse failover support for multi-instance per chain. Reads go to the primary instance; connection-level errors (refused/timeout/DNS) trigger automatic failover to the next instance. Each instance runs its own MaterializedPostgreSQL replication. Configure with `failover_urls` in `[chains.clickhouse]`. Existing single-URL configs work unchanged. (by @GeorgiosKonstantopoulos, [#71](https://github.com/tempoxyz/tidx/pull/71))
+
+### Patch Changes
+
+- Handle SIGTERM for graceful container shutdown. Previously only SIGINT (ctrl-c) triggered graceful shutdown; now SIGTERM from Kubernetes/Docker also triggers the same broadcast for clean connection draining. (by @GeorgiosKonstantopoulos, [#71](https://github.com/tempoxyz/tidx/pull/71))
+
+## 0.2.0 (2026-02-06)
+
+### Minor Changes
+
 - Add ClickHouse failover support for multi-instance per chain. Reads go to the primary instance; connection-level errors (refused/timeout/DNS) trigger automatic failover to the next instance. Each instance runs its own MaterializedPostgreSQL replication. Configure with `failover_urls` in `[chains.clickhouse]`. Existing single-URL configs work unchanged. (by @tempo-ai, [a74f174](https://github.com/tempoxyz/tidx/commit/a74f174))
 
 ## 0.1.3 (2026-02-03)
