@@ -150,7 +150,17 @@ async fn print_status(config: &Config) -> Result<()> {
         println!("│");
 
         // Connect to this chain's database
-        let pool = match db::create_pool(&chain.pg_url).await {
+        let pg_url = match chain.resolved_pg_url() {
+            Ok(url) => url,
+            Err(e) => {
+                println!("│  Status: Failed to resolve pg_url");
+                println!("│  Error: {e}");
+                println!("└───────────────────────────────────────────────────────────");
+                println!();
+                continue;
+            }
+        };
+        let pool = match db::create_pool(&pg_url).await {
             Ok(p) => p,
             Err(e) => {
                 println!("│  Status: Database connection failed");
@@ -253,13 +263,17 @@ async fn print_json_status(config: &Config) -> Result<()> {
         let rpc = RpcClient::new(&chain.rpc_url);
         let live_head = rpc.latest_block_number().await.ok();
 
-        let (state, gaps) = if let Ok(pool) = db::create_pool(&chain.pg_url).await {
-            let state = load_sync_state(&pool, chain.chain_id).await.ok().flatten();
-            let tip = state.as_ref().map(|s| s.tip_num).unwrap_or(0);
-            let gaps = detect_all_gaps(&pool, tip).await.unwrap_or_default();
-            (state, gaps)
-        } else {
-            (None, vec![])
+        let (state, gaps) = match chain.resolved_pg_url() {
+            Ok(pg_url) => match db::create_pool(&pg_url).await {
+                Ok(pool) => {
+                    let state = load_sync_state(&pool, chain.chain_id).await.ok().flatten();
+                    let tip = state.as_ref().map(|s| s.tip_num).unwrap_or(0);
+                    let gaps = detect_all_gaps(&pool, tip).await.unwrap_or_default();
+                    (state, gaps)
+                }
+                Err(_) => (None, vec![]),
+            },
+            Err(_) => (None, vec![]),
         };
 
         let gaps_json: Vec<_> = gaps.iter().map(|(s, e)| serde_json::json!({"start": s, "end": e, "size": e - s + 1})).collect();

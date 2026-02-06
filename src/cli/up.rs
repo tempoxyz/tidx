@@ -84,12 +84,12 @@ pub async fn run(args: Args) -> Result<()> {
         // Initialize ClickHouse if configured (for each chain)
         if let Some(ref ch_config) = chain.clickhouse {
             if ch_config.enabled {
-                match ClickHouseEngine::new(ch_config, chain.chain_id, &chain.pg_url) {
+                let pg_url = chain.resolved_pg_url()?;
+                match ClickHouseEngine::new(ch_config, chain.chain_id, &pg_url) {
                     Ok(engine) => {
                         let engine = Arc::new(engine);
                         
                         // Ensure replication is set up
-                        let pg_url = chain.pg_url.clone();
                         let engine_clone = Arc::clone(&engine);
                         let chain_name = chain.name.clone();
                         tokio::spawn(async move {
@@ -219,8 +219,9 @@ async fn initialize_chain(
     chain: &ChainConfig,
     clickhouse_configs: SharedClickHouseConfigs,
 ) -> Result<ThrottledPool> {
-    info!(chain = %chain.name, db = %chain.pg_url, "Connecting to database with throttled pool...");
-    let throttled_pool = ThrottledPool::new(&chain.pg_url).await?;
+    let pg_url = chain.resolved_pg_url()?;
+    info!(chain = %chain.name, "Connecting to database with throttled pool...");
+    let throttled_pool = ThrottledPool::new(&pg_url).await?;
 
     info!(chain = %chain.name, "Running migrations...");
     db::run_migrations(&throttled_pool.pool).await?;
