@@ -133,7 +133,6 @@ impl ClickHouseEngine {
                         database = %self.database,
                         "ClickHouse instance unreachable, trying next"
                     );
-                    continue;
                 }
                 Err(e) => return Err(e),
             }

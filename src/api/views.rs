@@ -72,7 +72,7 @@ pub async fn list_views(
 
     let mut views = Vec::new();
     for row in &result.rows {
-        let name = row.get(0).and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let name = row.first().and_then(|v| v.as_str()).unwrap_or("").to_string();
         let engine = row.get(1).and_then(|v| v.as_str()).unwrap_or("").to_string();
         
         // Get columns for this view
@@ -85,7 +85,7 @@ pub async fn list_views(
         
         let columns: Vec<ColumnInfo> = columns_result.rows.iter().map(|col_row| {
             ColumnInfo {
-                name: col_row.get(0).and_then(|v| v.as_str()).unwrap_or("").to_string(),
+                name: col_row.first().and_then(|v| v.as_str()).unwrap_or("").to_string(),
                 col_type: col_row.get(1).and_then(|v| v.as_str()).unwrap_or("").to_string(),
             }
         }).collect();
@@ -333,7 +333,7 @@ pub async fn get_view(
     }
 
     let row = &result.rows[0];
-    let engine = row.get(0).and_then(|v| v.as_str()).unwrap_or("").to_string();
+    let engine = row.first().and_then(|v| v.as_str()).unwrap_or("").to_string();
     let definition = row.get(1).and_then(|v| v.as_str()).unwrap_or("").to_string();
 
     // Get row count

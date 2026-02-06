@@ -139,7 +139,7 @@ pub async fn run(args: Args) -> Result<()> {
                 return Ok(());
             }
 
-            println!("{:<30} {:<20} {}", "NAME", "ENGINE", "DATABASE");
+            println!("{:<30} {:<20} DATABASE", "NAME", "ENGINE");
             println!("{}", "-".repeat(70));
             for view in resp.views {
                 println!("{:<30} {:<20} {}", view.name, view.engine, view.database);

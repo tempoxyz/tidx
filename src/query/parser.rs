@@ -292,7 +292,7 @@ impl EventSignature {
                     continue;
                 }
 
-                if let Some(encoded) = self.encode_value_for_pushdown(ty, &value) {
+                if let Some(encoded) = Self::encode_value_for_pushdown(ty, &value) {
                     // Build the replacement patterns
                     // Match: "col" = 'value' or "col" = '0xvalue'
                     let patterns = [
@@ -318,7 +318,7 @@ impl EventSignature {
     }
 
     /// Encode a filter value based on the ABI type.
-    fn encode_value_for_pushdown(&self, ty: &AbiType, value: &str) -> Option<String> {
+    fn encode_value_for_pushdown(ty: &AbiType, value: &str) -> Option<String> {
         match ty {
             AbiType::Address => encode_address_for_topic(value),
             AbiType::Uint(_) | AbiType::Int(_) => encode_uint256_for_topic(value),
