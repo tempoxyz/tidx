@@ -1,3 +1,5 @@
+use std::collections::HashSet;
+
 use anyhow::{anyhow, Result};
 use sqlparser::ast::{
     Expr, Function, FunctionArg, FunctionArgExpr, FunctionArguments, ObjectName, Query, SetExpr,
@@ -5,6 +7,15 @@ use sqlparser::ast::{
 };
 use sqlparser::dialect::GenericDialect;
 use sqlparser::parser::Parser;
+
+const ALLOWED_TABLES: &[&str] = &[
+    "blocks",
+    "txs",
+    "logs",
+    "receipts",
+    "token_holders",
+    "token_balances",
+];
 
 /// Validates that a SQL query is safe to execute.
 ///
@@ -30,48 +41,64 @@ pub fn validate_query(sql: &str) -> Result<()> {
     let stmt = &statements[0];
 
     match stmt {
-        Statement::Query(query) => validate_query_ast(query),
+        Statement::Query(query) => {
+            let cte_names = extract_cte_names(query);
+            validate_query_ast(query, &cte_names)
+        }
         _ => Err(anyhow!("Only SELECT queries are allowed")),
     }
 }
 
-fn validate_query_ast(query: &Query) -> Result<()> {
-    // Check CTEs for data-modifying statements
-    for cte in &query.with.as_ref().map_or(vec![], |w| w.cte_tables.clone()) {
-        validate_query_ast(&cte.query)?;
+fn extract_cte_names(query: &Query) -> HashSet<String> {
+    let mut names = HashSet::new();
+    if let Some(with) = &query.with {
+        for cte in &with.cte_tables {
+            names.insert(cte.alias.name.value.to_lowercase());
+        }
     }
-
-    validate_set_expr(&query.body)
+    names
 }
 
-fn validate_set_expr(set_expr: &SetExpr) -> Result<()> {
+fn validate_query_ast(query: &Query, cte_names: &HashSet<String>) -> Result<()> {
+    let mut all_cte_names = cte_names.clone();
+    if let Some(with) = &query.with {
+        for cte in &with.cte_tables {
+            all_cte_names.insert(cte.alias.name.value.to_lowercase());
+        }
+    }
+
+    for cte in &query.with.as_ref().map_or(vec![], |w| w.cte_tables.clone()) {
+        validate_query_ast(&cte.query, &all_cte_names)?;
+    }
+
+    validate_set_expr(&query.body, &all_cte_names)
+}
+
+fn validate_set_expr(set_expr: &SetExpr, cte_names: &HashSet<String>) -> Result<()> {
     match set_expr {
         SetExpr::Select(select) => {
-            // Validate FROM clause
             for table in &select.from {
-                validate_table_with_joins(table)?;
+                validate_table_with_joins(table, cte_names)?;
             }
 
-            // Validate SELECT expressions
             for item in &select.projection {
                 if let sqlparser::ast::SelectItem::UnnamedExpr(expr)
                 | sqlparser::ast::SelectItem::ExprWithAlias { expr, .. } = item
                 {
-                    validate_expr(expr)?;
+                    validate_expr(expr, cte_names)?;
                 }
             }
 
-            // Validate WHERE clause
             if let Some(selection) = &select.selection {
-                validate_expr(selection)?;
+                validate_expr(selection, cte_names)?;
             }
 
             Ok(())
         }
-        SetExpr::Query(q) => validate_query_ast(q),
+        SetExpr::Query(q) => validate_query_ast(q, cte_names),
         SetExpr::SetOperation { left, right, .. } => {
-            validate_set_expr(left)?;
-            validate_set_expr(right)
+            validate_set_expr(left, cte_names)?;
+            validate_set_expr(right, cte_names)
         }
         SetExpr::Values(_) => Ok(()),
         SetExpr::Insert(_) => Err(anyhow!("INSERT not allowed")),
@@ -82,29 +109,27 @@ fn validate_set_expr(set_expr: &SetExpr) -> Result<()> {
     }
 }
 
-fn validate_table_with_joins(table: &TableWithJoins) -> Result<()> {
-    validate_table_factor(&table.relation)?;
+fn validate_table_with_joins(table: &TableWithJoins, cte_names: &HashSet<String>) -> Result<()> {
+    validate_table_factor(&table.relation, cte_names)?;
     for join in &table.joins {
-        validate_table_factor(&join.relation)?;
+        validate_table_factor(&join.relation, cte_names)?;
     }
     Ok(())
 }
 
-fn validate_table_factor(factor: &TableFactor) -> Result<()> {
+fn validate_table_factor(factor: &TableFactor, cte_names: &HashSet<String>) -> Result<()> {
     match factor {
         TableFactor::Table { name, args, .. } => {
-            // Check if this is a table-valued function like read_csv(...)
             if args.is_some() {
                 let func_name = name.to_string().to_lowercase();
                 if is_dangerous_table_function(&func_name) {
                     return Err(anyhow!("Table function '{func_name}' is not allowed"));
                 }
             }
-            validate_table_name(name)
+            validate_table_name(name, cte_names)
         }
-        TableFactor::Derived { subquery, .. } => validate_query_ast(subquery),
+        TableFactor::Derived { subquery, .. } => validate_query_ast(subquery, cte_names),
         TableFactor::TableFunction { expr, .. } => {
-            // Block table functions that can read filesystem
             if let Expr::Function(func) = expr {
                 let func_name = func.name.to_string().to_lowercase();
                 if is_dangerous_table_function(&func_name) {
@@ -121,16 +146,15 @@ fn validate_table_factor(factor: &TableFactor) -> Result<()> {
             Ok(())
         }
         TableFactor::NestedJoin { table_with_joins, .. } => {
-            validate_table_with_joins(table_with_joins)
+            validate_table_with_joins(table_with_joins, cte_names)
         }
         _ => Ok(()),
     }
 }
 
-fn validate_table_name(name: &ObjectName) -> Result<()> {
+fn validate_table_name(name: &ObjectName, cte_names: &HashSet<String>) -> Result<()> {
     let full_name = name.to_string().to_lowercase();
 
-    // Block system catalogs
     const BLOCKED_SCHEMAS: &[&str] = &[
         "pg_catalog",
         "information_schema",
@@ -144,7 +168,6 @@ fn validate_table_name(name: &ObjectName) -> Result<()> {
         }
     }
 
-    // Block specific dangerous tables
     const BLOCKED_TABLES: &[&str] = &[
         "pg_stat_activity",
         "pg_settings",
@@ -160,44 +183,57 @@ fn validate_table_name(name: &ObjectName) -> Result<()> {
         }
     }
 
-    Ok(())
+    let bare_name = name.0.last()
+        .and_then(|part| part.as_ident())
+        .map(|ident| ident.value.to_lowercase())
+        .unwrap_or_default();
+
+    if ALLOWED_TABLES.contains(&bare_name.as_str()) {
+        return Ok(());
+    }
+
+    if cte_names.contains(&bare_name) {
+        return Ok(());
+    }
+
+    Err(anyhow!("Access to table '{bare_name}' is not allowed"))
 }
 
-fn validate_expr(expr: &Expr) -> Result<()> {
+fn validate_expr(expr: &Expr, cte_names: &HashSet<String>) -> Result<()> {
     match expr {
-        Expr::Function(func) => validate_function(func),
-        Expr::Subquery(q) => validate_query_ast(q),
-        Expr::InSubquery { subquery, .. } => validate_query_ast(subquery),
-        Expr::Exists { subquery, .. } => validate_query_ast(subquery),
+        Expr::Function(func) => validate_function(func, cte_names),
+        Expr::Subquery(q) => validate_query_ast(q, cte_names),
+        Expr::InSubquery { subquery, .. } => validate_query_ast(subquery, cte_names),
+        Expr::Exists { subquery, .. } => validate_query_ast(subquery, cte_names),
         Expr::BinaryOp { left, right, .. } => {
-            validate_expr(left)?;
-            validate_expr(right)
+            validate_expr(left, cte_names)?;
+            validate_expr(right, cte_names)
         }
-        Expr::UnaryOp { expr, .. } => validate_expr(expr),
+        Expr::UnaryOp { expr, .. } => validate_expr(expr, cte_names),
         Expr::Between { expr, low, high, .. } => {
-            validate_expr(expr)?;
-            validate_expr(low)?;
-            validate_expr(high)
+            validate_expr(expr, cte_names)?;
+            validate_expr(low, cte_names)?;
+            validate_expr(high, cte_names)
         }
         Expr::Case { operand, conditions, else_result, .. } => {
             if let Some(op) = operand {
-                validate_expr(op)?;
+                validate_expr(op, cte_names)?;
             }
             for case_when in conditions {
-                validate_expr(&case_when.condition)?;
-                validate_expr(&case_when.result)?;
+                validate_expr(&case_when.condition, cte_names)?;
+                validate_expr(&case_when.result, cte_names)?;
             }
             if let Some(else_r) = else_result {
-                validate_expr(else_r)?;
+                validate_expr(else_r, cte_names)?;
             }
             Ok(())
         }
-        Expr::Cast { expr, .. } => validate_expr(expr),
-        Expr::Nested(e) => validate_expr(e),
+        Expr::Cast { expr, .. } => validate_expr(expr, cte_names),
+        Expr::Nested(e) => validate_expr(e, cte_names),
         Expr::InList { expr, list, .. } => {
-            validate_expr(expr)?;
+            validate_expr(expr, cte_names)?;
             for item in list {
-                validate_expr(item)?;
+                validate_expr(item, cte_names)?;
             }
             Ok(())
         }
@@ -205,20 +241,19 @@ fn validate_expr(expr: &Expr) -> Result<()> {
     }
 }
 
-fn validate_function(func: &Function) -> Result<()> {
+fn validate_function(func: &Function, cte_names: &HashSet<String>) -> Result<()> {
     let func_name = func.name.to_string().to_lowercase();
 
     if is_dangerous_function(&func_name) {
         return Err(anyhow!("Function '{func_name}' is not allowed"));
     }
 
-    // Recursively validate function arguments
     if let FunctionArguments::List(arg_list) = &func.args {
         for arg in &arg_list.args {
             if let FunctionArg::Unnamed(FunctionArgExpr::Expr(expr))
             | FunctionArg::Named { arg: FunctionArgExpr::Expr(expr), .. } = arg
             {
-                validate_expr(expr)?;
+                validate_expr(expr, cte_names)?;
             }
         }
     }
@@ -250,6 +285,12 @@ fn is_dangerous_function(name: &str) -> bool {
         "lo_export",
         // PostgreSQL command execution
         "pg_execute_server_program",
+        // PostgreSQL dblink (remote connections)
+        "dblink",
+        "dblink_exec",
+        "dblink_connect",
+        "dblink_send_query",
+        "dblink_get_result",
         // ClickHouse system functions
         "system.flush_logs",
         "system.reload_config",
@@ -402,5 +443,42 @@ mod tests {
     #[test]
     fn test_rejects_nested_dangerous_function() {
         assert!(validate_query("SELECT COALESCE(pg_sleep(1), 0)").is_err());
+    }
+
+    #[test]
+    fn test_rejects_sync_state() {
+        assert!(validate_query("SELECT * FROM sync_state").is_err());
+    }
+
+    #[test]
+    fn test_rejects_pg_tables() {
+        assert!(validate_query("SELECT * FROM pg_tables").is_err());
+    }
+
+    #[test]
+    fn test_rejects_unknown_table() {
+        assert!(validate_query("SELECT * FROM some_random_table").is_err());
+    }
+
+    #[test]
+    fn test_allows_cte_defined_table() {
+        assert!(validate_query(
+            "WITH my_cte AS (SELECT * FROM blocks) SELECT * FROM my_cte"
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn test_rejects_dblink() {
+        assert!(validate_query("SELECT * FROM dblink('host=evil dbname=secrets', 'SELECT * FROM passwords')").is_err());
+        assert!(validate_query("SELECT dblink_connect('myconn', 'host=evil')").is_err());
+        assert!(validate_query("SELECT dblink_exec('myconn', 'DROP TABLE blocks')").is_err());
+    }
+
+    #[test]
+    fn test_allows_analytics_tables() {
+        assert!(validate_query("SELECT * FROM token_holders").is_ok());
+        assert!(validate_query("SELECT * FROM token_balances").is_ok());
+        assert!(validate_query("SELECT * FROM public.blocks").is_ok());
     }
 }
