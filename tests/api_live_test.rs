@@ -361,37 +361,57 @@ async fn test_query_live_returns_sse() {
 #[test]
 fn test_inject_block_filter_blocks_table() {
     let sql = "SELECT num, hash FROM blocks ORDER BY num DESC LIMIT 1";
-    let filtered = inject_block_filter(sql, 100);
-    assert!(filtered.contains("num = 100"), "got: {filtered}");
+    let filtered = inject_block_filter(sql, 100).unwrap();
+    assert!(filtered.contains("blocks.num = 100"), "got: {filtered}");
     assert!(filtered.contains("ORDER BY"), "should preserve ORDER BY");
 }
 
 #[test]
 fn test_inject_block_filter_txs_table() {
     let sql = "SELECT * FROM txs ORDER BY block_num DESC LIMIT 10";
-    let filtered = inject_block_filter(sql, 200);
-    assert!(filtered.contains("block_num = 200"), "got: {filtered}");
+    let filtered = inject_block_filter(sql, 200).unwrap();
+    assert!(filtered.contains("txs.block_num = 200"), "got: {filtered}");
 }
 
 #[test]
 fn test_inject_block_filter_logs_table() {
     let sql = "SELECT * FROM logs WHERE address = '0x123' ORDER BY block_num DESC";
-    let filtered = inject_block_filter(sql, 300);
-    assert!(filtered.contains("block_num = 300"), "got: {filtered}");
+    let filtered = inject_block_filter(sql, 300).unwrap();
+    assert!(filtered.contains("logs.block_num = 300"), "got: {filtered}");
     assert!(filtered.contains("address = '0x123'"), "should preserve existing WHERE");
 }
 
 #[test]
 fn test_inject_block_filter_with_existing_where() {
     let sql = "SELECT * FROM txs WHERE gas_used > 21000 ORDER BY block_num DESC";
-    let filtered = inject_block_filter(sql, 400);
-    assert!(filtered.contains("block_num = 400"), "got: {filtered}");
+    let filtered = inject_block_filter(sql, 400).unwrap();
+    assert!(filtered.contains("txs.block_num = 400"), "got: {filtered}");
     assert!(filtered.contains("gas_used > 21000"), "should preserve existing condition");
 }
 
 #[test]
 fn test_inject_block_filter_no_order_by() {
     let sql = "SELECT COUNT(*) FROM blocks LIMIT 1";
-    let filtered = inject_block_filter(sql, 500);
-    assert!(filtered.contains("num = 500"), "got: {filtered}");
+    let filtered = inject_block_filter(sql, 500).unwrap();
+    assert!(filtered.contains("blocks.num = 500"), "got: {filtered}");
+}
+
+#[test]
+fn test_inject_block_filter_rejects_union() {
+    let sql = "SELECT * FROM txs UNION SELECT * FROM logs";
+    assert!(inject_block_filter(sql, 100).is_err());
+}
+
+#[test]
+fn test_inject_block_filter_rejects_non_select() {
+    let sql = "INSERT INTO txs VALUES (1)";
+    assert!(inject_block_filter(sql, 100).is_err());
+}
+
+#[test]
+fn test_inject_block_filter_where_keyword_in_string_literal() {
+    let sql = "SELECT * FROM txs WHERE input = 'WHERE clause test'";
+    let filtered = inject_block_filter(sql, 100).unwrap();
+    assert!(filtered.contains("txs.block_num = 100"), "got: {filtered}");
+    assert!(filtered.contains("'WHERE clause test'"), "should preserve string literal");
 }
