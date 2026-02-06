@@ -248,7 +248,7 @@ impl ChainConfig {
                     .with_context(|| format!("Invalid pg_url: {}", self.pg_url))?;
                 
                 url.set_password(Some(&password))
-                    .map_err(|_| anyhow::anyhow!("Failed to set password in pg_url"))?;
+                    .map_err(|()| anyhow::anyhow!("Failed to set password in pg_url"))?;
                 
                 Ok(url.to_string())
             }
