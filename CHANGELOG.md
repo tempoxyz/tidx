@@ -1,11 +1,5 @@
 # Changelog
 
-## 0.1.4 (2026-02-06)
-
-### Patch Changes
-
-- Handle SIGTERM for graceful container shutdown. Previously only SIGINT (ctrl-c) triggered graceful shutdown; now SIGTERM from Kubernetes/Docker also triggers the same broadcast for clean connection draining. (by @tempo-ai, [b3fb5a6](https://github.com/tempoxyz/tidx/commit/b3fb5a6))
-
 ## 0.1.3 (2026-02-03)
 
 ### Patch Changes
