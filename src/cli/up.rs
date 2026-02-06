@@ -45,11 +45,23 @@ pub async fn run(args: Args) -> Result<()> {
     let broadcaster = Arc::new(Broadcaster::new());
     let (shutdown_tx, _shutdown_rx) = tokio::sync::broadcast::channel::<()>(1);
 
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+        let shutdown_tx_sigterm = shutdown_tx.clone();
+        tokio::spawn(async move {
+            let mut sigterm = signal(SignalKind::terminate()).expect("failed to register SIGTERM handler");
+            sigterm.recv().await;
+            info!("Received SIGTERM, shutting down...");
+            let _ = shutdown_tx_sigterm.send(());
+        });
+    }
+
     tokio::spawn({
         let shutdown_tx = shutdown_tx.clone();
         async move {
             tokio::signal::ctrl_c().await.ok();
-            info!("Shutting down...");
+            info!("Received SIGINT, shutting down...");
             let _ = shutdown_tx.send(());
         }
     });
