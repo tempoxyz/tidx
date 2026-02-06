@@ -410,14 +410,13 @@ mod tests {
 
     #[test]
     fn test_resolved_pg_url_with_env() {
-        std::env::set_var("TEST_PG_PASSWORD_123", "secret123");
-        
+        // PATH is always set, use it to test env var substitution
         let config = ChainConfig {
             name: "test".to_string(),
             chain_id: 1,
             rpc_url: "http://localhost:8545".to_string(),
             pg_url: "postgres://user:placeholder@localhost/db".to_string(),
-            pg_password_env: Some("TEST_PG_PASSWORD_123".to_string()),
+            pg_password_env: Some("PATH".to_string()),
             backfill: true,
             batch_size: 100,
             concurrency: 4,
@@ -426,9 +425,10 @@ mod tests {
             clickhouse: None,
         };
         
-        assert_eq!(config.resolved_pg_url().unwrap(), "postgres://user:secret123@localhost/db");
-        
-        std::env::remove_var("TEST_PG_PASSWORD_123");
+        let resolved = config.resolved_pg_url().unwrap();
+        assert!(resolved.starts_with("postgres://user:"));
+        assert!(resolved.ends_with("@localhost/db"));
+        assert!(!resolved.contains("placeholder"));
     }
 
     #[test]

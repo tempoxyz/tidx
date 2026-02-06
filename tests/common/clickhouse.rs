@@ -142,6 +142,7 @@ impl TestClickHouse {
     /// Insert mock log data (simulating MaterializedPostgreSQL format).
     /// Addresses/hashes are stored as '\x'-prefixed hex strings.
     /// Backslashes are automatically escaped for ClickHouse SQL.
+    #[allow(clippy::too_many_arguments)]
     pub async fn insert_mock_log(
         &self,
         block_num: u64,

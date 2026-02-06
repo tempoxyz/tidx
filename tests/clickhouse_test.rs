@@ -285,14 +285,12 @@ async fn test_create_materialized_view_transfer_counts() {
     let cte = sig.to_cte_sql_clickhouse();
     
     // Create target table
-    let create_table = format!(
-        r#"CREATE TABLE transfer_counts (
+    let create_table = r#"CREATE TABLE transfer_counts (
             addr String,
             total_sent UInt64,
             total_received UInt64
         ) ENGINE = SummingMergeTree()
-        ORDER BY addr"#
-    );
+        ORDER BY addr"#;
     ch.query(&create_table).await.expect("Failed to create table");
     
     // Create materialized view
