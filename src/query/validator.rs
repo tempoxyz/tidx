@@ -60,6 +60,13 @@ fn extract_cte_names(query: &Query) -> HashSet<String> {
 }
 
 fn validate_query_ast(query: &Query, cte_names: &HashSet<String>) -> Result<()> {
+    // Block recursive CTEs (can cause endless loops / resource exhaustion)
+    if let Some(with) = &query.with {
+        if with.recursive {
+            return Err(anyhow!("Recursive CTEs are not allowed"));
+        }
+    }
+
     let mut all_cte_names = cte_names.clone();
     if let Some(with) = &query.with {
         for cte in &with.cte_tables {
@@ -77,6 +84,11 @@ fn validate_query_ast(query: &Query, cte_names: &HashSet<String>) -> Result<()> 
 fn validate_set_expr(set_expr: &SetExpr, cte_names: &HashSet<String>) -> Result<()> {
     match set_expr {
         SetExpr::Select(select) => {
+            // Reject SELECT INTO (creates objects)
+            if select.into.is_some() {
+                return Err(anyhow!("SELECT INTO is not allowed"));
+            }
+
             for table in &select.from {
                 validate_table_with_joins(table, cte_names)?;
             }
@@ -93,6 +105,18 @@ fn validate_set_expr(set_expr: &SetExpr, cte_names: &HashSet<String>) -> Result<
                 validate_expr(selection, cte_names)?;
             }
 
+            // Validate GROUP BY expressions
+            if let sqlparser::ast::GroupByExpr::Expressions(exprs, _) = &select.group_by {
+                for expr in exprs {
+                    validate_expr(expr, cte_names)?;
+                }
+            }
+
+            // Validate HAVING
+            if let Some(having) = &select.having {
+                validate_expr(having, cte_names)?;
+            }
+
             Ok(())
         }
         SetExpr::Query(q) => validate_query_ast(q, cte_names),
@@ -100,12 +124,20 @@ fn validate_set_expr(set_expr: &SetExpr, cte_names: &HashSet<String>) -> Result<
             validate_set_expr(left, cte_names)?;
             validate_set_expr(right, cte_names)
         }
-        SetExpr::Values(_) => Ok(()),
+        SetExpr::Values(values) => {
+            // Validate all expressions in VALUES rows to prevent function call bypass
+            for row in &values.rows {
+                for expr in row {
+                    validate_expr(expr, cte_names)?;
+                }
+            }
+            Ok(())
+        }
         SetExpr::Insert(_) => Err(anyhow!("INSERT not allowed")),
         SetExpr::Update(_) => Err(anyhow!("UPDATE not allowed")),
         SetExpr::Delete(_) => Err(anyhow!("DELETE not allowed")),
         SetExpr::Merge(_) => Err(anyhow!("MERGE not allowed")),
-        SetExpr::Table(_) => Ok(()),
+        SetExpr::Table(_) => Err(anyhow!("TABLE statement is not allowed")),
     }
 }
 
@@ -113,6 +145,27 @@ fn validate_table_with_joins(table: &TableWithJoins, cte_names: &HashSet<String>
     validate_table_factor(&table.relation, cte_names)?;
     for join in &table.joins {
         validate_table_factor(&join.relation, cte_names)?;
+        // Validate JOIN ON expressions
+        let constraint = match &join.join_operator {
+            sqlparser::ast::JoinOperator::Join(c)
+            | sqlparser::ast::JoinOperator::Inner(c)
+            | sqlparser::ast::JoinOperator::Left(c)
+            | sqlparser::ast::JoinOperator::LeftOuter(c)
+            | sqlparser::ast::JoinOperator::Right(c)
+            | sqlparser::ast::JoinOperator::RightOuter(c)
+            | sqlparser::ast::JoinOperator::FullOuter(c)
+            | sqlparser::ast::JoinOperator::CrossJoin(c)
+            | sqlparser::ast::JoinOperator::Semi(c)
+            | sqlparser::ast::JoinOperator::LeftSemi(c)
+            | sqlparser::ast::JoinOperator::RightSemi(c)
+            | sqlparser::ast::JoinOperator::Anti(c)
+            | sqlparser::ast::JoinOperator::LeftAnti(c)
+            | sqlparser::ast::JoinOperator::RightAnti(c) => Some(c),
+            _ => None,
+        };
+        if let Some(sqlparser::ast::JoinConstraint::On(expr)) = constraint {
+            validate_expr(expr, cte_names)?;
+        }
     }
     Ok(())
 }
@@ -237,6 +290,19 @@ fn validate_expr(expr: &Expr, cte_names: &HashSet<String>) -> Result<()> {
             }
             Ok(())
         }
+        Expr::IsNull(e)
+        | Expr::IsNotNull(e)
+        | Expr::IsTrue(e)
+        | Expr::IsFalse(e)
+        | Expr::IsNotTrue(e)
+        | Expr::IsNotFalse(e)
+        | Expr::IsUnknown(e)
+        | Expr::IsNotUnknown(e) => validate_expr(e, cte_names),
+        Expr::Like { expr, pattern, .. } | Expr::ILike { expr, pattern, .. } => {
+            validate_expr(expr, cte_names)?;
+            validate_expr(pattern, cte_names)
+        }
+        Expr::AnyOp { right, .. } | Expr::AllOp { right, .. } => validate_expr(right, cte_names),
         _ => Ok(()),
     }
 }
@@ -291,6 +357,24 @@ fn is_dangerous_function(name: &str) -> bool {
         "dblink_connect",
         "dblink_send_query",
         "dblink_get_result",
+        // PostgreSQL large object access
+        "lo_get",
+        "lo_open",
+        "lo_close",
+        "loread",
+        "lowrite",
+        "lo_creat",
+        "lo_create",
+        "lo_unlink",
+        "lo_put",
+        // PostgreSQL set-returning functions (DoS via row generation)
+        "generate_series",
+        // PostgreSQL admin extension functions (file access)
+        "pg_file_read",
+        "pg_file_write",
+        "pg_file_rename",
+        "pg_file_unlink",
+        "pg_logdir_ls",
         // ClickHouse system functions
         "system.flush_logs",
         "system.reload_config",
@@ -480,5 +564,64 @@ mod tests {
         assert!(validate_query("SELECT * FROM token_holders").is_ok());
         assert!(validate_query("SELECT * FROM token_balances").is_ok());
         assert!(validate_query("SELECT * FROM public.blocks").is_ok());
+    }
+
+    #[test]
+    fn test_rejects_recursive_cte() {
+        assert!(validate_query(
+            "WITH RECURSIVE r AS (SELECT 1 AS n UNION ALL SELECT n+1 FROM r) SELECT * FROM r"
+        ).is_err());
+    }
+
+    #[test]
+    fn test_rejects_generate_series() {
+        assert!(validate_query("SELECT generate_series(1, 1000000000)").is_err());
+        assert!(validate_query("SELECT * FROM blocks WHERE num IN (SELECT generate_series(1, 1000000))").is_err());
+    }
+
+    #[test]
+    fn test_rejects_values_function_bypass() {
+        assert!(validate_query("VALUES (pg_sleep(10))").is_err());
+        assert!(validate_query("VALUES (pg_read_file('/etc/passwd'))").is_err());
+    }
+
+    #[test]
+    fn test_rejects_table_statement() {
+        assert!(validate_query("TABLE blocks").is_err());
+        assert!(validate_query("TABLE pg_shadow").is_err());
+    }
+
+    #[test]
+    fn test_rejects_select_into() {
+        assert!(validate_query("SELECT * INTO newtable FROM blocks").is_err());
+    }
+
+    #[test]
+    fn test_rejects_lo_functions() {
+        assert!(validate_query("SELECT lo_get(12345)").is_err());
+        assert!(validate_query("SELECT lo_open(12345, 262144)").is_err());
+    }
+
+    #[test]
+    fn test_rejects_admin_file_functions() {
+        assert!(validate_query("SELECT pg_file_read('/etc/passwd', 0, 1000)").is_err());
+        assert!(validate_query("SELECT pg_file_write('/tmp/evil', 'data', false)").is_err());
+    }
+
+    #[test]
+    fn test_rejects_dangerous_function_in_having() {
+        assert!(validate_query("SELECT COUNT(*) FROM blocks GROUP BY num HAVING pg_sleep(1) IS NOT NULL").is_err());
+    }
+
+    #[test]
+    fn test_rejects_dangerous_function_in_join_on() {
+        assert!(validate_query(
+            "SELECT * FROM blocks JOIN txs ON pg_sleep(1) IS NOT NULL"
+        ).is_err());
+    }
+
+    #[test]
+    fn test_allows_simple_values() {
+        assert!(validate_query("VALUES (1, 'hello'), (2, 'world')").is_ok());
     }
 }
