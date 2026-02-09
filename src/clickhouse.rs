@@ -237,6 +237,10 @@ impl ClickHouseEngine {
     /// Each instance gets its own replication stream from Postgres via a unique
     /// database name (e.g., `tidx_4217_0`, `tidx_4217_1`) and pre-created replication
     /// slots to avoid slot conflicts between instances.
+    ///
+    /// Uses the PostgreSQL replication protocol to create slots with EXPORT_SNAPSHOT
+    /// and FAILOVER flags. The snapshot is passed to ClickHouse for consistent initial
+    /// sync, and FAILOVER enables CNPG to synchronize slots to standbys.
     pub async fn ensure_replication(&self, pg_url: &str) -> Result<()> {
         let pg = parse_pg_url(pg_url)?;
 
@@ -267,61 +271,63 @@ impl ClickHouseEngine {
                 i
             );
 
-            // Connect to PostgreSQL to create replication slot with exported snapshot
-            // Each ClickHouse instance needs its own slot to avoid conflicts
-            let pg_conn_str = format!(
-                "host={} port={} dbname={} user={} password={}",
+            // Use unique slot name per ClickHouse instance
+            let slot_name = &inst.database;
+
+            // Connect to PostgreSQL using replication protocol to create slot with
+            // EXPORT_SNAPSHOT (required by ClickHouse) and FAILOVER (required by CNPG)
+            let pg_repl_conn_str = format!(
+                "host={} port={} dbname={} user={} password={} replication=database",
                 pg.host, pg.port, pg.database, pg.user, pg.password
             );
-            let (pg_client, connection) = tokio_postgres::connect(&pg_conn_str, NoTls).await?;
 
-            // Spawn connection handler
-            tokio::spawn(async move {
+            let (pg_client, connection) =
+                tokio_postgres::connect(&pg_repl_conn_str, NoTls).await?;
+
+            // Spawn connection handler - keep alive until ClickHouse starts using the slot
+            let conn_handle = tokio::spawn(async move {
                 if let Err(e) = connection.await {
-                    error!(error = %e, "PostgreSQL connection error");
+                    error!(error = %e, "PostgreSQL replication connection error");
                 }
             });
 
-            // Use unique slot name per ClickHouse instance
-            let slot_name = &inst.database;
-            
-            // Check if slot already exists
-            let slot_exists: bool = pg_client
-                .query_one(
-                    "SELECT EXISTS(SELECT 1 FROM pg_replication_slots WHERE slot_name = $1)",
+            // Check if slot already exists (reuse if so - ClickHouse will ATTACH)
+            let slot_row = pg_client
+                .query_opt(
+                    "SELECT slot_name FROM pg_replication_slots WHERE slot_name = $1",
                     &[&slot_name],
                 )
-                .await
-                .map(|row| row.get(0))
-                .unwrap_or(false);
+                .await?;
 
-            // Create slot if it doesn't exist
-            // CNPG will sync this slot to standby for failover support
-            if slot_exists {
+            let snapshot_name = if slot_row.is_some() {
+                // Slot exists - we can't get a new snapshot for an existing slot
+                // Drop and recreate to get a fresh snapshot
                 info!(
                     slot_name = %slot_name,
-                    "Replication slot already exists, reusing"
+                    "Dropping existing replication slot to recreate with snapshot"
                 );
-            } else {
+
+                // Use simple query for replication protocol commands
                 pg_client
-                    .execute(
-                        &format!(
-                            "SELECT pg_create_logical_replication_slot('{}', 'pgoutput', false, false, true)",
-                            slot_name
-                        ),
-                        &[],
-                    )
+                    .simple_query(&format!("DROP_REPLICATION_SLOT {} WAIT", slot_name))
                     .await
-                    .map_err(|e| anyhow!("Failed to create replication slot: {}", e))?;
-                
-                info!(
-                    slot_name = %slot_name,
-                    "Created PostgreSQL replication slot"
-                );
-            }
+                    .map_err(|e| anyhow!("Failed to drop replication slot: {}", e))?;
 
-            // Create ClickHouse database with the pre-created slot
-            // ClickHouse will do initial snapshot sync internally
+                // Create new slot with EXPORT_SNAPSHOT and FAILOVER
+                self.create_replication_slot_with_snapshot(&pg_client, slot_name).await?
+            } else {
+                // Create new slot with EXPORT_SNAPSHOT and FAILOVER
+                self.create_replication_slot_with_snapshot(&pg_client, slot_name).await?
+            };
+
+            info!(
+                slot_name = %slot_name,
+                snapshot_name = %snapshot_name,
+                "Created PostgreSQL replication slot with exported snapshot"
+            );
+
+            // Create ClickHouse database with slot AND snapshot
+            // The snapshot ensures consistent initial sync from the slot's LSN
             let create_sql = format!(
                 r#"CREATE DATABASE IF NOT EXISTS {database}
 ENGINE = MaterializedPostgreSQL(
@@ -331,7 +337,8 @@ ENGINE = MaterializedPostgreSQL(
     '{password}'
 )
 SETTINGS materialized_postgresql_tables_list = 'logs,blocks,txs,receipts',
-         materialized_postgresql_replication_slot = '{slot_name}'"#,
+         materialized_postgresql_replication_slot = '{slot_name}',
+         materialized_postgresql_snapshot = '{snapshot_name}'"#,
                 database = inst.database,
                 host = pg.host,
                 port = pg.port,
@@ -339,6 +346,7 @@ SETTINGS materialized_postgresql_tables_list = 'logs,blocks,txs,receipts',
                 user = pg.user,
                 password = pg.password,
                 slot_name = slot_name,
+                snapshot_name = snapshot_name,
             );
 
             inst.admin_client.query(&create_sql).execute().await?;
@@ -349,6 +357,11 @@ SETTINGS materialized_postgresql_tables_list = 'logs,blocks,txs,receipts',
                 "MaterializedPostgreSQL database created on instance {}, replication starting",
                 i
             );
+
+            // Drop the replication connection - ClickHouse now owns the slot
+            // The snapshot was only needed for the CREATE DATABASE command
+            drop(pg_client);
+            conn_handle.abort();
 
             tokio::spawn({
                 let client = inst.admin_client.clone();
@@ -364,6 +377,41 @@ SETTINGS materialized_postgresql_tables_list = 'logs,blocks,txs,receipts',
         }
 
         Ok(())
+    }
+
+    /// Create a replication slot using the replication protocol with EXPORT_SNAPSHOT
+    /// and FAILOVER flags. Returns the snapshot name for use in ClickHouse.
+    async fn create_replication_slot_with_snapshot(
+        &self,
+        pg_client: &tokio_postgres::Client,
+        slot_name: &str,
+    ) -> Result<String> {
+        // Use replication protocol command (not SQL function) to get EXPORT_SNAPSHOT
+        // Format: CREATE_REPLICATION_SLOT slot_name LOGICAL pgoutput EXPORT_SNAPSHOT FAILOVER
+        let cmd = format!(
+            "CREATE_REPLICATION_SLOT {} LOGICAL pgoutput EXPORT_SNAPSHOT FAILOVER",
+            slot_name
+        );
+
+        let results = pg_client
+            .simple_query(&cmd)
+            .await
+            .map_err(|e| anyhow!("Failed to create replication slot: {}", e))?;
+
+        // Parse the response to extract snapshot_name
+        // Response format: slot_name, consistent_point, snapshot_name, output_plugin
+        for msg in results {
+            if let tokio_postgres::SimpleQueryMessage::Row(row) = msg {
+                // Column order: slot_name, consistent_point, snapshot_name, output_plugin
+                if let Some(snapshot) = row.get(2) {
+                    return Ok(snapshot.to_string());
+                }
+            }
+        }
+
+        Err(anyhow!(
+            "Failed to get snapshot name from CREATE_REPLICATION_SLOT response"
+        ))
     }
 
     /// Return the URL of the currently active instance (for observability).
