@@ -13,6 +13,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use tokio::sync::Mutex;
+use tokio_postgres::NoTls;
 use tracing::{debug, error, info, warn};
 
 use crate::config::ClickHouseConfig;
@@ -23,6 +24,8 @@ struct Instance {
     admin_client: Client,
     http_client: reqwest::Client,
     url: String,
+    /// Database name for this instance (includes instance index suffix)
+    database: String,
 }
 
 /// ClickHouse engine for OLAP queries.
@@ -31,11 +34,14 @@ struct Instance {
 /// When multiple instances are configured, queries are sent to the active
 /// instance (starting with the primary). On connection failure the engine
 /// automatically tries the next instance in order.
+///
+/// Each instance gets its own database name (e.g., `tidx_4217_0`, `tidx_4217_1`)
+/// to ensure unique PostgreSQL replication slots per instance.
 pub struct ClickHouseEngine {
     instances: Vec<Instance>,
     /// Index of the currently active instance (0 = primary).
     active: AtomicUsize,
-    /// Database name for this chain (e.g., "tidx_4217" for chain 4217)
+    /// Base database name for this chain (e.g., "tidx_4217" for chain 4217)
     database: String,
     /// Chain ID
     chain_id: u64,
@@ -49,8 +55,10 @@ impl ClickHouseEngine {
         let database = format!("tidx_{chain_id}");
 
         let mut instances = Vec::new();
-        for url in config.all_urls() {
-            instances.push(Self::make_instance(url)?);
+        for (i, url) in config.all_urls().iter().enumerate() {
+            // Each instance gets a unique database name to avoid replication slot conflicts
+            let instance_database = format!("{}_{}", database, i);
+            instances.push(Self::make_instance(url, instance_database)?);
         }
 
         Ok(Self {
@@ -61,7 +69,7 @@ impl ClickHouseEngine {
         })
     }
 
-    fn make_instance(url: &str) -> Result<Instance> {
+    fn make_instance(url: &str, database: String) -> Result<Instance> {
         let admin_client = Client::default().with_url(url);
         let http_client = reqwest::Client::builder()
             .pool_max_idle_per_host(4)
@@ -71,6 +79,7 @@ impl ClickHouseEngine {
             admin_client,
             http_client,
             url: url.to_string(),
+            database,
         })
     }
 
@@ -150,7 +159,7 @@ impl ClickHouseEngine {
         let url = format!(
             "{}/?database={}&default_format=JSON",
             inst.url.trim_end_matches('/'),
-            self.database
+            inst.database
         );
 
         let resp = inst
@@ -225,7 +234,9 @@ impl ClickHouseEngine {
     }
 
     /// Ensure MaterializedPostgreSQL replication is set up on **all** instances.
-    /// Each instance gets its own replication stream from Postgres.
+    /// Each instance gets its own replication stream from Postgres via a unique
+    /// database name (e.g., `tidx_4217_0`, `tidx_4217_1`) and pre-created replication
+    /// slots to avoid slot conflicts between instances.
     pub async fn ensure_replication(&self, pg_url: &str) -> Result<()> {
         let pg = parse_pg_url(pg_url)?;
 
@@ -233,14 +244,14 @@ impl ClickHouseEngine {
             let exists: u8 = inst
                 .admin_client
                 .query("SELECT count() FROM system.databases WHERE name = ?")
-                .bind(&self.database)
+                .bind(&inst.database)
                 .fetch_one()
                 .await
                 .unwrap_or(0);
 
             if exists > 0 {
                 debug!(
-                    database = %self.database,
+                    database = %inst.database,
                     url = %inst.url,
                     "ClickHouse database already exists on instance {}",
                     i
@@ -249,13 +260,68 @@ impl ClickHouseEngine {
             }
 
             info!(
-                database = %self.database,
+                database = %inst.database,
                 chain_id = self.chain_id,
                 url = %inst.url,
                 "Creating MaterializedPostgreSQL database on instance {}",
                 i
             );
 
+            // Connect to PostgreSQL to create replication slot with exported snapshot
+            // Each ClickHouse instance needs its own slot to avoid conflicts
+            let pg_conn_str = format!(
+                "host={} port={} dbname={} user={} password={}",
+                pg.host, pg.port, pg.database, pg.user, pg.password
+            );
+            let (pg_client, connection) = tokio_postgres::connect(&pg_conn_str, NoTls).await?;
+
+            // Spawn connection handler
+            tokio::spawn(async move {
+                if let Err(e) = connection.await {
+                    error!(error = %e, "PostgreSQL connection error");
+                }
+            });
+
+            // Use unique slot name per ClickHouse instance
+            let slot_name = &inst.database;
+            
+            // Check if slot already exists
+            let slot_exists: bool = pg_client
+                .query_one(
+                    "SELECT EXISTS(SELECT 1 FROM pg_replication_slots WHERE slot_name = $1)",
+                    &[&slot_name],
+                )
+                .await
+                .map(|row| row.get(0))
+                .unwrap_or(false);
+
+            // Create slot if it doesn't exist
+            // CNPG will sync this slot to standby for failover support
+            if slot_exists {
+                info!(
+                    slot_name = %slot_name,
+                    "Replication slot already exists, reusing"
+                );
+            } else {
+                pg_client
+                    .execute(
+                        &format!(
+                            "SELECT pg_create_logical_replication_slot('{}', 'pgoutput', false, false, true)",
+                            slot_name
+                        ),
+                        &[],
+                    )
+                    .await
+                    .map_err(|e| anyhow!("Failed to create replication slot: {}", e))?;
+                
+                info!(
+                    slot_name = %slot_name,
+                    "Created PostgreSQL replication slot"
+                );
+            }
+
+            // Create ClickHouse database with the pre-created slot
+            // ClickHouse will do initial snapshot sync internally
             let create_sql = format!(
                 r#"CREATE DATABASE IF NOT EXISTS {database}
 ENGINE = MaterializedPostgreSQL(
@@ -264,19 +330,21 @@ ENGINE = MaterializedPostgreSQL(
     '{user}',
     '{password}'
 )
-SETTINGS materialized_postgresql_tables_list = 'logs,blocks,txs,receipts'"#,
-                database = self.database,
+SETTINGS materialized_postgresql_tables_list = 'logs,blocks,txs,receipts',
+         materialized_postgresql_replication_slot = '{slot_name}'"#,
+                database = inst.database,
                 host = pg.host,
                 port = pg.port,
                 pg_database = pg.database,
                 user = pg.user,
                 password = pg.password,
+                slot_name = slot_name,
             );
 
             inst.admin_client.query(&create_sql).execute().await?;
 
             info!(
-                database = %self.database,
+                database = %inst.database,
                 url = %inst.url,
                 "MaterializedPostgreSQL database created on instance {}, replication starting",
                 i
@@ -284,7 +352,7 @@ SETTINGS materialized_postgresql_tables_list = 'logs,blocks,txs,receipts'"#,
 
             tokio::spawn({
                 let client = inst.admin_client.clone();
-                let database = self.database.clone();
+                let database = inst.database.clone();
                 async move {
                     tokio::time::sleep(std::time::Duration::from_secs(10)).await;
 
@@ -469,6 +537,8 @@ mod tests {
         let engine = ClickHouseEngine::new(&config, 4217, "postgres://localhost/test").unwrap();
         assert_eq!(engine.instance_count(), 1);
         assert_eq!(engine.active_url(), "http://clickhouse-1:8123");
+        // Single instance should have database name with _0 suffix
+        assert_eq!(engine.instances[0].database, "tidx_4217_0");
     }
 
     #[test]
@@ -482,6 +552,9 @@ mod tests {
         let engine = ClickHouseEngine::new(&config, 4217, "postgres://localhost/test").unwrap();
         assert_eq!(engine.instance_count(), 2);
         assert_eq!(engine.active_url(), "http://clickhouse-1:8123");
+        // Each instance should have a unique database name
+        assert_eq!(engine.instances[0].database, "tidx_4217_0");
+        assert_eq!(engine.instances[1].database, "tidx_4217_1");
     }
 
     #[test]
