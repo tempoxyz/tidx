@@ -69,6 +69,7 @@ rust_decimal = { version = "1.40.0", features = ["db-tokio-postgres"] }
 # Random
 rand = "0.9"
 url = "2.5.8"
+urlencoding = "2.1"
 
 # File watching
 notify = "8"
