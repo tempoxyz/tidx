@@ -183,51 +183,6 @@ pub struct ChainConfig {
     #[serde(default)]
     pub trust_rpc: bool,
 
-    /// ClickHouse OLAP settings (for analytical queries via MaterializedPostgreSQL)
-    #[serde(default)]
-    pub clickhouse: Option<ClickHouseConfig>,
-}
-
-/// Configuration for ClickHouse OLAP engine
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ClickHouseConfig {
-    /// Enable ClickHouse OLAP queries (default: false)
-    #[serde(default)]
-    pub enabled: bool,
-
-    /// Primary ClickHouse HTTP URL (default: http://clickhouse:8123)
-    #[serde(default = "default_clickhouse_url")]
-    pub url: String,
-
-    /// Additional ClickHouse instance URLs for failover.
-    /// Each instance runs its own MaterializedPostgreSQL replication.
-    /// Queries go to the primary `url`; failover instances are tried
-    /// in order if the primary is unavailable.
-    #[serde(default)]
-    pub failover_urls: Vec<String>,
-}
-
-impl ClickHouseConfig {
-    /// Returns all URLs: primary first, then failover instances.
-    pub fn all_urls(&self) -> Vec<&str> {
-        let mut urls = vec![self.url.as_str()];
-        urls.extend(self.failover_urls.iter().map(|u| u.as_str()));
-        urls
-    }
-}
-
-impl Default for ClickHouseConfig {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            url: "http://clickhouse:8123".to_string(),
-            failover_urls: Vec::new(),
-        }
-    }
-}
-
-fn default_clickhouse_url() -> String {
-    "http://clickhouse:8123".to_string()
 }
 
 fn default_backfill() -> bool {
@@ -340,56 +295,6 @@ mod tests {
     }
 
     #[test]
-    fn test_clickhouse_config_with_failover() {
-        let toml_str = r#"
-            name = "test"
-            chain_id = 1
-            rpc_url = "http://localhost:8545"
-            pg_url = "postgres://localhost/test"
-
-            [clickhouse]
-            enabled = true
-            url = "http://clickhouse-1:8123"
-            failover_urls = ["http://clickhouse-2:8123", "http://clickhouse-3:8123"]
-        "#;
-
-        let config: ChainConfig = toml::from_str(toml_str).unwrap();
-        let ch = config.clickhouse.unwrap();
-
-        assert!(ch.enabled);
-        assert_eq!(ch.url, "http://clickhouse-1:8123");
-        assert_eq!(ch.failover_urls.len(), 2);
-        assert_eq!(
-            ch.all_urls(),
-            vec![
-                "http://clickhouse-1:8123",
-                "http://clickhouse-2:8123",
-                "http://clickhouse-3:8123",
-            ]
-        );
-    }
-
-    #[test]
-    fn test_clickhouse_config_without_failover() {
-        let toml_str = r#"
-            name = "test"
-            chain_id = 1
-            rpc_url = "http://localhost:8545"
-            pg_url = "postgres://localhost/test"
-
-            [clickhouse]
-            enabled = true
-            url = "http://clickhouse:8123"
-        "#;
-
-        let config: ChainConfig = toml::from_str(toml_str).unwrap();
-        let ch = config.clickhouse.unwrap();
-
-        assert!(ch.failover_urls.is_empty());
-        assert_eq!(ch.all_urls(), vec!["http://clickhouse:8123"]);
-    }
-
-    #[test]
     fn test_resolved_pg_url_without_env() {
         let config = ChainConfig {
             name: "test".to_string(),
@@ -402,7 +307,7 @@ mod tests {
             concurrency: 4,
             backfill_first: false,
             trust_rpc: false,
-            clickhouse: None,
+
         };
         
         assert_eq!(config.resolved_pg_url().unwrap(), "postgres://user:pass@localhost/db");
@@ -422,7 +327,7 @@ mod tests {
             concurrency: 4,
             backfill_first: false,
             trust_rpc: false,
-            clickhouse: None,
+
         };
         
         let resolved = config.resolved_pg_url().unwrap();
@@ -444,7 +349,7 @@ mod tests {
             concurrency: 4,
             backfill_first: false,
             trust_rpc: false,
-            clickhouse: None,
+
         };
         
         assert!(config.resolved_pg_url().is_err());

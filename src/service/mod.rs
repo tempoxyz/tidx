@@ -314,7 +314,7 @@ fn sanitize_db_error(error: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::query::{route_query, EventSignature, QueryEngine};
+    use crate::query::EventSignature;
     use insta::assert_snapshot;
 
     // ========================================================================
@@ -328,21 +328,9 @@ mod tests {
     }
 
     #[test]
-    fn test_transfer_cte_clickhouse() {
-        let sig = EventSignature::parse("Transfer(address indexed from, address indexed to, uint256 value)").unwrap();
-        assert_snapshot!(sig.to_cte_sql_clickhouse());
-    }
-
-    #[test]
     fn test_approval_cte_postgres() {
         let sig = EventSignature::parse("Approval(address indexed owner, address indexed spender, uint256 value)").unwrap();
         assert_snapshot!(sig.to_cte_sql_postgres());
-    }
-
-    #[test]
-    fn test_approval_cte_clickhouse() {
-        let sig = EventSignature::parse("Approval(address indexed owner, address indexed spender, uint256 value)").unwrap();
-        assert_snapshot!(sig.to_cte_sql_clickhouse());
     }
 
     #[test]
@@ -354,23 +342,9 @@ mod tests {
     }
 
     #[test]
-    fn test_swap_cte_clickhouse() {
-        let sig = EventSignature::parse(
-            "Swap(address indexed sender, uint256 amount0In, uint256 amount1In, uint256 amount0Out, uint256 amount1Out, address indexed to)"
-        ).unwrap();
-        assert_snapshot!(sig.to_cte_sql_clickhouse());
-    }
-
-    #[test]
     fn test_paused_cte_postgres() {
         let sig = EventSignature::parse("Paused(bool paused)").unwrap();
         assert_snapshot!(sig.to_cte_sql_postgres());
-    }
-
-    #[test]
-    fn test_paused_cte_clickhouse() {
-        let sig = EventSignature::parse("Paused(bool paused)").unwrap();
-        assert_snapshot!(sig.to_cte_sql_clickhouse());
     }
 
     #[test]
@@ -380,54 +354,12 @@ mod tests {
     }
 
     #[test]
-    fn test_role_granted_cte_clickhouse() {
-        let sig = EventSignature::parse("RoleGranted(bytes32 indexed role, address indexed account, address indexed sender)").unwrap();
-        assert_snapshot!(sig.to_cte_sql_clickhouse());
-    }
-
-    #[test]
     fn test_filtered_cte_postgres() {
         let sig = EventSignature::parse("Transfer(address indexed from, address indexed to, uint256 value)").unwrap();
         let mut used_columns = std::collections::HashSet::new();
         used_columns.insert("to".to_string());
         used_columns.insert("value".to_string());
         assert_snapshot!(sig.to_cte_sql_postgres_filtered(Some(&used_columns)));
-    }
-
-    #[test]
-    fn test_filtered_cte_clickhouse() {
-        let sig = EventSignature::parse("Transfer(address indexed from, address indexed to, uint256 value)").unwrap();
-        let mut used_columns = std::collections::HashSet::new();
-        used_columns.insert("to".to_string());
-        used_columns.insert("value".to_string());
-        assert_snapshot!(sig.to_cte_sql_clickhouse_filtered(Some(&used_columns)));
-    }
-
-    // ========================================================================
-    // Query Routing Tests
-    // ========================================================================
-
-    #[test]
-    fn test_route_olap_query_to_clickhouse() {
-        // OLAP patterns should route to ClickHouse
-        assert_eq!(route_query("SELECT COUNT(*) FROM logs GROUP BY address"), QueryEngine::ClickHouse);
-        assert_eq!(route_query("SELECT SUM(gas_used) FROM blocks"), QueryEngine::ClickHouse);
-        assert_eq!(route_query("SELECT AVG(gas_limit) FROM txs"), QueryEngine::ClickHouse);
-        assert_eq!(route_query("SELECT *, ROW_NUMBER() OVER (PARTITION BY address) FROM logs"), QueryEngine::ClickHouse);
-    }
-
-    #[test]
-    fn test_route_oltp_query_to_postgres() {
-        // Point lookups should route to Postgres
-        assert_eq!(route_query("SELECT * FROM blocks WHERE num = 100"), QueryEngine::Postgres);
-        assert_eq!(route_query("SELECT * FROM txs WHERE hash = '\\x1234'"), QueryEngine::Postgres);
-        assert_eq!(route_query("SELECT * FROM logs WHERE address = '\\xabcd'"), QueryEngine::Postgres);
-    }
-
-    #[test]
-    fn test_explicit_engine_hints() {
-        assert_eq!(route_query("/* engine=clickhouse */ SELECT * FROM blocks"), QueryEngine::ClickHouse);
-        assert_eq!(route_query("/* engine=postgres */ SELECT COUNT(*) FROM logs GROUP BY address"), QueryEngine::Postgres);
     }
 
     // ========================================================================

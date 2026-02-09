@@ -18,13 +18,7 @@ services:
       - checkpoint_timeout=30min
       - -c
       - synchronous_commit=off
-      # Logical replication for ClickHouse MaterializedPostgreSQL
-      - -c
-      - wal_level=logical
-      - -c
-      - max_replication_slots=4
-      - -c
-      - max_wal_senders=4
+
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U tidx -d postgres"]
       interval: 2s
@@ -106,24 +100,5 @@ services:
         condition: service_started
     restart: always
 
-  clickhouse:
-    image: clickhouse/clickhouse-server:latest
-    ports:
-      - "8123:8123"   # HTTP interface
-      - "9000:9000"   # Native interface
-    volumes:
-      - clickhouse_data:/var/lib/clickhouse
-    environment:
-      CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: 1
-    depends_on:
-      postgres:
-        condition: service_healthy
-    healthcheck:
-      test: ["CMD", "clickhouse-client", "--query", "SELECT 1"]
-      interval: 2s
-      timeout: 5s
-      retries: 10
-
 volumes:
   postgres_data:
-  clickhouse_data:

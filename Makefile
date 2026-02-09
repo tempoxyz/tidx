@@ -85,12 +85,10 @@ LOCALNET_COMPOSE := docker compose -f docker/local/docker-compose.yml
 
 # Run tests (sequential execution due to shared DB)
 test:
-	@$(LOCALNET_COMPOSE) up -d postgres tempo clickhouse
+	@$(LOCALNET_COMPOSE) up -d postgres tempo
 	@echo "Waiting for PostgreSQL..."
 	@until $(LOCALNET_COMPOSE) exec -T postgres pg_isready -U tidx -d postgres > /dev/null 2>&1; do sleep 1; done
 	@$(LOCALNET_COMPOSE) exec -T postgres psql -U tidx -d postgres -c "CREATE DATABASE tidx" > /dev/null 2>&1 || true
-	@echo "Waiting for ClickHouse..."
-	@until curl -sf http://localhost:8123/ping > /dev/null 2>&1; do sleep 1; done
 	@echo "Waiting for Tempo..."
 	@until curl -s http://localhost:8545 -X POST -H "Content-Type: application/json" \
 		-d '{"jsonrpc":"2.0","method":"eth_blockNumber","params":[],"id":1}' | grep -q result; do sleep 1; done
@@ -282,7 +280,7 @@ help:
 	@echo "  make logs              Tail indexer logs"
 	@echo "  make build             Build Docker image"
 	@echo ""
-	@echo "  make test              Run all tests (PostgreSQL + ClickHouse)"
+	@echo "  make test              Run all tests (PostgreSQL)"
 	@echo "  make check             Run clippy lints"
 	@echo ""
 	@echo "  make seed              Generate transactions (DURATION=30 TPS=100)"

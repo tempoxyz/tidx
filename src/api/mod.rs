@@ -1,5 +1,4 @@
 mod rate_limit;
-mod views;
 
 use std::collections::HashMap;
 use std::convert::Infallible;
@@ -25,7 +24,6 @@ use tower_http::cors::CorsLayer;
 use tower_http::trace::TraceLayer;
 
 use crate::broadcast::Broadcaster;
-use crate::clickhouse::ClickHouseEngine;
 use crate::config::{HttpConfig, SharedHttpConfig};
 use crate::db::Pool;
 use crate::service::{QueryOptions, QueryResult, SyncStatus};
@@ -33,17 +31,6 @@ use crate::service::{QueryOptions, QueryResult, SyncStatus};
 pub use rate_limit::{RateLimiter, SseConnectionGuard};
 
 pub type SharedPools = Arc<RwLock<HashMap<u64, Pool>>>;
-pub type SharedClickHouseEngines = Arc<RwLock<HashMap<u64, Arc<ClickHouseEngine>>>>;
-
-/// Per-chain ClickHouse configuration.
-#[derive(Clone, Debug, Default)]
-pub struct ChainClickHouseConfig {
-    pub enabled: bool,
-    pub url: String,
-    pub failover_urls: Vec<String>,
-}
-
-pub type SharedClickHouseConfigs = Arc<RwLock<HashMap<u64, ChainClickHouseConfig>>>;
 
 #[derive(Clone)]
 pub struct AppState {
@@ -52,12 +39,8 @@ pub struct AppState {
     /// Default chain_id (first chain)
     pub default_chain_id: u64,
     pub broadcaster: Arc<Broadcaster>,
-    /// Per-chain ClickHouse configuration (hot-reloadable)
-    pub clickhouse_configs: SharedClickHouseConfigs,
     /// Rate limiter for request throttling
     pub rate_limiter: RateLimiter,
-    /// ClickHouse engines for OLAP queries (per chain)
-    pub clickhouse_engines: SharedClickHouseEngines,
     /// Parsed trusted CIDRs for admin operations
     pub trusted_cidrs: Arc<Vec<(IpAddr, u8)>>,
 }
@@ -66,11 +49,6 @@ impl AppState {
     async fn get_pool(&self, chain_id: Option<u64>) -> Option<Pool> {
         let id = chain_id.unwrap_or(self.default_chain_id);
         self.pools.read().await.get(&id).cloned()
-    }
-    
-    async fn get_clickhouse(&self, chain_id: Option<u64>) -> Option<Arc<ClickHouseEngine>> {
-        let id = chain_id.unwrap_or(self.default_chain_id);
-        self.clickhouse_engines.read().await.get(&id).cloned()
     }
 
     /// Check if an IP address is in the trusted CIDRs
@@ -123,14 +101,13 @@ fn ip_in_cidr(ip: &IpAddr, network: &IpAddr, prefix_len: u8) -> bool {
 }
 
 pub fn router(pools: HashMap<u64, Pool>, default_chain_id: u64, broadcaster: Arc<Broadcaster>) -> Router<()> {
-    router_with_options(pools, default_chain_id, broadcaster, HashMap::new(), &HttpConfig::default())
+    router_with_options(pools, default_chain_id, broadcaster, &HttpConfig::default())
 }
 
 pub fn router_with_options(
     pools: HashMap<u64, Pool>,
     default_chain_id: u64,
     broadcaster: Arc<Broadcaster>,
-    clickhouse_configs: HashMap<u64, ChainClickHouseConfig>,
     http_config: &HttpConfig,
 ) -> Router<()> {
     let rate_limiter = RateLimiter::new(
@@ -146,9 +123,7 @@ pub fn router_with_options(
         pools: Arc::new(RwLock::new(pools)),
         default_chain_id,
         broadcaster,
-        clickhouse_configs: Arc::new(RwLock::new(clickhouse_configs)),
         rate_limiter: rate_limiter.clone(),
-        clickhouse_engines: Arc::new(RwLock::new(HashMap::new())),
         trusted_cidrs,
     };
 
@@ -159,9 +134,7 @@ pub fn router_shared(
     pools: SharedPools,
     default_chain_id: u64,
     broadcaster: Arc<Broadcaster>,
-    clickhouse_configs: SharedClickHouseConfigs,
     http_config: SharedHttpConfig,
-    clickhouse_engines: SharedClickHouseEngines,
     trusted_cidrs: Vec<String>,
 ) -> Router<()> {
     let rate_limiter = RateLimiter::new_shared(http_config);
@@ -173,9 +146,7 @@ pub fn router_shared(
         pools,
         default_chain_id,
         broadcaster,
-        clickhouse_configs,
         rate_limiter: rate_limiter.clone(),
-        clickhouse_engines,
         trusted_cidrs,
     };
 
@@ -184,7 +155,7 @@ pub fn router_shared(
 
 fn build_router(state: AppState, rate_limiter: RateLimiter) -> Router<()> {
     let cors = CorsLayer::new()
-        .allow_methods([Method::GET, Method::POST, Method::DELETE, Method::OPTIONS])
+        .allow_methods([Method::GET, Method::OPTIONS])
         .allow_headers([header::CONTENT_TYPE, header::AUTHORIZATION])
         .allow_origin(tower_http::cors::Any);
 
@@ -192,8 +163,6 @@ fn build_router(state: AppState, rate_limiter: RateLimiter) -> Router<()> {
         .route("/health", get(handle_health))
         .route("/status", get(handle_status))
         .route("/query", get(handle_query))
-        .route("/views", get(views::list_views).post(views::create_view))
-        .route("/views/{name}", get(views::get_view).delete(views::delete_view))
         .layer(middleware::from_fn_with_state(
             rate_limiter,
             rate_limit::rate_limit_middleware,
@@ -248,9 +217,6 @@ pub struct QueryParams {
     /// Maximum rows to return
     #[serde(default = "default_limit")]
     limit: i64,
-    /// Force a specific engine: "postgres" or "clickhouse"
-    #[serde(default)]
-    engine: Option<String>,
 }
 
 fn default_timeout() -> u64 {
@@ -274,11 +240,6 @@ async fn handle_query(
     Query(params): Query<QueryParams>,
 ) -> Response {
     if params.live {
-        if params.engine.as_deref() == Some("clickhouse") {
-            return ApiError::BadRequest(
-                "engine=clickhouse is not supported with live=true (use PostgreSQL for real-time streaming)".to_string()
-            ).into_response();
-        }
         handle_query_live(state, params, addr, headers).await.into_response()
     } else {
         handle_query_once(state, params).await.into_response()
@@ -302,45 +263,15 @@ async fn handle_query_once(
         limit: params.limit.clamp(1, 100000),
     };
 
-    // Route to appropriate engine
-    let use_clickhouse = matches!(
-        params.engine.as_deref(),
-        Some("clickhouse")
-    );
-
-    let result = if use_clickhouse {
-        // Use ClickHouse engine for OLAP queries
-        let clickhouse = state.get_clickhouse(Some(params.chain_id)).await
-            .ok_or_else(|| ApiError::BadRequest(format!(
-                "ClickHouse not configured for chain_id: {}",
-                params.chain_id
-            )))?;
-
-        // Rewrite analytics table references to include chain-specific database
-        let sql = rewrite_analytics_tables(&params.sql, params.chain_id);
-
-        clickhouse.query(&sql, params.signature.as_deref())
-            .await
-            .map(|r| QueryResult {
-                columns: r.columns,
-                rows: r.rows,
-                row_count: r.row_count,
-                engine: r.engine,
-                query_time_ms: r.query_time_ms,
-            })
-            .map_err(|e| ApiError::QueryError(e.to_string()))?
-    } else {
-        // Use PostgreSQL
-        crate::service::execute_query_postgres(&pool, &params.sql, params.signature.as_deref(), &options)
-            .await
-            .map_err(|e| {
-                if e.to_string().contains("timeout") {
-                    ApiError::Timeout
-                } else {
-                    ApiError::QueryError(e.to_string())
-                }
-            })?
-    };
+    let result = crate::service::execute_query_postgres(&pool, &params.sql, params.signature.as_deref(), &options)
+        .await
+        .map_err(|e| {
+            if e.to_string().contains("timeout") {
+                ApiError::Timeout
+            } else {
+                ApiError::QueryError(e.to_string())
+            }
+        })?;
 
     Ok(Json(QueryResponse { result, ok: true }))
 }
@@ -401,7 +332,7 @@ async fn handle_query_live(
     };
 
     // Detect if this is an OLAP query (aggregations, etc.)
-    let is_olap = crate::query::route_query(&sql) == crate::query::QueryEngine::ClickHouse;
+    let is_olap = crate::query::route_query(&sql) == crate::query::QueryEngine::Olap;
 
     let stream = async_stream::stream! {
         // Keep guard alive for the lifetime of the stream
@@ -562,32 +493,6 @@ pub fn inject_block_filter(sql: &str, block_num: u64) -> String {
     }
 }
 
-/// Rewrite analytics table references to include chain-specific database prefix.
-/// Transforms `FROM token_holders` to `FROM analytics_42431.token_holders`.
-/// Only rewrites known analytics tables, leaves other table references unchanged.
-fn rewrite_analytics_tables(sql: &str, chain_id: u64) -> String {
-    // Known analytics tables that should be prefixed
-    let analytics_tables = ["token_holders", "token_balances"];
-    
-    let mut result = sql.to_string();
-    for table in analytics_tables {
-        // Simple case-insensitive replacement for FROM/JOIN table_name
-        // Handles: FROM token_holders, JOIN token_holders
-        for keyword in ["FROM ", "JOIN "] {
-            let search_lower = format!("{keyword}{table}");
-            let search_upper = format!("{}{}", keyword.to_uppercase(), table);
-            let replacement = format!("{keyword}analytics_{chain_id}.{table}");
-            
-            // Replace lowercase
-            result = result.replace(&search_lower, &replacement);
-            // Replace uppercase keyword
-            result = result.replace(&search_upper, &replacement);
-        }
-    }
-    
-    result
-}
-
 #[derive(Debug)]
 pub enum ApiError {
     BadRequest(String),
@@ -622,39 +527,6 @@ impl IntoResponse for ApiError {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn test_rewrite_analytics_tables() {
-        // Basic FROM rewrite
-        assert_eq!(
-            rewrite_analytics_tables("SELECT * FROM token_holders", 42431),
-            "SELECT * FROM analytics_42431.token_holders"
-        );
-
-        // WITH uppercase FROM
-        assert_eq!(
-            rewrite_analytics_tables("SELECT * FROM token_balances WHERE token = '0x123'", 4217),
-            "SELECT * FROM analytics_4217.token_balances WHERE token = '0x123'"
-        );
-
-        // Already prefixed - should not double-prefix
-        assert_eq!(
-            rewrite_analytics_tables("SELECT * FROM analytics_42431.token_holders", 42431),
-            "SELECT * FROM analytics_42431.token_holders"
-        );
-
-        // Non-analytics table - should not rewrite
-        assert_eq!(
-            rewrite_analytics_tables("SELECT * FROM logs", 42431),
-            "SELECT * FROM logs"
-        );
-
-        // JOIN rewrite
-        assert_eq!(
-            rewrite_analytics_tables("SELECT * FROM logs JOIN token_holders ON 1=1", 42431),
-            "SELECT * FROM logs JOIN analytics_42431.token_holders ON 1=1"
-        );
-    }
 
     #[test]
     fn test_parse_cidrs() {

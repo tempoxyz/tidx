@@ -1,42 +1,33 @@
 use std::fmt;
 
-/// The database engine to route a query to.
+/// The query type classification for routing behavior.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum QueryEngine {
-    /// ClickHouse for analytical queries (OLAP)
-    ClickHouse,
-    /// PostgreSQL for transactional queries (OLTP)
+    /// Analytical queries (OLAP): aggregations, window functions, large joins
+    Olap,
+    /// Transactional queries (OLTP): point lookups on indexed keys
     Postgres,
 }
 
 impl fmt::Display for QueryEngine {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::ClickHouse => write!(f, "clickhouse"),
+            Self::Olap => write!(f, "olap"),
             Self::Postgres => write!(f, "postgres"),
         }
     }
 }
 
-/// Routes a SQL query to the appropriate database engine.
+/// Classifies a SQL query as OLAP or OLTP.
 ///
 /// Uses heuristics to detect OLAP patterns (aggregations, window functions,
 /// large joins) vs OLTP patterns (point lookups on indexed keys).
-///
-/// Supports explicit hints via SQL comments:
-/// - `/* engine=clickhouse */` - force ClickHouse
-/// - `/* engine=postgres */` - force PostgreSQL
 pub fn route_query(sql: &str) -> QueryEngine {
-    // Check for explicit hints first
-    if let Some(engine) = parse_engine_hint(sql) {
-        return engine;
-    }
-
     let upper = sql.to_uppercase();
 
-    // OLAP patterns → ClickHouse
+    // OLAP patterns
     if has_olap_patterns(&upper) {
-        return QueryEngine::ClickHouse;
+        return QueryEngine::Olap;
     }
 
     // Point lookups on indexed keys → Postgres
@@ -44,29 +35,14 @@ pub fn route_query(sql: &str) -> QueryEngine {
         return QueryEngine::Postgres;
     }
 
-    // Multi-join queries without selective predicates → ClickHouse
+    // Multi-join queries without selective predicates → OLAP
     let join_count = upper.matches(" JOIN ").count();
     if join_count >= 2 {
-        return QueryEngine::ClickHouse;
+        return QueryEngine::Olap;
     }
 
     // Default to Postgres for simple queries
     QueryEngine::Postgres
-}
-
-/// Parses explicit engine hints from SQL comments.
-fn parse_engine_hint(sql: &str) -> Option<QueryEngine> {
-    let lower = sql.to_lowercase();
-
-    if lower.contains("/* engine=clickhouse */") || lower.contains("/*engine=clickhouse*/") {
-        return Some(QueryEngine::ClickHouse);
-    }
-
-    if lower.contains("/* engine=postgres */") || lower.contains("/*engine=postgres*/") {
-        return Some(QueryEngine::Postgres);
-    }
-
-    None
 }
 
 /// Detects OLAP patterns that benefit from columnar execution.
@@ -153,42 +129,30 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_explicit_hints() {
-        assert_eq!(
-            route_query("/* engine=clickhouse */ SELECT * FROM logs"),
-            QueryEngine::ClickHouse
-        );
-        assert_eq!(
-            route_query("/* engine=postgres */ SELECT COUNT(*) FROM logs GROUP BY address"),
-            QueryEngine::Postgres
-        );
-    }
-
-    #[test]
-    fn test_group_by_routes_to_clickhouse() {
+    fn test_group_by_routes_to_olap() {
         assert_eq!(
             route_query("SELECT address, COUNT(*) FROM logs GROUP BY address"),
-            QueryEngine::ClickHouse
+            QueryEngine::Olap
         );
     }
 
     #[test]
-    fn test_window_function_routes_to_clickhouse() {
+    fn test_window_function_routes_to_olap() {
         assert_eq!(
             route_query("SELECT *, ROW_NUMBER() OVER (PARTITION BY address) FROM txs"),
-            QueryEngine::ClickHouse
+            QueryEngine::Olap
         );
     }
 
     #[test]
-    fn test_aggregates_route_to_clickhouse() {
+    fn test_aggregates_route_to_olap() {
         assert_eq!(
             route_query("SELECT SUM(gas_used) FROM blocks"),
-            QueryEngine::ClickHouse
+            QueryEngine::Olap
         );
         assert_eq!(
             route_query("SELECT AVG(gas_limit) FROM blocks"),
-            QueryEngine::ClickHouse
+            QueryEngine::Olap
         );
     }
 
@@ -217,20 +181,20 @@ mod tests {
     }
 
     #[test]
-    fn test_multi_join_routes_to_clickhouse() {
+    fn test_multi_join_routes_to_olap() {
         assert_eq!(
             route_query(
                 "SELECT * FROM blocks b JOIN txs t ON b.num = t.block_num JOIN logs l ON t.hash = l.tx_hash"
             ),
-            QueryEngine::ClickHouse
+            QueryEngine::Olap
         );
     }
 
     #[test]
-    fn test_union_routes_to_clickhouse() {
+    fn test_union_routes_to_olap() {
         assert_eq!(
             route_query("SELECT address FROM logs UNION SELECT \"from\" FROM txs"),
-            QueryEngine::ClickHouse
+            QueryEngine::Olap
         );
     }
 
@@ -238,7 +202,7 @@ mod tests {
     fn test_lowercase_keywords() {
         assert_eq!(
             route_query("select count(*) from logs group by address"),
-            QueryEngine::ClickHouse
+            QueryEngine::Olap
         );
         assert_eq!(
             route_query("select * from txs where hash = '0x...'"),
@@ -246,7 +210,7 @@ mod tests {
         );
         assert_eq!(
             route_query("select sum(gas_used), avg(gas_limit) from blocks"),
-            QueryEngine::ClickHouse
+            QueryEngine::Olap
         );
     }
 }

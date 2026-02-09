@@ -1,3 +1,1 @@
 -- No additional extensions required.
--- ClickHouse handles OLAP queries via MaterializedPostgreSQL (WAL replication).
--- PostgreSQL only needs wal_level=logical configured (done in docker-compose).

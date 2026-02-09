@@ -16,10 +16,6 @@ pub struct Args {
     #[arg(short, long, default_value = "config.toml")]
     pub config: PathBuf,
 
-    /// Force query engine (postgres, clickhouse). Auto-routes if not specified.
-    #[arg(long)]
-    pub engine: Option<String>,
-
     /// Output format (table, json, csv)
     #[arg(long, default_value = "table")]
     pub format: String,
@@ -72,12 +68,6 @@ pub async fn run(args: Args) -> Result<()> {
         timeout_ms: args.timeout,
         limit: args.limit,
     };
-
-    // CLI currently only supports PostgreSQL engine
-    // For ClickHouse OLAP queries, use the HTTP API with engine=clickhouse
-    if args.engine.as_deref() == Some("clickhouse") {
-        anyhow::bail!("ClickHouse engine not available in CLI. Use HTTP API with engine=clickhouse for OLAP queries.");
-    }
 
     let result = execute_query_postgres(
         &pool,
@@ -166,9 +156,6 @@ async fn run_via_http(base_url: &str, args: &Args) -> Result<()> {
 
     if let Some(sig) = &args.signature {
         url.query_pairs_mut().append_pair("signature", sig);
-    }
-    if let Some(engine) = &args.engine {
-        url.query_pairs_mut().append_pair("engine", engine);
     }
 
     let resp = client.get(url).send().await?;

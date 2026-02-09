@@ -250,7 +250,7 @@ fn is_dangerous_function(name: &str) -> bool {
         "lo_export",
         // PostgreSQL command execution
         "pg_execute_server_program",
-        // ClickHouse system functions
+        // System functions
         "system.flush_logs",
         "system.reload_config",
         "system.shutdown",
@@ -266,7 +266,7 @@ fn is_dangerous_function(name: &str) -> bool {
 /// Check if a table function is dangerous (filesystem access).
 fn is_dangerous_table_function(name: &str) -> bool {
     const DANGEROUS: &[&str] = &[
-        // ClickHouse file/URL table functions
+        // File/URL table functions
         "file",
         "url",
         "s3",
@@ -276,15 +276,15 @@ fn is_dangerous_table_function(name: &str) -> bool {
         "remoteSecure",
         "cluster",
         "clusterAllReplicas",
-        // ClickHouse input formats
+        // Input formats
         "input",
         "format",
-        // ClickHouse system access
+        // System access
         "system",
         "numbers",
         "zeros",
         "generateRandom",
-        // ClickHouse dictionary access (could leak data)
+        // Dictionary access (could leak data)
         "dictGet",
         "dictGetOrDefault",
         "dictHas",

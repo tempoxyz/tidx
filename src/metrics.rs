@@ -158,18 +158,6 @@ impl SyncProgress {
     }
 }
 
-// ClickHouse OLAP metrics
-
-pub fn record_clickhouse_query(duration: std::time::Duration, success: bool) {
-    let labels = [("success", success.to_string())];
-    counter!("tidx_clickhouse_queries_total", &labels).increment(1);
-    histogram!("tidx_clickhouse_query_duration_seconds", &labels).record(duration.as_secs_f64());
-}
-
-pub fn record_clickhouse_rows(count: u64) {
-    histogram!("tidx_clickhouse_query_rows").record(count as f64);
-}
-
 fn format_eta(secs: f64) -> String {
     if secs <= 0.0 || secs.is_nan() || secs.is_infinite() {
         return "unknown".to_string();
