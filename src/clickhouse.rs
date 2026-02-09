@@ -276,14 +276,14 @@ impl ClickHouseEngine {
 
             // Connect to PostgreSQL using replication protocol to create slot with
             // EXPORT_SNAPSHOT (required by ClickHouse) and FAILOVER (required by CNPG)
-            // Use URL format with replication param for proper escaping of special chars
+            // Build key=value connection string with proper quoting for special chars
             let pg_repl_conn_str = format!(
-                "postgres://{}:{}@{}:{}/{}?replication=database",
-                urlencoding::encode(&pg.user),
-                urlencoding::encode(&pg.password),
-                pg.host,
+                "host='{}' port='{}' dbname='{}' user='{}' password='{}' replication=database",
+                pg.host.replace('\'', "\\'"),
                 pg.port,
-                urlencoding::encode(&pg.database)
+                pg.database.replace('\'', "\\'"),
+                pg.user.replace('\'', "\\'"),
+                pg.password.replace('\'', "\\'")
             );
 
             let (pg_client, connection) =
