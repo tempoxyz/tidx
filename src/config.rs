@@ -195,25 +195,9 @@ pub struct ClickHouseConfig {
     #[serde(default)]
     pub enabled: bool,
 
-    /// Primary ClickHouse HTTP URL (default: http://clickhouse:8123)
+    /// ClickHouse HTTP URL (default: http://clickhouse:8123)
     #[serde(default = "default_clickhouse_url")]
     pub url: String,
-
-    /// Additional ClickHouse instance URLs for failover.
-    /// Each instance runs its own MaterializedPostgreSQL replication.
-    /// Queries go to the primary `url`; failover instances are tried
-    /// in order if the primary is unavailable.
-    #[serde(default)]
-    pub failover_urls: Vec<String>,
-}
-
-impl ClickHouseConfig {
-    /// Returns all URLs: primary first, then failover instances.
-    pub fn all_urls(&self) -> Vec<&str> {
-        let mut urls = vec![self.url.as_str()];
-        urls.extend(self.failover_urls.iter().map(|u| u.as_str()));
-        urls
-    }
 }
 
 impl Default for ClickHouseConfig {
@@ -221,7 +205,6 @@ impl Default for ClickHouseConfig {
         Self {
             enabled: false,
             url: "http://clickhouse:8123".to_string(),
-            failover_urls: Vec::new(),
         }
     }
 }
@@ -243,13 +226,13 @@ impl ChainConfig {
                 let password = std::env::var(env_var).with_context(|| {
                     format!("pg_password_env '{env_var}' is set but environment variable not found")
                 })?;
-                
+
                 let mut url = url::Url::parse(&self.pg_url)
                     .with_context(|| format!("Invalid pg_url: {}", self.pg_url))?;
-                
+
                 url.set_password(Some(&password))
                     .map_err(|()| anyhow::anyhow!("Failed to set password in pg_url"))?;
-                
+
                 Ok(url.to_string())
             }
             None => Ok(self.pg_url.clone()),
@@ -293,9 +276,9 @@ mod tests {
             rpc_url = "http://localhost:8545"
             pg_url = "postgres://localhost/test"
         "#;
-        
+
         let config: ChainConfig = toml::from_str(toml_str).unwrap();
-        
+
         assert!(config.backfill);
         assert_eq!(config.batch_size, 100);
         assert_eq!(config.concurrency, 4);
@@ -324,9 +307,9 @@ mod tests {
             rpc_url = "http://localhost:8546"
             pg_url = "postgres://localhost/chain2"
         "#;
-        
+
         let config: Config = toml::from_str(toml_str).unwrap();
-        
+
         assert_eq!(config.chains.len(), 2);
     }
 
@@ -340,7 +323,7 @@ mod tests {
     }
 
     #[test]
-    fn test_clickhouse_config_with_failover() {
+    fn test_clickhouse_config_with_url() {
         let toml_str = r#"
             name = "test"
             chain_id = 1
@@ -350,7 +333,6 @@ mod tests {
             [clickhouse]
             enabled = true
             url = "http://clickhouse-1:8123"
-            failover_urls = ["http://clickhouse-2:8123", "http://clickhouse-3:8123"]
         "#;
 
         let config: ChainConfig = toml::from_str(toml_str).unwrap();
@@ -358,19 +340,10 @@ mod tests {
 
         assert!(ch.enabled);
         assert_eq!(ch.url, "http://clickhouse-1:8123");
-        assert_eq!(ch.failover_urls.len(), 2);
-        assert_eq!(
-            ch.all_urls(),
-            vec![
-                "http://clickhouse-1:8123",
-                "http://clickhouse-2:8123",
-                "http://clickhouse-3:8123",
-            ]
-        );
     }
 
     #[test]
-    fn test_clickhouse_config_without_failover() {
+    fn test_clickhouse_config_default() {
         let toml_str = r#"
             name = "test"
             chain_id = 1
@@ -379,14 +352,13 @@ mod tests {
 
             [clickhouse]
             enabled = true
-            url = "http://clickhouse:8123"
         "#;
 
         let config: ChainConfig = toml::from_str(toml_str).unwrap();
         let ch = config.clickhouse.unwrap();
 
-        assert!(ch.failover_urls.is_empty());
-        assert_eq!(ch.all_urls(), vec!["http://clickhouse:8123"]);
+        assert!(ch.enabled);
+        assert_eq!(ch.url, "http://clickhouse:8123");
     }
 
     #[test]
@@ -404,8 +376,11 @@ mod tests {
             trust_rpc: false,
             clickhouse: None,
         };
-        
-        assert_eq!(config.resolved_pg_url().unwrap(), "postgres://user:pass@localhost/db");
+
+        assert_eq!(
+            config.resolved_pg_url().unwrap(),
+            "postgres://user:pass@localhost/db"
+        );
     }
 
     #[test]
@@ -424,7 +399,7 @@ mod tests {
             trust_rpc: false,
             clickhouse: None,
         };
-        
+
         let resolved = config.resolved_pg_url().unwrap();
         assert!(resolved.starts_with("postgres://user:"));
         assert!(resolved.ends_with("@localhost/db"));
@@ -446,7 +421,7 @@ mod tests {
             trust_rpc: false,
             clickhouse: None,
         };
-        
+
         assert!(config.resolved_pg_url().is_err());
     }
 }
