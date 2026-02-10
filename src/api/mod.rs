@@ -257,7 +257,7 @@ fn default_timeout() -> u64 {
     5000
 }
 fn default_limit() -> i64 {
-    10000
+    crate::query::HARD_LIMIT_MAX
 }
 
 #[derive(Serialize)]
@@ -299,7 +299,7 @@ async fn handle_query_once(
 
     let options = QueryOptions {
         timeout_ms: params.timeout_ms.clamp(100, 30000),
-        limit: params.limit.clamp(1, 100000),
+        limit: params.limit.clamp(1, crate::query::HARD_LIMIT_MAX),
     };
 
     // Route to appropriate engine
@@ -397,7 +397,7 @@ async fn handle_query_live(
     let signature = params.signature;
     let options = QueryOptions {
         timeout_ms: params.timeout_ms.clamp(100, 30000),
-        limit: params.limit.clamp(1, 100000),
+        limit: params.limit.clamp(1, crate::query::HARD_LIMIT_MAX),
     };
 
     // Detect if this is an OLAP query (aggregations, etc.)

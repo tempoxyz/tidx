@@ -7,7 +7,7 @@ pub use parser::{
     extract_order_by_columns, AbiParam, AbiType, EventSignature,
 };
 pub use router::{route_query, QueryEngine};
-pub use validator::validate_query;
+pub use validator::{validate_query, HARD_LIMIT_MAX};
 
 use regex_lite::Regex;
 use std::sync::LazyLock;

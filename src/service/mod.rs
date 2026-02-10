@@ -5,7 +5,7 @@ use std::time::Instant;
 
 use crate::db::Pool;
 use crate::metrics;
-use crate::query::{extract_column_references, validate_query, EventSignature};
+use crate::query::{extract_column_references, validate_query, EventSignature, HARD_LIMIT_MAX};
 
 #[derive(Debug, Clone, Serialize)]
 pub struct SyncStatus {
@@ -109,7 +109,7 @@ impl Default for QueryOptions {
     fn default() -> Self {
         Self {
             timeout_ms: 5000,
-            limit: 10000,
+            limit: HARD_LIMIT_MAX,
         }
     }
 }
@@ -145,13 +145,8 @@ pub async fn execute_query_postgres(
         sql.to_string()
     };
 
-    // Add LIMIT if not present
-    let sql_upper = sql.to_uppercase();
-    let sql = if !sql_upper.contains("LIMIT") {
-        format!("{} LIMIT {}", sql, options.limit)
-    } else {
-        sql
-    };
+    // Add LIMIT if not present (AST-based detection to avoid string matching bypass)
+    let sql = append_limit_if_missing(&sql, options.limit);
 
     // Convert '0x...' hex literals to '\x...' bytea literals for PostgreSQL
     // Only replace hex values (40+ chars), not short '0x' prefixes used in concat()
@@ -224,6 +219,21 @@ pub async fn execute_query_postgres(
         engine: Some("postgres".to_string()),
         query_time_ms: Some(elapsed_ms),
     })
+}
+
+fn append_limit_if_missing(sql: &str, limit: i64) -> String {
+    use sqlparser::dialect::GenericDialect;
+    use sqlparser::parser::Parser;
+
+    let dialect = GenericDialect {};
+    if let Ok(stmts) = Parser::parse_sql(&dialect, sql) {
+        if let Some(sqlparser::ast::Statement::Query(query)) = stmts.first() {
+            if query.limit_clause.is_none() {
+                return format!("{sql} LIMIT {limit}");
+            }
+        }
+    }
+    sql.to_string()
 }
 
 pub fn format_column_json(row: &tokio_postgres::Row, idx: usize) -> serde_json::Value {

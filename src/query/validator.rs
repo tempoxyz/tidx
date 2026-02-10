@@ -17,18 +17,26 @@ const ALLOWED_TABLES: &[&str] = &[
     "token_balances",
 ];
 
+const MAX_QUERY_LENGTH: usize = 65_536;
+const MAX_SUBQUERY_DEPTH: usize = 4;
+pub const HARD_LIMIT_MAX: i64 = 10_000;
+
 /// Validates that a SQL query is safe to execute.
 ///
-/// Rejects:
-/// - Multiple statements
-/// - Non-SELECT statements (INSERT, UPDATE, DELETE, etc.)
-/// - Data-modifying CTEs
-/// - Dangerous functions (pg_sleep, read_csv, pg_read_file, etc.)
-/// - System catalog access
+/// Uses a reject-by-default approach: only explicitly allowed tables,
+/// functions, and expression types are permitted. Everything else is rejected.
 pub fn validate_query(sql: &str) -> Result<()> {
+    if sql.len() > MAX_QUERY_LENGTH {
+        return Err(anyhow!(
+            "Query too large ({} bytes, max {})",
+            sql.len(),
+            MAX_QUERY_LENGTH
+        ));
+    }
+
     let dialect = GenericDialect {};
-    let statements = Parser::parse_sql(&dialect, sql)
-        .map_err(|e| anyhow!("SQL parse error: {e}"))?;
+    let statements =
+        Parser::parse_sql(&dialect, sql).map_err(|e| anyhow!("SQL parse error: {e}"))?;
 
     if statements.is_empty() {
         return Err(anyhow!("Empty query"));
@@ -43,7 +51,7 @@ pub fn validate_query(sql: &str) -> Result<()> {
     match stmt {
         Statement::Query(query) => {
             let cte_names = extract_cte_names(query);
-            validate_query_ast(query, &cte_names)
+            validate_query_ast(query, &cte_names, 0)
         }
         _ => Err(anyhow!("Only SELECT queries are allowed")),
     }
@@ -59,12 +67,26 @@ fn extract_cte_names(query: &Query) -> HashSet<String> {
     names
 }
 
-fn validate_query_ast(query: &Query, cte_names: &HashSet<String>) -> Result<()> {
+fn validate_query_ast(query: &Query, cte_names: &HashSet<String>, depth: usize) -> Result<()> {
+    if depth > MAX_SUBQUERY_DEPTH {
+        return Err(anyhow!(
+            "Subquery nesting too deep (max {} levels)",
+            MAX_SUBQUERY_DEPTH
+        ));
+    }
+
     // Block recursive CTEs (can cause endless loops / resource exhaustion)
     if let Some(with) = &query.with {
         if with.recursive {
             return Err(anyhow!("Recursive CTEs are not allowed"));
         }
+    }
+
+    // Block FOR UPDATE / FOR SHARE locking clauses
+    if !query.locks.is_empty() {
+        return Err(anyhow!(
+            "Locking clauses (FOR UPDATE/SHARE) are not allowed"
+        ));
     }
 
     let mut all_cte_names = cte_names.clone();
@@ -74,14 +96,86 @@ fn validate_query_ast(query: &Query, cte_names: &HashSet<String>) -> Result<()> 
         }
     }
 
-    for cte in &query.with.as_ref().map_or(vec![], |w| w.cte_tables.clone()) {
-        validate_query_ast(&cte.query, &all_cte_names)?;
+    for cte in &query
+        .with
+        .as_ref()
+        .map_or(vec![], |w| w.cte_tables.clone())
+    {
+        validate_query_ast(&cte.query, &all_cte_names, depth + 1)?;
     }
 
-    validate_set_expr(&query.body, &all_cte_names)
+    validate_set_expr(&query.body, &all_cte_names, depth)?;
+
+    // Validate ORDER BY expressions
+    if let Some(order_by) = &query.order_by {
+        match &order_by.kind {
+            sqlparser::ast::OrderByKind::Expressions(exprs) => {
+                for order_expr in exprs {
+                    validate_expr(&order_expr.expr, &all_cte_names, depth)?;
+                }
+            }
+            sqlparser::ast::OrderByKind::All(_) => {}
+        }
+    }
+
+    // Validate LIMIT / OFFSET: only allow numeric literals
+    if let Some(limit_clause) = &query.limit_clause {
+        match limit_clause {
+            sqlparser::ast::LimitClause::LimitOffset {
+                limit,
+                offset,
+                limit_by,
+            } => {
+                if let Some(limit_expr) = limit {
+                    validate_limit_expr(limit_expr, "LIMIT")?;
+                }
+                if let Some(offset) = offset {
+                    validate_limit_expr(&offset.value, "OFFSET")?;
+                }
+                if !limit_by.is_empty() {
+                    return Err(anyhow!("LIMIT BY is not allowed"));
+                }
+            }
+            sqlparser::ast::LimitClause::OffsetCommaLimit { offset, limit } => {
+                validate_limit_expr(offset, "OFFSET")?;
+                validate_limit_expr(limit, "LIMIT")?;
+            }
+        }
+    }
+
+    Ok(())
 }
 
-fn validate_set_expr(set_expr: &SetExpr, cte_names: &HashSet<String>) -> Result<()> {
+fn validate_limit_expr(expr: &Expr, context: &str) -> Result<()> {
+    match expr {
+        Expr::Value(v) => {
+            let val = &v.value;
+            match val {
+                sqlparser::ast::Value::Number(n, _) => {
+                    if let Ok(num) = n.parse::<i64>() {
+                        if num > HARD_LIMIT_MAX {
+                            return Err(anyhow!(
+                                "{context} value {num} exceeds maximum ({HARD_LIMIT_MAX})"
+                            ));
+                        }
+                        Ok(())
+                    } else {
+                        Err(anyhow!("{context} must be a valid integer"))
+                    }
+                }
+                sqlparser::ast::Value::Null => Ok(()),
+                _ => Err(anyhow!("{context} must be a numeric literal")),
+            }
+        }
+        _ => Err(anyhow!("{context} must be a numeric literal")),
+    }
+}
+
+fn validate_set_expr(
+    set_expr: &SetExpr,
+    cte_names: &HashSet<String>,
+    depth: usize,
+) -> Result<()> {
     match set_expr {
         SetExpr::Select(select) => {
             // Reject SELECT INTO (creates objects)
@@ -90,45 +184,44 @@ fn validate_set_expr(set_expr: &SetExpr, cte_names: &HashSet<String>) -> Result<
             }
 
             for table in &select.from {
-                validate_table_with_joins(table, cte_names)?;
+                validate_table_with_joins(table, cte_names, depth)?;
             }
 
             for item in &select.projection {
                 if let sqlparser::ast::SelectItem::UnnamedExpr(expr)
                 | sqlparser::ast::SelectItem::ExprWithAlias { expr, .. } = item
                 {
-                    validate_expr(expr, cte_names)?;
+                    validate_expr(expr, cte_names, depth)?;
                 }
             }
 
             if let Some(selection) = &select.selection {
-                validate_expr(selection, cte_names)?;
+                validate_expr(selection, cte_names, depth)?;
             }
 
             // Validate GROUP BY expressions
             if let sqlparser::ast::GroupByExpr::Expressions(exprs, _) = &select.group_by {
                 for expr in exprs {
-                    validate_expr(expr, cte_names)?;
+                    validate_expr(expr, cte_names, depth)?;
                 }
             }
 
             // Validate HAVING
             if let Some(having) = &select.having {
-                validate_expr(having, cte_names)?;
+                validate_expr(having, cte_names, depth)?;
             }
 
             Ok(())
         }
-        SetExpr::Query(q) => validate_query_ast(q, cte_names),
+        SetExpr::Query(q) => validate_query_ast(q, cte_names, depth),
         SetExpr::SetOperation { left, right, .. } => {
-            validate_set_expr(left, cte_names)?;
-            validate_set_expr(right, cte_names)
+            validate_set_expr(left, cte_names, depth)?;
+            validate_set_expr(right, cte_names, depth)
         }
         SetExpr::Values(values) => {
-            // Validate all expressions in VALUES rows to prevent function call bypass
             for row in &values.rows {
                 for expr in row {
-                    validate_expr(expr, cte_names)?;
+                    validate_expr(expr, cte_names, depth)?;
                 }
             }
             Ok(())
@@ -141,11 +234,14 @@ fn validate_set_expr(set_expr: &SetExpr, cte_names: &HashSet<String>) -> Result<
     }
 }
 
-fn validate_table_with_joins(table: &TableWithJoins, cte_names: &HashSet<String>) -> Result<()> {
-    validate_table_factor(&table.relation, cte_names)?;
+fn validate_table_with_joins(
+    table: &TableWithJoins,
+    cte_names: &HashSet<String>,
+    depth: usize,
+) -> Result<()> {
+    validate_table_factor(&table.relation, cte_names, depth)?;
     for join in &table.joins {
-        validate_table_factor(&join.relation, cte_names)?;
-        // Validate JOIN ON expressions
+        validate_table_factor(&join.relation, cte_names, depth)?;
         let constraint = match &join.join_operator {
             sqlparser::ast::JoinOperator::Join(c)
             | sqlparser::ast::JoinOperator::Inner(c)
@@ -164,13 +260,17 @@ fn validate_table_with_joins(table: &TableWithJoins, cte_names: &HashSet<String>
             _ => None,
         };
         if let Some(sqlparser::ast::JoinConstraint::On(expr)) = constraint {
-            validate_expr(expr, cte_names)?;
+            validate_expr(expr, cte_names, depth)?;
         }
     }
     Ok(())
 }
 
-fn validate_table_factor(factor: &TableFactor, cte_names: &HashSet<String>) -> Result<()> {
+fn validate_table_factor(
+    factor: &TableFactor,
+    cte_names: &HashSet<String>,
+    depth: usize,
+) -> Result<()> {
     match factor {
         TableFactor::Table { name, args, .. } => {
             if args.is_some() {
@@ -178,12 +278,14 @@ fn validate_table_factor(factor: &TableFactor, cte_names: &HashSet<String>) -> R
             }
             validate_table_name(name, cte_names)
         }
-        TableFactor::Derived { subquery, .. } => validate_query_ast(subquery, cte_names),
+        TableFactor::Derived { subquery, .. } => {
+            validate_query_ast(subquery, cte_names, depth + 1)
+        }
         TableFactor::TableFunction { .. } => Err(anyhow!("Table functions are not allowed")),
         TableFactor::Function { .. } => Err(anyhow!("Table functions are not allowed")),
-        TableFactor::NestedJoin { table_with_joins, .. } => {
-            validate_table_with_joins(table_with_joins, cte_names)
-        }
+        TableFactor::NestedJoin {
+            table_with_joins, ..
+        } => validate_table_with_joins(table_with_joins, cte_names, depth),
         _ => Err(anyhow!("Unsupported FROM clause type")),
     }
 }
@@ -200,7 +302,9 @@ fn validate_table_name(name: &ObjectName, cte_names: &HashSet<String>) -> Result
 
     for schema in BLOCKED_SCHEMAS {
         if full_name.starts_with(schema) {
-            return Err(anyhow!("Access to system catalog '{schema}' is not allowed"));
+            return Err(anyhow!(
+                "Access to system catalog '{schema}' is not allowed"
+            ));
         }
     }
 
@@ -219,7 +323,9 @@ fn validate_table_name(name: &ObjectName, cte_names: &HashSet<String>) -> Result
         }
     }
 
-    let bare_name = name.0.last()
+    let bare_name = name
+        .0
+        .last()
         .and_then(|part| part.as_ident())
         .map(|ident| ident.value.to_lowercase())
         .unwrap_or_default();
@@ -235,44 +341,79 @@ fn validate_table_name(name: &ObjectName, cte_names: &HashSet<String>) -> Result
     Err(anyhow!("Access to table '{bare_name}' is not allowed"))
 }
 
-fn validate_expr(expr: &Expr, cte_names: &HashSet<String>) -> Result<()> {
+/// Reject-by-default expression validation.
+/// Only explicitly allowed expression types are permitted.
+fn validate_expr(expr: &Expr, cte_names: &HashSet<String>, depth: usize) -> Result<()> {
     match expr {
-        Expr::Function(func) => validate_function(func, cte_names),
-        Expr::Subquery(q) => validate_query_ast(q, cte_names),
-        Expr::InSubquery { subquery, .. } => validate_query_ast(subquery, cte_names),
-        Expr::Exists { subquery, .. } => validate_query_ast(subquery, cte_names),
+        // Safe leaf nodes
+        Expr::Identifier(_) | Expr::CompoundIdentifier(_) => Ok(()),
+        Expr::Value(_) => Ok(()),
+        Expr::TypedString(_) => Ok(()),
+        Expr::Wildcard(_) | Expr::QualifiedWildcard(_, _) => Ok(()),
+
+        // Function calls (validated against allowlist)
+        Expr::Function(func) => validate_function(func, cte_names, depth),
+
+        // Subqueries (increment depth)
+        Expr::Subquery(q) => validate_query_ast(q, cte_names, depth + 1),
+        Expr::InSubquery {
+            expr, subquery, ..
+        } => {
+            validate_expr(expr, cte_names, depth)?;
+            validate_query_ast(subquery, cte_names, depth + 1)
+        }
+        Expr::Exists { subquery, .. } => validate_query_ast(subquery, cte_names, depth + 1),
+
+        // Binary / unary operations
         Expr::BinaryOp { left, right, .. } => {
-            validate_expr(left, cte_names)?;
-            validate_expr(right, cte_names)
+            validate_expr(left, cte_names, depth)?;
+            validate_expr(right, cte_names, depth)
         }
-        Expr::UnaryOp { expr, .. } => validate_expr(expr, cte_names),
-        Expr::Between { expr, low, high, .. } => {
-            validate_expr(expr, cte_names)?;
-            validate_expr(low, cte_names)?;
-            validate_expr(high, cte_names)
+        Expr::UnaryOp { expr, .. } => validate_expr(expr, cte_names, depth),
+
+        // Range expressions
+        Expr::Between {
+            expr, low, high, ..
+        } => {
+            validate_expr(expr, cte_names, depth)?;
+            validate_expr(low, cte_names, depth)?;
+            validate_expr(high, cte_names, depth)
         }
-        Expr::Case { operand, conditions, else_result, .. } => {
+
+        // CASE WHEN
+        Expr::Case {
+            operand,
+            conditions,
+            else_result,
+            ..
+        } => {
             if let Some(op) = operand {
-                validate_expr(op, cte_names)?;
+                validate_expr(op, cte_names, depth)?;
             }
             for case_when in conditions {
-                validate_expr(&case_when.condition, cte_names)?;
-                validate_expr(&case_when.result, cte_names)?;
+                validate_expr(&case_when.condition, cte_names, depth)?;
+                validate_expr(&case_when.result, cte_names, depth)?;
             }
             if let Some(else_r) = else_result {
-                validate_expr(else_r, cte_names)?;
+                validate_expr(else_r, cte_names, depth)?;
             }
             Ok(())
         }
-        Expr::Cast { expr, .. } => validate_expr(expr, cte_names),
-        Expr::Nested(e) => validate_expr(e, cte_names),
+
+        // Type casting
+        Expr::Cast { expr, .. } => validate_expr(expr, cte_names, depth),
+        Expr::Nested(e) => validate_expr(e, cte_names, depth),
+
+        // IN list
         Expr::InList { expr, list, .. } => {
-            validate_expr(expr, cte_names)?;
+            validate_expr(expr, cte_names, depth)?;
             for item in list {
-                validate_expr(item, cte_names)?;
+                validate_expr(item, cte_names, depth)?;
             }
             Ok(())
         }
+
+        // Boolean tests
         Expr::IsNull(e)
         | Expr::IsNotNull(e)
         | Expr::IsTrue(e)
@@ -280,36 +421,159 @@ fn validate_expr(expr: &Expr, cte_names: &HashSet<String>) -> Result<()> {
         | Expr::IsNotTrue(e)
         | Expr::IsNotFalse(e)
         | Expr::IsUnknown(e)
-        | Expr::IsNotUnknown(e) => validate_expr(e, cte_names),
+        | Expr::IsNotUnknown(e) => validate_expr(e, cte_names, depth),
+
+        // Pattern matching
         Expr::Like { expr, pattern, .. } | Expr::ILike { expr, pattern, .. } => {
-            validate_expr(expr, cte_names)?;
-            validate_expr(pattern, cte_names)
+            validate_expr(expr, cte_names, depth)?;
+            validate_expr(pattern, cte_names, depth)
         }
-        Expr::AnyOp { right, .. } | Expr::AllOp { right, .. } => validate_expr(right, cte_names),
-        _ => Ok(()),
+        Expr::SimilarTo { expr, pattern, .. } => {
+            validate_expr(expr, cte_names, depth)?;
+            validate_expr(pattern, cte_names, depth)
+        }
+
+        // ANY/ALL operators
+        Expr::AnyOp { right, .. } | Expr::AllOp { right, .. } => {
+            validate_expr(right, cte_names, depth)
+        }
+
+        // IS DISTINCT FROM
+        Expr::IsDistinctFrom(a, b) | Expr::IsNotDistinctFrom(a, b) => {
+            validate_expr(a, cte_names, depth)?;
+            validate_expr(b, cte_names, depth)
+        }
+
+        // SQL builtins parsed as dedicated Expr variants (not Function)
+        Expr::Extract { expr, .. } => validate_expr(expr, cte_names, depth),
+        Expr::Substring { expr, substring_from, substring_for, .. } => {
+            validate_expr(expr, cte_names, depth)?;
+            if let Some(from) = substring_from {
+                validate_expr(from, cte_names, depth)?;
+            }
+            if let Some(for_expr) = substring_for {
+                validate_expr(for_expr, cte_names, depth)?;
+            }
+            Ok(())
+        }
+        Expr::Trim { expr, trim_what, .. } => {
+            validate_expr(expr, cte_names, depth)?;
+            if let Some(what) = trim_what {
+                validate_expr(what, cte_names, depth)?;
+            }
+            Ok(())
+        }
+        Expr::Ceil { expr, .. } | Expr::Floor { expr, .. } => {
+            validate_expr(expr, cte_names, depth)
+        }
+        Expr::Position { expr, r#in, .. } => {
+            validate_expr(expr, cte_names, depth)?;
+            validate_expr(r#in, cte_names, depth)
+        }
+        Expr::Overlay { expr, overlay_what, overlay_from, overlay_for, .. } => {
+            validate_expr(expr, cte_names, depth)?;
+            validate_expr(overlay_what, cte_names, depth)?;
+            validate_expr(overlay_from, cte_names, depth)?;
+            if let Some(for_expr) = overlay_for {
+                validate_expr(for_expr, cte_names, depth)?;
+            }
+            Ok(())
+        }
+        Expr::Collate { expr, .. } => validate_expr(expr, cte_names, depth),
+        Expr::AtTimeZone { timestamp, time_zone, .. } => {
+            validate_expr(timestamp, cte_names, depth)?;
+            validate_expr(time_zone, cte_names, depth)
+        }
+
+        // Tuple / row constructors
+        Expr::Tuple(exprs) => {
+            for e in exprs {
+                validate_expr(e, cte_names, depth)?;
+            }
+            Ok(())
+        }
+
+        // Array literal
+        Expr::Array(arr) => {
+            for e in &arr.elem {
+                validate_expr(e, cte_names, depth)?;
+            }
+            Ok(())
+        }
+
+        // Interval literal
+        Expr::Interval(_) => Ok(()),
+
+        // Reject everything else (reject-by-default)
+        _ => Err(anyhow!("Unsupported expression type")),
     }
 }
 
 const ALLOWED_FUNCTIONS: &[&str] = &[
     // ABI decode helpers (custom PostgreSQL functions)
-    "abi_uint", "abi_int", "abi_address", "abi_bool", "abi_bytes", "abi_string",
-    "format_address", "format_uint",
+    "abi_uint",
+    "abi_int",
+    "abi_address",
+    "abi_bool",
+    "abi_bytes",
+    "abi_string",
+    "format_address",
+    "format_uint",
     // Aggregates
-    "count", "sum", "avg", "min", "max",
+    "count",
+    "sum",
+    "avg",
+    "min",
+    "max",
     // Scalar / null handling
-    "coalesce", "nullif", "greatest", "least",
+    "coalesce",
+    "nullif",
+    "greatest",
+    "least",
     // Numeric
-    "abs", "round", "floor", "ceil", "ceiling", "trunc", "pow", "power",
+    "abs",
+    "round",
+    "floor",
+    "ceil",
+    "ceiling",
+    "trunc",
+    "pow",
+    "power",
     // String
-    "lower", "upper", "length", "substring", "substr", "trim", "ltrim", "rtrim",
-    "replace", "concat", "left", "right", "lpad", "rpad",
+    "lower",
+    "upper",
+    "length",
+    "substring",
+    "substr",
+    "trim",
+    "ltrim",
+    "rtrim",
+    "replace",
+    "concat",
+    "left",
+    "right",
+    "lpad",
+    "rpad",
     // Bytea / hex
-    "encode", "decode", "octet_length",
+    "encode",
+    "decode",
+    "octet_length",
     // Time
-    "date_trunc", "extract", "to_timestamp", "now",
+    "date_trunc",
+    "extract",
+    "to_timestamp",
+    "now",
     // Window functions
-    "row_number", "rank", "dense_rank", "lag", "lead", "first_value", "last_value",
-    "ntile", "percent_rank", "cume_dist",
+    "row_number",
+    "rank",
+    "dense_rank",
+    "lag",
+    "lead",
+    "first_value",
+    "last_value",
+    "ntile",
+    "percent_rank",
+    "cume_dist",
     // Type casting helpers
     "cast",
 ];
@@ -319,7 +583,7 @@ fn is_allowed_function(name: &str) -> bool {
     ALLOWED_FUNCTIONS.contains(&bare_name)
 }
 
-fn validate_function(func: &Function, cte_names: &HashSet<String>) -> Result<()> {
+fn validate_function(func: &Function, cte_names: &HashSet<String>, depth: usize) -> Result<()> {
     let func_name = func.name.to_string().to_lowercase();
 
     if !is_allowed_function(&func_name) {
@@ -329,9 +593,24 @@ fn validate_function(func: &Function, cte_names: &HashSet<String>) -> Result<()>
     if let FunctionArguments::List(arg_list) = &func.args {
         for arg in &arg_list.args {
             if let FunctionArg::Unnamed(FunctionArgExpr::Expr(expr))
-            | FunctionArg::Named { arg: FunctionArgExpr::Expr(expr), .. } = arg
+            | FunctionArg::Named {
+                arg: FunctionArgExpr::Expr(expr),
+                ..
+            } = arg
             {
-                validate_expr(expr, cte_names)?;
+                validate_expr(expr, cte_names, depth)?;
+            }
+        }
+    }
+
+    // Validate window function OVER clause
+    if let Some(window_type) = &func.over {
+        if let sqlparser::ast::WindowType::WindowSpec(spec) = window_type {
+            for expr in &spec.partition_by {
+                validate_expr(expr, cte_names, depth)?;
+            }
+            for order_expr in &spec.order_by {
+                validate_expr(&order_expr.expr, cte_names, depth)?;
             }
         }
     }
@@ -376,7 +655,6 @@ mod tests {
 
     #[test]
     fn test_rejects_data_modifying_cte() {
-        // This is the V1 bypass attempt
         let result = validate_query(
             "WITH x AS (UPDATE blocks SET miner = 'pwn' RETURNING 1) SELECT * FROM x",
         );
@@ -385,11 +663,9 @@ mod tests {
 
     #[test]
     fn test_rejects_comment_bypass() {
-        // Comments are stripped by parser, so this becomes a valid UPDATE
         let result = validate_query(
             "WITH x AS (UPDA/**/TE blocks SET miner = 'pwn' RETURNING 1) SELECT * FROM x",
         );
-        // Parser will either fail to parse or recognize it as UPDATE
         assert!(result.is_err());
     }
 
@@ -431,18 +707,16 @@ mod tests {
 
     #[test]
     fn test_allows_window_functions() {
-        assert!(validate_query(
-            "SELECT num, ROW_NUMBER() OVER (ORDER BY num) FROM blocks"
-        )
-        .is_ok());
+        assert!(
+            validate_query("SELECT num, ROW_NUMBER() OVER (ORDER BY num) FROM blocks").is_ok()
+        );
     }
 
     #[test]
     fn test_allows_subquery() {
-        assert!(validate_query(
-            "SELECT * FROM blocks WHERE num IN (SELECT block_num FROM txs)"
-        )
-        .is_ok());
+        assert!(
+            validate_query("SELECT * FROM blocks WHERE num IN (SELECT block_num FROM txs)").is_ok()
+        );
     }
 
     #[test]
@@ -467,15 +741,17 @@ mod tests {
 
     #[test]
     fn test_allows_cte_defined_table() {
-        assert!(validate_query(
-            "WITH my_cte AS (SELECT * FROM blocks) SELECT * FROM my_cte"
-        )
-        .is_ok());
+        assert!(
+            validate_query("WITH my_cte AS (SELECT * FROM blocks) SELECT * FROM my_cte").is_ok()
+        );
     }
 
     #[test]
     fn test_rejects_dblink() {
-        assert!(validate_query("SELECT * FROM dblink('host=evil dbname=secrets', 'SELECT * FROM passwords')").is_err());
+        assert!(validate_query(
+            "SELECT * FROM dblink('host=evil dbname=secrets', 'SELECT * FROM passwords')"
+        )
+        .is_err());
         assert!(validate_query("SELECT dblink_connect('myconn', 'host=evil')").is_err());
         assert!(validate_query("SELECT dblink_exec('myconn', 'DROP TABLE blocks')").is_err());
     }
@@ -491,13 +767,17 @@ mod tests {
     fn test_rejects_recursive_cte() {
         assert!(validate_query(
             "WITH RECURSIVE r AS (SELECT 1 AS n UNION ALL SELECT n+1 FROM r) SELECT * FROM r"
-        ).is_err());
+        )
+        .is_err());
     }
 
     #[test]
     fn test_rejects_generate_series() {
         assert!(validate_query("SELECT generate_series(1, 1000000000)").is_err());
-        assert!(validate_query("SELECT * FROM blocks WHERE num IN (SELECT generate_series(1, 1000000))").is_err());
+        assert!(validate_query(
+            "SELECT * FROM blocks WHERE num IN (SELECT generate_series(1, 1000000))"
+        )
+        .is_err());
     }
 
     #[test]
@@ -531,14 +811,17 @@ mod tests {
 
     #[test]
     fn test_rejects_dangerous_function_in_having() {
-        assert!(validate_query("SELECT COUNT(*) FROM blocks GROUP BY num HAVING pg_sleep(1) IS NOT NULL").is_err());
+        assert!(validate_query(
+            "SELECT COUNT(*) FROM blocks GROUP BY num HAVING pg_sleep(1) IS NOT NULL"
+        )
+        .is_err());
     }
 
     #[test]
     fn test_rejects_dangerous_function_in_join_on() {
-        assert!(validate_query(
-            "SELECT * FROM blocks JOIN txs ON pg_sleep(1) IS NOT NULL"
-        ).is_err());
+        assert!(
+            validate_query("SELECT * FROM blocks JOIN txs ON pg_sleep(1) IS NOT NULL").is_err()
+        );
     }
 
     #[test]
@@ -564,7 +847,9 @@ mod tests {
         assert!(validate_query("SELECT COALESCE(gas_used, 0) FROM blocks").is_ok());
         assert!(validate_query("SELECT ABS(gas_used) FROM blocks").is_ok());
         assert!(validate_query("SELECT LOWER('test') FROM blocks").is_ok());
-        assert!(validate_query("SELECT date_trunc('hour', to_timestamp(ts)) FROM blocks").is_ok());
+        assert!(
+            validate_query("SELECT date_trunc('hour', to_timestamp(ts)) FROM blocks").is_ok()
+        );
     }
 
     #[test]
@@ -576,5 +861,99 @@ mod tests {
     #[test]
     fn test_rejects_unsupported_table_factor() {
         assert!(validate_query("SELECT * FROM UNNEST(ARRAY[1,2,3])").is_err());
+    }
+
+    // === New tests for this commit ===
+
+    #[test]
+    fn test_rejects_for_update() {
+        assert!(validate_query("SELECT * FROM blocks FOR UPDATE").is_err());
+        assert!(validate_query("SELECT * FROM blocks FOR SHARE").is_err());
+    }
+
+    #[test]
+    fn test_rejects_dangerous_function_in_order_by() {
+        assert!(
+            validate_query("SELECT * FROM blocks ORDER BY pg_sleep(1)").is_err()
+        );
+    }
+
+    #[test]
+    fn test_rejects_excessive_limit() {
+        assert!(validate_query("SELECT * FROM blocks LIMIT 100000000").is_err());
+        assert!(validate_query("SELECT * FROM blocks LIMIT 10001").is_err());
+    }
+
+    #[test]
+    fn test_allows_reasonable_limit() {
+        assert!(validate_query("SELECT * FROM blocks LIMIT 100").is_ok());
+        assert!(validate_query("SELECT * FROM blocks LIMIT 10000").is_ok());
+        assert!(validate_query("SELECT * FROM blocks LIMIT 1 OFFSET 5").is_ok());
+    }
+
+    #[test]
+    fn test_rejects_subquery_in_limit() {
+        assert!(validate_query("SELECT * FROM blocks LIMIT (SELECT 1)").is_err());
+    }
+
+    #[test]
+    fn test_rejects_deep_subquery_nesting() {
+        // 5 levels of derived table nesting exceeds MAX_SUBQUERY_DEPTH (4)
+        let deep = "SELECT * FROM (SELECT * FROM (SELECT * FROM (SELECT * FROM (SELECT * FROM (SELECT * FROM blocks) a) b) c) d) e";
+        assert!(validate_query(deep).is_err());
+    }
+
+    #[test]
+    fn test_allows_moderate_subquery_nesting() {
+        // 3 levels of nesting is within limits
+        let moderate = "SELECT * FROM (SELECT * FROM (SELECT * FROM blocks) a) b";
+        assert!(validate_query(moderate).is_ok());
+    }
+
+    #[test]
+    fn test_rejects_query_too_large() {
+        let huge = format!("SELECT * FROM blocks WHERE num IN ({})", "1,".repeat(70_000));
+        assert!(validate_query(&huge).is_err());
+    }
+
+    #[test]
+    fn test_allows_order_by_column() {
+        assert!(validate_query("SELECT * FROM blocks ORDER BY num DESC").is_ok());
+        assert!(
+            validate_query("SELECT * FROM blocks ORDER BY num DESC, hash ASC").is_ok()
+        );
+    }
+
+    #[test]
+    fn test_allows_cast_expression() {
+        assert!(validate_query("SELECT CAST(num AS TEXT) FROM blocks").is_ok());
+    }
+
+    #[test]
+    fn test_allows_between() {
+        assert!(validate_query("SELECT * FROM blocks WHERE num BETWEEN 1 AND 100").is_ok());
+    }
+
+    #[test]
+    fn test_allows_like() {
+        assert!(validate_query("SELECT * FROM txs WHERE hash LIKE '%abc%'").is_ok());
+    }
+
+    #[test]
+    fn test_allows_is_null() {
+        assert!(validate_query("SELECT * FROM blocks WHERE miner IS NOT NULL").is_ok());
+    }
+
+    #[test]
+    fn test_allows_case_when() {
+        assert!(validate_query(
+            "SELECT CASE WHEN num > 100 THEN 'big' ELSE 'small' END FROM blocks"
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn test_allows_array_literal() {
+        assert!(validate_query("SELECT * FROM blocks WHERE num = ANY(ARRAY[1,2,3])").is_ok());
     }
 }
