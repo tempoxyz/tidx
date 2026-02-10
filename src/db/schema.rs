@@ -39,6 +39,9 @@ pub async fn run_migrations(pool: &Pool) -> Result<()> {
     // Load any optional extensions
     conn.batch_execute(include_str!("../../db/extensions.sql")).await?;
 
+    // Create read-only API role with SELECT-only access to indexed tables
+    conn.batch_execute(include_str!("../../db/api_role.sql")).await?;
+
     Ok(())
 }
 
