@@ -26,6 +26,11 @@ const ALLOWED_TABLES: &[&str] = &[
 /// - Dangerous functions (pg_sleep, read_csv, pg_read_file, etc.)
 /// - System catalog access
 pub fn validate_query(sql: &str) -> Result<()> {
+    const MAX_QUERY_LENGTH: usize = 16_384;
+    if sql.len() > MAX_QUERY_LENGTH {
+        return Err(anyhow!("Query too long (max {MAX_QUERY_LENGTH} bytes)"));
+    }
+
     let dialect = GenericDialect {};
     let statements = Parser::parse_sql(&dialect, sql)
         .map_err(|e| anyhow!("SQL parse error: {e}"))?;
@@ -78,7 +83,41 @@ fn validate_query_ast(query: &Query, cte_names: &HashSet<String>) -> Result<()> 
         validate_query_ast(&cte.query, &all_cte_names)?;
     }
 
-    validate_set_expr(&query.body, &all_cte_names)
+    validate_set_expr(&query.body, &all_cte_names)?;
+
+    if let Some(order_by) = &query.order_by {
+        if let sqlparser::ast::OrderByKind::Expressions(exprs) = &order_by.kind {
+            for order_expr in exprs {
+                validate_expr(&order_expr.expr, &all_cte_names)?;
+            }
+        }
+    }
+
+    if let Some(limit_clause) = &query.limit_clause {
+        match limit_clause {
+            sqlparser::ast::LimitClause::LimitOffset { limit, offset, limit_by } => {
+                if let Some(limit) = limit {
+                    validate_expr(limit, &all_cte_names)?;
+                }
+                if let Some(offset) = offset {
+                    validate_expr(&offset.value, &all_cte_names)?;
+                }
+                for expr in limit_by {
+                    validate_expr(expr, &all_cte_names)?;
+                }
+            }
+            sqlparser::ast::LimitClause::OffsetCommaLimit { offset, limit } => {
+                validate_expr(offset, &all_cte_names)?;
+                validate_expr(limit, &all_cte_names)?;
+            }
+        }
+    }
+
+    if !query.locks.is_empty() {
+        return Err(anyhow!("FOR UPDATE/FOR SHARE is not allowed"));
+    }
+
+    Ok(())
 }
 
 fn validate_set_expr(set_expr: &SetExpr, cte_names: &HashSet<String>) -> Result<()> {
@@ -182,21 +221,11 @@ fn validate_table_factor(factor: &TableFactor, cte_names: &HashSet<String>) -> R
             validate_table_name(name, cte_names)
         }
         TableFactor::Derived { subquery, .. } => validate_query_ast(subquery, cte_names),
-        TableFactor::TableFunction { expr, .. } => {
-            if let Expr::Function(func) = expr {
-                let func_name = func.name.to_string().to_lowercase();
-                if is_dangerous_table_function(&func_name) {
-                    return Err(anyhow!("Table function '{func_name}' is not allowed"));
-                }
-            }
-            Ok(())
+        TableFactor::TableFunction { .. } => {
+            Err(anyhow!("Table functions in FROM clause are not allowed"))
         }
-        TableFactor::Function { name, .. } => {
-            let func_name = name.to_string().to_lowercase();
-            if is_dangerous_table_function(&func_name) {
-                return Err(anyhow!("Table function '{func_name}' is not allowed"));
-            }
-            Ok(())
+        TableFactor::Function { .. } => {
+            Err(anyhow!("Table functions in FROM clause are not allowed"))
         }
         TableFactor::NestedJoin { table_with_joins, .. } => {
             validate_table_with_joins(table_with_joins, cte_names)
@@ -303,7 +332,12 @@ fn validate_expr(expr: &Expr, cte_names: &HashSet<String>) -> Result<()> {
             validate_expr(pattern, cte_names)
         }
         Expr::AnyOp { right, .. } | Expr::AllOp { right, .. } => validate_expr(right, cte_names),
-        _ => Ok(()),
+        Expr::Value(_)
+        | Expr::Identifier(_)
+        | Expr::CompoundIdentifier(_)
+        | Expr::Wildcard(_)
+        | Expr::QualifiedWildcard(_, _) => Ok(()),
+        other => Err(anyhow!("Expression type not allowed: {other}")),
     }
 }
 
@@ -623,5 +657,46 @@ mod tests {
     #[test]
     fn test_allows_simple_values() {
         assert!(validate_query("VALUES (1, 'hello'), (2, 'world')").is_ok());
+    }
+
+    #[test]
+    fn test_rejects_long_query() {
+        let long_query = format!("SELECT * FROM blocks WHERE num > {}", "1".repeat(20000));
+        assert!(validate_query(&long_query).is_err());
+    }
+
+    #[test]
+    fn test_rejects_for_update() {
+        assert!(validate_query("SELECT * FROM blocks FOR UPDATE").is_err());
+        assert!(validate_query("SELECT * FROM blocks FOR SHARE").is_err());
+    }
+
+    #[test]
+    fn test_rejects_dangerous_function_in_order_by() {
+        assert!(validate_query(
+            "SELECT * FROM blocks ORDER BY pg_sleep(1)"
+        ).is_err());
+    }
+
+    #[test]
+    fn test_rejects_dangerous_function_in_limit() {
+        assert!(validate_query(
+            "SELECT * FROM blocks LIMIT (SELECT pg_sleep(1))"
+        ).is_err());
+    }
+
+    #[test]
+    fn test_rejects_table_function_in_from() {
+        assert!(validate_query("SELECT * FROM generate_series(1, 100) AS t").is_err());
+    }
+
+    #[test]
+    fn test_allows_normal_order_by() {
+        assert!(validate_query("SELECT * FROM blocks ORDER BY num DESC").is_ok());
+    }
+
+    #[test]
+    fn test_allows_normal_limit_offset() {
+        assert!(validate_query("SELECT * FROM blocks LIMIT 10 OFFSET 5").is_ok());
     }
 }
