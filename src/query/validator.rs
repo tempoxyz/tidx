@@ -89,6 +89,11 @@ fn validate_query_ast(query: &Query, cte_names: &HashSet<String>, depth: usize) 
         ));
     }
 
+    // Block FETCH clause (alternative to LIMIT, could bypass cap)
+    if query.fetch.is_some() {
+        return Err(anyhow!("FETCH clause is not allowed, use LIMIT instead"));
+    }
+
     let mut all_cte_names = cte_names.clone();
     if let Some(with) = &query.with {
         for cte in &with.cte_tables {
@@ -153,6 +158,9 @@ fn validate_limit_expr(expr: &Expr, context: &str) -> Result<()> {
             match val {
                 sqlparser::ast::Value::Number(n, _) => {
                     if let Ok(num) = n.parse::<i64>() {
+                        if num < 0 {
+                            return Err(anyhow!("{context} must not be negative"));
+                        }
                         if num > HARD_LIMIT_MAX {
                             return Err(anyhow!(
                                 "{context} value {num} exceeds maximum ({HARD_LIMIT_MAX})"
@@ -163,7 +171,9 @@ fn validate_limit_expr(expr: &Expr, context: &str) -> Result<()> {
                         Err(anyhow!("{context} must be a valid integer"))
                     }
                 }
-                sqlparser::ast::Value::Null => Ok(()),
+                sqlparser::ast::Value::Null => {
+                    Err(anyhow!("{context} NULL is not allowed"))
+                }
                 _ => Err(anyhow!("{context} must be a numeric literal")),
             }
         }
@@ -603,6 +613,16 @@ fn validate_function(func: &Function, cte_names: &HashSet<String>, depth: usize)
         }
     }
 
+    // Validate FILTER (WHERE ...) clause
+    if let Some(filter) = &func.filter {
+        validate_expr(filter, cte_names, depth)?;
+    }
+
+    // Validate WITHIN GROUP (ORDER BY ...) clause
+    for order_expr in &func.within_group {
+        validate_expr(&order_expr.expr, cte_names, depth)?;
+    }
+
     // Validate window function OVER clause
     if let Some(window_type) = &func.over {
         if let sqlparser::ast::WindowType::WindowSpec(spec) = window_type {
@@ -955,5 +975,30 @@ mod tests {
     #[test]
     fn test_allows_array_literal() {
         assert!(validate_query("SELECT * FROM blocks WHERE num = ANY(ARRAY[1,2,3])").is_ok());
+    }
+
+    #[test]
+    fn test_rejects_filter_clause_bypass() {
+        assert!(validate_query(
+            "SELECT COUNT(*) FILTER (WHERE pg_sleep(1) IS NOT NULL) FROM blocks"
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn test_rejects_limit_null() {
+        assert!(validate_query("SELECT * FROM blocks LIMIT NULL").is_err());
+    }
+
+    #[test]
+    fn test_rejects_negative_limit() {
+        assert!(validate_query("SELECT * FROM blocks LIMIT -1").is_err());
+    }
+
+    #[test]
+    fn test_rejects_fetch_clause() {
+        assert!(
+            validate_query("SELECT * FROM blocks FETCH FIRST 10 ROWS ONLY").is_err()
+        );
     }
 }
