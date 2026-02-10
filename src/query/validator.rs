@@ -13,8 +13,6 @@ const ALLOWED_TABLES: &[&str] = &[
     "txs",
     "logs",
     "receipts",
-    "token_holders",
-    "token_balances",
 ];
 
 /// Validates that a SQL query is safe to execute.
@@ -594,10 +592,16 @@ mod tests {
     }
 
     #[test]
-    fn test_allows_analytics_tables() {
-        assert!(validate_query("SELECT * FROM token_holders").is_ok());
-        assert!(validate_query("SELECT * FROM token_balances").is_ok());
+    fn test_allows_schema_qualified_tables() {
         assert!(validate_query("SELECT * FROM public.blocks").is_ok());
+    }
+
+    #[test]
+    fn test_rejects_analytics_tables_on_postgres() {
+        // Analytics tables (token_holders, token_balances) are ClickHouse-only
+        // and go through a separate code path that doesn't use this validator
+        assert!(validate_query("SELECT * FROM token_holders").is_err());
+        assert!(validate_query("SELECT * FROM token_balances").is_err());
     }
 
     #[test]
