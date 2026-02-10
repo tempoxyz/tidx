@@ -174,34 +174,17 @@ fn validate_table_factor(factor: &TableFactor, cte_names: &HashSet<String>) -> R
     match factor {
         TableFactor::Table { name, args, .. } => {
             if args.is_some() {
-                let func_name = name.to_string().to_lowercase();
-                if is_dangerous_table_function(&func_name) {
-                    return Err(anyhow!("Table function '{func_name}' is not allowed"));
-                }
+                return Err(anyhow!("Table functions are not allowed"));
             }
             validate_table_name(name, cte_names)
         }
         TableFactor::Derived { subquery, .. } => validate_query_ast(subquery, cte_names),
-        TableFactor::TableFunction { expr, .. } => {
-            if let Expr::Function(func) = expr {
-                let func_name = func.name.to_string().to_lowercase();
-                if is_dangerous_table_function(&func_name) {
-                    return Err(anyhow!("Table function '{func_name}' is not allowed"));
-                }
-            }
-            Ok(())
-        }
-        TableFactor::Function { name, .. } => {
-            let func_name = name.to_string().to_lowercase();
-            if is_dangerous_table_function(&func_name) {
-                return Err(anyhow!("Table function '{func_name}' is not allowed"));
-            }
-            Ok(())
-        }
+        TableFactor::TableFunction { .. } => Err(anyhow!("Table functions are not allowed")),
+        TableFactor::Function { .. } => Err(anyhow!("Table functions are not allowed")),
         TableFactor::NestedJoin { table_with_joins, .. } => {
             validate_table_with_joins(table_with_joins, cte_names)
         }
-        _ => Ok(()),
+        _ => Err(anyhow!("Unsupported FROM clause type")),
     }
 }
 
@@ -307,11 +290,40 @@ fn validate_expr(expr: &Expr, cte_names: &HashSet<String>) -> Result<()> {
     }
 }
 
+const ALLOWED_FUNCTIONS: &[&str] = &[
+    // ABI decode helpers (custom PostgreSQL functions)
+    "abi_uint", "abi_int", "abi_address", "abi_bool", "abi_bytes", "abi_string",
+    "format_address", "format_uint",
+    // Aggregates
+    "count", "sum", "avg", "min", "max",
+    // Scalar / null handling
+    "coalesce", "nullif", "greatest", "least",
+    // Numeric
+    "abs", "round", "floor", "ceil", "ceiling", "trunc", "pow", "power",
+    // String
+    "lower", "upper", "length", "substring", "substr", "trim", "ltrim", "rtrim",
+    "replace", "concat", "left", "right", "lpad", "rpad",
+    // Bytea / hex
+    "encode", "decode", "octet_length",
+    // Time
+    "date_trunc", "extract", "to_timestamp", "now",
+    // Window functions
+    "row_number", "rank", "dense_rank", "lag", "lead", "first_value", "last_value",
+    "ntile", "percent_rank", "cume_dist",
+    // Type casting helpers
+    "cast",
+];
+
+fn is_allowed_function(name: &str) -> bool {
+    let bare_name = name.rsplit('.').next().unwrap_or(name);
+    ALLOWED_FUNCTIONS.contains(&bare_name)
+}
+
 fn validate_function(func: &Function, cte_names: &HashSet<String>) -> Result<()> {
     let func_name = func.name.to_string().to_lowercase();
 
-    if is_dangerous_function(&func_name) {
-        return Err(anyhow!("Function '{func_name}' is not allowed"));
+    if !is_allowed_function(&func_name) {
+        return Err(anyhow!("Function '{}' is not allowed", func_name));
     }
 
     if let FunctionArguments::List(arg_list) = &func.args {
@@ -325,97 +337,6 @@ fn validate_function(func: &Function, cte_names: &HashSet<String>) -> Result<()>
     }
 
     Ok(())
-}
-
-/// Check if a function is dangerous (DoS, file access, side effects).
-fn is_dangerous_function(name: &str) -> bool {
-    const DANGEROUS: &[&str] = &[
-        // PostgreSQL DoS/side-effect functions
-        "pg_sleep",
-        "pg_terminate_backend",
-        "pg_cancel_backend",
-        "pg_reload_conf",
-        "pg_rotate_logfile",
-        "pg_switch_wal",
-        "pg_create_restore_point",
-        "pg_start_backup",
-        "pg_stop_backup",
-        "set_config",
-        "current_setting",
-        // PostgreSQL file access
-        "pg_read_file",
-        "pg_read_binary_file",
-        "pg_ls_dir",
-        "pg_stat_file",
-        "lo_import",
-        "lo_export",
-        // PostgreSQL command execution
-        "pg_execute_server_program",
-        // PostgreSQL dblink (remote connections)
-        "dblink",
-        "dblink_exec",
-        "dblink_connect",
-        "dblink_send_query",
-        "dblink_get_result",
-        // PostgreSQL large object access
-        "lo_get",
-        "lo_open",
-        "lo_close",
-        "loread",
-        "lowrite",
-        "lo_creat",
-        "lo_create",
-        "lo_unlink",
-        "lo_put",
-        // PostgreSQL set-returning functions (DoS via row generation)
-        "generate_series",
-        // PostgreSQL admin extension functions (file access)
-        "pg_file_read",
-        "pg_file_write",
-        "pg_file_rename",
-        "pg_file_unlink",
-        "pg_logdir_ls",
-        // ClickHouse system functions
-        "system.flush_logs",
-        "system.reload_config",
-        "system.shutdown",
-        "system.kill_query",
-        "system.drop_dns_cache",
-        "system.drop_mark_cache",
-        "system.drop_uncompressed_cache",
-    ];
-
-    DANGEROUS.iter().any(|&d| name == d || name.ends_with(&format!(".{d}")))
-}
-
-/// Check if a table function is dangerous (filesystem access).
-fn is_dangerous_table_function(name: &str) -> bool {
-    const DANGEROUS: &[&str] = &[
-        // ClickHouse file/URL table functions
-        "file",
-        "url",
-        "s3",
-        "gcs",
-        "hdfs",
-        "remote",
-        "remoteSecure",
-        "cluster",
-        "clusterAllReplicas",
-        // ClickHouse input formats
-        "input",
-        "format",
-        // ClickHouse system access
-        "system",
-        "numbers",
-        "zeros",
-        "generateRandom",
-        // ClickHouse dictionary access (could leak data)
-        "dictGet",
-        "dictGetOrDefault",
-        "dictHas",
-    ];
-
-    DANGEROUS.iter().any(|&d| name == d || name.contains(&format!("{d}(")))
 }
 
 #[cfg(test)]
@@ -623,5 +544,37 @@ mod tests {
     #[test]
     fn test_allows_simple_values() {
         assert!(validate_query("VALUES (1, 'hello'), (2, 'world')").is_ok());
+    }
+
+    #[test]
+    fn test_rejects_unknown_function() {
+        assert!(validate_query("SELECT md5('test') FROM blocks").is_err());
+        assert!(validate_query("SELECT regexp_replace(hash, 'a', 'b') FROM blocks").is_err());
+    }
+
+    #[test]
+    fn test_allows_abi_helpers() {
+        assert!(validate_query("SELECT abi_uint(input) FROM txs").is_ok());
+        assert!(validate_query("SELECT abi_address(input) FROM txs").is_ok());
+        assert!(validate_query("SELECT format_address(miner) FROM blocks").is_ok());
+    }
+
+    #[test]
+    fn test_allows_common_functions() {
+        assert!(validate_query("SELECT COALESCE(gas_used, 0) FROM blocks").is_ok());
+        assert!(validate_query("SELECT ABS(gas_used) FROM blocks").is_ok());
+        assert!(validate_query("SELECT LOWER('test') FROM blocks").is_ok());
+        assert!(validate_query("SELECT date_trunc('hour', to_timestamp(ts)) FROM blocks").is_ok());
+    }
+
+    #[test]
+    fn test_rejects_all_table_functions() {
+        assert!(validate_query("SELECT * FROM generate_series(1, 100)").is_err());
+        assert!(validate_query("SELECT * FROM unnest(ARRAY[1,2,3])").is_err());
+    }
+
+    #[test]
+    fn test_rejects_unsupported_table_factor() {
+        assert!(validate_query("SELECT * FROM UNNEST(ARRAY[1,2,3])").is_err());
     }
 }
