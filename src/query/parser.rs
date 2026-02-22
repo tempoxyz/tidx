@@ -629,6 +629,23 @@ impl AbiType {
     pub fn parse(s: &str) -> Result<Self> {
         let s = s.trim();
 
+        // Check array types first, before scalar parsing eats the suffix
+        if let Some(inner_str) = s.strip_suffix("[]") {
+            let inner = AbiType::parse(inner_str)?;
+            return Ok(AbiType::DynamicArray(Box::new(inner)));
+        }
+
+        if let Some(bracket_pos) = s.rfind('[')
+            && let Some(inner_with_bracket) = s.strip_suffix(']')
+        {
+            let inner = AbiType::parse(&s[..bracket_pos])?;
+            let size_str = &inner_with_bracket[bracket_pos + 1..];
+            let size: usize = size_str
+                .parse()
+                .map_err(|_| anyhow!("Invalid array size: {size_str}"))?;
+            return Ok(AbiType::FixedArray(Box::new(inner), size));
+        }
+
         if s == "address" {
             return Ok(AbiType::Address);
         }
@@ -668,22 +685,6 @@ impl AbiType {
                 .parse()
                 .map_err(|_| anyhow!("Invalid bytes size: {rest}"))?;
             return Ok(AbiType::Bytes(Some(size)));
-        }
-
-        if let Some(inner_str) = s.strip_suffix("[]") {
-            let inner = AbiType::parse(inner_str)?;
-            return Ok(AbiType::DynamicArray(Box::new(inner)));
-        }
-
-        if let Some(bracket_pos) = s.rfind('[')
-            && let Some(inner_with_bracket) = s.strip_suffix(']')
-        {
-            let inner = AbiType::parse(&s[..bracket_pos])?;
-            let size_str = &inner_with_bracket[bracket_pos + 1..];
-            let size: usize = size_str
-                .parse()
-                .map_err(|_| anyhow!("Invalid array size: {size_str}"))?;
-            return Ok(AbiType::FixedArray(Box::new(inner), size));
         }
 
         Err(anyhow!("Unknown ABI type: {s}"))
@@ -872,6 +873,27 @@ mod tests {
     fn test_parse_dynamic_bytes() {
         let sig = EventSignature::parse("SomeEvent(bytes)").unwrap();
         assert_eq!(sig.params[0].ty, AbiType::Bytes(None));
+    }
+
+    #[test]
+    fn test_parse_array_types() {
+        let sig = EventSignature::parse(
+            "TransferBatch(address indexed operator, address indexed from, address indexed to, uint256[] ids, uint256[] values)",
+        )
+        .unwrap();
+        assert_eq!(sig.name, "TransferBatch");
+        assert_eq!(sig.params.len(), 5);
+        assert_eq!(sig.params[3].ty, AbiType::DynamicArray(Box::new(AbiType::Uint(256))));
+        assert_eq!(sig.params[3].name.as_deref(), Some("ids"));
+        assert_eq!(sig.params[4].ty, AbiType::DynamicArray(Box::new(AbiType::Uint(256))));
+        // ERC-1155 TransferBatch topic0
+        assert!(sig.topic0_hex().starts_with("4a39dc06"));
+    }
+
+    #[test]
+    fn test_parse_fixed_array_type() {
+        let sig = EventSignature::parse("SomeEvent(uint256[3])").unwrap();
+        assert_eq!(sig.params[0].ty, AbiType::FixedArray(Box::new(AbiType::Uint(256)), 3));
     }
 
     #[test]
