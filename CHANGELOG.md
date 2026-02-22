@@ -1,5 +1,15 @@
 # Changelog
 
+## `tidx@0.3.0`
+
+### Minor Changes
+
+- Added support for multiple event signatures per query. The HTTP API now accepts repeated `signature` query params (`?signature=Transfer(...)&signature=Approval(...)`) and the CLI accepts multiple `-s` flags. Each signature generates a separate CTE, enabling cross-event queries like `SELECT * FROM Transfer UNION ALL SELECT * FROM Approval`. (by @jxom, [#83](https://github.com/tempoxyz/tidx/pull/83))
+
+### Patch Changes
+
+- Hardened SQL query API: replaced string-based injection with AST manipulation, switched from function blocklist to allowlist, added table allowlist, enforced reject-by-default expression validation, capped LIMIT/depth/size, and locked down API role with connection and resource limits. (by @jxom, [f9da1eb](https://github.com/tempoxyz/tidx/commit/f9da1eb))
+
 ## 0.2.0 (2026-02-06)
 
 ### Minor Changes
