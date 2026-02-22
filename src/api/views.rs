@@ -67,7 +67,7 @@ pub async fn list_views(
         database
     );
 
-    let result = clickhouse.query(&sql, None).await
+    let result = clickhouse.query(&sql, &[]).await
         .map_err(|e| ApiError::QueryError(e.to_string()))?;
 
     let mut views = Vec::new();
@@ -80,7 +80,7 @@ pub async fn list_views(
             "SELECT name, type FROM system.columns WHERE database = '{}' AND table = '{}' ORDER BY position",
             database, name
         );
-        let columns_result = clickhouse.query(&columns_sql, None).await
+        let columns_result = clickhouse.query(&columns_sql, &[]).await
             .map_err(|e| ApiError::QueryError(e.to_string()))?;
         
         let columns: Vec<ColumnInfo> = columns_result.rows.iter().map(|col_row| {
@@ -195,7 +195,7 @@ pub async fn create_view(
 
     // 1. Ensure database exists
     let create_db = format!("CREATE DATABASE IF NOT EXISTS {}", database);
-    clickhouse.query(&create_db, None).await
+    clickhouse.query(&create_db, &[]).await
         .map_err(|e| ApiError::QueryError(format!("Failed to create database: {}", e)))?;
 
     // 2. Create target table (infer schema from SELECT ... LIMIT 0)
@@ -203,7 +203,7 @@ pub async fn create_view(
         "CREATE TABLE IF NOT EXISTS {}.{} ENGINE = {} ORDER BY ({}) AS {} LIMIT 0",
         database, table_name, req.engine, order_by, sql
     );
-    clickhouse.query(&create_table, None).await
+    clickhouse.query(&create_table, &[]).await
         .map_err(|e| ApiError::QueryError(format!("Failed to create table: {}", e)))?;
 
     // 3. Create materialized view
@@ -211,7 +211,7 @@ pub async fn create_view(
         "CREATE MATERIALIZED VIEW IF NOT EXISTS {}.{} TO {}.{} AS {}",
         database, mv_name, database, table_name, sql
     );
-    clickhouse.query(&create_mv, None).await
+    clickhouse.query(&create_mv, &[]).await
         .map_err(|e| ApiError::QueryError(format!("Failed to create materialized view: {}", e)))?;
 
     // 4. Backfill existing data
@@ -219,12 +219,12 @@ pub async fn create_view(
         "INSERT INTO {}.{} {}",
         database, table_name, sql
     );
-    clickhouse.query(&backfill, None).await
+    clickhouse.query(&backfill, &[]).await
         .map_err(|e| ApiError::QueryError(format!("Failed to backfill: {}", e)))?;
 
     // 5. Get row count
     let count_sql = format!("SELECT count() FROM {}.{}", database, table_name);
-    let count_result = clickhouse.query(&count_sql, None).await
+    let count_result = clickhouse.query(&count_sql, &[]).await
         .map_err(|e| ApiError::QueryError(format!("Failed to get count: {}", e)))?;
     
     let backfill_rows = count_result.rows
@@ -283,13 +283,13 @@ pub async fn delete_view(
 
     // Drop MV first
     let drop_mv = format!("DROP VIEW IF EXISTS {}.{}", database, mv_name);
-    if clickhouse.query(&drop_mv, None).await.is_ok() {
+    if clickhouse.query(&drop_mv, &[]).await.is_ok() {
         deleted.push(mv_name);
     }
 
     // Drop target table
     let drop_table = format!("DROP TABLE IF EXISTS {}.{}", database, name);
-    if clickhouse.query(&drop_table, None).await.is_ok() {
+    if clickhouse.query(&drop_table, &[]).await.is_ok() {
         deleted.push(name);
     }
 
@@ -325,7 +325,7 @@ pub async fn get_view(
         "SELECT engine, create_table_query FROM system.tables WHERE database = '{}' AND name = '{}'",
         database, name
     );
-    let result = clickhouse.query(&sql, None).await
+    let result = clickhouse.query(&sql, &[]).await
         .map_err(|e| ApiError::QueryError(e.to_string()))?;
 
     if result.rows.is_empty() {
@@ -338,7 +338,7 @@ pub async fn get_view(
 
     // Get row count
     let count_sql = format!("SELECT count() FROM {}.{}", database, name);
-    let count_result = clickhouse.query(&count_sql, None).await.ok();
+    let count_result = clickhouse.query(&count_sql, &[]).await.ok();
     let row_count = count_result
         .and_then(|r| r.rows.first().cloned())
         .and_then(|r| r.first().cloned())

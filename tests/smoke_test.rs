@@ -872,7 +872,7 @@ async fn test_query_blocks_postgres() {
     let result = execute_query_postgres(
         &db.pool,
         "SELECT num, hash FROM blocks ORDER BY num DESC LIMIT 5",
-        None,
+        &[],
         &opts,
     )
     .await
@@ -893,7 +893,7 @@ async fn test_query_txs_point_lookup() {
     let result = execute_query_postgres(
         &db.pool,
         "SELECT block_num, hash, \"from\" FROM txs WHERE block_num = 1 LIMIT 10",
-        None,
+        &[],
         &opts,
     )
     .await
@@ -911,7 +911,7 @@ async fn test_query_logs_with_event_signature() {
     let result = execute_query_postgres(
         &db.pool,
         "SELECT * FROM transfer LIMIT 10",
-        Some("Transfer(address indexed from, address indexed to, uint256 value)"),
+        &["Transfer(address indexed from, address indexed to, uint256 value)"],
         &opts,
     )
     .await
@@ -933,7 +933,7 @@ async fn test_query_receipts() {
     let result = execute_query_postgres(
         &db.pool,
         "SELECT block_num, tx_idx, status, gas_used FROM receipts LIMIT 10",
-        None,
+        &[],
         &opts,
     )
     .await
@@ -952,7 +952,7 @@ async fn test_query_rejects_non_select() {
     let result = execute_query_postgres(
         &db.pool,
         "DELETE FROM blocks",
-        None,
+        &[],
         &opts,
     )
     .await;
@@ -970,7 +970,7 @@ async fn test_query_rejects_forbidden_keywords() {
     let result = execute_query_postgres(
         &db.pool,
         "SELECT * FROM blocks; DROP TABLE blocks;",
-        None,
+        &[],
         &opts,
     )
     .await;
@@ -990,7 +990,7 @@ async fn test_query_explicit_engine_hint() {
     let result = execute_query_postgres(
         &db.pool,
         "SELECT COUNT(*) FROM blocks GROUP BY miner",
-        None,
+        &[],
         &opts,
     )
     .await
@@ -1027,7 +1027,7 @@ async fn test_query_transfer_with_indexed_params() {
     let result = execute_query_postgres(
         &db.pool,
         r#"SELECT "from", "to", value FROM transfer LIMIT 5"#,
-        Some("Transfer(address indexed from, address indexed to, uint256 value)"),
+        &["Transfer(address indexed from, address indexed to, uint256 value)"],
         &opts,
     )
     .await
@@ -1048,7 +1048,7 @@ async fn test_query_approval_signature() {
     let result = execute_query_postgres(
         &db.pool,
         r#"SELECT owner, spender, value FROM Approval LIMIT 5"#,
-        Some("Approval(address indexed owner, address indexed spender, uint256 value)"),
+        &["Approval(address indexed owner, address indexed spender, uint256 value)"],
         &opts,
     )
     .await
@@ -1068,7 +1068,7 @@ async fn test_query_swap_complex_signature() {
     let result = execute_query_postgres(
         &db.pool,
         r#"SELECT sender, "amount0In", "amount1In", "amount0Out", "amount1Out", "to" FROM Swap LIMIT 5"#,
-        Some("Swap(address indexed sender, uint256 amount0In, uint256 amount1In, uint256 amount0Out, uint256 amount1Out, address indexed to)"),
+        &["Swap(address indexed sender, uint256 amount0In, uint256 amount1In, uint256 amount0Out, uint256 amount1Out, address indexed to)"],
         &opts,
     )
     .await
@@ -1088,7 +1088,7 @@ async fn test_query_with_aggregation() {
     let result = execute_query_postgres(
         &db.pool,
         r#"SELECT "to", COUNT(*) as cnt FROM transfer GROUP BY "to" ORDER BY cnt DESC LIMIT 10"#,
-        Some("Transfer(address indexed from, address indexed to, uint256 value)"),
+        &["Transfer(address indexed from, address indexed to, uint256 value)"],
         &opts,
     )
     .await
@@ -1108,7 +1108,7 @@ async fn test_query_case_insensitive_table_name() {
     let result = execute_query_postgres(
         &db.pool,
         r#"SELECT * FROM transfer LIMIT 1"#,
-        Some("Transfer(address indexed from, address indexed to, uint256 value)"),
+        &["Transfer(address indexed from, address indexed to, uint256 value)"],
         &opts,
     )
     .await
@@ -1127,7 +1127,7 @@ async fn test_query_with_hex_filter() {
     let result = execute_query_postgres(
         &db.pool,
         r#"SELECT * FROM blocks WHERE miner = '0x0000000000000000000000000000000000000000' LIMIT 1"#,
-        None,
+        &[],
         &opts,
     )
     .await
@@ -1145,7 +1145,7 @@ async fn test_query_bytes32_indexed_param() {
     let result = execute_query_postgres(
         &db.pool,
         r#"SELECT role, account, sender FROM RoleGranted LIMIT 5"#,
-        Some("RoleGranted(bytes32 indexed role, address indexed account, address indexed sender)"),
+        &["RoleGranted(bytes32 indexed role, address indexed account, address indexed sender)"],
         &opts,
     )
     .await
@@ -1164,7 +1164,7 @@ async fn test_query_bool_param() {
     let result = execute_query_postgres(
         &db.pool,
         r#"SELECT paused FROM Paused LIMIT 5"#,
-        Some("Paused(bool paused)"),
+        &["Paused(bool paused)"],
         &opts,
     )
     .await
@@ -1183,7 +1183,7 @@ async fn test_query_unnamed_params() {
     let result = execute_query_postgres(
         &db.pool,
         r#"SELECT arg0, arg1, arg2 FROM Transfer LIMIT 5"#,
-        Some("Transfer(address indexed, address indexed, uint256)"),
+        &["Transfer(address indexed, address indexed, uint256)"],
         &opts,
     )
     .await
@@ -1203,7 +1203,7 @@ async fn test_query_int256_param() {
     let result = execute_query_postgres(
         &db.pool,
         r#"SELECT price FROM PriceUpdate LIMIT 5"#,
-        Some("PriceUpdate(int256 price)"),
+        &["PriceUpdate(int256 price)"],
         &opts,
     )
     .await
@@ -1238,7 +1238,7 @@ async fn test_query_token_holder_pattern() {
     let result = execute_query_postgres(
         &db.pool,
         sql,
-        Some("Transfer(address indexed from, address indexed to, uint256 value)"),
+        &["Transfer(address indexed from, address indexed to, uint256 value)"],
         &opts,
     )
     .await
@@ -1268,7 +1268,7 @@ async fn test_query_daily_stats_pattern() {
     let result = execute_query_postgres(
         &db.pool,
         sql,
-        Some("Transfer(address indexed from, address indexed to, uint256 value)"),
+        &["Transfer(address indexed from, address indexed to, uint256 value)"],
         &opts,
     )
     .await

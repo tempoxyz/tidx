@@ -118,32 +118,40 @@ impl Default for QueryOptions {
 pub async fn execute_query_postgres(
     pool: &Pool,
     sql: &str,
-    signature: Option<&str>,
+    signatures: &[&str],
     options: &QueryOptions,
 ) -> Result<QueryResult> {
-    // Validate query
-    validate_query(sql)?;
+    // Generate CTE SQL if signatures are provided
+    let sql = if !signatures.is_empty() {
+        let sigs: Vec<EventSignature> = signatures
+            .iter()
+            .map(|s| EventSignature::parse(s))
+            .collect::<Result<_>>()?;
 
-    // Generate CTE SQL if a signature is provided
-    let sql = if let Some(sig_str) = signature {
-        let sig = EventSignature::parse(sig_str)?;
-        
-        // Normalize table references to match CTE name (case-insensitive)
-        let sql = sig.normalize_table_references(sql);
-        // Rewrite filters to push down to indexed columns (e.g., "from" = '0x...' -> topic1 = '0x...')
-        let sql = sig.rewrite_filters_for_pushdown(&sql);
-        
+        // Normalize table references and rewrite filters for each signature
+        let mut sql = sql.to_string();
+        for sig in &sigs {
+            sql = sig.normalize_table_references(&sql);
+            sql = sig.rewrite_filters_for_pushdown(&sql);
+        }
+
         let used_columns = extract_column_references(&sql);
         let filter = if used_columns.is_empty() {
             None
         } else {
             Some(&used_columns)
         };
-        let cte = sig.to_cte_sql_postgres_filtered(filter);
-        format!("WITH {cte} {sql}")
+        let ctes: Vec<String> = sigs
+            .iter()
+            .map(|sig| sig.to_cte_sql_postgres_filtered(filter))
+            .collect();
+        format!("WITH {} {sql}", ctes.join(", "))
     } else {
         sql.to_string()
     };
+
+    // Validate query (after CTE wrapping so signature-derived table names are valid)
+    validate_query(&sql)?;
 
     // Add LIMIT if not present (AST-based detection to avoid string matching bypass)
     let sql = append_limit_if_missing(&sql, options.limit);

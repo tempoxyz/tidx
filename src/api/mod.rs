@@ -232,9 +232,6 @@ async fn handle_status(State(state): State<AppState>) -> Result<Json<StatusRespo
 pub struct QueryParams {
     /// SQL query (SELECT only)
     sql: String,
-    /// Event signature to create a CTE
-    #[serde(default)]
-    signature: Option<String>,
     /// Chain ID to query (required)
     #[serde(alias = "chain_id")]
     #[serde(rename = "chainId")]
@@ -260,6 +257,16 @@ fn default_limit() -> i64 {
     crate::query::HARD_LIMIT_MAX
 }
 
+/// Extract all `signature` query params from the raw query string.
+/// Supports multiple params: `?signature=Transfer(...)&signature=Approval(...)`
+fn extract_signatures(query_str: Option<&str>) -> Vec<String> {
+    let Some(qs) = query_str else { return vec![] };
+    form_urlencoded::parse(qs.as_bytes())
+        .filter(|(key, _)| key == "signature")
+        .map(|(_, value)| value.into_owned())
+        .collect()
+}
+
 #[derive(Serialize)]
 struct QueryResponse {
     #[serde(flatten)]
@@ -271,23 +278,27 @@ async fn handle_query(
     State(state): State<AppState>,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
     headers: axum::http::HeaderMap,
+    uri: axum::http::Uri,
     Query(params): Query<QueryParams>,
 ) -> Response {
+    let signatures = extract_signatures(uri.query());
+
     if params.live {
         if params.engine.as_deref() == Some("clickhouse") {
             return ApiError::BadRequest(
                 "engine=clickhouse is not supported with live=true (use PostgreSQL for real-time streaming)".to_string()
             ).into_response();
         }
-        handle_query_live(state, params, addr, headers).await.into_response()
+        handle_query_live(state, params, signatures, addr, headers).await.into_response()
     } else {
-        handle_query_once(state, params).await.into_response()
+        handle_query_once(state, params, signatures).await.into_response()
     }
 }
 
 async fn handle_query_once(
     state: AppState,
     params: QueryParams,
+    signatures: Vec<String>,
 ) -> Result<Json<QueryResponse>, ApiError> {
     let pool = state
         .get_pool(Some(params.chain_id))
@@ -308,6 +319,8 @@ async fn handle_query_once(
         Some("clickhouse")
     );
 
+    let sigs: Vec<&str> = signatures.iter().map(String::as_str).collect();
+
     let result = if use_clickhouse {
         // Use ClickHouse engine for OLAP queries
         let clickhouse = state.get_clickhouse(Some(params.chain_id)).await
@@ -319,7 +332,7 @@ async fn handle_query_once(
         // Rewrite analytics table references to include chain-specific database
         let sql = rewrite_analytics_tables(&params.sql, params.chain_id);
 
-        clickhouse.query(&sql, params.signature.as_deref())
+        clickhouse.query(&sql, &sigs)
             .await
             .map(|r| QueryResult {
                 columns: r.columns,
@@ -331,7 +344,7 @@ async fn handle_query_once(
             .map_err(|e| ApiError::QueryError(e.to_string()))?
     } else {
         // Use PostgreSQL
-        crate::service::execute_query_postgres(&pool, &params.sql, params.signature.as_deref(), &options)
+        crate::service::execute_query_postgres(&pool, &params.sql, &sigs, &options)
             .await
             .map_err(|e| {
                 if e.to_string().contains("timeout") {
@@ -353,6 +366,7 @@ const MAX_CATCHUP_BLOCKS: u64 = 10;
 async fn handle_query_live(
     state: AppState,
     params: QueryParams,
+    signatures: Vec<String>,
     addr: SocketAddr,
     headers: axum::http::HeaderMap,
 ) -> Sse<KeepAliveStream<SseStream>> {
@@ -394,7 +408,6 @@ async fn handle_query_live(
 
     let mut rx = state.broadcaster.subscribe();
     let sql = params.sql;
-    let signature = params.signature;
     let options = QueryOptions {
         timeout_ms: params.timeout_ms.clamp(100, 30000),
         limit: params.limit.clamp(1, crate::query::HARD_LIMIT_MAX),
@@ -407,9 +420,10 @@ async fn handle_query_live(
         // Keep guard alive for the lifetime of the stream
         let _guard = connection_guard;
         let mut last_block_num: u64 = 0;
+        let sigs: Vec<&str> = signatures.iter().map(String::as_str).collect();
 
         // Execute initial query (live streaming uses Postgres for realtime data)
-        match crate::service::execute_query_postgres(&pool, &sql, signature.as_deref(), &options).await {
+        match crate::service::execute_query_postgres(&pool, &sql, &sigs, &options).await {
             Ok(result) => {
                 yield Ok(SseEvent::default()
                     .event("result")
@@ -459,7 +473,7 @@ async fn handle_query_live(
                     // For OLAP queries, re-execute the full query once per update (not per-block)
                     // For OLTP queries, filter by each block
                     if is_olap {
-                        match crate::service::execute_query_postgres(&pool, &sql, signature.as_deref(), &options).await {
+                        match crate::service::execute_query_postgres(&pool, &sql, &sigs, &options).await {
                             Ok(result) => {
                                 yield Ok(SseEvent::default()
                                     .event("result")
@@ -487,7 +501,7 @@ async fn handle_query_live(
                                     return;
                                 }
                             };
-                            match crate::service::execute_query_postgres(&pool, &filtered_sql, signature.as_deref(), &options).await {
+                            match crate::service::execute_query_postgres(&pool, &filtered_sql, &sigs, &options).await {
                                 Ok(result) => {
                                     yield Ok(SseEvent::default()
                                         .event("result")

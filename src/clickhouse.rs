@@ -92,14 +92,25 @@ impl ClickHouseEngine {
     pub async fn query(
         &self,
         sql: &str,
-        signature: Option<&str>,
+        signatures: &[&str],
     ) -> Result<QueryResult> {
-        let sql = if let Some(sig_str) = signature {
-            let sig = EventSignature::parse(sig_str)?;
-            let sql = sig.normalize_table_references(sql);
-            let sql = sig.rewrite_filters_for_pushdown(&sql);
-            let cte = sig.to_cte_sql_clickhouse();
-            format!("WITH {cte} {sql}")
+        let sql = if !signatures.is_empty() {
+            let sigs: Vec<EventSignature> = signatures
+                .iter()
+                .map(|s| EventSignature::parse(s))
+                .collect::<Result<_>>()?;
+
+            let mut sql = sql.to_string();
+            for sig in &sigs {
+                sql = sig.normalize_table_references(&sql);
+                sql = sig.rewrite_filters_for_pushdown(&sql);
+            }
+
+            let ctes: Vec<String> = sigs
+                .iter()
+                .map(|sig| sig.to_cte_sql_clickhouse())
+                .collect();
+            format!("WITH {} {sql}", ctes.join(", "))
         } else {
             sql.to_string()
         };
