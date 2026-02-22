@@ -13,8 +13,6 @@ const ALLOWED_TABLES: &[&str] = &[
     "txs",
     "logs",
     "receipts",
-    "token_holders",
-    "token_balances",
 ];
 
 const MAX_QUERY_LENGTH: usize = 65_536;
@@ -535,6 +533,10 @@ const ALLOWED_FUNCTIONS: &[&str] = &[
     "avg",
     "min",
     "max",
+    "array_agg",
+    "string_agg",
+    "bool_and",
+    "bool_or",
     // Scalar / null handling
     "coalesce",
     "nullif",
@@ -549,6 +551,8 @@ const ALLOWED_FUNCTIONS: &[&str] = &[
     "trunc",
     "pow",
     "power",
+    "mod",
+    "sign",
     // String
     "lower",
     "upper",
@@ -560,19 +564,32 @@ const ALLOWED_FUNCTIONS: &[&str] = &[
     "rtrim",
     "replace",
     "concat",
+    "concat_ws",
     "left",
     "right",
     "lpad",
     "rpad",
+    "position",
+    "strpos",
+    "starts_with",
+    "repeat",
+    "reverse",
+    "to_hex",
     // Bytea / hex
     "encode",
     "decode",
     "octet_length",
+    // Bytea
+    "bit_length",
     // Time
+    "date",
     "date_trunc",
+    "date_part",
     "extract",
     "to_timestamp",
+    "to_char",
     "now",
+    "age",
     // Window functions
     "row_number",
     "rank",
@@ -777,9 +794,7 @@ mod tests {
     }
 
     #[test]
-    fn test_allows_analytics_tables() {
-        assert!(validate_query("SELECT * FROM token_holders").is_ok());
-        assert!(validate_query("SELECT * FROM token_balances").is_ok());
+    fn test_allows_schema_qualified_tables() {
         assert!(validate_query("SELECT * FROM public.blocks").is_ok());
     }
 

@@ -176,17 +176,14 @@ pub async fn create_view(
     let mv_name = format!("{}_mv", req.name);
     let order_by = req.order_by.join(", ");
 
-    // Rewrite table references in SQL to include database prefix
-    let sql = super::rewrite_analytics_tables(&req.sql, req.chain_id);
-
     // If signature provided, generate CTE with decoded columns and apply predicate pushdown
     let sql = if let Some(ref sig) = signature {
-        let sql = sig.normalize_table_references(&sql);
+        let sql = sig.normalize_table_references(&req.sql);
         let sql = sig.rewrite_filters_for_pushdown(&sql);
         let cte = sig.to_cte_sql_clickhouse();
         format!("WITH {} {}", cte, sql)
     } else {
-        sql
+        req.sql.clone()
     };
     
     // Convert '0x...' hex literals to ClickHouse-compatible format

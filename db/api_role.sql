@@ -16,7 +16,7 @@ REVOKE EXECUTE ON ALL FUNCTIONS IN SCHEMA public FROM tidx_api;
 
 -- Grant read-only access to indexed tables only
 GRANT USAGE ON SCHEMA public TO tidx_api;
-GRANT SELECT ON blocks, txs, logs, receipts, token_holders, token_balances TO tidx_api;
+GRANT SELECT ON blocks, txs, logs, receipts TO tidx_api;
 
 -- Grant execute only on ABI decode helper functions
 GRANT EXECUTE ON FUNCTION abi_uint(bytea) TO tidx_api;
