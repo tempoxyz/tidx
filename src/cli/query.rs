@@ -28,9 +28,9 @@ pub struct Args {
     #[arg(long, default_value = "10000")]
     pub limit: i64,
 
-    /// Event signature to create a CTE (e.g., "Transfer(address indexed from, address indexed to, uint256 value)")
+    /// Event signature(s) to create CTEs (e.g., "Transfer(address indexed from, address indexed to, uint256 value)")
     #[arg(long, short)]
-    pub signature: Option<String>,
+    pub signature: Vec<String>,
 
     /// SQL query (SELECT only). Use event name from --signature as table.
     pub sql: String,
@@ -79,10 +79,11 @@ pub async fn run(args: Args) -> Result<()> {
         anyhow::bail!("ClickHouse engine not available in CLI. Use HTTP API with engine=clickhouse for OLAP queries.");
     }
 
+    let sig_strs: Vec<&str> = args.signature.iter().map(String::as_str).collect();
     let result = execute_query_postgres(
         &pool,
         &args.sql,
-        args.signature.as_deref(),
+        &sig_strs,
         &options,
     )
     .await?;
@@ -164,7 +165,7 @@ async fn run_via_http(base_url: &str, args: &Args) -> Result<()> {
         .append_pair("timeout_ms", &args.timeout.to_string())
         .append_pair("limit", &args.limit.to_string());
 
-    if let Some(sig) = &args.signature {
+    for sig in &args.signature {
         url.query_pairs_mut().append_pair("signature", sig);
     }
     if let Some(engine) = &args.engine {
