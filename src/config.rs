@@ -433,6 +433,7 @@ mod tests {
             concurrency: 4,
             backfill_first: false,
             trust_rpc: false,
+            api_pg_password_env: None,
             clickhouse: None,
         };
         
@@ -453,6 +454,7 @@ mod tests {
             concurrency: 4,
             backfill_first: false,
             trust_rpc: false,
+            api_pg_password_env: None,
             clickhouse: None,
         };
         
@@ -475,6 +477,7 @@ mod tests {
             concurrency: 4,
             backfill_first: false,
             trust_rpc: false,
+            api_pg_password_env: None,
             clickhouse: None,
         };
         

@@ -641,14 +641,12 @@ fn validate_function(func: &Function, cte_names: &HashSet<String>, depth: usize)
     }
 
     // Validate window function OVER clause
-    if let Some(window_type) = &func.over {
-        if let sqlparser::ast::WindowType::WindowSpec(spec) = window_type {
-            for expr in &spec.partition_by {
-                validate_expr(expr, cte_names, depth)?;
-            }
-            for order_expr in &spec.order_by {
-                validate_expr(&order_expr.expr, cte_names, depth)?;
-            }
+    if let Some(sqlparser::ast::WindowType::WindowSpec(spec)) = &func.over {
+        for expr in &spec.partition_by {
+            validate_expr(expr, cte_names, depth)?;
+        }
+        for order_expr in &spec.order_by {
+            validate_expr(&order_expr.expr, cte_names, depth)?;
         }
     }
 
