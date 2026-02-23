@@ -8,9 +8,11 @@ use metrics_exporter_prometheus::PrometheusBuilder;
 use tokio::sync::RwLock;
 use tracing::{error, info};
 
-use tidx::api::{self, ChainClickHouseConfig, SharedClickHouseConfigs, SharedClickHouseEngines, SharedPools};
-use tidx::clickhouse::ClickHouseEngine;
+use tidx::api::{
+    self, ChainClickHouseConfig, SharedClickHouseConfigs, SharedClickHouseEngines, SharedPools,
+};
 use tidx::broadcast::Broadcaster;
+use tidx::clickhouse::ClickHouseEngine;
 use tidx::config::{ChainConfig, Config, ConfigWatcher, NewChainEvent};
 use tidx::db::{self, ThrottledPool};
 use tidx::sync::engine::SyncEngine;
@@ -47,10 +49,11 @@ pub async fn run(args: Args) -> Result<()> {
 
     #[cfg(unix)]
     {
-        use tokio::signal::unix::{signal, SignalKind};
+        use tokio::signal::unix::{SignalKind, signal};
         let shutdown_tx_sigterm = shutdown_tx.clone();
         tokio::spawn(async move {
-            let mut sigterm = signal(SignalKind::terminate()).expect("failed to register SIGTERM handler");
+            let mut sigterm =
+                signal(SignalKind::terminate()).expect("failed to register SIGTERM handler");
             sigterm.recv().await;
             info!("Received SIGTERM, shutting down...");
             let _ = shutdown_tx_sigterm.send(());
@@ -71,11 +74,14 @@ pub async fn run(args: Args) -> Result<()> {
     let clickhouse_engines: SharedClickHouseEngines = Arc::new(RwLock::new(HashMap::new()));
     let mut default_chain_id = 0u64;
 
+    // Collect ClickHouse engines that need replication setup.
+    // These must be initialized sequentially (not spawned concurrently) because
+    // ClickHouse's MaterializedPostgreSQL engine can stall when multiple CREATE
+    // DATABASE commands race on the same instance.
+    let mut pending_replication: Vec<(Arc<ClickHouseEngine>, String, String)> = Vec::new();
+
     for chain in &config.chains {
-        let throttled_pool = initialize_chain(
-            chain,
-            Arc::clone(&clickhouse_configs),
-        ).await?;
+        let throttled_pool = initialize_chain(chain, Arc::clone(&clickhouse_configs)).await?;
 
         if default_chain_id == 0 {
             default_chain_id = chain.chain_id;
@@ -88,17 +94,11 @@ pub async fn run(args: Args) -> Result<()> {
                 match ClickHouseEngine::new(ch_config, chain.chain_id, &pg_url) {
                     Ok(engine) => {
                         let engine = Arc::new(engine);
-                        
-                        // Ensure replication is set up
-                        let engine_clone = Arc::clone(&engine);
-                        let chain_name = chain.name.clone();
-                        tokio::spawn(async move {
-                            if let Err(e) = engine_clone.ensure_replication(&pg_url).await {
-                                error!(error = %e, chain = %chain_name, "Failed to set up ClickHouse replication");
-                            }
-                        });
-                        
-                        clickhouse_engines.write().await.insert(chain.chain_id, engine);
+                        pending_replication.push((Arc::clone(&engine), pg_url, chain.name.clone()));
+                        clickhouse_engines
+                            .write()
+                            .await
+                            .insert(chain.chain_id, engine);
                         info!(chain = %chain.name, chain_id = chain.chain_id, "ClickHouse OLAP engine initialized");
                     }
                     Err(e) => {
@@ -127,6 +127,17 @@ pub async fn run(args: Args) -> Result<()> {
         );
     }
 
+    // Set up ClickHouse replication sequentially to avoid race conditions.
+    if !pending_replication.is_empty() {
+        tokio::spawn(async move {
+            for (engine, pg_url, chain_name) in pending_replication {
+                if let Err(e) = engine.ensure_replication(&pg_url).await {
+                    error!(error = %e, chain = %chain_name, "Failed to set up ClickHouse replication");
+                }
+            }
+        });
+    }
+
     let (chain_tx, mut chain_rx) = tokio::sync::mpsc::channel::<NewChainEvent>(16);
 
     if !args.no_watch {
@@ -136,7 +147,7 @@ pub async fn run(args: Args) -> Result<()> {
 
         if config.http.enabled && default_chain_id != 0 {
             let addr: SocketAddr = format!("{}:{}", config.http.bind, config.http.port).parse()?;
-            
+
             let router = api::router_shared(
                 Arc::clone(&pools),
                 default_chain_id,
@@ -172,18 +183,21 @@ pub async fn run(args: Args) -> Result<()> {
 
         tokio::spawn(async move {
             while let Some(event) = chain_rx.recv().await {
-                match initialize_chain(&event.chain, Arc::clone(&clickhouse_configs_for_watcher)).await {
+                match initialize_chain(&event.chain, Arc::clone(&clickhouse_configs_for_watcher))
+                    .await
+                {
                     Ok(throttled_pool) => {
                         let api_pool = match event.chain.resolved_api_pg_url() {
-                            Ok(Some(api_url)) => {
-                                match db::create_pool(&api_url).await {
-                                    Ok(pool) => pool,
-                                    Err(_) => throttled_pool.pool.clone(),
-                                }
-                            }
+                            Ok(Some(api_url)) => match db::create_pool(&api_url).await {
+                                Ok(pool) => pool,
+                                Err(_) => throttled_pool.pool.clone(),
+                            },
                             _ => throttled_pool.pool.clone(),
                         };
-                        pools_for_watcher.write().await.insert(event.chain.chain_id, api_pool);
+                        pools_for_watcher
+                            .write()
+                            .await
+                            .insert(event.chain.chain_id, api_pool);
 
                         spawn_sync_engine(
                             event.chain,
@@ -250,7 +264,10 @@ async fn initialize_chain(
             url: ch_config.url.clone(),
             failover_urls: ch_config.failover_urls.clone(),
         };
-        clickhouse_configs.write().await.insert(chain.chain_id, config);
+        clickhouse_configs
+            .write()
+            .await
+            .insert(chain.chain_id, config);
         info!(chain = %chain.name, "ClickHouse OLAP engine configured");
     }
 
