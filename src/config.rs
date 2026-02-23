@@ -183,6 +183,16 @@ pub struct ChainConfig {
     #[serde(default)]
     pub trust_rpc: bool,
 
+    /// Environment variable name containing the API role username.
+    /// When set (along with `api_pg_password_env`), the HTTP API uses a separate
+    /// read-only database connection pool with these credentials.
+    #[serde(default)]
+    pub api_pg_username_env: Option<String>,
+
+    /// Environment variable name containing the API role password.
+    #[serde(default)]
+    pub api_pg_password_env: Option<String>,
+
     /// ClickHouse OLAP settings (for analytical queries via MaterializedPostgreSQL)
     #[serde(default)]
     pub clickhouse: Option<ClickHouseConfig>,
@@ -253,6 +263,33 @@ impl ChainConfig {
                 Ok(url.to_string())
             }
             None => Ok(self.pg_url.clone()),
+        }
+    }
+
+    /// Returns a separate API database URL if `api_pg_username_env` and `api_pg_password_env`
+    /// are configured. The URL is derived from `pg_url` with the username and password replaced.
+    pub fn resolved_api_pg_url(&self) -> Result<Option<String>> {
+        match (&self.api_pg_username_env, &self.api_pg_password_env) {
+            (Some(user_env), Some(pass_env)) => {
+                let username = std::env::var(user_env).with_context(|| {
+                    format!("api_pg_username_env '{user_env}' is set but environment variable not found")
+                })?;
+                let password = std::env::var(pass_env).with_context(|| {
+                    format!("api_pg_password_env '{pass_env}' is set but environment variable not found")
+                })?;
+
+                let base_url = self.resolved_pg_url()?;
+                let mut url = url::Url::parse(&base_url)
+                    .with_context(|| format!("Invalid pg_url: {}", self.pg_url))?;
+
+                url.set_username(&username)
+                    .map_err(|()| anyhow::anyhow!("Failed to set API username in pg_url"))?;
+                url.set_password(Some(&password))
+                    .map_err(|()| anyhow::anyhow!("Failed to set API password in pg_url"))?;
+
+                Ok(Some(url.to_string()))
+            }
+            _ => Ok(None),
         }
     }
 }
