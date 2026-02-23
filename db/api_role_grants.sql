@@ -1,13 +1,7 @@
--- Read-only API role for query connections.
+-- Grant read-only access to the tidx_api role.
 -- Defense-in-depth: even if the query validator is bypassed,
 -- this role cannot modify data, execute arbitrary functions,
 -- or exhaust server resources.
-DO $$
-BEGIN
-    IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'tidx_api') THEN
-        CREATE ROLE tidx_api WITH LOGIN PASSWORD 'tidx_api' NOSUPERUSER NOCREATEDB NOCREATEROLE;
-    END IF;
-END $$;
 
 -- Revoke all privileges first (deny-by-default)
 REVOKE ALL ON ALL TABLES IN SCHEMA public FROM tidx_api;
