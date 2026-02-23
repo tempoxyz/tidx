@@ -39,15 +39,6 @@ pub async fn run_migrations(pool: &Pool) -> Result<()> {
     // Load any optional extensions
     conn.batch_execute(include_str!("../../db/extensions.sql")).await?;
 
-    // Create read-only API role if it doesn't exist. This may fail if the
-    // database user lacks CREATEROLE (e.g., CNPG-managed roles), which is fine.
-    if let Err(e) = conn.batch_execute(include_str!("../../db/api_role_create.sql")).await {
-        warn!("Skipping api role creation (may be managed externally): {e}");
-    }
-
-    // Always apply grants and resource limits for the api role
-    conn.batch_execute(include_str!("../../db/api_role_grants.sql")).await?;
-
     Ok(())
 }
 

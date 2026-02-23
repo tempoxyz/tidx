@@ -108,8 +108,16 @@ pub async fn run(args: Args) -> Result<()> {
             }
         }
 
-        // API uses the shared pool (backfill is throttled, so API isn't starved)
-        pools.write().await.insert(chain.chain_id, throttled_pool.pool.clone());
+        // Use a separate read-only API pool if API credentials are configured,
+        // otherwise fall back to the shared pool.
+        let api_pool = match chain.resolved_api_pg_url()? {
+            Some(api_url) => {
+                info!(chain = %chain.name, "Creating separate API pool with dedicated credentials");
+                db::create_pool(&api_url).await?
+            }
+            None => throttled_pool.pool.clone(),
+        };
+        pools.write().await.insert(chain.chain_id, api_pool);
 
         spawn_sync_engine(
             chain.clone(),
@@ -166,7 +174,16 @@ pub async fn run(args: Args) -> Result<()> {
             while let Some(event) = chain_rx.recv().await {
                 match initialize_chain(&event.chain, Arc::clone(&clickhouse_configs_for_watcher)).await {
                     Ok(throttled_pool) => {
-                        pools_for_watcher.write().await.insert(event.chain.chain_id, throttled_pool.pool.clone());
+                        let api_pool = match event.chain.resolved_api_pg_url() {
+                            Ok(Some(api_url)) => {
+                                match db::create_pool(&api_url).await {
+                                    Ok(pool) => pool,
+                                    Err(_) => throttled_pool.pool.clone(),
+                                }
+                            }
+                            _ => throttled_pool.pool.clone(),
+                        };
+                        pools_for_watcher.write().await.insert(event.chain.chain_id, api_pool);
 
                         spawn_sync_engine(
                             event.chain,
