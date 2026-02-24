@@ -206,11 +206,14 @@ pub struct ClickHouseConfig {
     pub url: String,
 
     /// Additional ClickHouse instance URLs for failover.
-    /// Each instance runs its own MaterializedPostgreSQL replication.
     /// Queries go to the primary `url`; failover instances are tried
     /// in order if the primary is unavailable.
     #[serde(default)]
     pub failover_urls: Vec<String>,
+
+    /// Database name override (default: tidx_{chain_id})
+    #[serde(default)]
+    pub database: Option<String>,
 }
 
 impl ClickHouseConfig {
@@ -228,6 +231,7 @@ impl Default for ClickHouseConfig {
             enabled: false,
             url: "http://clickhouse:8123".to_string(),
             failover_urls: Vec::new(),
+            database: None,
         }
     }
 }

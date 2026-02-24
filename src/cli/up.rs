@@ -15,7 +15,9 @@ use tidx::broadcast::Broadcaster;
 use tidx::clickhouse::ClickHouseEngine;
 use tidx::config::{ChainConfig, Config, ConfigWatcher, NewChainEvent};
 use tidx::db::{self, ThrottledPool};
+use tidx::sync::ch_sink::ClickHouseSink;
 use tidx::sync::engine::SyncEngine;
+use tidx::sync::sink::SinkSet;
 
 #[derive(ClapArgs)]
 pub struct Args {
@@ -292,8 +294,46 @@ fn spawn_sync_engine(
     let trust_rpc = chain.trust_rpc;
 
     tokio::spawn(async move {
-        // Create sync engine with throttled pool
-        let mut engine = match SyncEngine::new(throttled_pool, &chain.rpc_url).await {
+        // Build SinkSet with PG (always) + optional ClickHouse direct-write sink
+        let mut sinks = SinkSet::new(throttled_pool.inner().clone());
+
+        if let Some(ref ch_config) = chain.clickhouse {
+            if ch_config.enabled {
+                let database = ch_config
+                    .database
+                    .clone()
+                    .unwrap_or_else(|| format!("tidx_{}", chain.chain_id));
+
+                match ClickHouseSink::new(&ch_config.url, &database) {
+                    Ok(ch_sink) => {
+                        if let Err(e) = ch_sink.ensure_schema().await {
+                            error!(
+                                error = %e,
+                                chain = %chain.name,
+                                "Failed to initialize ClickHouse schema (continuing without CH sink)"
+                            );
+                        } else {
+                            info!(
+                                chain = %chain.name,
+                                database = %database,
+                                "ClickHouse direct-write sink enabled"
+                            );
+                            sinks = sinks.with_clickhouse(ch_sink);
+                        }
+                    }
+                    Err(e) => {
+                        error!(
+                            error = %e,
+                            chain = %chain.name,
+                            "Failed to create ClickHouse sink (continuing without CH)"
+                        );
+                    }
+                }
+            }
+        }
+
+        // Create sync engine with throttled pool and configured sinks
+        let mut engine = match SyncEngine::new(throttled_pool, sinks, &chain.rpc_url).await {
             Ok(e) => e
                 .with_broadcaster(broadcaster)
                 .with_batch_size(chain.batch_size)
@@ -306,8 +346,6 @@ fn spawn_sync_engine(
             }
         };
 
-        // Run the sync engine - handles both realtime sync and gap sync
-        // Gap sync fills ALL gaps from most recent to earliest (replaces backfill)
         if let Err(e) = engine.run(shutdown_rx).await {
             error!(error = %e, chain = %chain.name, "Sync engine failed");
         }

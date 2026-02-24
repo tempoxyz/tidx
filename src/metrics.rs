@@ -158,6 +158,29 @@ impl SyncProgress {
     }
 }
 
+// Sink metrics (dual-sink write path)
+
+pub fn record_sink_write_duration(sink: &str, table: &str, duration: std::time::Duration) {
+    let labels = [
+        ("sink", sink.to_string()),
+        ("table", table.to_string()),
+    ];
+    histogram!("tidx_sink_write_duration_seconds", &labels).record(duration.as_secs_f64());
+}
+
+pub fn record_sink_write_rows(sink: &str, table: &str, count: u64) {
+    let labels = [
+        ("sink", sink.to_string()),
+        ("table", table.to_string()),
+    ];
+    counter!("tidx_sink_write_rows_total", &labels).increment(count);
+}
+
+pub fn record_sink_error(sink: &str) {
+    let labels = [("sink", sink.to_string())];
+    counter!("tidx_sink_errors_total", &labels).increment(1);
+}
+
 // ClickHouse OLAP metrics
 
 pub fn record_clickhouse_query(duration: std::time::Duration, success: bool) {

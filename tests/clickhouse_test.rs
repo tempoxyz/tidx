@@ -1,7 +1,7 @@
 //! ClickHouse integration tests
 //!
-//! Tests CTE generation, query execution, and materialized view creation
-//! against a local ClickHouse instance.
+//! Tests CTE generation, query execution, materialized view creation,
+//! and the ClickHouseSink direct-write path against a local ClickHouse instance.
 //!
 //! Run with: cargo test --test clickhouse_test
 //! Requires: docker compose -f docker/local/docker-compose.yml up -d postgres clickhouse
@@ -11,6 +11,8 @@ mod common;
 use common::clickhouse::TestClickHouse;
 use serial_test::serial;
 use tidx::query::{convert_hex_literals_clickhouse, EventSignature};
+use tidx::sync::ch_sink::ClickHouseSink;
+use tidx::types::{BlockRow, LogRow, ReceiptRow, TxRow};
 
 const TEST_DB: &str = "tidx_test";
 
@@ -673,4 +675,284 @@ async fn test_case_insensitive_table_reference() {
     
     assert!(data.is_some());
     assert_eq!(data.unwrap().len(), 1);
+}
+
+// ============================================================================
+// ClickHouseSink Direct-Write Tests
+// ============================================================================
+
+const SINK_DB: &str = "tidx_sink_test";
+
+/// Helper: create a ClickHouseSink pointed at the test instance, with a clean DB.
+async fn setup_sink() -> Option<(ClickHouseSink, TestClickHouse)> {
+    let ch = TestClickHouse::new(SINK_DB).await.expect("Failed to create CH client");
+    if ch.wait_for_ready().await.is_err() {
+        println!("ClickHouse not available, skipping test");
+        return None;
+    }
+    // Drop any previous test state
+    ch.reset_database().await.expect("Failed to reset database");
+
+    let sink = ClickHouseSink::new(&ch.url, SINK_DB).expect("Failed to create sink");
+    sink.ensure_schema().await.expect("Failed to ensure schema");
+    Some((sink, ch))
+}
+
+fn make_block(num: i64) -> BlockRow {
+    use chrono::TimeZone;
+    let ts = chrono::Utc.with_ymd_and_hms(2025, 1, 15, 12, 0, 0).unwrap()
+        + chrono::Duration::seconds(num);
+    BlockRow {
+        num,
+        hash: vec![num as u8; 32],
+        parent_hash: vec![(num.wrapping_sub(1)) as u8; 32],
+        timestamp: ts,
+        timestamp_ms: ts.timestamp_millis(),
+        gas_limit: 30_000_000,
+        gas_used: 21_000 * num,
+        miner: vec![0xaa; 20],
+        extra_data: Some(vec![0xbb, 0xcc]),
+    }
+}
+
+fn make_tx(block_num: i64, idx: i32) -> TxRow {
+    use chrono::TimeZone;
+    let ts = chrono::Utc.with_ymd_and_hms(2025, 1, 15, 12, 0, 0).unwrap()
+        + chrono::Duration::seconds(block_num);
+    TxRow {
+        block_num,
+        block_timestamp: ts,
+        idx,
+        hash: {
+            let mut h = vec![block_num as u8; 16];
+            h.extend_from_slice(&vec![idx as u8; 16]);
+            h
+        },
+        tx_type: 2,
+        from: vec![0x11; 20],
+        to: Some(vec![0x22; 20]),
+        value: "1000000000000000000".to_string(),
+        input: vec![0xa9, 0x05, 0x9c, 0xbb],
+        gas_limit: 21_000,
+        max_fee_per_gas: "100000000000".to_string(),
+        max_priority_fee_per_gas: "1000000000".to_string(),
+        gas_used: Some(21_000),
+        nonce_key: vec![0x11; 20],
+        nonce: block_num,
+        fee_token: None,
+        fee_payer: None,
+        calls: None,
+        call_count: 1,
+        valid_before: None,
+        valid_after: None,
+        signature_type: None,
+    }
+}
+
+fn make_log(block_num: i64, log_idx: i32) -> LogRow {
+    use chrono::TimeZone;
+    let ts = chrono::Utc.with_ymd_and_hms(2025, 1, 15, 12, 0, 0).unwrap()
+        + chrono::Duration::seconds(block_num);
+    LogRow {
+        block_num,
+        block_timestamp: ts,
+        log_idx,
+        tx_idx: 0,
+        tx_hash: vec![block_num as u8; 32],
+        address: vec![0xda; 20],
+        selector: Some(vec![0xdd, 0xf2, 0x52, 0xad]),
+        topic0: Some(vec![0xdd; 32]),
+        topic1: Some(vec![0x11; 32]),
+        topic2: Some(vec![0x22; 32]),
+        topic3: None,
+        data: vec![0x00; 32],
+    }
+}
+
+fn make_receipt(block_num: i64, tx_idx: i32) -> ReceiptRow {
+    use chrono::TimeZone;
+    let ts = chrono::Utc.with_ymd_and_hms(2025, 1, 15, 12, 0, 0).unwrap()
+        + chrono::Duration::seconds(block_num);
+    ReceiptRow {
+        block_num,
+        block_timestamp: ts,
+        tx_idx,
+        tx_hash: vec![block_num as u8; 32],
+        from: vec![0x11; 20],
+        to: Some(vec![0x22; 20]),
+        contract_address: None,
+        gas_used: 21_000,
+        cumulative_gas_used: 21_000,
+        effective_gas_price: Some("100000000000".to_string()),
+        status: Some(1),
+        fee_payer: None,
+    }
+}
+
+#[tokio::test]
+#[serial(clickhouse)]
+async fn test_sink_ensure_schema_creates_tables() {
+    let Some((_, ch)) = setup_sink().await else { return };
+
+    for table in ["blocks", "txs", "logs", "receipts"] {
+        let count = ch.table_count(table).await
+            .unwrap_or_else(|_| panic!("Table {table} should exist"));
+        assert_eq!(count, 0, "{table} should be empty after schema creation");
+    }
+}
+
+#[tokio::test]
+#[serial(clickhouse)]
+async fn test_sink_write_blocks() {
+    let Some((sink, ch)) = setup_sink().await else { return };
+
+    let blocks: Vec<BlockRow> = (1..=5).map(make_block).collect();
+    sink.write_blocks(&blocks).await.expect("write_blocks failed");
+
+    let count = ch.table_count("blocks").await.expect("count failed");
+    assert_eq!(count, 5);
+
+    // Verify data roundtrips correctly
+    let result = ch.query_json("SELECT num, gas_limit FROM blocks ORDER BY num").await.unwrap();
+    let rows = result["data"].as_array().unwrap();
+    let num0 = rows[0]["num"].as_i64().or_else(|| rows[0]["num"].as_str().and_then(|s| s.parse().ok())).unwrap();
+    let num4 = rows[4]["num"].as_i64().or_else(|| rows[4]["num"].as_str().and_then(|s| s.parse().ok())).unwrap();
+    assert_eq!(num0, 1);
+    assert_eq!(num4, 5);
+}
+
+#[tokio::test]
+#[serial(clickhouse)]
+async fn test_sink_write_txs() {
+    let Some((sink, ch)) = setup_sink().await else { return };
+
+    let txs: Vec<TxRow> = (1..=3)
+        .flat_map(|b| (0..2).map(move |i| make_tx(b, i)))
+        .collect();
+    sink.write_txs(&txs).await.expect("write_txs failed");
+
+    let count = ch.table_count("txs").await.expect("count failed");
+    assert_eq!(count, 6);
+}
+
+#[tokio::test]
+#[serial(clickhouse)]
+async fn test_sink_write_logs() {
+    let Some((sink, ch)) = setup_sink().await else { return };
+
+    let logs: Vec<LogRow> = (1..=3)
+        .flat_map(|b| (0..4).map(move |i| make_log(b, i)))
+        .collect();
+    sink.write_logs(&logs).await.expect("write_logs failed");
+
+    let count = ch.table_count("logs").await.expect("count failed");
+    assert_eq!(count, 12);
+}
+
+#[tokio::test]
+#[serial(clickhouse)]
+async fn test_sink_write_receipts() {
+    let Some((sink, ch)) = setup_sink().await else { return };
+
+    let receipts: Vec<ReceiptRow> = (1..=3).map(|b| make_receipt(b, 0)).collect();
+    sink.write_receipts(&receipts).await.expect("write_receipts failed");
+
+    let count = ch.table_count("receipts").await.expect("count failed");
+    assert_eq!(count, 3);
+}
+
+#[tokio::test]
+#[serial(clickhouse)]
+async fn test_sink_write_empty_batches() {
+    let Some((sink, _ch)) = setup_sink().await else { return };
+
+    // Empty writes should succeed without errors
+    sink.write_blocks(&[]).await.expect("empty blocks failed");
+    sink.write_txs(&[]).await.expect("empty txs failed");
+    sink.write_logs(&[]).await.expect("empty logs failed");
+    sink.write_receipts(&[]).await.expect("empty receipts failed");
+}
+
+#[tokio::test]
+#[serial(clickhouse)]
+async fn test_sink_delete_from_reorg() {
+    let Some((sink, ch)) = setup_sink().await else { return };
+
+    // Write blocks 1-10
+    let blocks: Vec<BlockRow> = (1..=10).map(make_block).collect();
+    let txs: Vec<TxRow> = (1..=10).map(|b| make_tx(b, 0)).collect();
+    let logs: Vec<LogRow> = (1..=10).map(|b| make_log(b, 0)).collect();
+    let receipts: Vec<ReceiptRow> = (1..=10).map(|b| make_receipt(b, 0)).collect();
+
+    sink.write_blocks(&blocks).await.unwrap();
+    sink.write_txs(&txs).await.unwrap();
+    sink.write_logs(&logs).await.unwrap();
+    sink.write_receipts(&receipts).await.unwrap();
+
+    assert_eq!(ch.table_count("blocks").await.unwrap(), 10);
+
+    // Simulate reorg: delete from block 8 onwards
+    sink.delete_from(8).await.expect("delete_from failed");
+
+    // ClickHouse mutations are async — wait for them
+    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+
+    assert_eq!(ch.table_count("blocks").await.unwrap(), 7);
+    assert_eq!(ch.table_count("txs").await.unwrap(), 7);
+    assert_eq!(ch.table_count("logs").await.unwrap(), 7);
+    assert_eq!(ch.table_count("receipts").await.unwrap(), 7);
+}
+
+#[tokio::test]
+#[serial(clickhouse)]
+async fn test_sink_hex_encoding() {
+    let Some((sink, ch)) = setup_sink().await else { return };
+
+    let block = make_block(1);
+    sink.write_blocks(&[block]).await.unwrap();
+
+    let result = ch.query_json("SELECT hash, miner FROM blocks WHERE num = 1").await.unwrap();
+    let row = &result["data"].as_array().unwrap()[0];
+
+    let hash = row["hash"].as_str().unwrap();
+    let miner = row["miner"].as_str().unwrap();
+
+    // Should be 0x-prefixed hex
+    assert!(hash.starts_with("0x"), "hash should be 0x-prefixed, got: {hash}");
+    assert!(miner.starts_with("0x"), "miner should be 0x-prefixed, got: {miner}");
+    assert_eq!(hash.len(), 66, "hash should be 32 bytes = 66 hex chars with 0x prefix");
+    assert_eq!(miner.len(), 42, "miner should be 20 bytes = 42 hex chars with 0x prefix");
+}
+
+#[tokio::test]
+#[serial(clickhouse)]
+async fn test_sink_nullable_fields() {
+    let Some((sink, ch)) = setup_sink().await else { return };
+
+    // Block with extra_data = None
+    let mut block = make_block(1);
+    block.extra_data = None;
+    sink.write_blocks(&[block]).await.unwrap();
+
+    let result = ch.query_json("SELECT extra_data FROM blocks WHERE num = 1").await.unwrap();
+    let row = &result["data"].as_array().unwrap()[0];
+    assert!(row["extra_data"].is_null(), "extra_data should be null");
+
+    // Tx with to = None (contract creation)
+    let mut tx = make_tx(1, 0);
+    tx.to = None;
+    sink.write_txs(&[tx]).await.unwrap();
+
+    let result = ch.query_json("SELECT `to` FROM txs WHERE block_num = 1").await.unwrap();
+    let row = &result["data"].as_array().unwrap()[0];
+    assert!(row["to"].is_null(), "to should be null for contract creation");
+}
+
+#[tokio::test]
+#[serial(clickhouse)]
+async fn test_sink_idempotent_schema() {
+    let Some((sink, _ch)) = setup_sink().await else { return };
+
+    // Calling ensure_schema twice should not error
+    sink.ensure_schema().await.expect("second ensure_schema failed");
 }

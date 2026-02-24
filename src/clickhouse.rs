@@ -475,6 +475,7 @@ mod tests {
             enabled: true,
             url: "http://clickhouse-1:8123".to_string(),
             failover_urls: vec![],
+            database: None,
         };
 
         let engine = ClickHouseEngine::new(&config, 4217, "postgres://localhost/test").unwrap();
@@ -488,6 +489,7 @@ mod tests {
             enabled: true,
             url: "http://clickhouse-1:8123".to_string(),
             failover_urls: vec!["http://clickhouse-2:8123".to_string()],
+            database: None,
         };
 
         let engine = ClickHouseEngine::new(&config, 4217, "postgres://localhost/test").unwrap();
@@ -504,6 +506,7 @@ mod tests {
                 "http://secondary:8123".to_string(),
                 "http://tertiary:8123".to_string(),
             ],
+            database: None,
         };
         assert_eq!(
             config.all_urls(),

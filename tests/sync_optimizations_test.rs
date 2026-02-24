@@ -5,6 +5,7 @@ use common::testdb::TestDb;
 
 use tidx::db::ThrottledPool;
 use tidx::sync::engine::SyncEngine;
+use tidx::sync::sink::SinkSet;
 use tidx::sync::writer::{write_blocks, write_logs, write_txs};
 use tidx::types::{BlockRow, LogRow, TxRow};
 use serial_test::serial;
@@ -378,7 +379,8 @@ async fn test_pipelined_sync() {
     // Wait for some blocks
     tempo.wait_for_block(30).await.expect("Block 30 not reached");
 
-    let mut engine = SyncEngine::new(ThrottledPool::from_pool(db.pool.clone()), &tempo.rpc_url)
+    let sinks = SinkSet::new(db.pool.clone());
+    let mut engine = SyncEngine::new(ThrottledPool::from_pool(db.pool.clone()), sinks, &tempo.rpc_url)
         .await
         .expect("Failed to create sync engine");
 

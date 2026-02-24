@@ -13,10 +13,11 @@ use crate::types::SyncState;
 
 use super::decoder::{decode_block, decode_log, decode_receipt, decode_transaction, timestamp_from_secs};
 use super::fetcher::RpcClient;
+use super::sink::SinkSet;
 use super::writer::{
-    delete_blocks_from, detect_all_gaps, detect_blocks_missing_receipts, find_fork_point,
+    detect_all_gaps, detect_blocks_missing_receipts, find_fork_point,
     get_block_hash, load_sync_state, save_sync_state, update_sync_rate, update_synced_num,
-    update_tip_num, write_block, write_blocks, write_logs, write_receipts, write_txs,
+    update_tip_num,
 };
 
 /// RPC concurrency limits
@@ -26,6 +27,8 @@ const BACKFILL_RPC_CONCURRENCY: usize = 8;
 pub struct SyncEngine {
     /// Throttled pool - shared by all, but backfill is rate-limited
     throttled_pool: ThrottledPool,
+    /// Fan-out writer for all configured sinks (PG, and later CH)
+    sinks: SinkSet,
     /// RPC client for realtime sync (guaranteed capacity)
     realtime_rpc: RpcClient,
     /// RPC client for backfill (separate limit, can't starve realtime)
@@ -40,9 +43,9 @@ pub struct SyncEngine {
 }
 
 impl SyncEngine {
-    /// Creates a sync engine with a throttled pool.
+    /// Creates a sync engine with a throttled pool and pre-configured sinks.
     /// Uses separate RPC clients for realtime vs backfill to guarantee capacity.
-    pub async fn new(throttled_pool: ThrottledPool, rpc_url: &str) -> Result<Self> {
+    pub async fn new(throttled_pool: ThrottledPool, sinks: SinkSet, rpc_url: &str) -> Result<Self> {
         let realtime_rpc = RpcClient::with_concurrency(rpc_url, REALTIME_RPC_CONCURRENCY);
         let backfill_rpc = RpcClient::with_concurrency(rpc_url, BACKFILL_RPC_CONCURRENCY);
         let chain_id = realtime_rpc.chain_id().await?;
@@ -56,6 +59,7 @@ impl SyncEngine {
 
         Ok(Self {
             throttled_pool,
+            sinks,
             realtime_rpc,
             backfill_rpc,
             chain_id,
@@ -162,7 +166,7 @@ impl SyncEngine {
 
             // Run one round of gap-fill (uses backfill RPC client)
             if let Err(e) = tick_gapfill_parallel_no_throttle(
-                self.pool(),
+                &self.sinks,
                 &self.backfill_rpc,
                 self.chain_id,
                 self.batch_size,
@@ -216,7 +220,7 @@ impl SyncEngine {
         );
 
         // Spawn gap-fill as a separate background task (throttled by semaphore)
-        let gapfill_pool = self.pool().clone();
+        let gapfill_sinks = self.sinks.clone();
         let gapfill_semaphore = self.backfill_semaphore().clone();
         let gapfill_rpc = self.backfill_rpc.clone();
         let gapfill_chain_id = self.chain_id;
@@ -224,7 +228,7 @@ impl SyncEngine {
         let gapfill_concurrency = self.concurrency;
         let gapfill_handle = tokio::spawn(async move {
             run_gapfill_loop(
-                gapfill_pool,
+                gapfill_sinks,
                 gapfill_semaphore,
                 gapfill_rpc,
                 gapfill_chain_id,
@@ -237,12 +241,12 @@ impl SyncEngine {
 
         // Spawn receipt backfill as a separate background task
         // This fills in receipts/logs for blocks that were synced without them
-        let receipt_pool = self.pool().clone();
+        let receipt_sinks = self.sinks.clone();
         let receipt_rpc = self.backfill_rpc.clone();
         let receipt_chain_id = self.chain_id;
         let receipt_handle = tokio::spawn(async move {
             run_receipt_backfill_loop(
-                receipt_pool,
+                receipt_sinks,
                 receipt_rpc,
                 receipt_chain_id,
                 receipt_shutdown,
@@ -340,11 +344,11 @@ impl SyncEngine {
                 None
             };
 
-            let pool = self.pool().clone();
+            let sinks = self.sinks.clone();
             let write_future = async move {
                 let write_start = std::time::Instant::now();
-                write_blocks(&pool, &block_rows).await?;
-                write_txs(&pool, &all_txs).await?;
+                sinks.write_blocks(&block_rows).await?;
+                sinks.write_txs(&all_txs).await?;
                 let write_ms = write_start.elapsed().as_millis();
                 Ok::<_, anyhow::Error>(write_ms)
             };
@@ -476,8 +480,8 @@ impl SyncEngine {
             Some(fork_block) => {
                 let delete_from = fork_block + 1;
 
-                // Delete orphaned blocks from PostgreSQL
-                let deleted = delete_blocks_from(self.pool(), delete_from).await?;
+                // Delete orphaned blocks from all sinks
+                let deleted = self.sinks.delete_from(delete_from).await?;
 
                 info!(
                     chain_id = self.chain_id,
@@ -611,10 +615,10 @@ impl SyncEngine {
         let (_blocks, block_rows, all_txs, all_logs, all_receipts) =
             self.fetch_range(from, to).await?;
 
-        write_blocks(self.pool(), &block_rows).await?;
-        write_txs(self.pool(), &all_txs).await?;
-        write_logs(self.pool(), &all_logs).await?;
-        write_receipts(self.pool(), &all_receipts).await?;
+        self.sinks.write_blocks(&block_rows).await?;
+        self.sinks.write_txs(&all_txs).await?;
+        self.sinks.write_logs(&all_logs).await?;
+        self.sinks.write_receipts(&all_receipts).await?;
 
         Ok(())
     }
@@ -627,7 +631,7 @@ impl SyncEngine {
 
         let block_row = decode_block(&block);
         let block_ts = timestamp_from_secs(block.header.timestamp);
-        write_block(self.pool(), &block_row).await?;
+        self.sinks.write_blocks(std::slice::from_ref(&block_row)).await?;
 
         let txs: Vec<_> = block
             .transactions
@@ -636,21 +640,21 @@ impl SyncEngine {
             .map(|(i, tx)| decode_transaction(tx, &block, i as u32))
             .collect();
 
-        write_txs(self.pool(), &txs).await?;
+        self.sinks.write_txs(&txs).await?;
 
         // Extract logs from receipts
         let log_rows: Vec<_> = receipts
             .iter()
             .flat_map(|r| r.inner.logs().iter().map(|log| decode_log(log, block_ts)))
             .collect();
-        write_logs(self.pool(), &log_rows).await?;
+        self.sinks.write_logs(&log_rows).await?;
 
         // Extract receipt rows
         let receipt_rows: Vec<_> = receipts
             .iter()
             .map(|r| decode_receipt(r, block_ts))
             .collect();
-        write_receipts(self.pool(), &receipt_rows).await?;
+        self.sinks.write_receipts(&receipt_rows).await?;
 
         // Update sync state
         let state = load_sync_state(self.pool(), self.chain_id).await?.unwrap_or_default();
@@ -771,7 +775,7 @@ impl SyncEngine {
 /// Throttled by semaphore to not starve realtime/API
 #[allow(clippy::too_many_arguments)]
 async fn run_gapfill_loop(
-    pool: Pool,
+    sinks: SinkSet,
     backfill_semaphore: Arc<tokio::sync::Semaphore>,
     rpc: RpcClient,
     chain_id: u64,
@@ -779,7 +783,7 @@ async fn run_gapfill_loop(
     concurrency: usize,
     mut shutdown: broadcast::Receiver<()>,
 ) -> Result<()> {
-    let state = load_sync_state(&pool, chain_id).await?.unwrap_or_default();
+    let state = load_sync_state(sinks.pool(), chain_id).await?.unwrap_or_default();
     let mut progress = SyncProgress::new(chain_id, state.synced_num);
 
     info!(
@@ -798,7 +802,7 @@ async fn run_gapfill_loop(
                 info!("Gap-fill: shutting down");
                 break;
             }
-            result = tick_gapfill_parallel(&pool, &backfill_semaphore, &rpc, chain_id, batch_size, concurrency, &mut progress) => {
+            result = tick_gapfill_parallel(&sinks, &backfill_semaphore, &rpc, chain_id, batch_size, concurrency, &mut progress) => {
                 if let Err(e) = result {
                     error!(error = %e, "Gap-fill sync tick failed");
                     tokio::time::sleep(Duration::from_secs(1)).await;
@@ -814,7 +818,7 @@ async fn run_gapfill_loop(
 /// Workers are throttled by semaphore to not starve realtime/API
 #[allow(clippy::too_many_arguments)]
 async fn tick_gapfill_parallel(
-    pool: &Pool,
+    sinks: &SinkSet,
     backfill_semaphore: &Arc<tokio::sync::Semaphore>,
     rpc: &RpcClient,
     chain_id: u64,
@@ -822,6 +826,7 @@ async fn tick_gapfill_parallel(
     concurrency: usize,
     progress: &mut SyncProgress,
 ) -> Result<()> {
+    let pool = sinks.pool();
     let state = load_sync_state(pool, chain_id).await?.unwrap_or_default();
 
     // Adaptive throttling: pause backfill when realtime lag is high
@@ -892,7 +897,7 @@ async fn tick_gapfill_parallel(
     // Seed initial concurrent tasks (limited by both concurrency and semaphore)
     for _ in 0..concurrency {
         if let Some((start, end)) = batch_iter.next() {
-            let pool = pool.clone();
+            let sinks = sinks.clone();
             let rpc = rpc.clone();
             let sem = backfill_semaphore.clone();
             join_set.spawn(async move {
@@ -901,7 +906,7 @@ async fn tick_gapfill_parallel(
                     Ok(p) => p,
                     Err(_) => return (start, end, Err(anyhow::anyhow!("Backfill semaphore closed"))),
                 };
-                let result = sync_range_standalone(&pool, &rpc, start, end).await;
+                let result = sync_range_standalone(&sinks, &rpc, start, end).await;
                 (start, end, result)
             });
         }
@@ -961,7 +966,7 @@ async fn tick_gapfill_parallel(
                     );
                     
                     // Queue first half
-                    let pool1 = pool.clone();
+                    let sinks1 = sinks.clone();
                     let rpc1 = rpc.clone();
                     let sem1 = backfill_semaphore.clone();
                     join_set.spawn(async move {
@@ -970,12 +975,12 @@ async fn tick_gapfill_parallel(
                             Ok(p) => p,
                             Err(_) => return (start, mid, Err(anyhow::anyhow!("Backfill semaphore closed"))),
                         };
-                        let result = sync_range_standalone(&pool1, &rpc1, start, mid).await;
+                        let result = sync_range_standalone(&sinks1, &rpc1, start, mid).await;
                         (start, mid, result)
                     });
                     
                     // Queue second half
-                    let pool2 = pool.clone();
+                    let sinks2 = sinks.clone();
                     let rpc2 = rpc.clone();
                     let sem2 = backfill_semaphore.clone();
                     join_set.spawn(async move {
@@ -984,7 +989,7 @@ async fn tick_gapfill_parallel(
                             Ok(p) => p,
                             Err(_) => return (mid + 1, end, Err(anyhow::anyhow!("Backfill semaphore closed"))),
                         };
-                        let result = sync_range_standalone(&pool2, &rpc2, mid + 1, end).await;
+                        let result = sync_range_standalone(&sinks2, &rpc2, mid + 1, end).await;
                         (mid + 1, end, result)
                     });
                 } else {
@@ -995,7 +1000,7 @@ async fn tick_gapfill_parallel(
                         "Gap sync: batch failed, will retry"
                     );
                     // Re-queue the failed batch
-                    let pool = pool.clone();
+                    let sinks = sinks.clone();
                     let rpc = rpc.clone();
                     let sem = backfill_semaphore.clone();
                     join_set.spawn(async move {
@@ -1004,7 +1009,7 @@ async fn tick_gapfill_parallel(
                             Ok(p) => p,
                             Err(_) => return (start, end, Err(anyhow::anyhow!("Backfill semaphore closed"))),
                         };
-                        let result = sync_range_standalone(&pool, &rpc, start, end).await;
+                        let result = sync_range_standalone(&sinks, &rpc, start, end).await;
                         (start, end, result)
                     });
                 }
@@ -1014,7 +1019,7 @@ async fn tick_gapfill_parallel(
 
         // Spawn next batch if available
         if let Some((start, end)) = batch_iter.next() {
-            let pool = pool.clone();
+            let sinks = sinks.clone();
             let rpc = rpc.clone();
             let sem = backfill_semaphore.clone();
             join_set.spawn(async move {
@@ -1022,7 +1027,7 @@ async fn tick_gapfill_parallel(
                     Ok(p) => p,
                     Err(_) => return (start, end, Err(anyhow::anyhow!("Backfill semaphore closed"))),
                 };
-                let result = sync_range_standalone(&pool, &rpc, start, end).await;
+                let result = sync_range_standalone(&sinks, &rpc, start, end).await;
                 (start, end, result)
             });
         }
@@ -1060,13 +1065,14 @@ async fn tick_gapfill_parallel(
 
 /// Same as tick_gapfill_parallel but without lag throttling (for backfill-first mode)
 async fn tick_gapfill_parallel_no_throttle(
-    pool: &Pool,
+    sinks: &SinkSet,
     rpc: &RpcClient,
     chain_id: u64,
     batch_size: u64,
     concurrency: usize,
     progress: &mut SyncProgress,
 ) -> Result<()> {
+    let pool = sinks.pool();
     let state = load_sync_state(pool, chain_id).await?.unwrap_or_default();
 
     // Detect ALL gaps including from genesis, sorted by end DESC (most recent first)
@@ -1116,10 +1122,10 @@ async fn tick_gapfill_parallel_no_throttle(
     // Seed initial concurrent tasks
     for _ in 0..concurrency {
         if let Some((start, end)) = batch_iter.next() {
-            let pool = pool.clone();
+            let sinks = sinks.clone();
             let rpc = rpc.clone();
             join_set.spawn(async move {
-                let result = sync_range_standalone(&pool, &rpc, start, end).await;
+                let result = sync_range_standalone(&sinks, &rpc, start, end).await;
                 (start, end, result)
             });
         }
@@ -1159,20 +1165,20 @@ async fn tick_gapfill_parallel_no_throttle(
                     );
                     
                     // Queue first half
-                    let pool1 = pool.clone();
+                    let sinks1 = sinks.clone();
                     let rpc1 = rpc.clone();
                     join_set.spawn(async move {
                         tokio::time::sleep(Duration::from_millis(100)).await;
-                        let result = sync_range_standalone(&pool1, &rpc1, start, mid).await;
+                        let result = sync_range_standalone(&sinks1, &rpc1, start, mid).await;
                         (start, mid, result)
                     });
                     
                     // Queue second half
-                    let pool2 = pool.clone();
+                    let sinks2 = sinks.clone();
                     let rpc2 = rpc.clone();
                     join_set.spawn(async move {
                         tokio::time::sleep(Duration::from_millis(100)).await;
-                        let result = sync_range_standalone(&pool2, &rpc2, mid + 1, end).await;
+                        let result = sync_range_standalone(&sinks2, &rpc2, mid + 1, end).await;
                         (mid + 1, end, result)
                     });
                 } else {
@@ -1182,11 +1188,11 @@ async fn tick_gapfill_parallel_no_throttle(
                         error = %e,
                         "Backfill: batch failed, will retry"
                     );
-                    let pool = pool.clone();
+                    let sinks = sinks.clone();
                     let rpc = rpc.clone();
                     join_set.spawn(async move {
                         tokio::time::sleep(Duration::from_millis(500)).await;
-                        let result = sync_range_standalone(&pool, &rpc, start, end).await;
+                        let result = sync_range_standalone(&sinks, &rpc, start, end).await;
                         (start, end, result)
                     });
                 }
@@ -1196,10 +1202,10 @@ async fn tick_gapfill_parallel_no_throttle(
 
         // Spawn next batch if available
         if let Some((start, end)) = batch_iter.next() {
-            let pool = pool.clone();
+            let sinks = sinks.clone();
             let rpc = rpc.clone();
             join_set.spawn(async move {
-                let result = sync_range_standalone(&pool, &rpc, start, end).await;
+                let result = sync_range_standalone(&sinks, &rpc, start, end).await;
                 (start, end, result)
             });
         }
@@ -1244,7 +1250,7 @@ async fn is_fully_synced(pool: &Pool, tip_num: u64) -> Result<bool> {
 
 /// Standalone sync_range for gap-fill (doesn't need SyncEngine self)
 async fn sync_range_standalone(
-    pool: &Pool,
+    sinks: &SinkSet,
     rpc: &RpcClient,
     from: u64,
     to: u64,
@@ -1297,10 +1303,10 @@ async fn sync_range_standalone(
         })
         .collect();
 
-    write_blocks(pool, &block_rows).await?;
-    write_txs(pool, &all_txs).await?;
-    write_logs(pool, &all_logs).await?;
-    write_receipts(pool, &all_receipts).await?;
+    sinks.write_blocks(&block_rows).await?;
+    sinks.write_txs(&all_txs).await?;
+    sinks.write_logs(&all_logs).await?;
+    sinks.write_receipts(&all_receipts).await?;
 
     Ok(())
 }
@@ -1310,7 +1316,7 @@ async fn sync_range_standalone(
 /// This runs as a background task and handles blocks where realtime sync wrote
 /// blocks + txs but skipped receipts for faster tip advancement.
 async fn run_receipt_backfill_loop(
-    pool: Pool,
+    sinks: SinkSet,
     rpc: RpcClient,
     chain_id: u64,
     mut shutdown: broadcast::Receiver<()>,
@@ -1325,7 +1331,7 @@ async fn run_receipt_backfill_loop(
                 info!(chain_id, "Receipt backfill: shutting down");
                 break;
             }
-            result = tick_receipt_backfill(&pool, &rpc, chain_id) => {
+            result = tick_receipt_backfill(&sinks, &rpc, chain_id) => {
                 if let Err(e) = result {
                     error!(chain_id, error = %e, "Receipt backfill tick failed");
                     tokio::time::sleep(Duration::from_secs(1)).await;
@@ -1339,7 +1345,7 @@ async fn run_receipt_backfill_loop(
 
 /// One tick of receipt backfill: finds blocks missing receipts and fills them in.
 async fn tick_receipt_backfill(
-    pool: &Pool,
+    sinks: &SinkSet,
     rpc: &RpcClient,
     chain_id: u64,
 ) -> Result<()> {
@@ -1347,6 +1353,7 @@ async fn tick_receipt_backfill(
     use super::decoder::{decode_log, decode_receipt};
 
     const BATCH_LIMIT: i64 = 100;
+    let pool = sinks.pool();
 
     // Find blocks that have no receipts (most recent first)
     let blocks_missing = detect_blocks_missing_receipts(pool, BATCH_LIMIT).await?;
@@ -1422,9 +1429,9 @@ async fn tick_receipt_backfill(
         let log_count = all_logs.len();
         let receipt_count = all_receipts.len();
 
-        // Write to DB
-        write_logs(pool, &all_logs).await?;
-        write_receipts(pool, &all_receipts).await?;
+        // Write to all sinks
+        sinks.write_logs(&all_logs).await?;
+        sinks.write_receipts(&all_receipts).await?;
 
         metrics::record_logs_indexed(chain_id, log_count as u64);
 
