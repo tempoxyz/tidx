@@ -12,6 +12,8 @@ use common::clickhouse::TestClickHouse;
 use serial_test::serial;
 use tidx::query::{convert_hex_literals_clickhouse, EventSignature};
 use tidx::sync::ch_sink::ClickHouseSink;
+use tidx::sync::sink::SinkSet;
+use tidx::sync::writer;
 use tidx::types::{BlockRow, LogRow, ReceiptRow, TxRow};
 
 const TEST_DB: &str = "tidx_test";
@@ -1165,4 +1167,136 @@ async fn test_hex_filter_against_sink_data() {
     let result = ch.query_json(&sql).await.expect("hex filter query failed");
     let data = result["data"].as_array().unwrap();
     assert_eq!(data.len(), 3, "all 3 blocks should match the miner filter");
+}
+
+// ============================================================================
+// PG→CH Automatic Backfill Tests
+// ============================================================================
+
+/// Helper: set up both PG (TestDb) and CH (ClickHouseSink) for backfill tests.
+/// Returns (PG pool, SinkSet with CH, TestClickHouse) or None if infra unavailable.
+async fn setup_backfill() -> Option<(tidx::db::Pool, SinkSet, TestClickHouse)> {
+    // Set up CH
+    let ch = TestClickHouse::new(SINK_DB).await.expect("Failed to create CH client");
+    if ch.wait_for_ready().await.is_err() {
+        println!("ClickHouse not available, skipping test");
+        return None;
+    }
+    ch.reset_database().await.expect("Failed to reset CH database");
+
+    let ch_sink = ClickHouseSink::new(&ch.url, SINK_DB).expect("Failed to create CH sink");
+    ch_sink.ensure_schema().await.expect("Failed to ensure CH schema");
+
+    // Set up PG
+    let pg_url = match std::env::var("DATABASE_URL") {
+        Ok(url) => url,
+        Err(_) => {
+            println!("DATABASE_URL not set, skipping backfill test");
+            return None;
+        }
+    };
+    let pool = tidx::db::create_pool(&pg_url).await.expect("Failed to create PG pool");
+    tidx::db::run_migrations(&pool).await.expect("Failed to run PG migrations");
+
+    // Truncate PG tables for clean state
+    let conn = pool.get().await.expect("Failed to get PG connection");
+    conn.batch_execute("TRUNCATE blocks, txs, logs, receipts CASCADE")
+        .await
+        .expect("Failed to truncate PG tables");
+
+    let sinks = SinkSet::new(pool.clone()).with_clickhouse(ch_sink);
+    Some((pool, sinks, ch))
+}
+
+/// Backfill should copy all blocks/txs/logs/receipts from PG to an empty CH.
+#[tokio::test]
+#[serial(clickhouse)]
+async fn test_backfill_pg_to_empty_clickhouse() {
+    let Some((pool, sinks, ch)) = setup_backfill().await else { return };
+
+    // Write data directly to PG only (bypass SinkSet to simulate pre-existing PG data)
+    let blocks: Vec<BlockRow> = (1..=10).map(make_block).collect();
+    let txs: Vec<TxRow> = (1..=10).flat_map(|b| (0..2).map(move |i| make_tx(b, i))).collect();
+    let logs: Vec<LogRow> = (1..=10).flat_map(|b| (0..3).map(move |i| make_log(b, i))).collect();
+    let receipts: Vec<ReceiptRow> = (1..=10).flat_map(|b| (0..2).map(move |i| make_receipt(b, i))).collect();
+
+    writer::write_blocks(&pool, &blocks).await.expect("PG write_blocks failed");
+    writer::write_txs(&pool, &txs).await.expect("PG write_txs failed");
+    writer::write_logs(&pool, &logs).await.expect("PG write_logs failed");
+    writer::write_receipts(&pool, &receipts).await.expect("PG write_receipts failed");
+
+    // Verify PG has data, CH is empty
+    assert_eq!(ch.table_count("blocks").await.unwrap(), 0);
+
+    // Run backfill
+    sinks.backfill_clickhouse().await.expect("backfill failed");
+
+    // Verify CH now has matching data
+    assert_eq!(ch.table_count("blocks").await.unwrap(), 10);
+    assert_eq!(ch.table_count("txs").await.unwrap(), 20);
+    assert_eq!(ch.table_count("logs").await.unwrap(), 30);
+    assert_eq!(ch.table_count("receipts").await.unwrap(), 20);
+}
+
+/// Backfill should be resumable — only copy blocks CH doesn't have yet.
+#[tokio::test]
+#[serial(clickhouse)]
+async fn test_backfill_resumes_from_highwater_mark() {
+    let Some((pool, sinks, ch)) = setup_backfill().await else { return };
+
+    // Write 20 blocks to PG
+    let blocks: Vec<BlockRow> = (1..=20).map(make_block).collect();
+    let txs: Vec<TxRow> = (1..=20).flat_map(|b| (0..1).map(move |i| make_tx(b, i))).collect();
+
+    writer::write_blocks(&pool, &blocks).await.expect("PG write_blocks failed");
+    writer::write_txs(&pool, &txs).await.expect("PG write_txs failed");
+
+    // Manually write first 10 blocks to CH (simulating a partial backfill)
+    let ch_sink = ClickHouseSink::new(&ch.url, SINK_DB).unwrap();
+    let first_10: Vec<BlockRow> = (1..=10).map(make_block).collect();
+    let first_10_txs: Vec<TxRow> = (1..=10).flat_map(|b| (0..1).map(move |i| make_tx(b, i))).collect();
+    ch_sink.write_blocks(&first_10).await.unwrap();
+    ch_sink.write_txs(&first_10_txs).await.unwrap();
+
+    assert_eq!(ch.table_count("blocks").await.unwrap(), 10);
+
+    // Run backfill — should only copy blocks 11-20
+    sinks.backfill_clickhouse().await.expect("backfill failed");
+
+    assert_eq!(ch.table_count("blocks").await.unwrap(), 20);
+    assert_eq!(ch.table_count("txs").await.unwrap(), 20);
+}
+
+/// Backfill should be a no-op when CH is already up to date.
+#[tokio::test]
+#[serial(clickhouse)]
+async fn test_backfill_noop_when_up_to_date() {
+    let Some((pool, sinks, ch)) = setup_backfill().await else { return };
+
+    // Write 5 blocks to both PG and CH via SinkSet (normal dual-write path)
+    let blocks: Vec<BlockRow> = (1..=5).map(make_block).collect();
+    writer::write_blocks(&pool, &blocks).await.expect("PG write failed");
+
+    let ch_sink = ClickHouseSink::new(&ch.url, SINK_DB).unwrap();
+    ch_sink.write_blocks(&blocks).await.unwrap();
+
+    assert_eq!(ch.table_count("blocks").await.unwrap(), 5);
+
+    // Run backfill — should detect CH is current and skip
+    sinks.backfill_clickhouse().await.expect("backfill failed");
+
+    // Count should remain 5 (no duplicates)
+    assert_eq!(ch.table_count("blocks").await.unwrap(), 5);
+}
+
+/// Backfill should be a no-op when PG is empty.
+#[tokio::test]
+#[serial(clickhouse)]
+async fn test_backfill_noop_when_pg_empty() {
+    let Some((_pool, sinks, ch)) = setup_backfill().await else { return };
+
+    // PG is empty (truncated in setup), CH is empty
+    sinks.backfill_clickhouse().await.expect("backfill failed");
+
+    assert_eq!(ch.table_count("blocks").await.unwrap(), 0);
 }
