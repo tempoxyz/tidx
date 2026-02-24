@@ -19,8 +19,7 @@ batch_size = 500
 concurrency = 8
 
 # ClickHouse OLAP engine (optional)
-# Uses MaterializedPostgreSQL for real-time WAL replication.
-# Each instance gets its own replication stream from PostgreSQL.
+# Data is written directly via HTTP batch inserts (JSONEachRow).
 # Queries go to the primary; failover instances are tried on connection failure.
 [chains.clickhouse]
 enabled = false

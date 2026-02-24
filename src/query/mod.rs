@@ -17,15 +17,6 @@ use std::sync::LazyLock;
 static HEX_LITERAL_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"'0x([0-9a-fA-F]{40,})'").unwrap());
 
-/// No-op: ClickHouse data is now stored with '0x' prefix via direct-write (ClickHouseSink),
-/// so user hex literals like '0xABCD...' already match the stored format.
-/// 
-/// Previously converted '0x...' → concat(char(92), 'x...') for MaterializedPostgreSQL
-/// which stored data with '\x' prefix.
-pub fn convert_hex_literals_clickhouse(sql: &str) -> String {
-    sql.to_owned()
-}
-
 /// Convert '0x...' hex literals to '\x...' for PostgreSQL bytea comparison.
 /// Only replaces hex values of 40+ chars (addresses, topics, hashes), not short '0x' prefixes.
 pub fn convert_hex_literals_postgres(sql: &str) -> String {

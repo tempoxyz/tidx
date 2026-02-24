@@ -86,8 +86,7 @@ pub async fn run(args: Args) -> Result<()> {
         // Initialize ClickHouse if configured (for each chain)
         if let Some(ref ch_config) = chain.clickhouse {
             if ch_config.enabled {
-                let pg_url = chain.resolved_pg_url()?;
-                match ClickHouseEngine::new(ch_config, chain.chain_id, &pg_url) {
+                match ClickHouseEngine::new(ch_config, chain.chain_id) {
                     Ok(engine) => {
                         let engine = Arc::new(engine);
                         clickhouse_engines
@@ -314,13 +313,20 @@ fn spawn_sync_engine(
             }
         }
 
-        // Auto-backfill ClickHouse from PostgreSQL if CH is behind
-        if let Err(e) = sinks.backfill_clickhouse().await {
-            error!(
-                error = %e,
-                chain = %chain.name,
-                "ClickHouse backfill failed (continuing, will catch up during sync)"
-            );
+        // Auto-backfill ClickHouse from PostgreSQL in background (non-blocking).
+        // SyncEngine starts immediately so new blocks are indexed while CH catches up.
+        {
+            let backfill_sinks = sinks.clone();
+            let backfill_chain_name = chain.name.clone();
+            tokio::spawn(async move {
+                if let Err(e) = backfill_sinks.backfill_clickhouse().await {
+                    error!(
+                        error = %e,
+                        chain = %backfill_chain_name,
+                        "ClickHouse backfill failed (CH will catch up during sync)"
+                    );
+                }
+            });
         }
 
         // Create sync engine with throttled pool and configured sinks

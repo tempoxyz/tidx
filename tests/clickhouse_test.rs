@@ -10,7 +10,7 @@ mod common;
 
 use common::clickhouse::TestClickHouse;
 use serial_test::serial;
-use tidx::query::{convert_hex_literals_clickhouse, EventSignature};
+use tidx::query::EventSignature;
 use tidx::sync::ch_sink::ClickHouseSink;
 use tidx::sync::sink::SinkSet;
 use tidx::sync::writer;
@@ -193,12 +193,9 @@ async fn test_hex_literal_filter_execution() {
     let cte = sig.to_cte_sql_clickhouse();
     let full_sql = format!("WITH {} {}", cte, pushed);
     
-    // Convert hex literals to ClickHouse format
-    let final_sql = convert_hex_literals_clickhouse(&full_sql);
+    println!("Final SQL: {}", full_sql);
     
-    println!("Final SQL: {}", final_sql);
-    
-    let result = ch.query_json(&final_sql).await.expect("Query failed");
+    let result = ch.query_json(&full_sql).await.expect("Query failed");
     let data = result.get("data").and_then(|d| d.as_array());
     
     assert!(data.is_some());
@@ -626,14 +623,13 @@ async fn test_predicate_pushdown_indexed_param() {
     let pushed = sig.rewrite_filters_for_pushdown(&normalized);
     let cte = sig.to_cte_sql_clickhouse();
     let full_sql = format!("WITH {} {}", cte, pushed);
-    let final_sql = convert_hex_literals_clickhouse(&full_sql);
     
-    println!("Pushdown SQL: {}", final_sql);
+    println!("Pushdown SQL: {}", full_sql);
     
     // Verify the topic1 filter is in the CTE WHERE clause
-    assert!(final_sql.contains("topic1 ="), "Expected topic1 predicate pushdown");
+    assert!(full_sql.contains("topic1 ="), "Expected topic1 predicate pushdown");
     
-    let result = ch.query_json(&final_sql).await.expect("Query failed");
+    let result = ch.query_json(&full_sql).await.expect("Query failed");
     let data = result.get("data").and_then(|d| d.as_array());
     
     assert!(data.is_some());
@@ -1299,4 +1295,101 @@ async fn test_backfill_noop_when_pg_empty() {
     sinks.backfill_clickhouse().await.expect("backfill failed");
 
     assert_eq!(ch.table_count("blocks").await.unwrap(), 0);
+}
+
+/// Per-table backfill: blocks present in CH but txs/logs/receipts missing.
+/// Each table should backfill independently from its own high-water mark.
+#[tokio::test]
+#[serial(clickhouse)]
+async fn test_backfill_per_table_independent_highwater() {
+    let Some((pool, sinks, ch)) = setup_backfill().await else { return };
+
+    // Write full data to PG
+    let blocks: Vec<BlockRow> = (1..=10).map(make_block).collect();
+    let txs: Vec<TxRow> = (1..=10).flat_map(|b| (0..2).map(move |i| make_tx(b, i))).collect();
+    let logs: Vec<LogRow> = (1..=10).flat_map(|b| (0..3).map(move |i| make_log(b, i))).collect();
+    let receipts: Vec<ReceiptRow> = (1..=10).flat_map(|b| (0..2).map(move |i| make_receipt(b, i))).collect();
+
+    writer::write_blocks(&pool, &blocks).await.unwrap();
+    writer::write_txs(&pool, &txs).await.unwrap();
+    writer::write_logs(&pool, &logs).await.unwrap();
+    writer::write_receipts(&pool, &receipts).await.unwrap();
+
+    // Pre-populate CH with ALL blocks but only txs for blocks 1-5 (simulate partial failure)
+    let ch_sink = ClickHouseSink::new(&ch.url, SINK_DB).unwrap();
+    ch_sink.write_blocks(&blocks).await.unwrap();
+    let partial_txs: Vec<TxRow> = (1..=5).flat_map(|b| (0..2).map(move |i| make_tx(b, i))).collect();
+    ch_sink.write_txs(&partial_txs).await.unwrap();
+    // logs and receipts: nothing in CH
+
+    assert_eq!(ch.table_count("blocks").await.unwrap(), 10);
+    assert_eq!(ch.table_count("txs").await.unwrap(), 10); // only 5 blocks × 2 txs
+    assert_eq!(ch.table_count("logs").await.unwrap(), 0);
+    assert_eq!(ch.table_count("receipts").await.unwrap(), 0);
+
+    // Run backfill — blocks should skip (already up to date),
+    // txs should fill 6-10, logs/receipts should fill 1-10
+    sinks.backfill_clickhouse().await.expect("backfill failed");
+
+    assert_eq!(ch.table_count("blocks").await.unwrap(), 10);
+    assert_eq!(ch.table_count("txs").await.unwrap(), 20); // 10 old + 10 new
+    assert_eq!(ch.table_count("logs").await.unwrap(), 30);
+    assert_eq!(ch.table_count("receipts").await.unwrap(), 20);
+}
+
+/// Backfill with >5000 blocks to exercise multi-batch range pagination.
+#[tokio::test]
+#[serial(clickhouse)]
+async fn test_backfill_multi_batch_pagination() {
+    let Some((pool, sinks, ch)) = setup_backfill().await else { return };
+
+    // Write 6000 blocks to PG — forces at least 2 range-pagination batches (batch size = 5000)
+    let block_count = 6000i64;
+    // Write in chunks to avoid huge single inserts
+    for chunk_start in (1..=block_count).step_by(500) {
+        let chunk_end = (chunk_start + 499).min(block_count);
+        let blocks: Vec<BlockRow> = (chunk_start..=chunk_end).map(make_block).collect();
+        writer::write_blocks(&pool, &blocks).await.unwrap();
+    }
+
+    assert_eq!(ch.table_count("blocks").await.unwrap(), 0);
+
+    // Run backfill
+    sinks.backfill_clickhouse().await.expect("backfill failed");
+
+    assert_eq!(ch.table_count("blocks").await.unwrap(), block_count as u64);
+
+    // Verify first and last blocks roundtripped
+    let result = ch.query_json("SELECT min(num), max(num) FROM blocks").await.unwrap();
+    let row = &result["data"].as_array().unwrap()[0];
+    let min_num = row["min(num)"].as_i64()
+        .or_else(|| row["min(num)"].as_str().and_then(|s| s.parse().ok()))
+        .unwrap();
+    let max_num = row["max(num)"].as_i64()
+        .or_else(|| row["max(num)"].as_str().and_then(|s| s.parse().ok()))
+        .unwrap();
+    assert_eq!(min_num, 1);
+    assert_eq!(max_num, block_count);
+}
+
+/// Backfill is idempotent — running twice should not duplicate data.
+#[tokio::test]
+#[serial(clickhouse)]
+async fn test_backfill_idempotent() {
+    let Some((pool, sinks, ch)) = setup_backfill().await else { return };
+
+    let blocks: Vec<BlockRow> = (1..=10).map(make_block).collect();
+    let txs: Vec<TxRow> = (1..=10).map(|b| make_tx(b, 0)).collect();
+    writer::write_blocks(&pool, &blocks).await.unwrap();
+    writer::write_txs(&pool, &txs).await.unwrap();
+
+    // First backfill
+    sinks.backfill_clickhouse().await.expect("first backfill failed");
+    assert_eq!(ch.table_count("blocks").await.unwrap(), 10);
+    assert_eq!(ch.table_count("txs").await.unwrap(), 10);
+
+    // Second backfill — should be a no-op (per-table high-water marks match)
+    sinks.backfill_clickhouse().await.expect("second backfill failed");
+    assert_eq!(ch.table_count("blocks").await.unwrap(), 10);
+    assert_eq!(ch.table_count("txs").await.unwrap(), 10);
 }

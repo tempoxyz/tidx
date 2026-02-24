@@ -37,7 +37,7 @@ impl ClickHouseEngine {
     /// Create a new ClickHouse engine for the given chain.
     /// The primary URL comes from `config.url`; additional failover URLs
     /// come from `config.failover_urls`.
-    pub fn new(config: &ClickHouseConfig, chain_id: u64, _pg_url: &str) -> Result<Self> {
+    pub fn new(config: &ClickHouseConfig, chain_id: u64) -> Result<Self> {
         let database = config
             .database
             .clone()
@@ -102,7 +102,6 @@ impl ClickHouseEngine {
             sql.to_string()
         };
 
-        let sql = crate::query::convert_hex_literals_clickhouse(&sql);
         let start = std::time::Instant::now();
         let n = self.instances.len();
         let starting = self.active.load(Ordering::Relaxed);
@@ -200,9 +199,7 @@ impl ClickHouseEngine {
                         columns
                             .iter()
                             .map(|col| {
-                                let value =
-                                    row.get(col).cloned().unwrap_or(serde_json::Value::Null);
-                                normalize_hex_output(value)
+                                row.get(col).cloned().unwrap_or(serde_json::Value::Null)
                             })
                             .collect()
                     })
@@ -258,17 +255,6 @@ pub struct QueryResult {
     pub query_time_ms: Option<f64>,
 }
 
-/// Convert '\x...' hex strings to '0x...' format for output (legacy compat).
-/// Direct-write data already uses '0x' prefix so this is a no-op for new data.
-fn normalize_hex_output(value: serde_json::Value) -> serde_json::Value {
-    match value {
-        serde_json::Value::String(s) if s.starts_with("\\x") => {
-            serde_json::Value::String(format!("0x{}", &s[2..]))
-        }
-        other => other,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -291,7 +277,7 @@ mod tests {
             database: None,
         };
 
-        let engine = ClickHouseEngine::new(&config, 4217, "postgres://localhost/test").unwrap();
+        let engine = ClickHouseEngine::new(&config, 4217).unwrap();
         assert_eq!(engine.instance_count(), 1);
         assert_eq!(engine.active_url(), "http://clickhouse-1:8123");
     }
@@ -305,7 +291,7 @@ mod tests {
             database: None,
         };
 
-        let engine = ClickHouseEngine::new(&config, 4217, "postgres://localhost/test").unwrap();
+        let engine = ClickHouseEngine::new(&config, 4217).unwrap();
         assert_eq!(engine.instance_count(), 2);
         assert_eq!(engine.active_url(), "http://clickhouse-1:8123");
     }
@@ -319,7 +305,7 @@ mod tests {
             database: Some("custom_db".to_string()),
         };
 
-        let engine = ClickHouseEngine::new(&config, 4217, "postgres://localhost/test").unwrap();
+        let engine = ClickHouseEngine::new(&config, 4217).unwrap();
         assert_eq!(engine.database(), "custom_db");
     }
 
@@ -332,7 +318,7 @@ mod tests {
             database: None,
         };
 
-        let engine = ClickHouseEngine::new(&config, 4217, "postgres://localhost/test").unwrap();
+        let engine = ClickHouseEngine::new(&config, 4217).unwrap();
         assert_eq!(engine.database(), "tidx_4217");
     }
 }

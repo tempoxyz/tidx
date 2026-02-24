@@ -186,10 +186,6 @@ pub async fn create_view(
         req.sql.clone()
     };
     
-    // Convert '0x...' hex literals to ClickHouse-compatible format
-    // Uses concat(char(92), 'x...') because ClickHouse interprets '\x' as escape sequence
-    let sql = crate::query::convert_hex_literals_clickhouse(&sql);
-
     // 1. Ensure database exists
     let create_db = format!("CREATE DATABASE IF NOT EXISTS {}", database);
     clickhouse.query(&create_db, &[]).await
@@ -384,10 +380,9 @@ mod tests {
         format!("WITH {} {}", cte, sql)
     }
     
-    /// Generate runtime SQL with 0x -> ClickHouse format conversion (what actually gets executed)
+    /// Generate runtime SQL (what actually gets executed against ClickHouse)
     fn generate_runtime_sql(signature: &str, user_sql: &str) -> String {
-        let sql = generate_view_sql(signature, user_sql);
-        crate::query::convert_hex_literals_clickhouse(&sql)
+        generate_view_sql(signature, user_sql)
     }
 
     // ========================================================================

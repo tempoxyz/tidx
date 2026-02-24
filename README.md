@@ -21,8 +21,7 @@
 
 ## Features
 
-- **Dual Storage** — PostgreSQL for OLTP + ClickHouse columnar for OLAP
-- **Real-time Replication** — ClickHouse syncs via MaterializedPostgreSQL (WAL streaming)
+- **Dual Storage** — PostgreSQL (OLTP) + ClickHouse (OLAP), written in parallel
 - **Event/Function Decoding** — Query decoded events or function calldata by ABI signature (no pre-registration)
 - **HTTP API + CLI** — Query data via REST, SQL, or command line
 
@@ -47,7 +46,7 @@ curl -L https://tidx.vercel.app/docker | bash
 
 ## Overview
 
-tidx uses a hybrid PostgreSQL + ClickHouse architecture. Use the `engine` parameter to choose:
+The sync engine writes to both PostgreSQL and ClickHouse in parallel. Use the `engine` query parameter to choose which backend to query:
 
 ```
                                               ┌─────────────────────┐
@@ -61,19 +60,20 @@ tidx uses a hybrid PostgreSQL + ClickHouse architecture. Use the `engine` parame
               │                                          │                                          │
               ▼                                          ▼                                          ▼
 ┌─────────────────────┐                    ┌─────────────────────┐                    ┌─────────────────────┐
-│    PostgreSQL       │     WAL stream     │     ClickHouse      │                    │  Materialized Views │
-│    (OLTP)           │ ─────────────────► │      (OLAP)         │ ─────────────────► │  (auto-updated)     │
-│                     │   MaterializedPG   │                     │                    │                     │
-│  blocks, txs, logs  │                    │  blocks, txs, logs  │                    │  top_holders, etc.  │
-│         │           │                    │         │           │                    └─────────────────────┘
-│         ▼           │                    │         ▼           │
-│  ┌─────────────┐    │                    │  ┌─────────────┐    │
-│  │ Transfer()  │    │                    │  │ Transfer()  │    │
-│  │ Approval()  │    │                    │  │ Approval()  │    │
-│  │ ...         │    │                    │  │ ...         │    │
-│  └─────────────┘    │                    │  └─────────────┘    │
-│   (lazy decode)     │                    │   (lazy decode)     │
-└─────────────────────┘                    └─────────────────────┘
+│    PostgreSQL       │                    │     ClickHouse      │                    │  Materialized Views │
+│    (OLTP)           │                    │      (OLAP)         │ ─────────────────► │  (auto-updated)     │
+│                     │                    │                     │                    │                     │
+└─────────┬───────────┘                    └─────────┬───────────┘                    └─────────────────────┘
+          │                                          │
+          └──────────────────┬───────────────────────┘
+                             │
+                     ┌───────┴───────┐
+                     │  Dual Sink    │
+                     └───────┬───────┘
+                             │
+                     ┌───────┴───────┐
+                     │  Sync Engine  │
+                     └───────────────┘
 ```
 
 ```bash
@@ -151,7 +151,7 @@ pg_url = "postgres://user@tidx.example.com:5432/tidx_mainnet"
 pg_password_env = "TIDX_PG_PASSWORD"  # Password from environment variable
 batch_size = 100
 
-# Optional: ClickHouse for OLAP queries (uses MaterializedPostgreSQL)
+# Optional: ClickHouse for OLAP queries
 [chains.clickhouse]
 enabled = true
 url = "http://clickhouse:8123"
