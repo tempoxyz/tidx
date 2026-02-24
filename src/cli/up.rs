@@ -314,6 +314,15 @@ fn spawn_sync_engine(
             }
         }
 
+        // Auto-backfill ClickHouse from PostgreSQL if CH is behind
+        if let Err(e) = sinks.backfill_clickhouse().await {
+            error!(
+                error = %e,
+                chain = %chain.name,
+                "ClickHouse backfill failed (continuing, will catch up during sync)"
+            );
+        }
+
         // Create sync engine with throttled pool and configured sinks
         let mut engine = match SyncEngine::new(throttled_pool, sinks, &chain.rpc_url).await {
             Ok(e) => e

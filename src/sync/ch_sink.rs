@@ -212,6 +212,52 @@ impl ClickHouseSink {
         Ok(())
     }
 
+    /// Query the highest block number in ClickHouse, or None if empty.
+    pub async fn max_block_num(&self) -> Result<Option<i64>> {
+        let url = format!(
+            "{}/?database={}&default_format=TabSeparated",
+            self.url, self.database
+        );
+        let resp = self
+            .http_client
+            .post(&url)
+            .body("SELECT max(num) FROM blocks")
+            .send()
+            .await
+            .map_err(|e| anyhow!("ClickHouse HTTP request failed: {e}"))?;
+
+        if !resp.status().is_success() {
+            let error = resp.text().await.unwrap_or_default();
+            return Err(anyhow!("ClickHouse query failed: {error}"));
+        }
+
+        let text = resp.text().await.unwrap_or_default();
+        let trimmed = text.trim();
+        if trimmed.is_empty() || trimmed == "0" {
+            // max() on empty table returns 0 in ClickHouse
+            // Check if there are actually any rows
+            let count_url = format!(
+                "{}/?database={}&default_format=TabSeparated",
+                self.url, self.database
+            );
+            let count_resp = self
+                .http_client
+                .post(&count_url)
+                .body("SELECT count() FROM blocks")
+                .send()
+                .await
+                .map_err(|e| anyhow!("ClickHouse HTTP request failed: {e}"))?;
+            let count_text = count_resp.text().await.unwrap_or_default();
+            if count_text.trim() == "0" {
+                return Ok(None);
+            }
+        }
+        trimmed
+            .parse::<i64>()
+            .map(Some)
+            .map_err(|e| anyhow!("Failed to parse max block num '{trimmed}': {e}"))
+    }
+
     /// Delete all data from a given block number onwards (reorg support).
     pub async fn delete_from(&self, block_num: u64) -> Result<()> {
         let tables = ["logs", "receipts", "txs", "blocks"];
