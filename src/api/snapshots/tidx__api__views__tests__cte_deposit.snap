@@ -7,5 +7,5 @@ Deposit AS (
            concat('0x', lower(substring(tx_hash, 3))) AS tx_hash,
            concat('0x', lower(substring(address, 3))) AS address, selector, topic1, topic2, topic3, data, concat('0x', lower(substring(topic1, 27))) AS "dst", reinterpretAsUInt256(reverse(unhex(substring(data, 3, 64)))) AS "wad"
     FROM logs
-    WHERE selector = concat(char(92), 'xe1fffcc4923d04b559f4d29a8bfc6cda04eb5b0d3c460751c2402c5c5cc9109c')
+    WHERE selector = '0xe1fffcc4923d04b559f4d29a8bfc6cda04eb5b0d3c460751c2402c5c5cc9109c'
 )

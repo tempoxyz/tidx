@@ -410,9 +410,6 @@ async fn handle_query_live(
         limit: params.limit.clamp(1, crate::query::HARD_LIMIT_MAX),
     };
 
-    // Detect if this is an OLAP query (aggregations, etc.)
-    let is_olap = crate::query::route_query(&sql) == crate::query::QueryEngine::ClickHouse;
-
     let stream = async_stream::stream! {
         // Keep guard alive for the lifetime of the stream
         let _guard = connection_guard;
@@ -467,10 +464,20 @@ async fn handle_query_live(
                         last_block_num = end - MAX_CATCHUP_BLOCKS;
                     }
 
-                    // For OLAP queries, re-execute the full query once per update (not per-block)
-                    // For OLTP queries, filter by each block
-                    if is_olap {
-                        match crate::service::execute_query_postgres(&pool, &sql, &sigs, &options).await {
+                    // Filter by each block for per-block streaming
+                    let catch_up_start = last_block_num + 1;
+                    for block_num in catch_up_start..=end {
+                        let filtered_sql = match inject_block_filter(&sql, block_num) {
+                            Ok(s) => s,
+                            Err(e) => {
+                                yield Ok(SseEvent::default()
+                                    .event("error")
+                                    .json_data(serde_json::json!({ "ok": false, "error": e.to_string() }))
+                                    .unwrap());
+                                return;
+                            }
+                        };
+                        match crate::service::execute_query_postgres(&pool, &filtered_sql, &sigs, &options).await {
                             Ok(result) => {
                                 yield Ok(SseEvent::default()
                                     .event("result")
@@ -484,37 +491,8 @@ async fn handle_query_live(
                                     .unwrap());
                             }
                         }
-                        last_block_num = end;
-                    } else {
-                        let catch_up_start = last_block_num + 1;
-                        for block_num in catch_up_start..=end {
-                            let filtered_sql = match inject_block_filter(&sql, block_num) {
-                                Ok(s) => s,
-                                Err(e) => {
-                                    yield Ok(SseEvent::default()
-                                        .event("error")
-                                        .json_data(serde_json::json!({ "ok": false, "error": e.to_string() }))
-                                        .unwrap());
-                                    return;
-                                }
-                            };
-                            match crate::service::execute_query_postgres(&pool, &filtered_sql, &sigs, &options).await {
-                                Ok(result) => {
-                                    yield Ok(SseEvent::default()
-                                        .event("result")
-                                        .json_data(QueryResponse { result, ok: true })
-                                        .unwrap());
-                                }
-                                Err(e) => {
-                                    yield Ok(SseEvent::default()
-                                        .event("error")
-                                        .json_data(serde_json::json!({ "ok": false, "error": e.to_string() }))
-                                        .unwrap());
-                                }
-                            }
-                        }
-                        last_block_num = end;
                     }
+                    last_block_num = end;
                 }
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
                     yield Ok(SseEvent::default()

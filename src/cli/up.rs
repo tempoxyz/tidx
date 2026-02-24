@@ -76,12 +76,6 @@ pub async fn run(args: Args) -> Result<()> {
     let clickhouse_engines: SharedClickHouseEngines = Arc::new(RwLock::new(HashMap::new()));
     let mut default_chain_id = 0u64;
 
-    // Collect ClickHouse engines that need replication setup.
-    // These must be initialized sequentially (not spawned concurrently) because
-    // ClickHouse's MaterializedPostgreSQL engine can stall when multiple CREATE
-    // DATABASE commands race on the same instance.
-    let mut pending_replication: Vec<(Arc<ClickHouseEngine>, String, String)> = Vec::new();
-
     for chain in &config.chains {
         let throttled_pool = initialize_chain(chain, Arc::clone(&clickhouse_configs)).await?;
 
@@ -96,7 +90,6 @@ pub async fn run(args: Args) -> Result<()> {
                 match ClickHouseEngine::new(ch_config, chain.chain_id, &pg_url) {
                     Ok(engine) => {
                         let engine = Arc::new(engine);
-                        pending_replication.push((Arc::clone(&engine), pg_url, chain.name.clone()));
                         clickhouse_engines
                             .write()
                             .await
@@ -127,17 +120,6 @@ pub async fn run(args: Args) -> Result<()> {
             broadcaster.clone(),
             shutdown_tx.subscribe(),
         );
-    }
-
-    // Set up ClickHouse replication sequentially to avoid race conditions.
-    if !pending_replication.is_empty() {
-        tokio::spawn(async move {
-            for (engine, pg_url, chain_name) in pending_replication {
-                if let Err(e) = engine.ensure_replication(&pg_url).await {
-                    error!(error = %e, chain = %chain_name, "Failed to set up ClickHouse replication");
-                }
-            }
-        });
     }
 
     let (chain_tx, mut chain_rx) = tokio::sync::mpsc::channel::<NewChainEvent>(16);

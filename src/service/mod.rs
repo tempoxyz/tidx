@@ -332,7 +332,7 @@ fn sanitize_db_error(error: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::query::{route_query, EventSignature, QueryEngine};
+    use crate::query::EventSignature;
     use insta::assert_snapshot;
 
     // ========================================================================
@@ -419,33 +419,6 @@ mod tests {
         used_columns.insert("to".to_string());
         used_columns.insert("value".to_string());
         assert_snapshot!(sig.to_cte_sql_clickhouse_filtered(Some(&used_columns)));
-    }
-
-    // ========================================================================
-    // Query Routing Tests
-    // ========================================================================
-
-    #[test]
-    fn test_route_olap_query_to_clickhouse() {
-        // OLAP patterns should route to ClickHouse
-        assert_eq!(route_query("SELECT COUNT(*) FROM logs GROUP BY address"), QueryEngine::ClickHouse);
-        assert_eq!(route_query("SELECT SUM(gas_used) FROM blocks"), QueryEngine::ClickHouse);
-        assert_eq!(route_query("SELECT AVG(gas_limit) FROM txs"), QueryEngine::ClickHouse);
-        assert_eq!(route_query("SELECT *, ROW_NUMBER() OVER (PARTITION BY address) FROM logs"), QueryEngine::ClickHouse);
-    }
-
-    #[test]
-    fn test_route_oltp_query_to_postgres() {
-        // Point lookups should route to Postgres
-        assert_eq!(route_query("SELECT * FROM blocks WHERE num = 100"), QueryEngine::Postgres);
-        assert_eq!(route_query("SELECT * FROM txs WHERE hash = '\\x1234'"), QueryEngine::Postgres);
-        assert_eq!(route_query("SELECT * FROM logs WHERE address = '\\xabcd'"), QueryEngine::Postgres);
-    }
-
-    #[test]
-    fn test_explicit_engine_hints() {
-        assert_eq!(route_query("/* engine=clickhouse */ SELECT * FROM blocks"), QueryEngine::ClickHouse);
-        assert_eq!(route_query("/* engine=postgres */ SELECT COUNT(*) FROM logs GROUP BY address"), QueryEngine::Postgres);
     }
 
     // ========================================================================

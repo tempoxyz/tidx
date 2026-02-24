@@ -116,19 +116,19 @@ async fn test_approval_cte_execution() {
     ch.create_mock_logs_table().await.expect("Failed to create logs table");
     
     // Insert Approval log with proper topic0
-    let approval_topic0 = "\\x8c5be1e5ebec7d5bd14f71427d1e84f3dd0314c0f7b2291e5b200ac8c7c3b925";
-    let owner = "\\x000000000000000000000000a975ba910c2ee169956f3df99ee2ece79d3887cf";
-    let spender = "\\x000000000000000000000000dAC17F958D2ee523a2206206994597C13D831ec7";
-    let value_data = "\\xffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff";
+    let approval_topic0 = "0x8c5be1e5ebec7d5bd14f71427d1e84f3dd0314c0f7b2291e5b200ac8c7c3b925";
+    let owner = "0x000000000000000000000000a975ba910c2ee169956f3df99ee2ece79d3887cf";
+    let spender = "0x000000000000000000000000dAC17F958D2ee523a2206206994597C13D831ec7";
+    let value_data = "0xffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff";
     
     ch.insert_mock_log(
         10, 0, 0,
-        "\\x0000000000000000000000000000000000000000000000000000000000000002",
-        "\\xdAC17F958D2ee523a2206206994597C13D831ec7",
+        "0x0000000000000000000000000000000000000000000000000000000000000002",
+        "0xdAC17F958D2ee523a2206206994597C13D831ec7",
         approval_topic0,
         owner,
         spender,
-        "\\x0000000000000000000000000000000000000000000000000000000000000000",
+        "0x0000000000000000000000000000000000000000000000000000000000000000",
         value_data,
     ).await.expect("Failed to insert log");
     
@@ -489,21 +489,21 @@ async fn test_uniswap_swap_cte() {
     
     // Insert Swap event
     // Swap(address indexed sender, uint256 amount0In, uint256 amount1In, uint256 amount0Out, uint256 amount1Out, address indexed to)
-    let swap_topic0 = "\\xd78ad95fa46c994b6551d0da85fc275fe613ce37657fb8d5e3d130840159d822";
-    let sender = "\\x0000000000000000000000007a250d5630B4cF539739dF2C5dAcb4c659F2488D";
-    let to = "\\x000000000000000000000000a975ba910c2ee169956f3df99ee2ece79d3887cf";
+    let swap_topic0 = "0xd78ad95fa46c994b6551d0da85fc275fe613ce37657fb8d5e3d130840159d822";
+    let sender = "0x0000000000000000000000007a250d5630B4cF539739dF2C5dAcb4c659F2488D";
+    let to = "0x000000000000000000000000a975ba910c2ee169956f3df99ee2ece79d3887cf";
     
     // Data: 4 uint256 values (amount0In, amount1In, amount0Out, amount1Out)
-    let data = "\\x0000000000000000000000000000000000000000000000000de0b6b3a76400000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000001b1ae4d6e2ef500000";
+    let data = "0x0000000000000000000000000000000000000000000000000de0b6b3a76400000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000001b1ae4d6e2ef500000";
     
     ch.insert_mock_log(
         100, 0, 0,
-        "\\x0000000000000000000000000000000000000000000000000000000000000003",
-        "\\x0d4a11d5EEaaC28EC3F61d100daF4d40471f1852", // USDT-WETH pair
+        "0x0000000000000000000000000000000000000000000000000000000000000003",
+        "0x0d4a11d5EEaaC28EC3F61d100daF4d40471f1852", // USDT-WETH pair
         swap_topic0,
         sender,
         to,
-        "\\x0000000000000000000000000000000000000000000000000000000000000000",
+        "0x0000000000000000000000000000000000000000000000000000000000000000",
         data,
     ).await.expect("Failed to insert swap");
     
@@ -547,20 +547,20 @@ async fn test_role_granted_cte() {
     ch.create_mock_logs_table().await.expect("Failed to create logs table");
     
     // RoleGranted(bytes32 indexed role, address indexed account, address indexed sender)
-    let role_granted_topic0 = "\\x2f8788117e7eff1d82e926ec794901d17c78024a50270940304540a733656f0d";
-    let role = "\\x0000000000000000000000000000000000000000000000000000000000000000"; // DEFAULT_ADMIN_ROLE
-    let account = "\\x000000000000000000000000a975ba910c2ee169956f3df99ee2ece79d3887cf";
-    let sender = "\\x0000000000000000000000000000000000000000000000000000000000000000";
+    let role_granted_topic0 = "0x2f8788117e7eff1d82e926ec794901d17c78024a50270940304540a733656f0d";
+    let role = "0x0000000000000000000000000000000000000000000000000000000000000000"; // DEFAULT_ADMIN_ROLE
+    let account = "0x000000000000000000000000a975ba910c2ee169956f3df99ee2ece79d3887cf";
+    let sender = "0x0000000000000000000000000000000000000000000000000000000000000000";
     
     ch.insert_mock_log(
         50, 0, 0,
-        "\\x0000000000000000000000000000000000000000000000000000000000000004",
-        "\\x6B175474E89094C44Da98b954EescdKF63C02B94", // DAI
+        "0x0000000000000000000000000000000000000000000000000000000000000004",
+        "0x6B175474E89094C44Da98b954EescdKF63C02B94", // DAI
         role_granted_topic0,
         role,
         account,
         sender,
-        "\\x",
+        "0x",
     ).await.expect("Failed to insert role granted");
     
     let sig = EventSignature::parse(
@@ -892,15 +892,81 @@ async fn test_sink_delete_from_reorg() {
     assert_eq!(ch.table_count("blocks").await.unwrap(), 10);
 
     // Simulate reorg: delete from block 8 onwards
+    // mutations_sync=1 means this returns only after the mutation completes — no sleep needed
     sink.delete_from(8).await.expect("delete_from failed");
-
-    // ClickHouse mutations are async — wait for them
-    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
 
     assert_eq!(ch.table_count("blocks").await.unwrap(), 7);
     assert_eq!(ch.table_count("txs").await.unwrap(), 7);
     assert_eq!(ch.table_count("logs").await.unwrap(), 7);
     assert_eq!(ch.table_count("receipts").await.unwrap(), 7);
+}
+
+/// Reorg correctness: write → delete → re-insert different data → verify new data wins.
+#[tokio::test]
+#[serial(clickhouse)]
+async fn test_sink_reorg_reinsert_correctness() {
+    let Some((sink, ch)) = setup_sink().await else { return };
+
+    // Write blocks 1-10 with gas_used = 21000 * num
+    let blocks: Vec<BlockRow> = (1..=10).map(make_block).collect();
+    let txs: Vec<TxRow> = (1..=10).map(|b| make_tx(b, 0)).collect();
+    sink.write_blocks(&blocks).await.unwrap();
+    sink.write_txs(&txs).await.unwrap();
+
+    // Verify original block 9 gas_used
+    let result = ch.query_json("SELECT gas_used FROM blocks WHERE num = 9").await.unwrap();
+    let original_gas = result["data"].as_array().unwrap()[0]["gas_used"]
+        .as_i64()
+        .or_else(|| result["data"].as_array().unwrap()[0]["gas_used"].as_str().and_then(|s| s.parse().ok()))
+        .unwrap();
+    assert_eq!(original_gas, 21_000 * 9);
+
+    // Simulate reorg: delete from block 8 onwards (synchronous mutation)
+    sink.delete_from(8).await.unwrap();
+    assert_eq!(ch.table_count("blocks").await.unwrap(), 7);
+
+    // Re-insert blocks 8-10 with DIFFERENT data (gas_used = 99999)
+    let reorged_blocks: Vec<BlockRow> = (8..=10).map(|num| {
+        let mut b = make_block(num);
+        b.gas_used = 99999;
+        b.hash = vec![0xff; 32]; // different hash
+        b
+    }).collect();
+    let reorged_txs: Vec<TxRow> = (8..=10).map(|b| {
+        let mut tx = make_tx(b, 0);
+        tx.value = "9999".to_string(); // different value
+        tx
+    }).collect();
+    sink.write_blocks(&reorged_blocks).await.unwrap();
+    sink.write_txs(&reorged_txs).await.unwrap();
+
+    // Verify reorged data
+    assert_eq!(ch.table_count("blocks").await.unwrap(), 10);
+
+    let result = ch.query_json("SELECT gas_used, hash FROM blocks WHERE num = 9").await.unwrap();
+    let row = &result["data"].as_array().unwrap()[0];
+    let new_gas = row["gas_used"]
+        .as_i64()
+        .or_else(|| row["gas_used"].as_str().and_then(|s| s.parse().ok()))
+        .unwrap();
+    assert_eq!(new_gas, 99999, "gas_used should reflect reorged block data");
+
+    let hash = row["hash"].as_str().unwrap();
+    assert!(hash.starts_with("0x"), "hash should be 0x-prefixed");
+    assert!(hash.contains("ffffffff"), "hash should be the reorged hash (0xff bytes)");
+
+    // Verify txs also reflect reorged data
+    let result = ch.query_json("SELECT value FROM txs WHERE block_num = 9").await.unwrap();
+    let value = result["data"].as_array().unwrap()[0]["value"].as_str().unwrap();
+    assert_eq!(value, "9999", "tx value should reflect reorged data");
+
+    // Verify blocks before fork point are untouched
+    let result = ch.query_json("SELECT gas_used FROM blocks WHERE num = 7").await.unwrap();
+    let preserved_gas = result["data"].as_array().unwrap()[0]["gas_used"]
+        .as_i64()
+        .or_else(|| result["data"].as_array().unwrap()[0]["gas_used"].as_str().and_then(|s| s.parse().ok()))
+        .unwrap();
+    assert_eq!(preserved_gas, 21_000 * 7, "blocks before fork should be preserved");
 }
 
 #[tokio::test]
@@ -955,4 +1021,148 @@ async fn test_sink_idempotent_schema() {
 
     // Calling ensure_schema twice should not error
     sink.ensure_schema().await.expect("second ensure_schema failed");
+}
+
+// ============================================================================
+// End-to-end: CTE queries against ClickHouseSink-written data
+// ============================================================================
+
+/// Write Transfer event logs via ClickHouseSink, then query them with CTE decoding.
+/// This verifies the full pipeline: sink writes 0x-prefixed data → CTE decodes it correctly.
+#[tokio::test]
+#[serial(clickhouse)]
+async fn test_cte_query_against_sink_data() {
+    let Some((sink, ch)) = setup_sink().await else { return };
+
+    // Construct a Transfer(address indexed from, address indexed to, uint256 value) log
+    // topic0 = keccak256("Transfer(address,address,uint256)")
+    let topic0 = hex::decode("ddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef").unwrap();
+    let from_addr = hex::decode("000000000000000000000000a975ba910c2ee169956f3df99ee2ece79d3887cf").unwrap();
+    let to_addr = hex::decode("000000000000000000000000dead000000000000000000000000000000000000").unwrap();
+    // value = 1 ETH = 10^18 = 0xde0b6b3a7640000
+    let value_data = hex::decode("0000000000000000000000000000000000000000000000000de0b6b3a7640000").unwrap();
+
+    let log = LogRow {
+        block_num: 100,
+        block_timestamp: chrono::Utc::now(),
+        log_idx: 0,
+        tx_idx: 0,
+        tx_hash: vec![0x01; 32],
+        address: vec![0xda, 0xc1, 0x7f, 0x95, 0x8d, 0x2e, 0xe5, 0x23, 0xa2, 0x20, 0x62, 0x06, 0x99, 0x45, 0x97, 0xc1, 0x3d, 0x83, 0x1e, 0xc7],
+        selector: Some(topic0.clone()), // full 32-byte topic0 (same as decoder produces)
+        topic0: Some(topic0),
+        topic1: Some(from_addr),
+        topic2: Some(to_addr),
+        topic3: None,
+        data: value_data,
+    };
+
+    sink.write_logs(&[log]).await.expect("write_logs failed");
+
+    // Now query via CTE
+    let sig = tidx::query::EventSignature::parse(
+        "Transfer(address indexed from, address indexed to, uint256 value)"
+    ).unwrap();
+
+    let cte = sig.to_cte_sql_clickhouse();
+    let sql = format!(r#"WITH {} SELECT "from", "to", value FROM Transfer"#, cte);
+
+    let result = ch.query_json(&sql).await.expect("CTE query failed");
+    let data = result["data"].as_array().expect("no data array");
+    assert_eq!(data.len(), 1, "expected 1 Transfer event");
+
+    let row = &data[0];
+    let from = row["from"].as_str().unwrap();
+    let to = row["to"].as_str().unwrap();
+    assert_eq!(from, "0xa975ba910c2ee169956f3df99ee2ece79d3887cf");
+    assert_eq!(to, "0xdead000000000000000000000000000000000000");
+}
+
+/// Write logs via sink, then query with predicate pushdown on indexed param.
+#[tokio::test]
+#[serial(clickhouse)]
+async fn test_predicate_pushdown_against_sink_data() {
+    let Some((sink, ch)) = setup_sink().await else { return };
+
+    let topic0 = hex::decode("ddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef").unwrap();
+    let addr_a = hex::decode("000000000000000000000000aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa").unwrap();
+    let addr_b = hex::decode("000000000000000000000000bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb").unwrap();
+    let to_addr = hex::decode("000000000000000000000000dead000000000000000000000000000000000000").unwrap();
+    let value_data = hex::decode("0000000000000000000000000000000000000000000000000de0b6b3a7640000").unwrap();
+
+    let contract = vec![0xcc; 20];
+
+    // 5 logs from addr_a
+    let mut logs = Vec::new();
+    for i in 0..5 {
+        logs.push(LogRow {
+            block_num: i + 1,
+            block_timestamp: chrono::Utc::now(),
+            log_idx: 0,
+            tx_idx: 0,
+            tx_hash: vec![i as u8; 32],
+            address: contract.clone(),
+            selector: Some(topic0.clone()),
+            topic0: Some(topic0.clone()),
+            topic1: Some(addr_a.clone()),
+            topic2: Some(to_addr.clone()),
+            topic3: None,
+            data: value_data.clone(),
+        });
+    }
+    // 3 logs from addr_b
+    for i in 0..3 {
+        logs.push(LogRow {
+            block_num: i + 10,
+            block_timestamp: chrono::Utc::now(),
+            log_idx: 0,
+            tx_idx: 0,
+            tx_hash: vec![(i + 10) as u8; 32],
+            address: contract.clone(),
+            selector: Some(topic0.clone()),
+            topic0: Some(topic0.clone()),
+            topic1: Some(addr_b.clone()),
+            topic2: Some(to_addr.clone()),
+            topic3: None,
+            data: value_data.clone(),
+        });
+    }
+
+    sink.write_logs(&logs).await.unwrap();
+    assert_eq!(ch.table_count("logs").await.unwrap(), 8);
+
+    let sig = tidx::query::EventSignature::parse(
+        "Transfer(address indexed from, address indexed to, uint256 value)"
+    ).unwrap();
+
+    // Query with filter on indexed "from" param — should use predicate pushdown
+    let user_sql = r#"SELECT COUNT(*) as cnt FROM Transfer WHERE "from" = '0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'"#;
+    let normalized = sig.normalize_table_references(user_sql);
+    let pushed = sig.rewrite_filters_for_pushdown(&normalized);
+    let cte = sig.to_cte_sql_clickhouse();
+    let full_sql = format!("WITH {} {}", cte, pushed);
+
+    // Verify pushdown is in the SQL
+    assert!(full_sql.contains("topic1 ="), "expected topic1 predicate pushdown");
+
+    let result = ch.query_json(&full_sql).await.expect("pushdown query failed");
+    let cnt = result["data"].as_array().unwrap()[0]["cnt"].as_u64().unwrap();
+    assert_eq!(cnt, 5, "expected 5 transfers from addr_a");
+}
+
+/// Verify hex literal filter works with sink-written 0x data (no conversion needed).
+#[tokio::test]
+#[serial(clickhouse)]
+async fn test_hex_filter_against_sink_data() {
+    let Some((sink, ch)) = setup_sink().await else { return };
+
+    let blocks: Vec<BlockRow> = (1..=3).map(make_block).collect();
+    sink.write_blocks(&blocks).await.unwrap();
+
+    // Query with 0x-prefixed hex filter — should match directly (no conversion)
+    let miner_hex = format!("0x{}", hex::encode(vec![0xaa; 20]));
+    let sql = format!("SELECT num FROM blocks WHERE miner = '{}' ORDER BY num", miner_hex);
+    let result = ch.query_json(&sql).await.expect("hex filter query failed");
+    let data = result["data"].as_array().unwrap();
+    assert_eq!(data.len(), 3, "all 3 blocks should match the miner filter");
 }

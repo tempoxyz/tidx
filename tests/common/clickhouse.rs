@@ -117,31 +117,35 @@ impl TestClickHouse {
     }
     
     /// Create a mock logs table for testing CTE generation.
-    /// This simulates the structure that MaterializedPostgreSQL would create.
+    /// Matches the direct-write schema from db/clickhouse/logs.sql.
     pub async fn create_mock_logs_table(&self) -> Result<()> {
         let sql = r#"
             CREATE TABLE IF NOT EXISTS logs (
-                block_num UInt64,
-                block_timestamp DateTime,
-                log_idx UInt32,
-                tx_idx UInt32,
+                block_num Int64,
+                block_timestamp DateTime64(3, 'UTC'),
+                log_idx Int32,
+                tx_idx Int32,
                 tx_hash String,
                 address String,
-                selector String,
-                topic1 String,
-                topic2 String,
-                topic3 String,
-                data String
+                selector String DEFAULT '',
+                topic0 Nullable(String),
+                topic1 Nullable(String),
+                topic2 Nullable(String),
+                topic3 Nullable(String),
+                data String,
+                INDEX idx_selector selector TYPE bloom_filter GRANULARITY 1,
+                INDEX idx_address address TYPE bloom_filter GRANULARITY 1,
+                INDEX idx_topic1 topic1 TYPE bloom_filter GRANULARITY 1,
+                INDEX idx_topic2 topic2 TYPE bloom_filter GRANULARITY 1
             ) ENGINE = MergeTree()
-            ORDER BY (block_num, log_idx)
+            PARTITION BY toYYYYMM(block_timestamp)
+            ORDER BY (address, selector, block_num)
         "#;
         self.query(sql).await?;
         Ok(())
     }
     
-    /// Insert mock log data (simulating MaterializedPostgreSQL format).
-    /// Addresses/hashes are stored as '\x'-prefixed hex strings.
-    /// Backslashes are automatically escaped for ClickHouse SQL.
+    /// Insert mock log data using '0x'-prefixed hex strings (direct-write format).
     #[allow(clippy::too_many_arguments)]
     pub async fn insert_mock_log(
         &self,
@@ -156,19 +160,17 @@ impl TestClickHouse {
         topic3: &str,
         data: &str,
     ) -> Result<()> {
-        // Escape backslashes for ClickHouse SQL (\ -> \\)
-        let escape = |s: &str| s.replace('\\', "\\\\");
         let sql = format!(
-            r#"INSERT INTO logs VALUES ({}, now(), {}, {}, '{}', '{}', '{}', '{}', '{}', '{}', '{}')"#,
+            r#"INSERT INTO logs (block_num, block_timestamp, log_idx, tx_idx, tx_hash, address, selector, topic0, topic1, topic2, topic3, data) VALUES ({}, now(), {}, {}, '{}', '{}', '{}', '{}', '{}', '{}', '{}', '{}')"#,
             block_num, log_idx, tx_idx, 
-            escape(tx_hash), escape(address), escape(selector), 
-            escape(topic1), escape(topic2), escape(topic3), escape(data)
+            tx_hash, address, selector, 
+            selector, topic1, topic2, topic3, data
         );
         self.query(&sql).await?;
         Ok(())
     }
     
-    /// Insert a Transfer event log with proper encoding.
+    /// Insert a Transfer event log with proper encoding (0x-prefixed).
     pub async fn insert_transfer_log(
         &self,
         block_num: u64,
@@ -177,21 +179,21 @@ impl TestClickHouse {
         to: &str,
         value: u128,
     ) -> Result<()> {
-        let from_padded = format!("\\x000000000000000000000000{}", from.trim_start_matches("0x"));
-        let to_padded = format!("\\x000000000000000000000000{}", to.trim_start_matches("0x"));
+        let from_padded = format!("0x000000000000000000000000{}", from.trim_start_matches("0x"));
+        let to_padded = format!("0x000000000000000000000000{}", to.trim_start_matches("0x"));
         let value_hex = format!("{:064x}", value);
-        let data = format!("\\x{}", value_hex);
+        let data = format!("0x{}", value_hex);
         
         self.insert_mock_log(
             block_num,
             log_idx,
             0,
-            "\\x0000000000000000000000000000000000000000000000000000000000000001",
-            "\\xdAC17F958D2ee523a2206206994597C13D831ec7",
-            "\\xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef",
+            "0x0000000000000000000000000000000000000000000000000000000000000001",
+            "0xdAC17F958D2ee523a2206206994597C13D831ec7",
+            "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef",
             &from_padded,
             &to_padded,
-            "\\x0000000000000000000000000000000000000000000000000000000000000000",
+            "0x0000000000000000000000000000000000000000000000000000000000000000",
             &data,
         ).await
     }

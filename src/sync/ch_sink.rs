@@ -2,7 +2,7 @@
 //!
 //! Writes blocks, transactions, logs, and receipts directly to ClickHouse
 //! via the HTTP interface using JSONEachRow format. Replaces the old
-//! MaterializedPostgreSQL replication approach.
+//! Replaces the old MaterializedPostgreSQL replication approach.
 
 use anyhow::{anyhow, Result};
 use std::time::Instant;
@@ -219,7 +219,7 @@ impl ClickHouseSink {
 
         for table in &tables {
             let sql = format!(
-                "ALTER TABLE {} DELETE WHERE {} >= {}",
+                "ALTER TABLE {} DELETE WHERE {} >= {} SETTINGS mutations_sync = 1",
                 table,
                 block_col(table),
                 block_num

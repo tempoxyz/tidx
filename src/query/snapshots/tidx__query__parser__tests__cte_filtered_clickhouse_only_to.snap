@@ -7,5 +7,5 @@ Transfer AS (
            concat('0x', lower(substring(tx_hash, 3))) AS tx_hash,
            concat('0x', lower(substring(address, 3))) AS address, selector, topic1, topic2, topic3, data, concat('0x', lower(substring(topic2, 27))) AS "to"
     FROM logs
-    WHERE selector = concat(char(92), 'xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef')
+    WHERE selector = '0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef'
 )

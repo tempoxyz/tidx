@@ -189,7 +189,7 @@ pub struct ChainConfig {
     #[serde(default)]
     pub api_pg_password_env: Option<String>,
 
-    /// ClickHouse OLAP settings (for analytical queries via MaterializedPostgreSQL)
+    /// ClickHouse OLAP settings (for analytical queries)
     #[serde(default)]
     pub clickhouse: Option<ClickHouseConfig>,
 }

@@ -7,5 +7,5 @@ Approval AS (
            concat('0x', lower(substring(tx_hash, 3))) AS tx_hash,
            concat('0x', lower(substring(address, 3))) AS address, selector, topic1, topic2, topic3, data, concat('0x', lower(substring(topic1, 27))) AS "owner", concat('0x', lower(substring(topic2, 27))) AS "spender", reinterpretAsUInt256(reverse(unhex(substring(data, 3, 64)))) AS "value"
     FROM logs
-    WHERE selector = concat(char(92), 'x8c5be1e5ebec7d5bd14f71427d1e84f3dd0314c0f7b2291e5b200ac8c7c3b925')
+    WHERE selector = '0x8c5be1e5ebec7d5bd14f71427d1e84f3dd0314c0f7b2291e5b200ac8c7c3b925'
 )

@@ -7,5 +7,5 @@ PriceUpdate AS (
            concat('0x', lower(substring(tx_hash, 3))) AS tx_hash,
            concat('0x', lower(substring(address, 3))) AS address, selector, topic1, topic2, topic3, data, reinterpretAsInt256(reverse(unhex(substring(data, 3, 64)))) AS "price"
     FROM logs
-    WHERE selector = concat(char(92), 'x2fff13fe667959d5b4a87cc9ed3d77dada877ef984619950235466fc52eb2250')
+    WHERE selector = '0x2fff13fe667959d5b4a87cc9ed3d77dada877ef984619950235466fc52eb2250'
 )

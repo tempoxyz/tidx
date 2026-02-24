@@ -107,12 +107,10 @@ impl EventSignature {
 
     /// Generate ClickHouse-compatible CTE SQL, only including columns used in the query.
     /// 
-    /// Note: MaterializedPostgreSQL stores PostgreSQL bytea as '\x'-prefixed hex strings.
-    /// We use substring(..., 3) to strip the '\x' prefix before unhex().
+    /// Data is stored as '0x'-prefixed hex strings via ClickHouseSink direct-write.
+    /// We use substring(..., 3) to strip the '0x' prefix before unhex().
     /// 
     /// For output columns, we convert to '0x...' format for standard Ethereum hex representation.
-    /// For WHERE clause comparisons, we use concat(char(92), 'x...') because ClickHouse 
-    /// interprets '\x' as an escape sequence.
     pub fn to_cte_sql_clickhouse_filtered(&self, used_columns: Option<&HashSet<String>>) -> String {
         let selects = self.build_select_expressions_clickhouse(used_columns);
 
@@ -126,15 +124,14 @@ impl EventSignature {
         let tx_hash_col = r"concat('0x', lower(substring(tx_hash, 3))) AS tx_hash";
         let address_col = r"concat('0x', lower(substring(address, 3))) AS address";
 
-        // selector is stored as '\xABCD...' string - use concat(char(92), 'x...') for comparison
-        // because ClickHouse interprets '\x' as an escape sequence
+        // selector is stored as '0xABCD...' string via direct-write
         format!(
             r#"{name} AS (
     SELECT block_num, block_timestamp, log_idx, tx_idx, 
            {tx_hash_col},
            {address_col}, selector, topic1, topic2, topic3, data{select_clause}
     FROM logs
-    WHERE selector = concat(char(92), 'x{topic0}')
+    WHERE selector = '0x{topic0}'
 )"#,
             name = self.name,
             tx_hash_col = tx_hash_col,
@@ -741,19 +738,19 @@ impl AbiType {
         }
     }
 
-    // ClickHouse decode functions for MaterializedPostgreSQL data
+    // ClickHouse decode functions for 0x-prefixed hex data (direct-write)
     // 
-    // IMPORTANT: PostgreSQL bytea columns are stored as '\x'-prefixed hex strings.
-    // e.g., topic1 = '\x000000000000000000000000a975ba910c2ee169956f3df99ee2ece79d3887cf'
+    // Columns are stored as '0x'-prefixed hex strings via ClickHouseSink.
+    // e.g., topic1 = '0x000000000000000000000000a975ba910c2ee169956f3df99ee2ece79d3887cf'
     // We need to:
-    // 1. Strip the '\x' prefix with substring(..., 3)
+    // 1. Strip the '0x' prefix with substring(..., 3)
     // 2. Work with hex string (64 chars = 32 bytes) using substring on the hex
     // 3. unhex() only when we need actual bytes for reinterpret functions
 
     pub fn topic_decode_sql_clickhouse(&self, topic_idx: usize) -> String {
         // topic_idx is 1-based from the signature parser, maps to topic0, topic1, etc.
         let col = format!("topic{}", topic_idx.saturating_sub(1));
-        // Strip '\x' prefix: substring(col, 3) gives us the 64-char hex string
+        // Strip '0x' prefix: substring(col, 3) gives us the 64-char hex string
         match self {
             // Address: last 20 bytes = last 40 hex chars, add 0x prefix
             AbiType::Address => format!("concat('0x', lower(substring({col}, 27)))"),
@@ -770,9 +767,9 @@ impl AbiType {
     }
 
     pub fn data_decode_sql_clickhouse(&self, offset: usize) -> String {
-        // data is stored as '\x' + hex string
+        // data is stored as '0x' + hex string
         // offset is in bytes, but we're working with hex (2 chars per byte)
-        // +3 to skip '\x' prefix, then offset*2 for hex position
+        // +3 to skip '0x' prefix, then offset*2 for hex position
         let hex_start = 3 + offset * 2;
         match self {
             // Address: skip first 12 bytes (24 hex chars) of 32-byte word, take 20 bytes (40 hex chars)
