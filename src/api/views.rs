@@ -12,11 +12,25 @@ use crate::query::EventSignature;
 
 /// Validate view name (alphanumeric + underscore only)
 fn is_valid_view_name(name: &str) -> bool {
+    is_valid_identifier(name)
+}
+
+/// Validate that a string is a safe SQL identifier.
+/// Allows `[a-zA-Z_][a-zA-Z0-9_]{0,63}`.
+fn is_valid_identifier(name: &str) -> bool {
     !name.is_empty()
         && name.len() <= 64
         && name.chars().next().is_some_and(|c| c.is_ascii_alphabetic())
         && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
+
+/// Allowed ClickHouse table engines for materialized views.
+const ALLOWED_ENGINES: &[&str] = &[
+    "SummingMergeTree()",
+    "AggregatingMergeTree()",
+    "ReplacingMergeTree()",
+    "MergeTree()",
+];
 
 #[derive(Deserialize)]
 pub struct ChainQuery {
@@ -144,9 +158,24 @@ pub async fn create_view(
         return Err(ApiError::BadRequest("Invalid view name: must be alphanumeric with underscores".to_string()));
     }
 
-    // Validate order_by
+    // Validate order_by columns are safe identifiers
     if req.order_by.is_empty() {
         return Err(ApiError::BadRequest("orderBy is required".to_string()));
+    }
+    for col in &req.order_by {
+        if !is_valid_identifier(col) {
+            return Err(ApiError::BadRequest(format!(
+                "Invalid orderBy column '{col}': must be alphanumeric with underscores"
+            )));
+        }
+    }
+
+    // Validate engine is an allowed ClickHouse engine
+    if !ALLOWED_ENGINES.contains(&req.engine.as_str()) {
+        return Err(ApiError::BadRequest(format!(
+            "Invalid engine '{}': must be one of {:?}",
+            req.engine, ALLOWED_ENGINES
+        )));
     }
 
     // Validate SQL is SELECT only
@@ -303,6 +332,10 @@ pub async fn get_view(
     Path(name): Path<String>,
     Query(params): Query<ChainQuery>,
 ) -> Result<Json<GetViewResponse>, ApiError> {
+    if !is_valid_view_name(&name) {
+        return Err(ApiError::BadRequest("Invalid view name".to_string()));
+    }
+
     let clickhouse = state
         .get_clickhouse(Some(params.chain_id))
         .await

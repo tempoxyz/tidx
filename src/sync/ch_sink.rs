@@ -41,7 +41,17 @@ pub struct ClickHouseSink {
 
 impl ClickHouseSink {
     /// Create a new ClickHouse sink.
+    ///
+    /// The database name is validated to prevent SQL injection in DDL statements
+    /// that interpolate it (e.g., `CREATE DATABASE IF NOT EXISTS {database}`).
     pub fn new(url: &str, database: &str) -> Result<Self> {
+        if !is_valid_identifier(database) {
+            return Err(anyhow!(
+                "Invalid ClickHouse database name '{database}': must be alphanumeric/underscore, \
+                 start with a letter or underscore, and be 1-64 chars"
+            ));
+        }
+
         let url = url.trim_end_matches('/');
         let base_client = clickhouse::Client::default().with_url(url);
         let client = base_client.clone().with_database(database);
@@ -173,6 +183,7 @@ impl ClickHouseSink {
     /// Uses "num" for blocks table, "block_num" for others.
     /// Returns None if the table is empty.
     pub async fn max_block_in_table(&self, table: &str) -> Result<Option<i64>> {
+        let table = validate_table_name(table)?;
         let col = if table == "blocks" { "num" } else { "block_num" };
         let count: u64 = self
             .client
@@ -194,6 +205,7 @@ impl ClickHouseSink {
 
     /// Query the row count for a specific table.
     pub async fn row_count(&self, table: &str) -> Result<u64> {
+        let table = validate_table_name(table)?;
         self.client
             .query(&format!("SELECT count() FROM {table}"))
             .fetch_one()
@@ -454,6 +466,33 @@ fn hex_encode(bytes: &[u8]) -> String {
     format!("0x{}", hex::encode(bytes))
 }
 
+/// Known table names that are safe to interpolate into SQL.
+const KNOWN_TABLES: &[&str] = &["blocks", "txs", "logs", "receipts"];
+
+/// Validate that a table name is one of the known tables.
+/// Returns the validated name or an error for unknown tables.
+fn validate_table_name(table: &str) -> Result<&str> {
+    KNOWN_TABLES
+        .iter()
+        .find(|&&t| t == table)
+        .copied()
+        .ok_or_else(|| anyhow!("Unknown ClickHouse table: {table}"))
+}
+
+/// Validate that a string is a safe SQL identifier (for table/database names
+/// interpolated into DDL/queries). Allows `[a-zA-Z_][a-zA-Z0-9_]{0,63}`.
+fn is_valid_identifier(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 64
+        && name
+            .chars()
+            .next()
+            .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -503,5 +542,28 @@ mod tests {
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed["type"], 2);
         assert!(parsed.get("tx_type").is_none());
+    }
+
+    #[test]
+    fn test_valid_identifier() {
+        assert!(is_valid_identifier("tidx_4217"));
+        assert!(is_valid_identifier("blocks"));
+        assert!(is_valid_identifier("_private"));
+        assert!(is_valid_identifier("A"));
+
+        assert!(!is_valid_identifier(""));
+        assert!(!is_valid_identifier("123abc"));
+        assert!(!is_valid_identifier("my-db"));
+        assert!(!is_valid_identifier("db; DROP TABLE x"));
+        assert!(!is_valid_identifier("db name"));
+        assert!(!is_valid_identifier(&"a".repeat(65)));
+    }
+
+    #[test]
+    fn test_new_rejects_bad_database_name() {
+        assert!(ClickHouseSink::new("http://localhost:8123", "tidx_4217").is_ok());
+        assert!(ClickHouseSink::new("http://localhost:8123", "foo; DROP TABLE blocks").is_err());
+        assert!(ClickHouseSink::new("http://localhost:8123", "123bad").is_err());
+        assert!(ClickHouseSink::new("http://localhost:8123", "").is_err());
     }
 }
