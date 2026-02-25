@@ -229,20 +229,26 @@ async fn handle_status(State(state): State<AppState>) -> Result<Json<StatusRespo
 
         // PostgreSQL per-table watermarks (from in-memory atomics, no table scans)
         let (pg_blocks, pg_txs, pg_logs, pg_receipts) = crate::metrics::get_sink_watermarks("postgres");
+        let (pg_bc, pg_tc, pg_lc, pg_rc) = crate::metrics::get_sink_row_counts("postgres");
         if pg_blocks.is_some() || pg_txs.is_some() || pg_logs.is_some() || pg_receipts.is_some() {
             chain.postgres = Some(crate::service::StoreStatus {
                 blocks: pg_blocks, txs: pg_txs, logs: pg_logs, receipts: pg_receipts,
                 rate: crate::metrics::get_sink_block_rate("postgres"),
+                blocks_count: Some(pg_bc), txs_count: Some(pg_tc),
+                logs_count: Some(pg_lc), receipts_count: Some(pg_rc),
             });
         }
 
         // ClickHouse per-table watermarks (from in-memory atomics, no table scans)
         if ch_configs.get(&chain_id).is_some_and(|c| c.enabled) {
             let (ch_blocks, ch_txs, ch_logs, ch_receipts) = crate::metrics::get_sink_watermarks("clickhouse");
+            let (ch_bc, ch_tc, ch_lc, ch_rc) = crate::metrics::get_sink_row_counts("clickhouse");
             if ch_blocks.is_some() || ch_txs.is_some() || ch_logs.is_some() || ch_receipts.is_some() {
                 chain.clickhouse = Some(crate::service::StoreStatus {
                     blocks: ch_blocks, txs: ch_txs, logs: ch_logs, receipts: ch_receipts,
                     rate: crate::metrics::get_sink_block_rate("clickhouse"),
+                    blocks_count: Some(ch_bc), txs_count: Some(ch_tc),
+                    logs_count: Some(ch_lc), receipts_count: Some(ch_rc),
                 });
             }
         }

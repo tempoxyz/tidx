@@ -41,6 +41,15 @@ pub struct StoreStatus {
     /// Write rate in blocks/sec (from rolling window)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub rate: Option<f64>,
+    /// Cumulative row counts (since process start)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub blocks_count: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub txs_count: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub logs_count: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub receipts_count: Option<u64>,
 }
 
 pub async fn get_all_status(pool: &Pool) -> Result<Vec<SyncStatus>> {

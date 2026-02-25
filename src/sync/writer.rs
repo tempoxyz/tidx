@@ -64,6 +64,7 @@ pub async fn write_blocks(pool: &Pool, blocks: &[BlockRow]) -> Result<()> {
     metrics::record_sink_write_duration("postgres", "blocks", start.elapsed());
     metrics::record_sink_write_rows("postgres", "blocks", blocks.len() as u64);
     metrics::update_sink_block_rate("postgres", blocks.len() as u64);
+    metrics::increment_sink_row_count("postgres", "blocks", blocks.len() as u64);
     if let Some(max) = blocks.iter().map(|b| b.num).max() {
         metrics::update_sink_watermark("postgres", "blocks", max);
     }
@@ -161,6 +162,7 @@ pub async fn write_txs(pool: &Pool, txs: &[TxRow]) -> Result<()> {
 
     metrics::record_sink_write_duration("postgres", "txs", start.elapsed());
     metrics::record_sink_write_rows("postgres", "txs", txs.len() as u64);
+    metrics::increment_sink_row_count("postgres", "txs", txs.len() as u64);
     if let Some(max) = txs.iter().map(|t| t.block_num).max() {
         metrics::update_sink_watermark("postgres", "txs", max);
     }
@@ -235,6 +237,7 @@ pub async fn write_logs(pool: &Pool, logs: &[LogRow]) -> Result<()> {
 
     metrics::record_sink_write_duration("postgres", "logs", start.elapsed());
     metrics::record_sink_write_rows("postgres", "logs", logs.len() as u64);
+    metrics::increment_sink_row_count("postgres", "logs", logs.len() as u64);
     if let Some(max) = logs.iter().map(|l| l.block_num).max() {
         metrics::update_sink_watermark("postgres", "logs", max);
     }
@@ -311,6 +314,7 @@ pub async fn write_receipts(pool: &Pool, receipts: &[ReceiptRow]) -> Result<()> 
 
     metrics::record_sink_write_duration("postgres", "receipts", start.elapsed());
     metrics::record_sink_write_rows("postgres", "receipts", receipts.len() as u64);
+    metrics::increment_sink_row_count("postgres", "receipts", receipts.len() as u64);
     if let Some(max) = receipts.iter().map(|r| r.block_num).max() {
         metrics::update_sink_watermark("postgres", "receipts", max);
     }

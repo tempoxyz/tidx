@@ -200,7 +200,7 @@ pub fn record_clickhouse_rows(count: u64) {
 // instant per-table progress without touching the actual tables.
 
 use std::sync::OnceLock;
-use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 
 /// Per-table high-water marks for a single sink.
 pub struct SinkWatermarks {
@@ -208,6 +208,11 @@ pub struct SinkWatermarks {
     pub txs: AtomicI64,
     pub logs: AtomicI64,
     pub receipts: AtomicI64,
+    // Cumulative row counts (since process start)
+    pub blocks_rows: AtomicU64,
+    pub txs_rows: AtomicU64,
+    pub logs_rows: AtomicU64,
+    pub receipts_rows: AtomicU64,
 }
 
 impl SinkWatermarks {
@@ -217,6 +222,10 @@ impl SinkWatermarks {
             txs: AtomicI64::new(-1),
             logs: AtomicI64::new(-1),
             receipts: AtomicI64::new(-1),
+            blocks_rows: AtomicU64::new(0),
+            txs_rows: AtomicU64::new(0),
+            logs_rows: AtomicU64::new(0),
+            receipts_rows: AtomicU64::new(0),
         }
     }
 
@@ -227,6 +236,16 @@ impl SinkWatermarks {
             "logs" => &self.logs,
             "receipts" => &self.receipts,
             _ => &self.blocks,
+        }
+    }
+
+    fn get_row_counter(&self, table: &str) -> &AtomicU64 {
+        match table {
+            "blocks" => &self.blocks_rows,
+            "txs" => &self.txs_rows,
+            "logs" => &self.logs_rows,
+            "receipts" => &self.receipts_rows,
+            _ => &self.blocks_rows,
         }
     }
 }
@@ -265,6 +284,23 @@ pub fn get_sink_watermarks(sink: &str) -> (Option<i64>, Option<i64>, Option<i64>
         to_opt(wm.txs.load(Ordering::Relaxed)),
         to_opt(wm.logs.load(Ordering::Relaxed)),
         to_opt(wm.receipts.load(Ordering::Relaxed)),
+    )
+}
+
+/// Increment the cumulative row count for a table in a sink.
+pub fn increment_sink_row_count(sink: &str, table: &str, count: u64) {
+    let wm = watermarks_for(sink);
+    wm.get_row_counter(table).fetch_add(count, Ordering::Relaxed);
+}
+
+/// Get cumulative row counts for a sink as (blocks, txs, logs, receipts).
+pub fn get_sink_row_counts(sink: &str) -> (u64, u64, u64, u64) {
+    let wm = watermarks_for(sink);
+    (
+        wm.blocks_rows.load(Ordering::Relaxed),
+        wm.txs_rows.load(Ordering::Relaxed),
+        wm.logs_rows.load(Ordering::Relaxed),
+        wm.receipts_rows.load(Ordering::Relaxed),
     )
 }
 

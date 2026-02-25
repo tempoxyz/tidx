@@ -112,18 +112,16 @@ fn print_http_status(resp: &serde_json::Value) -> Result<()> {
     for chain in chains {
         let name = chain["name"].as_str().unwrap_or("unknown");
         let chain_id = chain["chain_id"].as_i64().unwrap_or(0);
-        let head = chain["head"].as_i64();
+        let head_num = chain["head_num"].as_i64().unwrap_or(0);
         let synced_num = chain["synced_num"].as_i64().unwrap_or(0);
-        let realtime_lag = chain["realtime_lag"].as_i64().unwrap_or(0);
-
-        let head_num = head.unwrap_or(synced_num);
+        let lag = chain["lag"].as_i64().unwrap_or(0);
 
         println!("┌─ {} (chain_id: {}) ─────────────────────", name, chain_id);
         println!("│");
-        if let Some(h) = head {
-            println!("│  Head:          {} (live)", format_number(h as u64));
+        if head_num > 0 {
+            println!("│  Head:          {} (live)", format_number(head_num as u64));
         }
-        println!("│  Lag:           {} blocks", realtime_lag);
+        println!("│  Lag:           {} blocks", lag);
 
         // PostgreSQL per-table status
         if let Some(pg) = chain.get("postgres") {
@@ -133,10 +131,7 @@ fn print_http_status(resp: &serde_json::Value) -> Result<()> {
             } else {
                 println!("│  PostgreSQL");
             }
-            for (i, table) in ["blocks", "txs", "logs", "receipts"].iter().enumerate() {
-                let prefix = if i == 3 { "└" } else { "├" };
-                print_table_row(prefix, table, pg[*table].as_i64(), head_num);
-            }
+            print_store_rows(pg, synced_num, head_num);
         }
 
         // ClickHouse per-table status
@@ -147,10 +142,7 @@ fn print_http_status(resp: &serde_json::Value) -> Result<()> {
             } else {
                 println!("│  ClickHouse");
             }
-            for (i, table) in ["blocks", "txs", "logs", "receipts"].iter().enumerate() {
-                let prefix = if i == 3 { "└" } else { "├" };
-                print_table_row(prefix, table, ch[*table].as_i64(), head_num);
-            }
+            print_store_rows(ch, synced_num, head_num);
         }
 
         println!("└───────────────────────────────────────────────────────────");
@@ -308,11 +300,66 @@ fn print_store_status_from_watermarks(label: &str, sink_name: &str, head: i64) {
     } else {
         println!("│  {label}");
     }
-    let tables = ["blocks", "txs", "logs", "receipts"];
-    for (i, table) in tables.iter().enumerate() {
-        let prefix = if i == tables.len() - 1 { "└" } else { "├" };
-        let max_block = tidx::metrics::get_sink_watermark(sink_name, table);
-        print_table_row(prefix, table, max_block, head);
+    let (_, txs_count, logs_count, receipts_count) =
+        tidx::metrics::get_sink_row_counts(sink_name);
+
+    // blocks: show watermark / head progress
+    let blocks_wm = tidx::metrics::get_sink_watermark(sink_name, "blocks");
+    print_table_row("├", "blocks", blocks_wm, head);
+
+    // txs, logs, receipts: show row counts
+    for (i, (table, count)) in [("txs", txs_count), ("logs", logs_count), ("receipts", receipts_count)]
+        .iter()
+        .enumerate()
+    {
+        let prefix = if i == 2 { "└" } else { "├" };
+        if *count > 0 {
+            println!("│  {prefix}─ {:<10} {} rows", table, format_number(*count));
+        } else {
+            println!("│  {prefix}─ {:<10} empty", table);
+        }
+    }
+}
+
+/// Print per-table rows for a store (blocks as progress, others as row counts).
+fn print_store_rows(store: &serde_json::Value, synced_num: i64, head: i64) {
+    // blocks: show backfill progress (synced_num / head)
+    let blocks_count = store["blocks_count"].as_u64();
+    if synced_num > 0 && head > 0 {
+        let pct = (synced_num as f64 / head as f64 * 100.0).min(100.0) as u64;
+        if pct >= 100 {
+            println!("│  ├─ {:<10} {} ✓", "blocks", format_number(head as u64));
+        } else {
+            println!(
+                "│  ├─ {:<10} {} / {} ({pct}%)",
+                "blocks",
+                format_number(synced_num as u64),
+                format_number(head as u64)
+            );
+        }
+    } else if let Some(count) = blocks_count {
+        if count > 0 {
+            println!("│  ├─ {:<10} {}", "blocks", format_number(count));
+        } else {
+            println!("│  ├─ {:<10} empty", "blocks");
+        }
+    } else {
+        println!("│  ├─ {:<10} empty", "blocks");
+    }
+
+    // txs, logs, receipts: show row counts
+    for (i, table) in ["txs", "logs", "receipts"].iter().enumerate() {
+        let prefix = if i == 2 { "└" } else { "├" };
+        let count_key = format!("{table}_count");
+        let count = store[&count_key].as_u64();
+        match count {
+            Some(n) if n > 0 => {
+                println!("│  {prefix}─ {:<10} {} rows", table, format_number(n));
+            }
+            _ => {
+                println!("│  {prefix}─ {:<10} empty", table);
+            }
+        }
     }
 }
 
