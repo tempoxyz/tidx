@@ -123,17 +123,16 @@ fn print_http_status(resp: &serde_json::Value) -> Result<()> {
         }
         println!("│  Lag:           {} blocks", lag);
 
-        // Backfill ETA (from sync_rate or store write rate)
-        if synced_num > 0 && synced_num < head_num {
-            let remaining = head_num - synced_num;
-            // Prefer store write rate (real-time), fall back to sync_rate from DB
+        let gap_blocks = chain["gap_blocks"].as_i64().unwrap_or(0);
+        if gap_blocks > 0 {
+            println!("│  Gaps:          {} blocks remaining", format_number(gap_blocks as u64));
             let rate = chain
                 .get("postgres")
                 .and_then(|pg| pg["rate"].as_f64())
-                .or_else(|| chain["sync_rate"].as_f64());
+                .or_else(|| chain["sync_rate"].as_f64().filter(|r| *r > 0.0));
             if let Some(r) = rate {
                 if r > 0.0 {
-                    println!("│  ETA:           {}", format_eta(remaining as f64 / r));
+                    println!("│  ETA:           {}", format_eta(gap_blocks as f64 / r));
                 }
             }
         }
