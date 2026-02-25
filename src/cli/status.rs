@@ -123,17 +123,21 @@ fn print_http_status(resp: &serde_json::Value) -> Result<()> {
         }
         println!("│  Lag:           {} blocks", lag);
 
-        // Backfill ETA (from sync_rate or store write rate)
-        if synced_num > 0 && synced_num < head_num {
-            let remaining = head_num - synced_num;
-            // Prefer store write rate (real-time), fall back to sync_rate from DB
+        let gap_blocks = chain["gap_blocks"].as_i64().unwrap_or(0);
+        let gap_count = chain["gaps"].as_array().map(|g| g.len()).unwrap_or(0);
+        if gap_blocks > 0 {
+            if gap_count > 0 {
+                println!("│  Gaps:          {} blocks across {} gaps", format_number(gap_blocks as u64), gap_count);
+            } else {
+                println!("│  Gaps:          {} blocks remaining", format_number(gap_blocks as u64));
+            }
             let rate = chain
                 .get("postgres")
                 .and_then(|pg| pg["rate"].as_f64())
-                .or_else(|| chain["sync_rate"].as_f64());
+                .or_else(|| chain["sync_rate"].as_f64().filter(|r| *r > 0.0));
             if let Some(r) = rate {
                 if r > 0.0 {
-                    println!("│  ETA:           {}", format_eta(remaining as f64 / r));
+                    println!("│  ETA:           {}", format_eta(gap_blocks as f64 / r));
                 }
             }
         }
@@ -146,7 +150,8 @@ fn print_http_status(resp: &serde_json::Value) -> Result<()> {
             } else {
                 println!("│  PostgreSQL");
             }
-            print_store_rows(pg, synced_num, head_num);
+            let pg_gaps = chain["gaps"].as_array().map(|g| g.len()).unwrap_or(0);
+            print_store_rows(pg, head_num, pg_gaps);
         }
 
         // ClickHouse per-table status
@@ -157,7 +162,7 @@ fn print_http_status(resp: &serde_json::Value) -> Result<()> {
             } else {
                 println!("│  ClickHouse");
             }
-            print_store_rows(ch, synced_num, head_num);
+            print_store_rows(ch, head_num, 0);
         }
 
         println!("└───────────────────────────────────────────────────────────");
@@ -337,29 +342,41 @@ fn print_store_status_from_watermarks(label: &str, sink_name: &str, head: i64) {
 }
 
 /// Print per-table rows for a store (blocks as progress, others as row counts).
-fn print_store_rows(store: &serde_json::Value, synced_num: i64, head: i64) {
-    // blocks: show backfill progress (synced_num / head)
+fn print_store_rows(store: &serde_json::Value, head: i64, gap_count: usize) {
+    // blocks: use the store's own watermark for progress
+    let blocks_wm = store["blocks"].as_i64();
     let blocks_count = store["blocks_count"].as_u64();
-    if synced_num > 0 && head > 0 {
-        let pct = (synced_num as f64 / head as f64 * 100.0).min(100.0) as u64;
-        if pct >= 100 {
-            println!("│  ├─ {:<10} {} ✓", "blocks", format_number(head as u64));
-        } else {
-            println!(
-                "│  ├─ {:<10} {} / {} ({pct}%)",
-                "blocks",
-                format_number(synced_num as u64),
-                format_number(head as u64)
-            );
+    match blocks_wm {
+        Some(wm) if head > 0 => {
+            let pct = (wm as f64 / head as f64 * 100.0).min(100.0) as u64;
+            let gap_suffix = if gap_count > 0 {
+                format!(" ({} gaps)", gap_count)
+            } else {
+                String::new()
+            };
+            if pct >= 100 {
+                println!("│  ├─ {:<10} {} ✓{}", "blocks", format_number(wm as u64), gap_suffix);
+            } else {
+                println!(
+                    "│  ├─ {:<10} {} / {} ({pct}%){}",
+                    "blocks",
+                    format_number(wm as u64),
+                    format_number(head as u64),
+                    gap_suffix
+                );
+            }
         }
-    } else if let Some(count) = blocks_count {
-        if count > 0 {
-            println!("│  ├─ {:<10} {}", "blocks", format_number(count));
-        } else {
-            println!("│  ├─ {:<10} empty", "blocks");
+        _ => {
+            if let Some(count) = blocks_count {
+                if count > 0 {
+                    println!("│  ├─ {:<10} {}", "blocks", format_number(count));
+                } else {
+                    println!("│  ├─ {:<10} empty", "blocks");
+                }
+            } else {
+                println!("│  ├─ {:<10} empty", "blocks");
+            }
         }
-    } else {
-        println!("│  ├─ {:<10} empty", "blocks");
     }
 
     // txs, logs, receipts: show row counts

@@ -303,6 +303,7 @@ fn spawn_sync_engine(
                                 database = %database,
                                 "ClickHouse direct-write sink enabled"
                             );
+                            seed_metrics_from_clickhouse(&ch_sink).await;
                             sinks = sinks.with_clickhouse(ch_sink);
                         }
                     }
@@ -353,6 +354,20 @@ fn spawn_sync_engine(
             error!(error = %e, chain = %chain.name, "Sync engine failed");
         }
     });
+}
+
+/// Seed in-memory ClickHouse watermarks and row counts from existing data.
+async fn seed_metrics_from_clickhouse(sink: &ClickHouseSink) {
+    for table in ["blocks", "txs", "logs", "receipts"] {
+        if let Ok(Some(max)) = sink.max_block_in_table(table).await {
+            tidx::metrics::update_sink_watermark("clickhouse", table, max);
+        }
+        if let Ok(count) = sink.row_count(table).await {
+            if count > 0 {
+                tidx::metrics::increment_sink_row_count("clickhouse", table, count);
+            }
+        }
+    }
 }
 
 /// Seed in-memory watermarks and row counts from existing database data.
