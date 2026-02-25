@@ -6,7 +6,7 @@ use anyhow::Result;
 use clap::Args as ClapArgs;
 use metrics_exporter_prometheus::PrometheusBuilder;
 use tokio::sync::RwLock;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 use tidx::api::{
     self, ChainClickHouseConfig, SharedClickHouseConfigs, SharedClickHouseEngines, SharedPools,
@@ -329,17 +329,19 @@ fn spawn_sync_engine(
             });
         }
 
-        // Create sync engine with throttled pool and configured sinks
-        let mut engine = match SyncEngine::new(throttled_pool, sinks, &chain.rpc_url).await {
-            Ok(e) => e
-                .with_broadcaster(broadcaster)
-                .with_batch_size(chain.batch_size)
-                .with_concurrency(chain.concurrency)
-                .with_backfill_first(backfill_first)
-                .with_trust_rpc(trust_rpc),
-            Err(e) => {
-                error!(error = %e, chain = %chain.name, "Failed to create sync engine");
-                return;
+        // Create sync engine with throttled pool and configured sinks (retry on transient RPC failures)
+        let mut engine = loop {
+            match SyncEngine::new(throttled_pool.clone(), sinks.clone(), &chain.rpc_url).await {
+                Ok(e) => break e
+                    .with_broadcaster(broadcaster)
+                    .with_batch_size(chain.batch_size)
+                    .with_concurrency(chain.concurrency)
+                    .with_backfill_first(backfill_first)
+                    .with_trust_rpc(trust_rpc),
+                Err(e) => {
+                    warn!(error = %e, chain = %chain.name, "Failed to create sync engine, retrying in 10s");
+                    tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+                }
             }
         };
 
