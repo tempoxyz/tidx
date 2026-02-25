@@ -193,9 +193,82 @@ pub fn record_clickhouse_rows(count: u64) {
     histogram!("tidx_clickhouse_query_rows").record(count as f64);
 }
 
-// ── Per-sink rolling write rate tracker ───────────────────────────────────
+// ── Per-sink watermarks (in-memory, no table scans) ──────────────────────
+//
+// Tracks the highest block number written to each table in each sink.
+// Updated atomically on every write, queried by status endpoints for
+// instant per-table progress without touching the actual tables.
 
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicI64, Ordering};
+
+/// Per-table high-water marks for a single sink.
+pub struct SinkWatermarks {
+    pub blocks: AtomicI64,
+    pub txs: AtomicI64,
+    pub logs: AtomicI64,
+    pub receipts: AtomicI64,
+}
+
+impl SinkWatermarks {
+    fn new() -> Self {
+        Self {
+            blocks: AtomicI64::new(-1),
+            txs: AtomicI64::new(-1),
+            logs: AtomicI64::new(-1),
+            receipts: AtomicI64::new(-1),
+        }
+    }
+
+    fn get_table(&self, table: &str) -> &AtomicI64 {
+        match table {
+            "blocks" => &self.blocks,
+            "txs" => &self.txs,
+            "logs" => &self.logs,
+            "receipts" => &self.receipts,
+            _ => &self.blocks,
+        }
+    }
+}
+
+static PG_WATERMARKS: OnceLock<SinkWatermarks> = OnceLock::new();
+static CH_WATERMARKS: OnceLock<SinkWatermarks> = OnceLock::new();
+
+fn watermarks_for(sink: &str) -> &'static SinkWatermarks {
+    match sink {
+        "clickhouse" => CH_WATERMARKS.get_or_init(SinkWatermarks::new),
+        _ => PG_WATERMARKS.get_or_init(SinkWatermarks::new),
+    }
+}
+
+/// Update the high-water mark for a table in a sink.
+/// Only increases (never decreases) to handle concurrent writers.
+pub fn update_sink_watermark(sink: &str, table: &str, max_block: i64) {
+    let wm = watermarks_for(sink);
+    let atomic = wm.get_table(table);
+    atomic.fetch_max(max_block, Ordering::Relaxed);
+}
+
+/// Get the high-water mark for a table in a sink, or None if no writes yet.
+pub fn get_sink_watermark(sink: &str, table: &str) -> Option<i64> {
+    let wm = watermarks_for(sink);
+    let val = wm.get_table(table).load(Ordering::Relaxed);
+    if val >= 0 { Some(val) } else { None }
+}
+
+/// Get all 4 table watermarks for a sink as (blocks, txs, logs, receipts).
+pub fn get_sink_watermarks(sink: &str) -> (Option<i64>, Option<i64>, Option<i64>, Option<i64>) {
+    let to_opt = |v: i64| if v >= 0 { Some(v) } else { None };
+    let wm = watermarks_for(sink);
+    (
+        to_opt(wm.blocks.load(Ordering::Relaxed)),
+        to_opt(wm.txs.load(Ordering::Relaxed)),
+        to_opt(wm.logs.load(Ordering::Relaxed)),
+        to_opt(wm.receipts.load(Ordering::Relaxed)),
+    )
+}
+
+// ── Per-sink rolling write rate tracker ───────────────────────────────────
 
 struct RateWindow {
     last_reset: Instant,

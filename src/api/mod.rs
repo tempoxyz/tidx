@@ -227,36 +227,23 @@ async fn handle_status(State(state): State<AppState>) -> Result<Json<StatusRespo
     for chain in &mut all_chains {
         let chain_id = chain.chain_id as u64;
 
-        // PostgreSQL per-table max blocks
-        if let Some(pool) = pools.get(&chain_id) {
-            if let Ok(conn) = pool.get().await {
-                let pg_blocks = conn.query_one("SELECT MAX(num) FROM blocks", &[]).await.ok().and_then(|r| r.get(0));
-                let pg_txs = conn.query_one("SELECT MAX(block_num) FROM txs", &[]).await.ok().and_then(|r| r.get(0));
-                let pg_logs = conn.query_one("SELECT MAX(block_num) FROM logs", &[]).await.ok().and_then(|r| r.get(0));
-                let pg_receipts = conn.query_one("SELECT MAX(block_num) FROM receipts", &[]).await.ok().and_then(|r| r.get(0));
-                chain.postgres = Some(crate::service::StoreStatus {
-                    blocks: pg_blocks, txs: pg_txs, logs: pg_logs, receipts: pg_receipts,
-                    rate: crate::metrics::get_sink_block_rate("postgres"),
-                });
-            }
+        // PostgreSQL per-table watermarks (from in-memory atomics, no table scans)
+        let (pg_blocks, pg_txs, pg_logs, pg_receipts) = crate::metrics::get_sink_watermarks("postgres");
+        if pg_blocks.is_some() || pg_txs.is_some() || pg_logs.is_some() || pg_receipts.is_some() {
+            chain.postgres = Some(crate::service::StoreStatus {
+                blocks: pg_blocks, txs: pg_txs, logs: pg_logs, receipts: pg_receipts,
+                rate: crate::metrics::get_sink_block_rate("postgres"),
+            });
         }
 
-        // ClickHouse per-table max blocks
-        if let Some(config) = ch_configs.get(&chain_id) {
-            if config.enabled {
-                let database = format!("tidx_{chain_id}");
-                if let Ok(sink) = crate::sync::ch_sink::ClickHouseSink::new(&config.url, &database)
-                {
-                    let blocks = sink.max_block_in_table("blocks").await.ok().flatten();
-                    let txs = sink.max_block_in_table("txs").await.ok().flatten();
-                    let logs = sink.max_block_in_table("logs").await.ok().flatten();
-                    let receipts = sink.max_block_in_table("receipts").await.ok().flatten();
-                    chain.clickhouse =
-                        Some(crate::service::StoreStatus {
-                            blocks, txs, logs, receipts,
-                            rate: crate::metrics::get_sink_block_rate("clickhouse"),
-                        });
-                }
+        // ClickHouse per-table watermarks (from in-memory atomics, no table scans)
+        if ch_configs.get(&chain_id).is_some_and(|c| c.enabled) {
+            let (ch_blocks, ch_txs, ch_logs, ch_receipts) = crate::metrics::get_sink_watermarks("clickhouse");
+            if ch_blocks.is_some() || ch_txs.is_some() || ch_logs.is_some() || ch_receipts.is_some() {
+                chain.clickhouse = Some(crate::service::StoreStatus {
+                    blocks: ch_blocks, txs: ch_txs, logs: ch_logs, receipts: ch_receipts,
+                    rate: crate::metrics::get_sink_block_rate("clickhouse"),
+                });
             }
         }
     }

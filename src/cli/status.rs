@@ -34,6 +34,18 @@ pub async fn run(args: Args) -> Result<()> {
 
     let config = Config::load(&args.config)?;
 
+    // Auto-detect running HTTP API for instant status (uses in-memory watermarks)
+    if config.http.enabled {
+        let url = format!("http://127.0.0.1:{}", config.http.port);
+        let client = reqwest::Client::builder()
+            .connect_timeout(std::time::Duration::from_millis(200))
+            .timeout(std::time::Duration::from_millis(500))
+            .build()?;
+        if client.get(format!("{url}/health")).send().await.is_ok() {
+            return run_via_http(&url, &args).await;
+        }
+    }
+
     loop {
         if args.watch {
             print!("\x1B[2J\x1B[1;1H");
@@ -198,27 +210,15 @@ async fn print_status(config: &Config) -> Result<()> {
             head
         };
 
-        // PostgreSQL per-table status
+        // PostgreSQL per-table status (from in-memory watermarks)
         println!("│");
-        print_store_status("PostgreSQL", &pool, head as i64, &["blocks", "txs", "logs", "receipts"], "postgres").await;
+        print_store_status_from_watermarks("PostgreSQL", "postgres", head as i64);
 
-        // ClickHouse per-table status
+        // ClickHouse per-table status (from in-memory watermarks)
         if let Some(ref ch_config) = chain.clickhouse {
             if ch_config.enabled {
-                let database = ch_config
-                    .database
-                    .clone()
-                    .unwrap_or_else(|| format!("tidx_{}", chain.chain_id));
                 println!("│");
-                match ClickHouseSink::new(&ch_config.url, &database) {
-                    Ok(sink) => {
-                        print_ch_store_status("ClickHouse", &sink, head as i64).await;
-                    }
-                    Err(_) => {
-                        println!("│  ClickHouse");
-                        println!("│  └─ ✗ Connection failed");
-                    }
-                }
+                print_store_status_from_watermarks("ClickHouse", "clickhouse", head as i64);
             }
         }
 
@@ -300,33 +300,9 @@ async fn print_json_status(config: &Config) -> Result<()> {
     Ok(())
 }
 
-/// Print per-table status for PostgreSQL.
-async fn print_store_status(label: &str, pool: &tidx::db::Pool, head: i64, tables: &[&str], sink_name: &str) {
+/// Print per-table status using in-memory watermarks (instant, no DB queries).
+fn print_store_status_from_watermarks(label: &str, sink_name: &str, head: i64) {
     let rate = tidx::metrics::get_sink_block_rate(sink_name);
-    if let Some(r) = rate {
-        println!("│  {label} ({:.0} blk/s)", r);
-    } else {
-        println!("│  {label}");
-    }
-    let conn = pool.get().await.ok();
-    for (i, table) in tables.iter().enumerate() {
-        let prefix = if i == tables.len() - 1 { "└" } else { "├" };
-        let col = if *table == "blocks" { "num" } else { "block_num" };
-        let max_block: Option<i64> = if let Some(ref c) = conn {
-            c.query_one(&format!("SELECT MAX({col}) FROM {table}"), &[])
-                .await
-                .ok()
-                .and_then(|r| r.get(0))
-        } else {
-            None
-        };
-        print_table_row(prefix, table, max_block, head);
-    }
-}
-
-/// Print per-table status for ClickHouse.
-async fn print_ch_store_status(label: &str, sink: &ClickHouseSink, head: i64) {
-    let rate = tidx::metrics::get_sink_block_rate("clickhouse");
     if let Some(r) = rate {
         println!("│  {label} ({:.0} blk/s)", r);
     } else {
@@ -335,7 +311,7 @@ async fn print_ch_store_status(label: &str, sink: &ClickHouseSink, head: i64) {
     let tables = ["blocks", "txs", "logs", "receipts"];
     for (i, table) in tables.iter().enumerate() {
         let prefix = if i == tables.len() - 1 { "└" } else { "├" };
-        let max_block = sink.max_block_in_table(table).await.ok().flatten();
+        let max_block = tidx::metrics::get_sink_watermark(sink_name, table);
         print_table_row(prefix, table, max_block, head);
     }
 }

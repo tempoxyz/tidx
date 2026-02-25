@@ -84,6 +84,9 @@ impl ClickHouseSink {
         metrics::record_sink_write_duration(self.name(), "blocks", start.elapsed());
         metrics::record_sink_write_rows(self.name(), "blocks", blocks.len() as u64);
         metrics::update_sink_block_rate(self.name(), blocks.len() as u64);
+        if let Some(max) = blocks.iter().map(|b| b.num).max() {
+            metrics::update_sink_watermark(self.name(), "blocks", max);
+        }
         Ok(())
     }
 
@@ -95,6 +98,9 @@ impl ClickHouseSink {
         self.write_chunked("txs", txs, ChTxWire::from_row).await?;
         metrics::record_sink_write_duration(self.name(), "txs", start.elapsed());
         metrics::record_sink_write_rows(self.name(), "txs", txs.len() as u64);
+        if let Some(max) = txs.iter().map(|t| t.block_num).max() {
+            metrics::update_sink_watermark(self.name(), "txs", max);
+        }
         Ok(())
     }
 
@@ -106,6 +112,9 @@ impl ClickHouseSink {
         self.write_chunked("logs", logs, ChLogWire::from_row).await?;
         metrics::record_sink_write_duration(self.name(), "logs", start.elapsed());
         metrics::record_sink_write_rows(self.name(), "logs", logs.len() as u64);
+        if let Some(max) = logs.iter().map(|l| l.block_num).max() {
+            metrics::update_sink_watermark(self.name(), "logs", max);
+        }
         Ok(())
     }
 
@@ -117,6 +126,9 @@ impl ClickHouseSink {
         self.write_chunked("receipts", receipts, ChReceiptWire::from_row).await?;
         metrics::record_sink_write_duration(self.name(), "receipts", start.elapsed());
         metrics::record_sink_write_rows(self.name(), "receipts", receipts.len() as u64);
+        if let Some(max) = receipts.iter().map(|r| r.block_num).max() {
+            metrics::update_sink_watermark(self.name(), "receipts", max);
+        }
         Ok(())
     }
 
