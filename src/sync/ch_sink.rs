@@ -230,6 +230,26 @@ impl ClickHouseSink {
             .map_err(|e| anyhow!("Failed to parse max block num '{trimmed}': {e}"))
     }
 
+    /// Query the row count for a specific table.
+    pub async fn row_count(&self, table: &str) -> Result<u64> {
+        let url = format!(
+            "{}/?database={}&default_format=TabSeparated",
+            self.url, self.database
+        );
+        let sql = format!("SELECT count() FROM {table}");
+        let resp = self
+            .http_client
+            .post(&url)
+            .body(sql)
+            .send()
+            .await
+            .map_err(|e| anyhow!("ClickHouse HTTP request failed: {e}"))?;
+        let text = resp.text().await.unwrap_or_default();
+        text.trim()
+            .parse::<u64>()
+            .map_err(|e| anyhow!("Failed to parse row count: {e}"))
+    }
+
     /// Delete all data from a given block number onwards (reorg support).
     pub async fn delete_from(&self, block_num: u64) -> Result<()> {
         let tables = ["logs", "receipts", "txs", "blocks"];
