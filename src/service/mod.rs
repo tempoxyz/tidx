@@ -31,13 +31,13 @@ pub struct SyncStatus {
     pub clickhouse: Option<StoreStatus>,
 }
 
-/// Per-table high-water marks for a storage backend.
+/// Per-table row counts for a storage backend.
 #[derive(Debug, Clone, Serialize)]
 pub struct StoreStatus {
-    pub blocks: Option<i64>,
-    pub txs: Option<i64>,
-    pub logs: Option<i64>,
-    pub receipts: Option<i64>,
+    pub blocks: i64,
+    pub txs: i64,
+    pub logs: i64,
+    pub receipts: i64,
 }
 
 pub async fn get_all_status(pool: &Pool) -> Result<Vec<SyncStatus>> {

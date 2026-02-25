@@ -119,6 +119,31 @@ impl ClickHouseSink {
         Ok(())
     }
 
+    /// Count rows in a ClickHouse table.
+    pub async fn count_rows(&self, table: &str) -> Result<i64> {
+        let url = format!(
+            "{}/?database={}&default_format=TabSeparated",
+            self.url, self.database
+        );
+        let resp = self
+            .http_client
+            .post(&url)
+            .body(format!("SELECT count() FROM {table}"))
+            .send()
+            .await
+            .map_err(|e| anyhow!("ClickHouse HTTP request failed: {e}"))?;
+
+        if !resp.status().is_success() {
+            let error = resp.text().await.unwrap_or_default();
+            return Err(anyhow!("ClickHouse query failed: {error}"));
+        }
+
+        let text = resp.text().await.unwrap_or_default();
+        text.trim()
+            .parse::<i64>()
+            .map_err(|e| anyhow!("Failed to parse count: {e}"))
+    }
+
     /// Query the highest block number in ClickHouse, or None if empty.
     pub async fn max_block_num(&self) -> Result<Option<i64>> {
         let url = format!(

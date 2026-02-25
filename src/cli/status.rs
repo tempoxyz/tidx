@@ -119,7 +119,7 @@ fn print_http_status(resp: &serde_json::Value) -> Result<()> {
             println!("│  PostgreSQL");
             for (i, table) in ["blocks", "txs", "logs", "receipts"].iter().enumerate() {
                 let prefix = if i == 3 { "└" } else { "├" };
-                print_table_row(prefix, table, pg[*table].as_i64(), head_num);
+                print_table_row(prefix, table, pg[*table].as_i64().unwrap_or(0), head_num);
             }
         }
 
@@ -129,7 +129,7 @@ fn print_http_status(resp: &serde_json::Value) -> Result<()> {
             println!("│  ClickHouse");
             for (i, table) in ["blocks", "txs", "logs", "receipts"].iter().enumerate() {
                 let prefix = if i == 3 { "└" } else { "├" };
-                print_table_row(prefix, table, ch[*table].as_i64(), head_num);
+                print_table_row(prefix, table, ch[*table].as_i64().unwrap_or(0), head_num);
             }
         }
 
@@ -180,6 +180,18 @@ async fn print_status(config: &Config) -> Result<()> {
             let lag = head.saturating_sub(state.tip_num);
             println!("│  Head:          {} {}", format_number(head as u64), if live_head.is_some() { "(live)" } else { "" });
             println!("│  Lag:           {} blocks", lag);
+
+            // Sync rate + ETA
+            let gaps = detect_all_gaps(&pool, state.tip_num).await.unwrap_or_default();
+            let total_gap_blocks: u64 = gaps.iter().map(|(s, e)| e - s + 1).sum();
+            if total_gap_blocks > 0 {
+                if let Some(rate) = state.current_rate() {
+                    let eta_secs = total_gap_blocks as f64 / rate;
+                    println!("│  Rate:          {:.0} blk/s", rate);
+                    println!("│  ETA:           {}", format_eta(eta_secs));
+                }
+            }
+
             head
         } else {
             let head = live_head.unwrap_or(0);
@@ -292,58 +304,70 @@ async fn print_json_status(config: &Config) -> Result<()> {
     Ok(())
 }
 
-/// Print per-table status for PostgreSQL.
+/// Print per-table row counts for PostgreSQL.
 async fn print_store_status(label: &str, pool: &tidx::db::Pool, head: i64, tables: &[&str]) {
     println!("│  {label}");
     let conn = pool.get().await.ok();
     for (i, table) in tables.iter().enumerate() {
         let prefix = if i == tables.len() - 1 { "└" } else { "├" };
-        let col = if *table == "blocks" { "num" } else { "block_num" };
-        let max_block: Option<i64> = if let Some(ref c) = conn {
-            c.query_one(&format!("SELECT MAX({col}) FROM {table}"), &[])
+        let count: i64 = if let Some(ref c) = conn {
+            c.query_one(&format!("SELECT COUNT(*) FROM {table}"), &[])
                 .await
                 .ok()
-                .and_then(|r| r.get(0))
+                .map(|r| r.get::<_, i64>(0))
+                .unwrap_or(0)
         } else {
-            None
+            0
         };
-        print_table_row(prefix, table, max_block, head);
+        print_table_row(prefix, table, count, head);
     }
 }
 
-/// Print per-table status for ClickHouse.
+/// Print per-table row counts for ClickHouse.
 async fn print_ch_store_status(label: &str, sink: &ClickHouseSink, head: i64) {
     println!("│  {label}");
     let tables = ["blocks", "txs", "logs", "receipts"];
     for (i, table) in tables.iter().enumerate() {
         let prefix = if i == tables.len() - 1 { "└" } else { "├" };
-        let max_block = sink.max_block_in_table(table).await.ok().flatten();
-        print_table_row(prefix, table, max_block, head);
+        let count = sink.count_rows(table).await.unwrap_or(0);
+        print_table_row(prefix, table, count, head);
     }
 }
 
-/// Print a single table row with optional percentage vs head.
-fn print_table_row(prefix: &str, table: &str, max_block: Option<i64>, head: i64) {
-    match max_block {
-        Some(n) if head > 0 => {
-            let pct = (n as f64 / head as f64 * 100.0).min(100.0) as u64;
-            if pct >= 100 {
-                println!("│  {prefix}─ {:<10} {} ✓", table, format_number(n as u64));
-            } else {
-                println!(
-                    "│  {prefix}─ {:<10} {} / {} ({pct}%)",
-                    table,
-                    format_number(n as u64),
-                    format_number(head as u64)
-                );
-            }
+/// Print a single table row: count / head (pct%).
+fn print_table_row(prefix: &str, table: &str, count: i64, head: i64) {
+    if head > 0 {
+        let pct = (count as f64 / head as f64 * 100.0).min(100.0) as u64;
+        if pct >= 100 {
+            println!("│  {prefix}─ {:<10} {} ✓", table, format_number(count as u64));
+        } else {
+            println!(
+                "│  {prefix}─ {:<10} {} / {} ({pct}%)",
+                table,
+                format_number(count as u64),
+                format_number(head as u64)
+            );
         }
-        Some(n) => {
-            println!("│  {prefix}─ {:<10} {}", table, format_number(n as u64));
-        }
-        None => {
-            println!("│  {prefix}─ {:<10} empty", table);
-        }
+    } else if count > 0 {
+        println!("│  {prefix}─ {:<10} {}", table, format_number(count as u64));
+    } else {
+        println!("│  {prefix}─ {:<10} empty", table);
+    }
+}
+
+fn format_eta(secs: f64) -> String {
+    if secs <= 0.0 || secs.is_nan() || secs.is_infinite() {
+        return "unknown".to_string();
+    }
+    let secs = secs as u64;
+    if secs < 60 {
+        format!("{secs}s")
+    } else if secs < 3600 {
+        format!("{}m {}s", secs / 60, secs % 60)
+    } else if secs < 86400 {
+        format!("{}h {}m", secs / 3600, (secs % 3600) / 60)
+    } else {
+        format!("{}d {}h", secs / 86400, (secs % 86400) / 3600)
     }
 }
 
