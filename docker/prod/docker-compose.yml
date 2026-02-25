@@ -23,6 +23,8 @@ services:
       - work_mem=64MB
       - -c
       - wal_level=minimal
+      - -c
+      - max_wal_senders=0
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U tidx -d tidx"]
       interval: 5s
@@ -65,6 +67,8 @@ services:
       - ./config.toml:/config.toml:ro
     depends_on:
       postgres:
+        condition: service_healthy
+      clickhouse:
         condition: service_healthy
     environment:
       RUST_LOG: ${RUST_LOG:-tidx=info}

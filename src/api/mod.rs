@@ -222,6 +222,41 @@ async fn handle_status(State(state): State<AppState>) -> Result<Json<StatusRespo
         }
     }
 
+    // Populate per-table store status for each chain
+    let ch_configs = state.clickhouse_configs.read().await;
+    for chain in &mut all_chains {
+        let chain_id = chain.chain_id as u64;
+
+        // PostgreSQL per-table max blocks
+        if let Some(pool) = pools.get(&chain_id) {
+            if let Ok(conn) = pool.get().await {
+                let pg_blocks = conn.query_one("SELECT MAX(num) FROM blocks", &[]).await.ok().and_then(|r| r.get(0));
+                let pg_txs = conn.query_one("SELECT MAX(block_num) FROM txs", &[]).await.ok().and_then(|r| r.get(0));
+                let pg_logs = conn.query_one("SELECT MAX(block_num) FROM logs", &[]).await.ok().and_then(|r| r.get(0));
+                let pg_receipts = conn.query_one("SELECT MAX(block_num) FROM receipts", &[]).await.ok().and_then(|r| r.get(0));
+                chain.postgres = Some(crate::service::StoreStatus {
+                    blocks: pg_blocks, txs: pg_txs, logs: pg_logs, receipts: pg_receipts,
+                });
+            }
+        }
+
+        // ClickHouse per-table max blocks
+        if let Some(config) = ch_configs.get(&chain_id) {
+            if config.enabled {
+                let database = format!("tidx_{chain_id}");
+                if let Ok(sink) = crate::sync::ch_sink::ClickHouseSink::new(&config.url, &database)
+                {
+                    let blocks = sink.max_block_in_table("blocks").await.ok().flatten();
+                    let txs = sink.max_block_in_table("txs").await.ok().flatten();
+                    let logs = sink.max_block_in_table("logs").await.ok().flatten();
+                    let receipts = sink.max_block_in_table("receipts").await.ok().flatten();
+                    chain.clickhouse =
+                        Some(crate::service::StoreStatus { blocks, txs, logs, receipts });
+                }
+            }
+        }
+    }
+
     Ok(Json(StatusResponse {
         ok: true,
         chains: all_chains,

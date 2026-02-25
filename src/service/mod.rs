@@ -23,6 +23,21 @@ pub struct SyncStatus {
     pub sync_rate: Option<f64>,
     pub eta_secs: Option<f64>,
     pub updated_at: DateTime<Utc>,
+    /// Per-table high-water marks for PostgreSQL.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub postgres: Option<StoreStatus>,
+    /// Per-table high-water marks for ClickHouse (if enabled).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub clickhouse: Option<StoreStatus>,
+}
+
+/// Per-table high-water marks for a storage backend.
+#[derive(Debug, Clone, Serialize)]
+pub struct StoreStatus {
+    pub blocks: Option<i64>,
+    pub txs: Option<i64>,
+    pub logs: Option<i64>,
+    pub receipts: Option<i64>,
 }
 
 pub async fn get_all_status(pool: &Pool) -> Result<Vec<SyncStatus>> {
@@ -83,6 +98,8 @@ pub async fn get_all_status(pool: &Pool) -> Result<Vec<SyncStatus>> {
                 sync_rate,
                 eta_secs,
                 updated_at: row.get(6),
+                postgres: None,
+                clickhouse: None,
             }
         })
         .collect())

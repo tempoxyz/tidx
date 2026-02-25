@@ -4,6 +4,7 @@ use std::path::PathBuf;
 
 use tidx::config::Config;
 use tidx::db;
+use tidx::sync::ch_sink::ClickHouseSink;
 use tidx::sync::fetcher::RpcClient;
 use tidx::sync::writer::{detect_all_gaps, load_sync_state};
 
@@ -102,33 +103,36 @@ fn print_http_status(resp: &serde_json::Value) -> Result<()> {
         let head = chain["head"].as_i64();
         let synced_num = chain["synced_num"].as_i64().unwrap_or(0);
         let realtime_lag = chain["realtime_lag"].as_i64().unwrap_or(0);
-        let backfill_complete = chain["backfill_complete"].as_bool().unwrap_or(false);
-        let gap_blocks = chain["gap_blocks"].as_i64().unwrap_or(0);
-        let gap_count = chain["gap_count"].as_i64().unwrap_or(0);
-        let sync_rate = chain["sync_rate"].as_f64();
+
+        let head_num = head.unwrap_or(synced_num);
 
         println!("┌─ {} (chain_id: {}) ─────────────────────", name, chain_id);
         println!("│");
-        println!("│  Realtime Sync");
         if let Some(h) = head {
-            println!("│  ├─ Head:      {} (live)", format_number(h as u64));
+            println!("│  Head:          {} (live)", format_number(h as u64));
         }
-        println!("│  ├─ Tip:       {}", format_number(synced_num as u64));
-        println!("│  └─ Lag:       {} blocks", realtime_lag);
-        println!("│");
-        println!("│  Backfill");
-        if backfill_complete {
-            println!("│  └─ Status:   ✓ Complete");
-        } else {
-            println!("│  ├─ Remaining: {} blocks in {} gap(s)", format_number(gap_blocks as u64), gap_count);
-            if let Some(rate) = sync_rate {
-                println!("│  ├─ Rate:     {:.0} blk/s", rate);
-                if rate > 0.0 {
-                    let eta_secs = gap_blocks as f64 / rate;
-                    println!("│  └─ ETA:      {}", format_eta(eta_secs));
-                }
+        println!("│  Lag:           {} blocks", realtime_lag);
+
+        // PostgreSQL per-table status
+        if let Some(pg) = chain.get("postgres") {
+            println!("│");
+            println!("│  PostgreSQL");
+            for (i, table) in ["blocks", "txs", "logs", "receipts"].iter().enumerate() {
+                let prefix = if i == 3 { "└" } else { "├" };
+                print_table_row(prefix, table, pg[*table].as_i64(), head_num);
             }
         }
+
+        // ClickHouse per-table status
+        if let Some(ch) = chain.get("clickhouse") {
+            println!("│");
+            println!("│  ClickHouse");
+            for (i, table) in ["blocks", "txs", "logs", "receipts"].iter().enumerate() {
+                let prefix = if i == 3 { "└" } else { "├" };
+                print_table_row(prefix, table, ch[*table].as_i64(), head_num);
+            }
+        }
+
         println!("└───────────────────────────────────────────────────────────");
         println!();
     }
@@ -171,81 +175,42 @@ async fn print_status(config: &Config) -> Result<()> {
             }
         };
 
-        if let Some(state) = load_sync_state(&pool, chain.chain_id).await? {
+        let head = if let Some(state) = load_sync_state(&pool, chain.chain_id).await? {
             let head = live_head.unwrap_or(state.head_num);
-            let realtime_lag = head.saturating_sub(state.tip_num);
-
-            // Realtime sync status
-            println!("│  Realtime Sync");
-            println!("│  ├─ Head:      {} {}", head, if live_head.is_some() { "(live)" } else { "" });
-            println!("│  ├─ Tip:       {}", state.tip_num);
-            println!("│  └─ Lag:       {realtime_lag} blocks");
-            println!("│");
-
-            // Gap sync status - show ALL gaps (sorted by end desc, most recent first)
-            let gaps = detect_all_gaps(&pool, state.tip_num).await.unwrap_or_default();
-            let total_gap_blocks: u64 = gaps.iter().map(|(s, e)| e - s + 1).sum();
-            
-            // Get actual block count from database for accurate stats
-            let actual_block_count: u64 = {
-                let conn = pool.get().await.ok();
-                if let Some(conn) = conn {
-                    conn.query_one("SELECT COUNT(*) FROM blocks", &[])
-                        .await
-                        .ok()
-                        .map(|row| row.get::<_, i64>(0) as u64)
-                        .unwrap_or(0)
-                } else {
-                    0
-                }
-            };
-            
-            println!("│  Backfill");
-            if gaps.is_empty() {
-                println!("│  └─ Status:   ✓ Complete (1 → {})", format_number(state.tip_num));
-            } else {
-                let total_needed = state.tip_num; // blocks 1 to tip_num
-                let pct = if total_needed > 0 {
-                    (actual_block_count as f64 / total_needed as f64 * 100.0) as u64
-                } else {
-                    0
-                };
-                
-                // Use the rolling sync rate stored in the database
-                let (rate_str, eta_str) = if let Some(rate) = state.sync_rate {
-                    if rate > 0.0 {
-                        let eta_secs = total_gap_blocks as f64 / rate;
-                        (format!("{:.0} blk/s", rate), format_eta(eta_secs))
-                    } else {
-                        ("--".to_string(), "calculating...".to_string())
-                    }
-                } else {
-                    // Fallback to overall rate if rolling rate unavailable
-                    if let Some(started) = state.started_at {
-                        let elapsed = chrono::Utc::now().signed_duration_since(started);
-                        let secs = elapsed.num_seconds() as f64;
-                        if secs > 10.0 && actual_block_count > 0 {
-                            let rate = actual_block_count as f64 / secs;
-                            let eta_secs = if rate > 0.0 { total_gap_blocks as f64 / rate } else { 0.0 };
-                            (format!("{:.0} blk/s", rate), format_eta(eta_secs))
-                        } else {
-                            ("--".to_string(), "calculating...".to_string())
-                        }
-                    } else {
-                        ("--".to_string(), "calculating...".to_string())
-                    }
-                };
-                
-                println!("│  ├─ Synced:   {} / {} ({pct}%)", format_number(actual_block_count), format_number(total_needed));
-                println!("│  ├─ Remaining: {} blocks in {} gap(s)", format_number(total_gap_blocks), gaps.len());
-                println!("│  ├─ Rate:     {rate_str}");
-                println!("│  └─ ETA:      {eta_str}");
-            }
-
+            let lag = head.saturating_sub(state.tip_num);
+            println!("│  Head:          {} {}", format_number(head as u64), if live_head.is_some() { "(live)" } else { "" });
+            println!("│  Lag:           {} blocks", lag);
+            head
         } else {
-            println!("│  Status: Not syncing");
-            if let Some(head) = live_head {
-                println!("│  Head: {head} (live)");
+            let head = live_head.unwrap_or(0);
+            if head > 0 {
+                println!("│  Head:          {} (live)", format_number(head as u64));
+            }
+            println!("│  Status:        Not syncing");
+            head
+        };
+
+        // PostgreSQL per-table status
+        println!("│");
+        print_store_status("PostgreSQL", &pool, head as i64, &["blocks", "txs", "logs", "receipts"]).await;
+
+        // ClickHouse per-table status
+        if let Some(ref ch_config) = chain.clickhouse {
+            if ch_config.enabled {
+                let database = ch_config
+                    .database
+                    .clone()
+                    .unwrap_or_else(|| format!("tidx_{}", chain.chain_id));
+                println!("│");
+                match ClickHouseSink::new(&ch_config.url, &database) {
+                    Ok(sink) => {
+                        print_ch_store_status("ClickHouse", &sink, head as i64).await;
+                    }
+                    Err(_) => {
+                        println!("│  ClickHouse");
+                        println!("│  └─ ✗ Connection failed");
+                    }
+                }
             }
         }
 
@@ -279,7 +244,7 @@ async fn print_json_status(config: &Config) -> Result<()> {
         let gaps_json: Vec<_> = gaps.iter().map(|(s, e)| serde_json::json!({"start": s, "end": e, "size": e - s + 1})).collect();
         let total_gap_blocks: u64 = gaps.iter().map(|(s, e)| e - s + 1).sum();
 
-        let chain_status = serde_json::json!({
+        let mut chain_status = serde_json::json!({
             "name": chain.name,
             "chain_id": chain.chain_id,
             "rpc_url": chain.rpc_url,
@@ -296,12 +261,90 @@ async fn print_json_status(config: &Config) -> Result<()> {
             "sync_rate": state.as_ref().and_then(|s| s.current_rate()),
             "backfill_eta_secs": state.as_ref().and_then(|s| s.backfill_eta_secs()),
         });
+
+        // Add ClickHouse status if configured
+        if let Some(ref ch_config) = chain.clickhouse {
+            if ch_config.enabled {
+                let database = ch_config
+                    .database
+                    .clone()
+                    .unwrap_or_else(|| format!("tidx_{}", chain.chain_id));
+                if let Ok(sink) = ClickHouseSink::new(&ch_config.url, &database) {
+                    let blocks = sink.max_block_in_table("blocks").await.ok().flatten();
+                    let txs = sink.max_block_in_table("txs").await.ok().flatten();
+                    let logs = sink.max_block_in_table("logs").await.ok().flatten();
+                    let receipts = sink.max_block_in_table("receipts").await.ok().flatten();
+                    chain_status["clickhouse"] = serde_json::json!({
+                        "blocks": blocks,
+                        "txs": txs,
+                        "logs": logs,
+                        "receipts": receipts,
+                    });
+                }
+            }
+        }
+
         chains.push(chain_status);
     }
 
     let output = serde_json::json!({ "chains": chains });
     println!("{}", serde_json::to_string_pretty(&output)?);
     Ok(())
+}
+
+/// Print per-table status for PostgreSQL.
+async fn print_store_status(label: &str, pool: &tidx::db::Pool, head: i64, tables: &[&str]) {
+    println!("│  {label}");
+    let conn = pool.get().await.ok();
+    for (i, table) in tables.iter().enumerate() {
+        let prefix = if i == tables.len() - 1 { "└" } else { "├" };
+        let col = if *table == "blocks" { "num" } else { "block_num" };
+        let max_block: Option<i64> = if let Some(ref c) = conn {
+            c.query_one(&format!("SELECT MAX({col}) FROM {table}"), &[])
+                .await
+                .ok()
+                .and_then(|r| r.get(0))
+        } else {
+            None
+        };
+        print_table_row(prefix, table, max_block, head);
+    }
+}
+
+/// Print per-table status for ClickHouse.
+async fn print_ch_store_status(label: &str, sink: &ClickHouseSink, head: i64) {
+    println!("│  {label}");
+    let tables = ["blocks", "txs", "logs", "receipts"];
+    for (i, table) in tables.iter().enumerate() {
+        let prefix = if i == tables.len() - 1 { "└" } else { "├" };
+        let max_block = sink.max_block_in_table(table).await.ok().flatten();
+        print_table_row(prefix, table, max_block, head);
+    }
+}
+
+/// Print a single table row with optional percentage vs head.
+fn print_table_row(prefix: &str, table: &str, max_block: Option<i64>, head: i64) {
+    match max_block {
+        Some(n) if head > 0 => {
+            let pct = (n as f64 / head as f64 * 100.0).min(100.0) as u64;
+            if pct >= 100 {
+                println!("│  {prefix}─ {:<10} {} ✓", table, format_number(n as u64));
+            } else {
+                println!(
+                    "│  {prefix}─ {:<10} {} / {} ({pct}%)",
+                    table,
+                    format_number(n as u64),
+                    format_number(head as u64)
+                );
+            }
+        }
+        Some(n) => {
+            println!("│  {prefix}─ {:<10} {}", table, format_number(n as u64));
+        }
+        None => {
+            println!("│  {prefix}─ {:<10} empty", table);
+        }
+    }
 }
 
 fn format_number(n: u64) -> String {
@@ -317,21 +360,6 @@ fn format_number(n: u64) -> String {
     result.chars().rev().collect()
 }
 
-fn format_eta(secs: f64) -> String {
-    if secs <= 0.0 || secs.is_nan() || secs.is_infinite() {
-        return "unknown".to_string();
-    }
 
-    let secs = secs as u64;
-    if secs < 60 {
-        format!("{secs}s")
-    } else if secs < 3600 {
-        format!("{}m {}s", secs / 60, secs % 60)
-    } else if secs < 86400 {
-        format!("{}h {}m", secs / 3600, (secs % 3600) / 60)
-    } else {
-        format!("{}d {}h", secs / 86400, (secs % 86400) / 3600)
-    }
-}
 
 
