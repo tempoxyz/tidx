@@ -65,6 +65,9 @@ anyhow = "1"
 # Time
 chrono = { version = "0.4", features = ["serde"] }
 
+# ClickHouse
+clickhouse = { version = "0.14", features = ["lz4", "chrono"] }
+
 # Hex encoding
 hex = "0.4"
 rust_decimal = { version = "1.40.0", features = ["db-tokio-postgres"] }

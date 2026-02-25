@@ -1,9 +1,10 @@
 //! ClickHouse direct-write sink.
 //!
 //! Writes blocks, transactions, logs, and receipts directly to ClickHouse
-//! via the HTTP interface using JSONEachRow format.
+//! via the official `clickhouse` crate using RowBinary format with LZ4 compression.
 
 use anyhow::{anyhow, Result};
+use clickhouse::Row;
 use serde::Serialize;
 use std::time::{Duration, Instant};
 use tracing::{debug, error, info, warn};
@@ -17,39 +18,45 @@ const TXS_SCHEMA: &str = include_str!("../../db/clickhouse/txs.sql");
 const LOGS_SCHEMA: &str = include_str!("../../db/clickhouse/logs.sql");
 const RECEIPTS_SCHEMA: &str = include_str!("../../db/clickhouse/receipts.sql");
 
-/// Max rows per ClickHouse HTTP INSERT to avoid timeouts on large backfills.
+/// Max rows per ClickHouse INSERT to avoid unbounded memory growth during backfills.
 const CH_INSERT_CHUNK_SIZE: usize = 2_000;
 
 /// Max retry attempts for transient ClickHouse write failures.
 const CH_MAX_RETRIES: u32 = 3;
 
-/// Direct-write ClickHouse sink using HTTP batch inserts.
+/// Direct-write ClickHouse sink using RowBinary format with LZ4 compression.
 #[derive(Clone)]
 pub struct ClickHouseSink {
-    http_client: reqwest::Client,
-    url: String,
+    client: clickhouse::Client,
+    /// Client without database context, used for `CREATE DATABASE` DDL.
+    base_client: clickhouse::Client,
     database: String,
 }
 
 impl ClickHouseSink {
     /// Create a new ClickHouse sink.
     pub fn new(url: &str, database: &str) -> Result<Self> {
-        let http_client = reqwest::Client::builder()
-            .pool_max_idle_per_host(4)
-            .build()
-            .map_err(|e| anyhow!("Failed to create HTTP client: {e}"))?;
+        let url = url.trim_end_matches('/');
+        let base_client = clickhouse::Client::default().with_url(url);
+        let client = base_client.clone().with_database(database);
 
         Ok(Self {
-            http_client,
-            url: url.trim_end_matches('/').to_string(),
+            client,
+            base_client,
             database: database.to_string(),
         })
     }
 
     /// Create database and tables if they don't exist.
     pub async fn ensure_schema(&self) -> Result<()> {
-        self.exec_raw(&format!("CREATE DATABASE IF NOT EXISTS {}", self.database))
-            .await?;
+        self.base_client
+            .query(&format!(
+                "CREATE DATABASE IF NOT EXISTS {}",
+                self.database
+            ))
+            .execute()
+            .await
+            .map_err(|e| anyhow!("Failed to create ClickHouse database: {e}"))?;
 
         for (name, ddl) in [
             ("blocks", BLOCKS_SCHEMA),
@@ -57,7 +64,7 @@ impl ClickHouseSink {
             ("logs", LOGS_SCHEMA),
             ("receipts", RECEIPTS_SCHEMA),
         ] {
-            self.exec(ddl).await.map_err(|e| {
+            self.client.query(ddl).execute().await.map_err(|e| {
                 anyhow!("Failed to create ClickHouse table {name}: {e}")
             })?;
             debug!(table = name, database = %self.database, "ClickHouse table ready");
@@ -80,7 +87,8 @@ impl ClickHouseSink {
             return Ok(());
         }
         let start = Instant::now();
-        self.write_chunked("blocks", blocks, ChBlockWire::from_row).await?;
+        let wire: Vec<ChBlockWire> = blocks.iter().map(ChBlockWire::from_row).collect();
+        self.insert_rows("blocks", &wire).await?;
         metrics::record_sink_write_duration(self.name(), "blocks", start.elapsed());
         metrics::record_sink_write_rows(self.name(), "blocks", blocks.len() as u64);
         metrics::update_sink_block_rate(self.name(), blocks.len() as u64);
@@ -96,7 +104,8 @@ impl ClickHouseSink {
             return Ok(());
         }
         let start = Instant::now();
-        self.write_chunked("txs", txs, ChTxWire::from_row).await?;
+        let wire: Vec<ChTxWire> = txs.iter().map(ChTxWire::from_row).collect();
+        self.insert_rows("txs", &wire).await?;
         metrics::record_sink_write_duration(self.name(), "txs", start.elapsed());
         metrics::record_sink_write_rows(self.name(), "txs", txs.len() as u64);
         metrics::increment_sink_row_count(self.name(), "txs", txs.len() as u64);
@@ -111,7 +120,8 @@ impl ClickHouseSink {
             return Ok(());
         }
         let start = Instant::now();
-        self.write_chunked("logs", logs, ChLogWire::from_row).await?;
+        let wire: Vec<ChLogWire> = logs.iter().map(ChLogWire::from_row).collect();
+        self.insert_rows("logs", &wire).await?;
         metrics::record_sink_write_duration(self.name(), "logs", start.elapsed());
         metrics::record_sink_write_rows(self.name(), "logs", logs.len() as u64);
         metrics::increment_sink_row_count(self.name(), "logs", logs.len() as u64);
@@ -126,7 +136,8 @@ impl ClickHouseSink {
             return Ok(());
         }
         let start = Instant::now();
-        self.write_chunked("receipts", receipts, ChReceiptWire::from_row).await?;
+        let wire: Vec<ChReceiptWire> = receipts.iter().map(ChReceiptWire::from_row).collect();
+        self.insert_rows("receipts", &wire).await?;
         metrics::record_sink_write_duration(self.name(), "receipts", start.elapsed());
         metrics::record_sink_write_rows(self.name(), "receipts", receipts.len() as u64);
         metrics::increment_sink_row_count(self.name(), "receipts", receipts.len() as u64);
@@ -138,48 +149,22 @@ impl ClickHouseSink {
 
     /// Query the highest block number in ClickHouse, or None if empty.
     pub async fn max_block_num(&self) -> Result<Option<i64>> {
-        let url = format!(
-            "{}/?database={}&default_format=TabSeparated",
-            self.url, self.database
-        );
-        let resp = self
-            .http_client
-            .post(&url)
-            .body("SELECT max(num) FROM blocks")
-            .send()
+        let count: u64 = self
+            .client
+            .query("SELECT count() FROM blocks")
+            .fetch_one()
             .await
-            .map_err(|e| anyhow!("ClickHouse HTTP request failed: {e}"))?;
-
-        if !resp.status().is_success() {
-            let error = resp.text().await.unwrap_or_default();
-            return Err(anyhow!("ClickHouse query failed: {error}"));
+            .map_err(|e| anyhow!("ClickHouse query failed: {e}"))?;
+        if count == 0 {
+            return Ok(None);
         }
-
-        let text = resp.text().await.unwrap_or_default();
-        let trimmed = text.trim();
-        if trimmed.is_empty() || trimmed == "0" {
-            // max() on empty table returns 0 in ClickHouse
-            // Check if there are actually any rows
-            let count_url = format!(
-                "{}/?database={}&default_format=TabSeparated",
-                self.url, self.database
-            );
-            let count_resp = self
-                .http_client
-                .post(&count_url)
-                .body("SELECT count() FROM blocks")
-                .send()
-                .await
-                .map_err(|e| anyhow!("ClickHouse HTTP request failed: {e}"))?;
-            let count_text = count_resp.text().await.unwrap_or_default();
-            if count_text.trim() == "0" {
-                return Ok(None);
-            }
-        }
-        trimmed
-            .parse::<i64>()
-            .map(Some)
-            .map_err(|e| anyhow!("Failed to parse max block num '{trimmed}': {e}"))
+        let max: i64 = self
+            .client
+            .query("SELECT max(num) FROM blocks")
+            .fetch_one()
+            .await
+            .map_err(|e| anyhow!("ClickHouse query failed: {e}"))?;
+        Ok(Some(max))
     }
 
     /// Query the highest block number for a specific table.
@@ -187,67 +172,31 @@ impl ClickHouseSink {
     /// Returns None if the table is empty.
     pub async fn max_block_in_table(&self, table: &str) -> Result<Option<i64>> {
         let col = if table == "blocks" { "num" } else { "block_num" };
-        let url = format!(
-            "{}/?database={}&default_format=TabSeparated",
-            self.url, self.database
-        );
-        let sql = format!("SELECT max({col}) FROM {table}");
-        let resp = self
-            .http_client
-            .post(&url)
-            .body(sql)
-            .send()
+        let count: u64 = self
+            .client
+            .query(&format!("SELECT count() FROM {table}"))
+            .fetch_one()
             .await
-            .map_err(|e| anyhow!("ClickHouse HTTP request failed: {e}"))?;
-
-        if !resp.status().is_success() {
-            let error = resp.text().await.unwrap_or_default();
-            return Err(anyhow!("ClickHouse query failed: {error}"));
+            .map_err(|e| anyhow!("ClickHouse query failed: {e}"))?;
+        if count == 0 {
+            return Ok(None);
         }
-
-        let text = resp.text().await.unwrap_or_default();
-        let trimmed = text.trim();
-        if trimmed.is_empty() || trimmed == "0" {
-            let count_sql = format!("SELECT count() FROM {table}");
-            let count_resp = self
-                .http_client
-                .post(&format!(
-                    "{}/?database={}&default_format=TabSeparated",
-                    self.url, self.database
-                ))
-                .body(count_sql)
-                .send()
-                .await
-                .map_err(|e| anyhow!("ClickHouse HTTP request failed: {e}"))?;
-            let count_text = count_resp.text().await.unwrap_or_default();
-            if count_text.trim() == "0" {
-                return Ok(None);
-            }
-        }
-        trimmed
-            .parse::<i64>()
-            .map(Some)
-            .map_err(|e| anyhow!("Failed to parse max block num '{trimmed}': {e}"))
+        let max: i64 = self
+            .client
+            .query(&format!("SELECT max({col}) FROM {table}"))
+            .fetch_one()
+            .await
+            .map_err(|e| anyhow!("ClickHouse query failed: {e}"))?;
+        Ok(Some(max))
     }
 
     /// Query the row count for a specific table.
     pub async fn row_count(&self, table: &str) -> Result<u64> {
-        let url = format!(
-            "{}/?database={}&default_format=TabSeparated",
-            self.url, self.database
-        );
-        let sql = format!("SELECT count() FROM {table}");
-        let resp = self
-            .http_client
-            .post(&url)
-            .body(sql)
-            .send()
+        self.client
+            .query(&format!("SELECT count() FROM {table}"))
+            .fetch_one()
             .await
-            .map_err(|e| anyhow!("ClickHouse HTTP request failed: {e}"))?;
-        let text = resp.text().await.unwrap_or_default();
-        text.trim()
-            .parse::<u64>()
-            .map_err(|e| anyhow!("Failed to parse row count: {e}"))
+            .map_err(|e| anyhow!("ClickHouse query failed: {e}"))
     }
 
     /// Delete all data from a given block number onwards (reorg support).
@@ -257,128 +206,83 @@ impl ClickHouseSink {
 
         for table in &tables {
             let sql = format!(
-                "ALTER TABLE {} DELETE WHERE {} >= {} SETTINGS mutations_sync = 1",
+                "ALTER TABLE {} DELETE WHERE {} >= {}",
                 table,
                 block_col(table),
                 block_num
             );
-            if let Err(e) = self.exec(&sql).await {
-                error!(table = *table, error = %e, "ClickHouse delete failed");
-                return Err(e);
-            }
+            self.client
+                .query(&sql)
+                .with_option("mutations_sync", "1")
+                .execute()
+                .await
+                .map_err(|e| {
+                    error!(table = *table, error = %e, "ClickHouse delete failed");
+                    anyhow!("ClickHouse delete from {table} failed: {e}")
+                })?;
         }
 
         debug!(from_block = block_num, "ClickHouse reorg delete complete");
         Ok(())
     }
 
-    /// Serialize rows to JSONEachRow and insert in chunks, avoiding large single requests.
-    async fn write_chunked<T, W, F>(&self, table: &str, rows: &[T], convert: F) -> Result<()>
+    /// Insert rows in chunks with retry logic.
+    async fn insert_rows<T>(&self, table: &str, rows: &[T]) -> Result<()>
     where
-        W: Serialize,
-        F: Fn(&T) -> W,
+        T: Serialize + for<'a> Row<Value<'a> = T>,
     {
         for chunk in rows.chunks(CH_INSERT_CHUNK_SIZE) {
-            let mut body = Vec::with_capacity(chunk.len() * 256);
-            for row in chunk {
-                serde_json::to_writer(&mut body, &convert(row))?;
-                body.push(b'\n');
+            let mut last_error = None;
+            for attempt in 0..CH_MAX_RETRIES {
+                if attempt > 0 {
+                    let backoff = Duration::from_millis(100 << attempt);
+                    warn!(table, attempt, "ClickHouse insert retry after {backoff:?}");
+                    tokio::time::sleep(backoff).await;
+                }
+                match self.try_insert(table, chunk).await {
+                    Ok(()) => {
+                        last_error = None;
+                        break;
+                    }
+                    Err(e) => {
+                        last_error = Some(e);
+                    }
+                }
             }
-            self.insert(table, body).await?;
+            if let Some(e) = last_error {
+                return Err(anyhow!(
+                    "ClickHouse insert into {table} failed after {CH_MAX_RETRIES} attempts: {e}"
+                ));
+            }
         }
         Ok(())
     }
 
-    /// Execute an INSERT using JSONEachRow format with retry on transient failures.
-    async fn insert(&self, table: &str, body: Vec<u8>) -> Result<()> {
-        let url = format!(
-            "{}/?database={}&query={}",
-            self.url,
-            self.database,
-            urlencoded_insert(table),
-        );
-
-        let mut last_error = String::new();
-        for attempt in 0..CH_MAX_RETRIES {
-            if attempt > 0 {
-                let backoff = Duration::from_millis(100 << attempt);
-                warn!(table, attempt, "ClickHouse insert retry after {backoff:?}");
-                tokio::time::sleep(backoff).await;
-            }
-
-            match self
-                .http_client
-                .post(&url)
-                .header("Content-Type", "application/json")
-                .body(body.clone())
-                .send()
-                .await
-            {
-                Ok(resp) if resp.status().is_success() => return Ok(()),
-                Ok(resp) => {
-                    last_error = resp.text().await.unwrap_or_default();
-                }
-                Err(e) => {
-                    last_error = e.to_string();
-                }
-            }
+    async fn try_insert<T>(&self, table: &str, rows: &[T]) -> Result<()>
+    where
+        T: Serialize + for<'a> Row<Value<'a> = T>,
+    {
+        let mut insert = self.client.insert::<T>(table).await?;
+        for row in rows {
+            insert.write(row).await?;
         }
-
-        Err(anyhow!(
-            "ClickHouse insert into {table} failed after {CH_MAX_RETRIES} attempts: {last_error}"
-        ))
-    }
-
-    /// Execute a SQL statement in the database context.
-    async fn exec(&self, sql: &str) -> Result<()> {
-        let url = format!("{}/?database={}", self.url, self.database);
-        let resp = self
-            .http_client
-            .post(&url)
-            .body(sql.to_string())
-            .send()
-            .await
-            .map_err(|e| anyhow!("ClickHouse HTTP request failed: {e}"))?;
-
-        if !resp.status().is_success() {
-            let error = resp.text().await.unwrap_or_default();
-            return Err(anyhow!("ClickHouse exec failed: {error}"));
-        }
-
-        Ok(())
-    }
-
-    /// Execute a SQL statement without database context (for DDL like CREATE DATABASE).
-    async fn exec_raw(&self, sql: &str) -> Result<()> {
-        let resp = self
-            .http_client
-            .post(&self.url)
-            .body(sql.to_string())
-            .send()
-            .await
-            .map_err(|e| anyhow!("ClickHouse HTTP request failed: {e}"))?;
-
-        if !resp.status().is_success() {
-            let error = resp.text().await.unwrap_or_default();
-            return Err(anyhow!("ClickHouse exec failed: {error}"));
-        }
-
+        insert.end().await?;
         Ok(())
     }
 }
 
 // ── ClickHouse wire-format structs ────────────────────────────────────────
 //
-// These derive Serialize for direct JSON serialization via serde_json::to_writer(),
-// avoiding the overhead of intermediate serde_json::Value allocations that the
-// serde_json::json!() macro creates.
+// These derive `clickhouse::Row` for RowBinary serialization and `serde::Serialize`
+// for the Row encoding. DateTime64(3) columns use the chrono serde adapter.
 
-#[derive(Serialize)]
+#[derive(Row, Serialize)]
 struct ChBlockWire {
     num: i64,
     hash: String,
     parent_hash: String,
-    timestamp: String,
+    #[serde(with = "clickhouse::serde::chrono::datetime64::millis")]
+    timestamp: chrono::DateTime<chrono::Utc>,
     timestamp_ms: i64,
     gas_limit: i64,
     gas_used: i64,
@@ -392,7 +296,7 @@ impl ChBlockWire {
             num: b.num,
             hash: hex_encode(&b.hash),
             parent_hash: hex_encode(&b.parent_hash),
-            timestamp: format_datetime(&b.timestamp),
+            timestamp: b.timestamp,
             timestamp_ms: b.timestamp_ms,
             gas_limit: b.gas_limit,
             gas_used: b.gas_used,
@@ -402,10 +306,11 @@ impl ChBlockWire {
     }
 }
 
-#[derive(Serialize)]
+#[derive(Row, Serialize)]
 struct ChTxWire {
     block_num: i64,
-    block_timestamp: String,
+    #[serde(with = "clickhouse::serde::chrono::datetime64::millis")]
+    block_timestamp: chrono::DateTime<chrono::Utc>,
     idx: i32,
     hash: String,
     #[serde(rename = "type")]
@@ -433,7 +338,7 @@ impl ChTxWire {
     fn from_row(tx: &TxRow) -> Self {
         Self {
             block_num: tx.block_num,
-            block_timestamp: format_datetime(&tx.block_timestamp),
+            block_timestamp: tx.block_timestamp,
             idx: tx.idx,
             hash: hex_encode(&tx.hash),
             tx_type: tx.tx_type,
@@ -458,10 +363,11 @@ impl ChTxWire {
     }
 }
 
-#[derive(Serialize)]
+#[derive(Row, Serialize)]
 struct ChLogWire {
     block_num: i64,
-    block_timestamp: String,
+    #[serde(with = "clickhouse::serde::chrono::datetime64::millis")]
+    block_timestamp: chrono::DateTime<chrono::Utc>,
     log_idx: i32,
     tx_idx: i32,
     tx_hash: String,
@@ -478,12 +384,16 @@ impl ChLogWire {
     fn from_row(log: &LogRow) -> Self {
         Self {
             block_num: log.block_num,
-            block_timestamp: format_datetime(&log.block_timestamp),
+            block_timestamp: log.block_timestamp,
             log_idx: log.log_idx,
             tx_idx: log.tx_idx,
             tx_hash: hex_encode(&log.tx_hash),
             address: hex_encode(&log.address),
-            selector: log.selector.as_ref().map(|v| hex_encode(v)).unwrap_or_default(),
+            selector: log
+                .selector
+                .as_ref()
+                .map(|v| hex_encode(v))
+                .unwrap_or_default(),
             topic0: log.topic0.as_ref().map(|v| hex_encode(v)),
             topic1: log.topic1.as_ref().map(|v| hex_encode(v)),
             topic2: log.topic2.as_ref().map(|v| hex_encode(v)),
@@ -493,10 +403,11 @@ impl ChLogWire {
     }
 }
 
-#[derive(Serialize)]
+#[derive(Row, Serialize)]
 struct ChReceiptWire {
     block_num: i64,
-    block_timestamp: String,
+    #[serde(with = "clickhouse::serde::chrono::datetime64::millis")]
+    block_timestamp: chrono::DateTime<chrono::Utc>,
     tx_idx: i32,
     tx_hash: String,
     from: String,
@@ -513,7 +424,7 @@ impl ChReceiptWire {
     fn from_row(r: &ReceiptRow) -> Self {
         Self {
             block_num: r.block_num,
-            block_timestamp: format_datetime(&r.block_timestamp),
+            block_timestamp: r.block_timestamp,
             tx_idx: r.tx_idx,
             tx_hash: hex_encode(&r.tx_hash),
             from: hex_encode(&r.from),
@@ -528,22 +439,9 @@ impl ChReceiptWire {
     }
 }
 
-/// URL-encode an INSERT ... FORMAT JSONEachRow query for use as a query parameter.
-fn urlencoded_insert(table: &str) -> String {
-    let query = format!("INSERT INTO {table} FORMAT JSONEachRow");
-    form_urlencoded::Serializer::new(String::new())
-        .append_key_only(&query)
-        .finish()
-}
-
 /// Hex-encode bytes with 0x prefix.
 fn hex_encode(bytes: &[u8]) -> String {
     format!("0x{}", hex::encode(bytes))
-}
-
-/// Format a chrono DateTime for ClickHouse DateTime64(3, 'UTC').
-fn format_datetime(dt: &chrono::DateTime<chrono::Utc>) -> String {
-    dt.format("%Y-%m-%d %H:%M:%S%.3f").to_string()
 }
 
 #[cfg(test)]
@@ -554,21 +452,6 @@ mod tests {
     fn test_hex_encode() {
         assert_eq!(hex_encode(&[0xde, 0xad, 0xbe, 0xef]), "0xdeadbeef");
         assert_eq!(hex_encode(&[]), "0x");
-    }
-
-    #[test]
-    fn test_format_datetime() {
-        use chrono::TimeZone;
-        let dt = chrono::Utc.with_ymd_and_hms(2024, 1, 15, 12, 34, 56).unwrap();
-        assert_eq!(format_datetime(&dt), "2024-01-15 12:34:56.000");
-    }
-
-    #[test]
-    fn test_urlencoded_insert() {
-        let encoded = urlencoded_insert("blocks");
-        assert!(encoded.contains("INSERT"));
-        assert!(encoded.contains("blocks"));
-        assert!(encoded.contains("JSONEachRow"));
     }
 
     #[test]
@@ -589,14 +472,12 @@ mod tests {
         };
 
         let wire = ChBlockWire::from_row(&block);
-        let json = serde_json::to_string(&wire).unwrap();
-        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
-
-        assert_eq!(parsed["num"], 42);
-        assert_eq!(parsed["hash"], format!("0x{}", "ab".repeat(32)));
-        assert_eq!(parsed["miner"], format!("0x{}", "ee".repeat(20)));
-        assert_eq!(parsed["timestamp"], "2024-01-15 12:00:00.000");
-        assert!(parsed["extra_data"].is_null());
+        // Verify field values via the struct fields directly
+        assert_eq!(wire.num, 42);
+        assert_eq!(wire.hash, format!("0x{}", "ab".repeat(32)));
+        assert_eq!(wire.miner, format!("0x{}", "ee".repeat(20)));
+        assert_eq!(wire.timestamp, dt);
+        assert!(wire.extra_data.is_none());
     }
 
     #[test]
@@ -607,10 +488,9 @@ mod tests {
         };
 
         let wire = ChTxWire::from_row(&tx);
+        // Verify via serde JSON that the rename applies
         let json = serde_json::to_string(&wire).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
-
-        // serde(rename = "type") should produce "type" not "tx_type"
         assert_eq!(parsed["type"], 2);
         assert!(parsed.get("tx_type").is_none());
     }
