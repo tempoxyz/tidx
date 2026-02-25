@@ -240,6 +240,10 @@ async fn initialize_chain(
     info!(chain = %chain.name, "Running migrations...");
     db::run_migrations(&throttled_pool.pool).await?;
 
+    // Seed in-memory watermarks and row counts from existing DB data
+    // so that status display is accurate immediately after restart.
+    seed_metrics_from_db(&throttled_pool.pool).await;
+
     // Store ClickHouse config for this chain (if enabled)
     if let Some(ref ch_config) = chain.clickhouse {
         let config = ChainClickHouseConfig {
@@ -349,4 +353,32 @@ fn spawn_sync_engine(
             error!(error = %e, chain = %chain.name, "Sync engine failed");
         }
     });
+}
+
+/// Seed in-memory watermarks and row counts from existing database data.
+/// Uses index-only scans for watermarks (instant) and pg_stat for approximate row counts.
+async fn seed_metrics_from_db(pool: &tidx::db::Pool) {
+    let Ok(conn) = pool.get().await else { return };
+
+    // Seed watermarks: MAX(block_num) per table (fast, index-only scans)
+    for (table, col) in [("blocks", "num"), ("txs", "block_num"), ("logs", "block_num"), ("receipts", "block_num")] {
+        let query = format!("SELECT MAX({col}) FROM {table}");
+        if let Ok(row) = conn.query_one(&query, &[]).await {
+            if let Some(max) = row.get::<_, Option<i64>>(0) {
+                tidx::metrics::update_sink_watermark("postgres", table, max);
+            }
+        }
+    }
+
+    // Seed approximate row counts from pg_stat (instant, no table scan)
+    let query = "SELECT relname, n_live_tup FROM pg_stat_user_tables WHERE relname IN ('blocks', 'txs', 'logs', 'receipts')";
+    if let Ok(rows) = conn.query(query, &[]).await {
+        for row in rows {
+            let table: String = row.get(0);
+            let count: i64 = row.get(1);
+            if count > 0 {
+                tidx::metrics::increment_sink_row_count("postgres", &table, count as u64);
+            }
+        }
+    }
 }
