@@ -6,26 +6,23 @@ use super::Pool;
 pub async fn run_migrations(pool: &Pool) -> Result<()> {
     let conn = pool.get().await?;
 
-    // Kill any stale connections that might be holding locks (e.g., from a previous crash mid-COPY)
-    // This prevents migrations from blocking indefinitely on lock acquisition
-    let terminated = conn
-        .execute(
+    // Kill ALL other connections to this database before running migrations.
+    // On container restart, any existing connections are stale (from the old process)
+    // and may hold locks that block DDL (e.g., COPY mid-flight blocks CREATE INDEX).
+    let terminated: Vec<_> = conn
+        .query(
             r#"
             SELECT pg_terminate_backend(pid)
             FROM pg_stat_activity
             WHERE pid != pg_backend_pid()
               AND datname = current_database()
-              AND state = 'active'
-              AND wait_event_type = 'Client'
-              AND wait_event = 'ClientRead'
-              AND query_start < NOW() - INTERVAL '30 seconds'
             "#,
             &[],
         )
         .await?;
 
-    if terminated > 0 {
-        warn!(terminated, "Terminated stale connections holding locks");
+    if !terminated.is_empty() {
+        warn!(count = terminated.len(), "Terminated stale connections before migrations");
     }
 
     info!("Running schema migrations");
