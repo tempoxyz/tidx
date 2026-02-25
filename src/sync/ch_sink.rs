@@ -232,6 +232,21 @@ impl ClickHouseSink {
             .map_err(|e| anyhow!("ClickHouse query failed: {e}"))
     }
 
+    /// Force merge all ReplacingMergeTree tables to deduplicate rows.
+    /// Should be called after backfill to collapse duplicates from overlapping
+    /// inserts between the backfill and the realtime sync.
+    pub async fn optimize_tables(&self) -> Result<()> {
+        for table in KNOWN_TABLES {
+            info!(table, database = %self.database, "Optimizing ClickHouse table (dedup)");
+            self.client
+                .query(&format!("OPTIMIZE TABLE {table} FINAL"))
+                .execute()
+                .await
+                .map_err(|e| anyhow!("Failed to optimize ClickHouse table {table}: {e}"))?;
+        }
+        Ok(())
+    }
+
     /// Delete all data from a given block number onwards (reorg support).
     pub async fn delete_from(&self, block_num: u64) -> Result<()> {
         let tables = ["logs", "receipts", "txs", "blocks"];

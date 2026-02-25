@@ -1,5 +1,5 @@
 use anyhow::Result;
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::db::Pool;
 use crate::types::{BlockRow, LogRow, ReceiptRow, TxRow};
@@ -177,6 +177,12 @@ impl SinkSet {
                 rate = format!("{rate:.0} blk/s"),
                 "ClickHouse backfill complete"
             );
+
+            // Force merge to deduplicate rows from overlapping backfill + realtime inserts.
+            // ReplacingMergeTree only deduplicates during merges, not at insert time.
+            if let Err(e) = ch.optimize_tables().await {
+                warn!(error = %e, "ClickHouse OPTIMIZE FINAL failed (duplicates will merge in background)");
+            }
         }
 
         Ok(())
