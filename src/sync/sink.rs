@@ -9,7 +9,7 @@ use super::writer;
 
 /// Number of blocks worth of data to fetch per query during backfill.
 /// Uses block-range pagination (no long-lived transactions).
-const BACKFILL_BLOCK_BATCH: i64 = 50_000;
+const BACKFILL_BLOCK_BATCH: i64 = 5_000;
 
 /// Fan-out writer that sends data to all configured sinks.
 ///
