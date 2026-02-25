@@ -25,6 +25,8 @@ concurrency = 8
 enabled = false
 url = "http://clickhouse:8123"
 # failover_urls = ["http://clickhouse-2:8123"]
+# user = "default"
+# password_env = "CH_PASSWORD"
 
 [[chains]]
 name = "mainnet"
@@ -40,3 +42,5 @@ concurrency = 8
 enabled = false
 url = "http://clickhouse:8123"
 # failover_urls = ["http://clickhouse-2:8123"]
+# user = "default"
+# password_env = "CH_PASSWORD"

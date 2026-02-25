@@ -7,7 +7,7 @@
 //! queries go to the primary instance and automatically fail over
 //! to secondary instances if the primary is unavailable.
 
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use tracing::{error, warn};
 
@@ -18,6 +18,8 @@ use crate::query::EventSignature;
 struct Instance {
     http_client: reqwest::Client,
     url: String,
+    user: Option<String>,
+    password: Option<String>,
 }
 
 /// ClickHouse engine for OLAP queries.
@@ -43,9 +45,14 @@ impl ClickHouseEngine {
             .clone()
             .unwrap_or_else(|| format!("tidx_{chain_id}"));
 
+        let password = config.resolved_password()?;
         let mut instances = Vec::new();
         for url in config.all_urls() {
-            instances.push(Self::make_instance(url)?);
+            instances.push(Self::make_instance(
+                url,
+                config.user.clone(),
+                password.clone(),
+            )?);
         }
 
         Ok(Self {
@@ -55,7 +62,11 @@ impl ClickHouseEngine {
         })
     }
 
-    fn make_instance(url: &str) -> Result<Instance> {
+    fn make_instance(
+        url: &str,
+        user: Option<String>,
+        password: Option<String>,
+    ) -> Result<Instance> {
         let http_client = reqwest::Client::builder()
             .pool_max_idle_per_host(4)
             .build()
@@ -63,6 +74,8 @@ impl ClickHouseEngine {
         Ok(Instance {
             http_client,
             url: url.to_string(),
+            user,
+            password,
         })
     }
 
@@ -76,11 +89,7 @@ impl ClickHouseEngine {
     /// instance (failover). Only connection-level errors trigger failover;
     /// ClickHouse query errors (syntax, missing table, etc.) are returned
     /// immediately.
-    pub async fn query(
-        &self,
-        sql: &str,
-        signatures: &[&str],
-    ) -> Result<QueryResult> {
+    pub async fn query(&self, sql: &str, signatures: &[&str]) -> Result<QueryResult> {
         let sql = if !signatures.is_empty() {
             let sigs: Vec<EventSignature> = signatures
                 .iter()
@@ -93,10 +102,7 @@ impl ClickHouseEngine {
                 sql = sig.rewrite_filters_for_pushdown(&sql);
             }
 
-            let ctes: Vec<String> = sigs
-                .iter()
-                .map(|sig| sig.to_cte_sql_clickhouse())
-                .collect();
+            let ctes: Vec<String> = sigs.iter().map(|sig| sig.to_cte_sql_clickhouse()).collect();
             format!("WITH {} {sql}", ctes.join(", "))
         } else {
             sql.to_string()
@@ -150,10 +156,14 @@ impl ClickHouseEngine {
             self.database
         );
 
-        let resp = inst
-            .http_client
-            .post(&url)
-            .body(sql.to_string())
+        let mut req = inst.http_client.post(&url).body(sql.to_string());
+        if let Some(ref user) = inst.user {
+            req = req.header("X-ClickHouse-User", user);
+        }
+        if let Some(ref password) = inst.password {
+            req = req.header("X-ClickHouse-Key", password);
+        }
+        let resp = req
             .send()
             .await
             .map_err(|e| anyhow!("ClickHouse HTTP request failed: {e}"))?;
@@ -198,9 +208,7 @@ impl ClickHouseEngine {
                     .map(|row| {
                         columns
                             .iter()
-                            .map(|col| {
-                                row.get(col).cloned().unwrap_or(serde_json::Value::Null)
-                            })
+                            .map(|col| row.get(col).cloned().unwrap_or(serde_json::Value::Null))
                             .collect()
                     })
                     .collect()
@@ -264,7 +272,8 @@ mod tests {
         let conn_err = anyhow!("ClickHouse HTTP request failed: connection refused");
         assert!(is_connection_error(&conn_err));
 
-        let query_err = anyhow!("ClickHouse query failed: Code: 60. DB::Exception: Table logs doesn't exist");
+        let query_err =
+            anyhow!("ClickHouse query failed: Code: 60. DB::Exception: Table logs doesn't exist");
         assert!(!is_connection_error(&query_err));
     }
 
@@ -275,6 +284,7 @@ mod tests {
             url: "http://clickhouse-1:8123".to_string(),
             failover_urls: vec![],
             database: None,
+            ..Default::default()
         };
 
         let engine = ClickHouseEngine::new(&config, 4217).unwrap();
@@ -289,6 +299,7 @@ mod tests {
             url: "http://clickhouse-1:8123".to_string(),
             failover_urls: vec!["http://clickhouse-2:8123".to_string()],
             database: None,
+            ..Default::default()
         };
 
         let engine = ClickHouseEngine::new(&config, 4217).unwrap();
@@ -303,6 +314,7 @@ mod tests {
             url: "http://clickhouse-1:8123".to_string(),
             failover_urls: vec![],
             database: Some("custom_db".to_string()),
+            ..Default::default()
         };
 
         let engine = ClickHouseEngine::new(&config, 4217).unwrap();
@@ -316,6 +328,7 @@ mod tests {
             url: "http://clickhouse-1:8123".to_string(),
             failover_urls: vec![],
             database: None,
+            ..Default::default()
         };
 
         let engine = ClickHouseEngine::new(&config, 4217).unwrap();

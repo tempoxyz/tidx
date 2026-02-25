@@ -214,6 +214,15 @@ pub struct ClickHouseConfig {
     /// Database name override (default: tidx_{chain_id})
     #[serde(default)]
     pub database: Option<String>,
+
+    /// ClickHouse username for HTTP basic auth.
+    #[serde(default)]
+    pub user: Option<String>,
+
+    /// Environment variable name containing the ClickHouse password.
+    /// When set, the password is read from this env var at startup.
+    #[serde(default)]
+    pub password_env: Option<String>,
 }
 
 impl ClickHouseConfig {
@@ -222,6 +231,21 @@ impl ClickHouseConfig {
         let mut urls = vec![self.url.as_str()];
         urls.extend(self.failover_urls.iter().map(|u| u.as_str()));
         urls
+    }
+
+    /// Resolve the ClickHouse password from the environment variable specified by `password_env`.
+    pub fn resolved_password(&self) -> Result<Option<String>> {
+        match &self.password_env {
+            Some(env_var) => {
+                let password = std::env::var(env_var).with_context(|| {
+                    format!(
+                        "clickhouse password_env '{env_var}' is set but environment variable not found"
+                    )
+                })?;
+                Ok(Some(password))
+            }
+            None => Ok(None),
+        }
     }
 }
 
@@ -232,6 +256,8 @@ impl Default for ClickHouseConfig {
             url: "http://clickhouse:8123".to_string(),
             failover_urls: Vec::new(),
             database: None,
+            user: None,
+            password_env: None,
         }
     }
 }
@@ -253,13 +279,13 @@ impl ChainConfig {
                 let password = std::env::var(env_var).with_context(|| {
                     format!("pg_password_env '{env_var}' is set but environment variable not found")
                 })?;
-                
+
                 let mut url = url::Url::parse(&self.pg_url)
                     .with_context(|| format!("Invalid pg_url: {}", self.pg_url))?;
-                
+
                 url.set_password(Some(&password))
                     .map_err(|()| anyhow::anyhow!("Failed to set password in pg_url"))?;
-                
+
                 Ok(url.to_string())
             }
             None => Ok(self.pg_url.clone()),
@@ -273,7 +299,9 @@ impl ChainConfig {
         match &self.api_pg_password_env {
             Some(pass_env) => {
                 let password = std::env::var(pass_env).with_context(|| {
-                    format!("api_pg_password_env '{pass_env}' is set but environment variable not found")
+                    format!(
+                        "api_pg_password_env '{pass_env}' is set but environment variable not found"
+                    )
                 })?;
 
                 let base_url = self.resolved_pg_url()?;
@@ -328,9 +356,9 @@ mod tests {
             rpc_url = "http://localhost:8545"
             pg_url = "postgres://localhost/test"
         "#;
-        
+
         let config: ChainConfig = toml::from_str(toml_str).unwrap();
-        
+
         assert!(config.backfill);
         assert_eq!(config.batch_size, 100);
         assert_eq!(config.concurrency, 4);
@@ -359,9 +387,9 @@ mod tests {
             rpc_url = "http://localhost:8546"
             pg_url = "postgres://localhost/chain2"
         "#;
-        
+
         let config: Config = toml::from_str(toml_str).unwrap();
-        
+
         assert_eq!(config.chains.len(), 2);
     }
 
@@ -440,8 +468,11 @@ mod tests {
             api_pg_password_env: None,
             clickhouse: None,
         };
-        
-        assert_eq!(config.resolved_pg_url().unwrap(), "postgres://user:pass@localhost/db");
+
+        assert_eq!(
+            config.resolved_pg_url().unwrap(),
+            "postgres://user:pass@localhost/db"
+        );
     }
 
     #[test]
@@ -461,7 +492,7 @@ mod tests {
             api_pg_password_env: None,
             clickhouse: None,
         };
-        
+
         let resolved = config.resolved_pg_url().unwrap();
         assert!(resolved.starts_with("postgres://user:"));
         assert!(resolved.ends_with("@localhost/db"));
@@ -484,7 +515,7 @@ mod tests {
             api_pg_password_env: None,
             clickhouse: None,
         };
-        
+
         assert!(config.resolved_pg_url().is_err());
     }
 }

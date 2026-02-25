@@ -3,7 +3,7 @@
 //! Writes blocks, transactions, logs, and receipts directly to ClickHouse
 //! via the official `clickhouse` crate using RowBinary format with LZ4 compression.
 
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use clickhouse::Row;
 use serde::Serialize;
 use std::time::{Duration, Instant};
@@ -44,7 +44,14 @@ impl ClickHouseSink {
     ///
     /// The database name is validated to prevent SQL injection in DDL statements
     /// that interpolate it (e.g., `CREATE DATABASE IF NOT EXISTS {database}`).
-    pub fn new(url: &str, database: &str) -> Result<Self> {
+    ///
+    /// Optional `user` and `password` enable HTTP basic auth for secured instances.
+    pub fn new(
+        url: &str,
+        database: &str,
+        user: Option<&str>,
+        password: Option<&str>,
+    ) -> Result<Self> {
         if !is_valid_identifier(database) {
             return Err(anyhow!(
                 "Invalid ClickHouse database name '{database}': must be alphanumeric/underscore, \
@@ -53,7 +60,13 @@ impl ClickHouseSink {
         }
 
         let url = url.trim_end_matches('/');
-        let base_client = clickhouse::Client::default().with_url(url);
+        let mut base_client = clickhouse::Client::default().with_url(url);
+        if let Some(user) = user {
+            base_client = base_client.with_user(user);
+        }
+        if let Some(password) = password {
+            base_client = base_client.with_password(password);
+        }
         let client = base_client.clone().with_database(database);
 
         Ok(Self {
@@ -66,10 +79,7 @@ impl ClickHouseSink {
     /// Create database and tables if they don't exist.
     pub async fn ensure_schema(&self) -> Result<()> {
         self.base_client
-            .query(&format!(
-                "CREATE DATABASE IF NOT EXISTS {}",
-                self.database
-            ))
+            .query(&format!("CREATE DATABASE IF NOT EXISTS {}", self.database))
             .execute()
             .await
             .map_err(|e| anyhow!("Failed to create ClickHouse database: {e}"))?;
@@ -80,9 +90,11 @@ impl ClickHouseSink {
             ("logs", LOGS_SCHEMA),
             ("receipts", RECEIPTS_SCHEMA),
         ] {
-            self.client.query(ddl).execute().await.map_err(|e| {
-                anyhow!("Failed to create ClickHouse table {name}: {e}")
-            })?;
+            self.client
+                .query(ddl)
+                .execute()
+                .await
+                .map_err(|e| anyhow!("Failed to create ClickHouse table {name}: {e}"))?;
             debug!(table = name, database = %self.database, "ClickHouse table ready");
         }
 
@@ -103,7 +115,8 @@ impl ClickHouseSink {
             return Ok(());
         }
         let start = Instant::now();
-        self.insert_chunked("blocks", blocks, ChBlockWire::from_row).await?;
+        self.insert_chunked("blocks", blocks, ChBlockWire::from_row)
+            .await?;
         metrics::record_sink_write_duration(self.name(), "blocks", start.elapsed());
         metrics::record_sink_write_rows(self.name(), "blocks", blocks.len() as u64);
         metrics::update_sink_block_rate(self.name(), blocks.len() as u64);
@@ -134,7 +147,8 @@ impl ClickHouseSink {
             return Ok(());
         }
         let start = Instant::now();
-        self.insert_chunked("logs", logs, ChLogWire::from_row).await?;
+        self.insert_chunked("logs", logs, ChLogWire::from_row)
+            .await?;
         metrics::record_sink_write_duration(self.name(), "logs", start.elapsed());
         metrics::record_sink_write_rows(self.name(), "logs", logs.len() as u64);
         metrics::increment_sink_row_count(self.name(), "logs", logs.len() as u64);
@@ -149,7 +163,8 @@ impl ClickHouseSink {
             return Ok(());
         }
         let start = Instant::now();
-        self.insert_chunked("receipts", receipts, ChReceiptWire::from_row).await?;
+        self.insert_chunked("receipts", receipts, ChReceiptWire::from_row)
+            .await?;
         metrics::record_sink_write_duration(self.name(), "receipts", start.elapsed());
         metrics::record_sink_write_rows(self.name(), "receipts", receipts.len() as u64);
         metrics::increment_sink_row_count(self.name(), "receipts", receipts.len() as u64);
@@ -184,7 +199,11 @@ impl ClickHouseSink {
     /// Returns None if the table is empty.
     pub async fn max_block_in_table(&self, table: &str) -> Result<Option<i64>> {
         let table = validate_table_name(table)?;
-        let col = if table == "blocks" { "num" } else { "block_num" };
+        let col = if table == "blocks" {
+            "num"
+        } else {
+            "block_num"
+        };
         let count: u64 = self
             .client
             .query(&format!("SELECT count() FROM {table}"))
@@ -488,9 +507,7 @@ fn is_valid_identifier(name: &str) -> bool {
             .chars()
             .next()
             .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
-        && name
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '_')
+        && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
 #[cfg(test)]
@@ -561,9 +578,17 @@ mod tests {
 
     #[test]
     fn test_new_rejects_bad_database_name() {
-        assert!(ClickHouseSink::new("http://localhost:8123", "tidx_4217").is_ok());
-        assert!(ClickHouseSink::new("http://localhost:8123", "foo; DROP TABLE blocks").is_err());
-        assert!(ClickHouseSink::new("http://localhost:8123", "123bad").is_err());
-        assert!(ClickHouseSink::new("http://localhost:8123", "").is_err());
+        assert!(ClickHouseSink::new("http://localhost:8123", "tidx_4217", None, None).is_ok());
+        assert!(
+            ClickHouseSink::new(
+                "http://localhost:8123",
+                "foo; DROP TABLE blocks",
+                None,
+                None
+            )
+            .is_err()
+        );
+        assert!(ClickHouseSink::new("http://localhost:8123", "123bad", None, None).is_err());
+        assert!(ClickHouseSink::new("http://localhost:8123", "", None, None).is_err());
     }
 }

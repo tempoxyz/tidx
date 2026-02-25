@@ -119,7 +119,10 @@ fn print_http_status(resp: &serde_json::Value) -> Result<()> {
         println!("┌─ {} (chain_id: {}) ─────────────────────", name, chain_id);
         println!("│");
         if head_num > 0 {
-            println!("│  Head:          {} (live)", format_number(head_num as u64));
+            println!(
+                "│  Head:          {} (live)",
+                format_number(head_num as u64)
+            );
         }
         println!("│  Lag:           {} blocks", lag);
 
@@ -176,7 +179,10 @@ async fn print_status(config: &Config) -> Result<()> {
         let rpc = RpcClient::new(&chain.rpc_url);
         let live_head = rpc.latest_block_number().await.ok();
 
-        println!("┌─ {} (chain_id: {}) ─────────────────────", chain.name, chain.chain_id);
+        println!(
+            "┌─ {} (chain_id: {}) ─────────────────────",
+            chain.name, chain.chain_id
+        );
         println!("│");
 
         // Connect to this chain's database
@@ -204,7 +210,11 @@ async fn print_status(config: &Config) -> Result<()> {
         let head = if let Some(state) = load_sync_state(&pool, chain.chain_id).await? {
             let head = live_head.unwrap_or(state.head_num);
             let lag = head.saturating_sub(state.tip_num);
-            println!("│  Head:          {} {}", format_number(head as u64), if live_head.is_some() { "(live)" } else { "" });
+            println!(
+                "│  Head:          {} {}",
+                format_number(head as u64),
+                if live_head.is_some() { "(live)" } else { "" }
+            );
             println!("│  Lag:           {} blocks", lag);
             head
         } else {
@@ -255,7 +265,10 @@ async fn print_json_status(config: &Config) -> Result<()> {
             Err(_) => (None, vec![]),
         };
 
-        let gaps_json: Vec<_> = gaps.iter().map(|(s, e)| serde_json::json!({"start": s, "end": e, "size": e - s + 1})).collect();
+        let gaps_json: Vec<_> = gaps
+            .iter()
+            .map(|(s, e)| serde_json::json!({"start": s, "end": e, "size": e - s + 1}))
+            .collect();
         let total_gap_blocks: u64 = gaps.iter().map(|(s, e)| e - s + 1).sum();
 
         let mut chain_status = serde_json::json!({
@@ -283,7 +296,13 @@ async fn print_json_status(config: &Config) -> Result<()> {
                     .database
                     .clone()
                     .unwrap_or_else(|| format!("tidx_{}", chain.chain_id));
-                if let Ok(sink) = ClickHouseSink::new(&ch_config.url, &database) {
+                let ch_password = ch_config.resolved_password().ok().flatten();
+                if let Ok(sink) = ClickHouseSink::new(
+                    &ch_config.url,
+                    &database,
+                    ch_config.user.as_deref(),
+                    ch_password.as_deref(),
+                ) {
                     let blocks = sink.max_block_in_table("blocks").await.ok().flatten();
                     let txs = sink.max_block_in_table("txs").await.ok().flatten();
                     let logs = sink.max_block_in_table("logs").await.ok().flatten();
@@ -314,17 +333,20 @@ fn print_store_status_from_watermarks(label: &str, sink_name: &str, head: i64) {
     } else {
         println!("│  {label}");
     }
-    let (_, txs_count, logs_count, receipts_count) =
-        tidx::metrics::get_sink_row_counts(sink_name);
+    let (_, txs_count, logs_count, receipts_count) = tidx::metrics::get_sink_row_counts(sink_name);
 
     // blocks: show watermark / head progress
     let blocks_wm = tidx::metrics::get_sink_watermark(sink_name, "blocks");
     print_table_row("├", "blocks", blocks_wm, head);
 
     // txs, logs, receipts: show row counts
-    for (i, (table, count)) in [("txs", txs_count), ("logs", logs_count), ("receipts", receipts_count)]
-        .iter()
-        .enumerate()
+    for (i, (table, count)) in [
+        ("txs", txs_count),
+        ("logs", logs_count),
+        ("receipts", receipts_count),
+    ]
+    .iter()
+    .enumerate()
     {
         let prefix = if i == 2 { "└" } else { "├" };
         if *count > 0 {
@@ -347,7 +369,12 @@ fn print_store_rows(store: &serde_json::Value, head: i64, gap_count: usize) {
             String::new()
         };
         if pct >= 100 {
-            println!("│  ├─ {:<10} {} ✓{}", "blocks", format_number(blocks_count), gap_suffix);
+            println!(
+                "│  ├─ {:<10} {} ✓{}",
+                "blocks",
+                format_number(blocks_count),
+                gap_suffix
+            );
         } else {
             println!(
                 "│  ├─ {:<10} {} / {} ({pct}%){}",
@@ -430,7 +457,3 @@ fn format_number(n: u64) -> String {
     }
     result.chars().rev().collect()
 }
-
-
-
-

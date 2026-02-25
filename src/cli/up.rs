@@ -289,30 +289,50 @@ fn spawn_sync_engine(
                     .clone()
                     .unwrap_or_else(|| format!("tidx_{}", chain.chain_id));
 
-                match ClickHouseSink::new(&ch_config.url, &database) {
-                    Ok(ch_sink) => {
-                        if let Err(e) = ch_sink.ensure_schema().await {
-                            error!(
-                                error = %e,
-                                chain = %chain.name,
-                                "Failed to initialize ClickHouse schema (continuing without CH sink)"
-                            );
-                        } else {
-                            info!(
-                                chain = %chain.name,
-                                database = %database,
-                                "ClickHouse direct-write sink enabled"
-                            );
-                            seed_metrics_from_clickhouse(&ch_sink).await;
-                            sinks = sinks.with_clickhouse(ch_sink);
-                        }
-                    }
+                let ch_password = match ch_config.resolved_password() {
+                    Ok(p) => p,
                     Err(e) => {
                         error!(
                             error = %e,
                             chain = %chain.name,
-                            "Failed to create ClickHouse sink (continuing without CH)"
+                            "Failed to resolve ClickHouse password (continuing without CH)"
                         );
+                        None
+                    }
+                };
+                if ch_password.is_none() && ch_config.password_env.is_some() {
+                    // password_env was set but resolution failed — skip CH
+                } else {
+                    match ClickHouseSink::new(
+                        &ch_config.url,
+                        &database,
+                        ch_config.user.as_deref(),
+                        ch_password.as_deref(),
+                    ) {
+                        Ok(ch_sink) => {
+                            if let Err(e) = ch_sink.ensure_schema().await {
+                                error!(
+                                    error = %e,
+                                    chain = %chain.name,
+                                    "Failed to initialize ClickHouse schema (continuing without CH sink)"
+                                );
+                            } else {
+                                info!(
+                                    chain = %chain.name,
+                                    database = %database,
+                                    "ClickHouse direct-write sink enabled"
+                                );
+                                seed_metrics_from_clickhouse(&ch_sink).await;
+                                sinks = sinks.with_clickhouse(ch_sink);
+                            }
+                        }
+                        Err(e) => {
+                            error!(
+                                error = %e,
+                                chain = %chain.name,
+                                "Failed to create ClickHouse sink (continuing without CH)"
+                            );
+                        }
                     }
                 }
             }
@@ -337,12 +357,14 @@ fn spawn_sync_engine(
         // Create sync engine with throttled pool and configured sinks (retry on transient RPC failures)
         let mut engine = loop {
             match SyncEngine::new(throttled_pool.clone(), sinks.clone(), &chain.rpc_url).await {
-                Ok(e) => break e
-                    .with_broadcaster(broadcaster)
-                    .with_batch_size(chain.batch_size)
-                    .with_concurrency(chain.concurrency)
-                    .with_backfill_first(backfill_first)
-                    .with_trust_rpc(trust_rpc),
+                Ok(e) => {
+                    break e
+                        .with_broadcaster(broadcaster)
+                        .with_batch_size(chain.batch_size)
+                        .with_concurrency(chain.concurrency)
+                        .with_backfill_first(backfill_first)
+                        .with_trust_rpc(trust_rpc);
+                }
                 Err(e) => {
                     warn!(error = %e, chain = %chain.name, "Failed to create sync engine, retrying in 10s");
                     tokio::time::sleep(std::time::Duration::from_secs(10)).await;
@@ -376,7 +398,12 @@ async fn seed_metrics_from_db(pool: &tidx::db::Pool) {
     let Ok(conn) = pool.get().await else { return };
 
     // Seed watermarks: MAX(block_num) per table (fast, index-only scans)
-    for (table, col) in [("blocks", "num"), ("txs", "block_num"), ("logs", "block_num"), ("receipts", "block_num")] {
+    for (table, col) in [
+        ("blocks", "num"),
+        ("txs", "block_num"),
+        ("logs", "block_num"),
+        ("receipts", "block_num"),
+    ] {
         let query = format!("SELECT MAX({col}) FROM {table}");
         if let Ok(row) = conn.query_one(&query, &[]).await {
             if let Some(max) = row.get::<_, Option<i64>>(0) {
