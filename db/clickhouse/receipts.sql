@@ -11,6 +11,6 @@ CREATE TABLE IF NOT EXISTS receipts (
     effective_gas_price     Nullable(String),
     status                  Nullable(Int16),
     fee_payer               Nullable(String)
-) ENGINE = MergeTree()
+) ENGINE = ReplacingMergeTree()
 PARTITION BY toYYYYMM(block_timestamp)
 ORDER BY (block_num, tx_idx)

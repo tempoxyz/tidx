@@ -21,6 +21,6 @@ CREATE TABLE IF NOT EXISTS txs (
     valid_before            Nullable(Int64),
     valid_after             Nullable(Int64),
     signature_type          Nullable(Int16)
-) ENGINE = MergeTree()
+) ENGINE = ReplacingMergeTree()
 PARTITION BY toYYYYMM(block_timestamp)
 ORDER BY (block_num, idx)

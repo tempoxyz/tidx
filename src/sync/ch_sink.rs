@@ -24,6 +24,12 @@ const CH_INSERT_CHUNK_SIZE: usize = 2_000;
 /// Max retry attempts for transient ClickHouse write failures.
 const CH_MAX_RETRIES: u32 = 3;
 
+/// Timeout for sending each chunk of row data to ClickHouse.
+const CH_SEND_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Timeout for waiting for ClickHouse to acknowledge the INSERT.
+const CH_END_TIMEOUT: Duration = Duration::from_secs(120);
+
 /// Direct-write ClickHouse sink using RowBinary format with LZ4 compression.
 #[derive(Clone)]
 pub struct ClickHouseSink {
@@ -87,8 +93,7 @@ impl ClickHouseSink {
             return Ok(());
         }
         let start = Instant::now();
-        let wire: Vec<ChBlockWire> = blocks.iter().map(ChBlockWire::from_row).collect();
-        self.insert_rows("blocks", &wire).await?;
+        self.insert_chunked("blocks", blocks, ChBlockWire::from_row).await?;
         metrics::record_sink_write_duration(self.name(), "blocks", start.elapsed());
         metrics::record_sink_write_rows(self.name(), "blocks", blocks.len() as u64);
         metrics::update_sink_block_rate(self.name(), blocks.len() as u64);
@@ -104,8 +109,7 @@ impl ClickHouseSink {
             return Ok(());
         }
         let start = Instant::now();
-        let wire: Vec<ChTxWire> = txs.iter().map(ChTxWire::from_row).collect();
-        self.insert_rows("txs", &wire).await?;
+        self.insert_chunked("txs", txs, ChTxWire::from_row).await?;
         metrics::record_sink_write_duration(self.name(), "txs", start.elapsed());
         metrics::record_sink_write_rows(self.name(), "txs", txs.len() as u64);
         metrics::increment_sink_row_count(self.name(), "txs", txs.len() as u64);
@@ -120,8 +124,7 @@ impl ClickHouseSink {
             return Ok(());
         }
         let start = Instant::now();
-        let wire: Vec<ChLogWire> = logs.iter().map(ChLogWire::from_row).collect();
-        self.insert_rows("logs", &wire).await?;
+        self.insert_chunked("logs", logs, ChLogWire::from_row).await?;
         metrics::record_sink_write_duration(self.name(), "logs", start.elapsed());
         metrics::record_sink_write_rows(self.name(), "logs", logs.len() as u64);
         metrics::increment_sink_row_count(self.name(), "logs", logs.len() as u64);
@@ -136,8 +139,7 @@ impl ClickHouseSink {
             return Ok(());
         }
         let start = Instant::now();
-        let wire: Vec<ChReceiptWire> = receipts.iter().map(ChReceiptWire::from_row).collect();
-        self.insert_rows("receipts", &wire).await?;
+        self.insert_chunked("receipts", receipts, ChReceiptWire::from_row).await?;
         metrics::record_sink_write_duration(self.name(), "receipts", start.elapsed());
         metrics::record_sink_write_rows(self.name(), "receipts", receipts.len() as u64);
         metrics::increment_sink_row_count(self.name(), "receipts", receipts.len() as u64);
@@ -226,12 +228,16 @@ impl ClickHouseSink {
         Ok(())
     }
 
-    /// Insert rows in chunks with retry logic.
-    async fn insert_rows<T>(&self, table: &str, rows: &[T]) -> Result<()>
+    /// Chunk source rows, convert each chunk to wire format, and insert with retry logic.
+    /// This avoids allocating the full wire-format vec upfront, bounding peak memory
+    /// to `CH_INSERT_CHUNK_SIZE` wire structs at a time.
+    async fn insert_chunked<S, W, F>(&self, table: &str, rows: &[S], convert: F) -> Result<()>
     where
-        T: Serialize + for<'a> Row<Value<'a> = T>,
+        W: Serialize + for<'a> Row<Value<'a> = W>,
+        F: Fn(&S) -> W,
     {
         for chunk in rows.chunks(CH_INSERT_CHUNK_SIZE) {
+            let wire: Vec<W> = chunk.iter().map(&convert).collect();
             let mut last_error = None;
             for attempt in 0..CH_MAX_RETRIES {
                 if attempt > 0 {
@@ -239,7 +245,7 @@ impl ClickHouseSink {
                     warn!(table, attempt, "ClickHouse insert retry after {backoff:?}");
                     tokio::time::sleep(backoff).await;
                 }
-                match self.try_insert(table, chunk).await {
+                match self.try_insert(table, &wire).await {
                     Ok(()) => {
                         last_error = None;
                         break;
@@ -262,7 +268,11 @@ impl ClickHouseSink {
     where
         T: Serialize + for<'a> Row<Value<'a> = T>,
     {
-        let mut insert = self.client.insert::<T>(table).await?;
+        let mut insert = self
+            .client
+            .insert::<T>(table)
+            .await?
+            .with_timeouts(Some(CH_SEND_TIMEOUT), Some(CH_END_TIMEOUT));
         for row in rows {
             insert.write(row).await?;
         }

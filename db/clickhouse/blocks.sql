@@ -8,6 +8,6 @@ CREATE TABLE IF NOT EXISTS blocks (
     gas_used        Int64,
     miner           String,
     extra_data      Nullable(String)
-) ENGINE = MergeTree()
+) ENGINE = ReplacingMergeTree()
 PARTITION BY toYYYYMM(timestamp)
 ORDER BY (num)
