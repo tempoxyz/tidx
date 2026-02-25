@@ -116,7 +116,11 @@ fn print_http_status(resp: &serde_json::Value) -> Result<()> {
         // PostgreSQL per-table status
         if let Some(pg) = chain.get("postgres") {
             println!("│");
-            println!("│  PostgreSQL");
+            if let Some(rate) = pg["rate"].as_f64() {
+                println!("│  PostgreSQL ({:.0} blk/s)", rate);
+            } else {
+                println!("│  PostgreSQL");
+            }
             for (i, table) in ["blocks", "txs", "logs", "receipts"].iter().enumerate() {
                 let prefix = if i == 3 { "└" } else { "├" };
                 print_table_row(prefix, table, pg[*table].as_i64(), head_num);
@@ -126,7 +130,11 @@ fn print_http_status(resp: &serde_json::Value) -> Result<()> {
         // ClickHouse per-table status
         if let Some(ch) = chain.get("clickhouse") {
             println!("│");
-            println!("│  ClickHouse");
+            if let Some(rate) = ch["rate"].as_f64() {
+                println!("│  ClickHouse ({:.0} blk/s)", rate);
+            } else {
+                println!("│  ClickHouse");
+            }
             for (i, table) in ["blocks", "txs", "logs", "receipts"].iter().enumerate() {
                 let prefix = if i == 3 { "└" } else { "├" };
                 print_table_row(prefix, table, ch[*table].as_i64(), head_num);
@@ -192,7 +200,7 @@ async fn print_status(config: &Config) -> Result<()> {
 
         // PostgreSQL per-table status
         println!("│");
-        print_store_status("PostgreSQL", &pool, head as i64, &["blocks", "txs", "logs", "receipts"]).await;
+        print_store_status("PostgreSQL", &pool, head as i64, &["blocks", "txs", "logs", "receipts"], "postgres").await;
 
         // ClickHouse per-table status
         if let Some(ref ch_config) = chain.clickhouse {
@@ -293,8 +301,13 @@ async fn print_json_status(config: &Config) -> Result<()> {
 }
 
 /// Print per-table status for PostgreSQL.
-async fn print_store_status(label: &str, pool: &tidx::db::Pool, head: i64, tables: &[&str]) {
-    println!("│  {label}");
+async fn print_store_status(label: &str, pool: &tidx::db::Pool, head: i64, tables: &[&str], sink_name: &str) {
+    let rate = tidx::metrics::get_sink_block_rate(sink_name);
+    if let Some(r) = rate {
+        println!("│  {label} ({:.0} blk/s)", r);
+    } else {
+        println!("│  {label}");
+    }
     let conn = pool.get().await.ok();
     for (i, table) in tables.iter().enumerate() {
         let prefix = if i == tables.len() - 1 { "└" } else { "├" };
@@ -313,7 +326,12 @@ async fn print_store_status(label: &str, pool: &tidx::db::Pool, head: i64, table
 
 /// Print per-table status for ClickHouse.
 async fn print_ch_store_status(label: &str, sink: &ClickHouseSink, head: i64) {
-    println!("│  {label}");
+    let rate = tidx::metrics::get_sink_block_rate("clickhouse");
+    if let Some(r) = rate {
+        println!("│  {label} ({:.0} blk/s)", r);
+    } else {
+        println!("│  {label}");
+    }
     let tables = ["blocks", "txs", "logs", "receipts"];
     for (i, table) in tables.iter().enumerate() {
         let prefix = if i == tables.len() - 1 { "└" } else { "├" };

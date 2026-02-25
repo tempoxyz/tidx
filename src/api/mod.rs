@@ -236,6 +236,7 @@ async fn handle_status(State(state): State<AppState>) -> Result<Json<StatusRespo
                 let pg_receipts = conn.query_one("SELECT MAX(block_num) FROM receipts", &[]).await.ok().and_then(|r| r.get(0));
                 chain.postgres = Some(crate::service::StoreStatus {
                     blocks: pg_blocks, txs: pg_txs, logs: pg_logs, receipts: pg_receipts,
+                    rate: crate::metrics::get_sink_block_rate("postgres"),
                 });
             }
         }
@@ -251,7 +252,10 @@ async fn handle_status(State(state): State<AppState>) -> Result<Json<StatusRespo
                     let logs = sink.max_block_in_table("logs").await.ok().flatten();
                     let receipts = sink.max_block_in_table("receipts").await.ok().flatten();
                     chain.clickhouse =
-                        Some(crate::service::StoreStatus { blocks, txs, logs, receipts });
+                        Some(crate::service::StoreStatus {
+                            blocks, txs, logs, receipts,
+                            rate: crate::metrics::get_sink_block_rate("clickhouse"),
+                        });
                 }
             }
         }

@@ -38,6 +38,9 @@ pub struct StoreStatus {
     pub txs: Option<i64>,
     pub logs: Option<i64>,
     pub receipts: Option<i64>,
+    /// Write rate in blocks/sec (from rolling window)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rate: Option<f64>,
 }
 
 pub async fn get_all_status(pool: &Pool) -> Result<Vec<SyncStatus>> {

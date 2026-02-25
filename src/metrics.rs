@@ -193,6 +193,48 @@ pub fn record_clickhouse_rows(count: u64) {
     histogram!("tidx_clickhouse_query_rows").record(count as f64);
 }
 
+// ── Per-sink rolling write rate tracker ───────────────────────────────────
+
+use std::sync::OnceLock;
+
+struct RateWindow {
+    last_reset: Instant,
+    rows_since_reset: u64,
+    current_rate: f64,
+}
+
+static SINK_RATES: OnceLock<std::sync::Mutex<std::collections::HashMap<String, RateWindow>>> =
+    OnceLock::new();
+
+/// Record that `count` blocks were written to `sink` (e.g., "postgres", "clickhouse").
+pub fn update_sink_block_rate(sink: &str, count: u64) {
+    let rates = SINK_RATES.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+    let mut map = rates.lock().unwrap();
+    let entry = map
+        .entry(sink.to_string())
+        .or_insert_with(|| RateWindow {
+            last_reset: Instant::now(),
+            rows_since_reset: 0,
+            current_rate: 0.0,
+        });
+    entry.rows_since_reset += count;
+    let elapsed = entry.last_reset.elapsed();
+    if elapsed.as_secs() >= 3 {
+        entry.current_rate = entry.rows_since_reset as f64 / elapsed.as_secs_f64();
+        entry.rows_since_reset = 0;
+        entry.last_reset = Instant::now();
+    }
+}
+
+/// Get the current write rate (blocks/sec) for a sink, or None if not yet measured.
+pub fn get_sink_block_rate(sink: &str) -> Option<f64> {
+    let rates = SINK_RATES.get()?;
+    let map = rates.lock().unwrap();
+    map.get(sink)
+        .map(|w| w.current_rate)
+        .filter(|r| *r > 0.0)
+}
+
 fn format_eta(secs: f64) -> String {
     if secs <= 0.0 || secs.is_nan() || secs.is_infinite() {
         return "unknown".to_string();

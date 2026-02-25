@@ -1,10 +1,12 @@
 use anyhow::Result;
 use std::fmt::Write;
 use std::pin::Pin;
+use std::time::Instant;
 use tokio_postgres::binary_copy::BinaryCopyInWriter;
 use tokio_postgres::types::Type;
 
 use crate::db::Pool;
+use crate::metrics;
 use crate::types::{BlockRow, LogRow, ReceiptRow, SyncState, TxRow};
 
 pub async fn write_block(pool: &Pool, block: &BlockRow) -> Result<()> {
@@ -17,6 +19,7 @@ pub async fn write_blocks(pool: &Pool, blocks: &[BlockRow]) -> Result<()> {
         return Ok(());
     }
 
+    let start = Instant::now();
     let conn = pool.get().await?;
 
     // Build multi-row VALUES clause
@@ -58,6 +61,10 @@ pub async fn write_blocks(pool: &Pool, blocks: &[BlockRow]) -> Result<()> {
 
     conn.execute(&query, &param_values).await?;
 
+    metrics::record_sink_write_duration("postgres", "blocks", start.elapsed());
+    metrics::record_sink_write_rows("postgres", "blocks", blocks.len() as u64);
+    metrics::update_sink_block_rate("postgres", blocks.len() as u64);
+
     Ok(())
 }
 
@@ -67,6 +74,7 @@ pub async fn write_txs(pool: &Pool, txs: &[TxRow]) -> Result<()> {
         return Ok(());
     }
 
+    let start = Instant::now();
     let conn = pool.get().await?;
     conn.execute("SET statement_timeout = 0", &[]).await?;
 
@@ -148,6 +156,9 @@ pub async fn write_txs(pool: &Pool, txs: &[TxRow]) -> Result<()> {
 
     pinned_writer.as_mut().finish().await?;
 
+    metrics::record_sink_write_duration("postgres", "txs", start.elapsed());
+    metrics::record_sink_write_rows("postgres", "txs", txs.len() as u64);
+
     Ok(())
 }
 
@@ -157,6 +168,7 @@ pub async fn write_logs(pool: &Pool, logs: &[LogRow]) -> Result<()> {
         return Ok(());
     }
 
+    let start = Instant::now();
     let conn = pool.get().await?;
     conn.execute("SET statement_timeout = 0", &[]).await?;
 
@@ -215,6 +227,9 @@ pub async fn write_logs(pool: &Pool, logs: &[LogRow]) -> Result<()> {
 
     pinned_writer.as_mut().finish().await?;
 
+    metrics::record_sink_write_duration("postgres", "logs", start.elapsed());
+    metrics::record_sink_write_rows("postgres", "logs", logs.len() as u64);
+
     Ok(())
 }
 
@@ -224,6 +239,7 @@ pub async fn write_receipts(pool: &Pool, receipts: &[ReceiptRow]) -> Result<()> 
         return Ok(());
     }
 
+    let start = Instant::now();
     let conn = pool.get().await?;
     conn.execute("SET statement_timeout = 0", &[]).await?;
 
@@ -283,6 +299,9 @@ pub async fn write_receipts(pool: &Pool, receipts: &[ReceiptRow]) -> Result<()> 
     }
 
     pinned_writer.as_mut().finish().await?;
+
+    metrics::record_sink_write_duration("postgres", "receipts", start.elapsed());
+    metrics::record_sink_write_rows("postgres", "receipts", receipts.len() as u64);
 
     Ok(())
 }

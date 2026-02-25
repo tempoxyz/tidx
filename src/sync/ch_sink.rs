@@ -83,6 +83,7 @@ impl ClickHouseSink {
         self.write_chunked("blocks", blocks, ChBlockWire::from_row).await?;
         metrics::record_sink_write_duration(self.name(), "blocks", start.elapsed());
         metrics::record_sink_write_rows(self.name(), "blocks", blocks.len() as u64);
+        metrics::update_sink_block_rate(self.name(), blocks.len() as u64);
         Ok(())
     }
 
