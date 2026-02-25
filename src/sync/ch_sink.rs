@@ -19,7 +19,7 @@ const LOGS_SCHEMA: &str = include_str!("../../db/clickhouse/logs.sql");
 const RECEIPTS_SCHEMA: &str = include_str!("../../db/clickhouse/receipts.sql");
 
 /// Max rows per ClickHouse INSERT to avoid unbounded memory growth during backfills.
-const CH_INSERT_CHUNK_SIZE: usize = 2_000;
+const CH_INSERT_CHUNK_SIZE: usize = 10_000;
 
 /// Max retry attempts for transient ClickHouse write failures.
 const CH_MAX_RETRIES: u32 = 3;

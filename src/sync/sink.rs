@@ -9,7 +9,7 @@ use super::writer;
 
 /// Number of blocks worth of data to fetch per query during backfill.
 /// Uses block-range pagination (no long-lived transactions).
-const BACKFILL_BLOCK_BATCH: i64 = 5_000;
+const BACKFILL_BLOCK_BATCH: i64 = 50_000;
 
 /// Fan-out writer that sends data to all configured sinks.
 ///
@@ -113,47 +113,64 @@ impl SinkSet {
         }
 
         let total = pg_max - from_block + 1;
-        info!(from_block, pg_max, total_blocks = total, "Starting ClickHouse backfill");
+        info!(chain_id, from_block, pg_max, total_blocks = total, "Starting ClickHouse backfill");
 
         let start = std::time::Instant::now();
         let mut blocks_written: i64 = 0;
         let mut current = from_block;
 
-        while current <= pg_max {
+        // Pre-fetch the first batch so we can pipeline fetch(N+1) with write(N)
+        let mut pending = {
             let batch_end = (current + BACKFILL_BLOCK_BATCH - 1).min(pg_max);
-
-            // Short-lived connection per batch — no long transactions
             let conn = self.pool.get().await?;
+            let data = tokio::try_join!(
+                fetch_blocks(&conn, current, batch_end),
+                fetch_txs(&conn, current, batch_end),
+                fetch_logs(&conn, current, batch_end),
+                fetch_receipts(&conn, current, batch_end),
+            )?;
+            current = batch_end + 1;
+            Some((batch_end, data))
+        };
 
-            let blocks = fetch_blocks(&conn, current, batch_end).await?;
-            let txs = fetch_txs(&conn, current, batch_end).await?;
-            let logs = fetch_logs(&conn, current, batch_end).await?;
-            let receipts = fetch_receipts(&conn, current, batch_end).await?;
-            drop(conn); // release connection immediately
-
+        while let Some((batch_end, (blocks, txs, logs, receipts))) = pending.take() {
             let block_count = blocks.len() as i64;
 
-            // Write all tables for this range
-            if !blocks.is_empty() {
-                ch.write_blocks(&blocks).await?;
-            }
-            if !txs.is_empty() {
-                ch.write_txs(&txs).await?;
-            }
-            if !logs.is_empty() {
-                ch.write_logs(&logs).await?;
-            }
-            if !receipts.is_empty() {
-                ch.write_receipts(&receipts).await?;
-            }
+            // Pipeline: fetch next batch from PG while writing current batch to CH
+            let next_fetch = async {
+                if current > pg_max {
+                    return Ok(None);
+                }
+                let next_end = (current + BACKFILL_BLOCK_BATCH - 1).min(pg_max);
+                let conn = self.pool.get().await?;
+                let data = tokio::try_join!(
+                    fetch_blocks(&conn, current, next_end),
+                    fetch_txs(&conn, current, next_end),
+                    fetch_logs(&conn, current, next_end),
+                    fetch_receipts(&conn, current, next_end),
+                )?;
+                Ok::<_, anyhow::Error>(Some((next_end, data)))
+            };
+
+            let ch_write = async {
+                tokio::try_join!(
+                    async { if !blocks.is_empty() { ch.write_blocks(&blocks).await } else { Ok(()) } },
+                    async { if !txs.is_empty() { ch.write_txs(&txs).await } else { Ok(()) } },
+                    async { if !logs.is_empty() { ch.write_logs(&logs).await } else { Ok(()) } },
+                    async { if !receipts.is_empty() { ch.write_receipts(&receipts).await } else { Ok(()) } },
+                )
+            };
+
+            let (next_data, _) = tokio::try_join!(next_fetch, ch_write)?;
 
             // Advance cursor only after all tables written successfully
             save_ch_backfill_cursor(&self.pool, chain_id, batch_end).await?;
 
             blocks_written += block_count;
             if blocks_written % 100_000 < block_count {
-                let pct = (((current - from_block + 1) as f64 / total as f64) * 100.0) as u64;
+                let pct = (((batch_end - from_block + 1) as f64 / total as f64) * 100.0) as u64;
                 info!(
+                    chain_id,
                     blocks_written,
                     pct,
                     batch_end,
@@ -161,7 +178,10 @@ impl SinkSet {
                 );
             }
 
-            current = batch_end + 1;
+            if next_data.is_some() {
+                current = next_data.as_ref().unwrap().0 + 1;
+            }
+            pending = next_data;
         }
 
         let elapsed = start.elapsed();
@@ -172,6 +192,7 @@ impl SinkSet {
                 blocks_written as f64
             };
             info!(
+                chain_id,
                 blocks = blocks_written,
                 elapsed_secs = elapsed.as_secs(),
                 rate = format!("{rate:.0} blk/s"),
