@@ -124,13 +124,7 @@ fn print_http_status(resp: &serde_json::Value) -> Result<()> {
         println!("│  Lag:           {} blocks", lag);
 
         let gap_blocks = chain["gap_blocks"].as_i64().unwrap_or(0);
-        let gap_count = chain["gaps"].as_array().map(|g| g.len()).unwrap_or(0);
         if gap_blocks > 0 {
-            if gap_count > 0 {
-                println!("│  Gaps:          {} blocks across {} gaps", format_number(gap_blocks as u64), gap_count);
-            } else {
-                println!("│  Gaps:          {} blocks remaining", format_number(gap_blocks as u64));
-            }
             let rate = chain
                 .get("postgres")
                 .and_then(|pg| pg["rate"].as_f64())
@@ -343,40 +337,28 @@ fn print_store_status_from_watermarks(label: &str, sink_name: &str, head: i64) {
 
 /// Print per-table rows for a store (blocks as progress, others as row counts).
 fn print_store_rows(store: &serde_json::Value, head: i64, gap_count: usize) {
-    // blocks: use the store's own watermark for progress
-    let blocks_wm = store["blocks"].as_i64();
-    let blocks_count = store["blocks_count"].as_u64();
-    match blocks_wm {
-        Some(wm) if head > 0 => {
-            let pct = (wm as f64 / head as f64 * 100.0).min(100.0) as u64;
-            let gap_suffix = if gap_count > 0 {
-                format!(" ({} gaps)", gap_count)
-            } else {
-                String::new()
-            };
-            if pct >= 100 {
-                println!("│  ├─ {:<10} {} ✓{}", "blocks", format_number(wm as u64), gap_suffix);
-            } else {
-                println!(
-                    "│  ├─ {:<10} {} / {} ({pct}%){}",
-                    "blocks",
-                    format_number(wm as u64),
-                    format_number(head as u64),
-                    gap_suffix
-                );
-            }
+    // blocks: use actual row count for progress (watermark can equal head while gaps exist)
+    let blocks_count = store["blocks_count"].as_u64().unwrap_or(0);
+    if blocks_count > 0 && head > 0 {
+        let pct = (blocks_count as f64 / head as f64 * 100.0).min(100.0) as u64;
+        let gap_suffix = if gap_count > 0 {
+            format!(" ({} gaps)", gap_count)
+        } else {
+            String::new()
+        };
+        if pct >= 100 {
+            println!("│  ├─ {:<10} {} ✓{}", "blocks", format_number(blocks_count), gap_suffix);
+        } else {
+            println!(
+                "│  ├─ {:<10} {} / {} ({pct}%){}",
+                "blocks",
+                format_number(blocks_count),
+                format_number(head as u64),
+                gap_suffix
+            );
         }
-        _ => {
-            if let Some(count) = blocks_count {
-                if count > 0 {
-                    println!("│  ├─ {:<10} {}", "blocks", format_number(count));
-                } else {
-                    println!("│  ├─ {:<10} empty", "blocks");
-                }
-            } else {
-                println!("│  ├─ {:<10} empty", "blocks");
-            }
-        }
+    } else {
+        println!("│  ├─ {:<10} empty", "blocks");
     }
 
     // txs, logs, receipts: show row counts
