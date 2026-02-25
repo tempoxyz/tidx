@@ -123,6 +123,21 @@ fn print_http_status(resp: &serde_json::Value) -> Result<()> {
         }
         println!("│  Lag:           {} blocks", lag);
 
+        // Backfill ETA (from sync_rate or store write rate)
+        if synced_num > 0 && synced_num < head_num {
+            let remaining = head_num - synced_num;
+            // Prefer store write rate (real-time), fall back to sync_rate from DB
+            let rate = chain
+                .get("postgres")
+                .and_then(|pg| pg["rate"].as_f64())
+                .or_else(|| chain["sync_rate"].as_f64());
+            if let Some(r) = rate {
+                if r > 0.0 {
+                    println!("│  ETA:           {}", format_eta(remaining as f64 / r));
+                }
+            }
+        }
+
         // PostgreSQL per-table status
         if let Some(pg) = chain.get("postgres") {
             println!("│");
@@ -385,6 +400,22 @@ fn print_table_row(prefix: &str, table: &str, max_block: Option<i64>, head: i64)
         None => {
             println!("│  {prefix}─ {:<10} empty", table);
         }
+    }
+}
+
+fn format_eta(secs: f64) -> String {
+    if secs <= 0.0 || secs.is_nan() || secs.is_infinite() {
+        return "unknown".to_string();
+    }
+    let secs = secs as u64;
+    if secs < 60 {
+        format!("{secs}s")
+    } else if secs < 3600 {
+        format!("{}m {}s", secs / 60, secs % 60)
+    } else if secs < 86400 {
+        format!("{}h {}m", secs / 3600, (secs % 3600) / 60)
+    } else {
+        format!("{}d {}h", secs / 86400, (secs % 86400) / 3600)
     }
 }
 
