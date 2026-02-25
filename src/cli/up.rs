@@ -343,8 +343,9 @@ fn spawn_sync_engine(
         {
             let backfill_sinks = sinks.clone();
             let backfill_chain_name = chain.name.clone();
+            let backfill_chain_id = chain.chain_id;
             tokio::spawn(async move {
-                if let Err(e) = backfill_sinks.backfill_clickhouse().await {
+                if let Err(e) = backfill_sinks.backfill_clickhouse(backfill_chain_id).await {
                     error!(
                         error = %e,
                         chain = %backfill_chain_name,

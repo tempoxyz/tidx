@@ -80,11 +80,14 @@ impl SinkSet {
 
     /// Automatically backfill ClickHouse from PostgreSQL if CH is behind.
     ///
-    /// Each table is backfilled independently from its own high-water mark
-    /// so that txs/logs/receipts are repaired even if blocks are already present.
-    /// Uses block-range pagination (no long-lived transactions) to avoid
-    /// holding PG snapshots that block autovacuum.
-    pub async fn backfill_clickhouse(&self) -> Result<()> {
+    /// Uses a persistent cursor (`ch_backfill_block`) in the PG `sync_state` table
+    /// to track progress. This avoids the race condition where realtime sync writes
+    /// blocks ahead of the backfill position, causing `max(block_num)` to skip gaps.
+    ///
+    /// All four tables (blocks, txs, logs, receipts) are backfilled together per
+    /// block range. The cursor advances only after all tables succeed for that range.
+    /// Tables use ReplacingMergeTree so re-inserts after a crash are safe.
+    pub async fn backfill_clickhouse(&self, chain_id: u64) -> Result<()> {
         let ch = match &self.ch {
             Some(ch) => ch,
             None => return Ok(()),
@@ -96,31 +99,70 @@ impl SinkSet {
             None => return Ok(()), // PG is empty, nothing to backfill
         };
 
+        // Load persisted cursor from PG (survives restarts)
+        let cursor = load_ch_backfill_cursor(&self.pool, chain_id).await?;
+        let from_block = cursor + 1;
+
+        if from_block > pg_max {
+            info!(
+                ch_backfill_block = cursor,
+                pg_max,
+                "ClickHouse backfill up to date"
+            );
+            return Ok(());
+        }
+
+        let total = pg_max - from_block + 1;
+        info!(from_block, pg_max, total_blocks = total, "Starting ClickHouse backfill");
+
         let start = std::time::Instant::now();
+        let mut blocks_written: i64 = 0;
+        let mut current = from_block;
 
-        let blocks_written = backfill_table(
-            &self.pool, ch, "blocks", pg_max,
-            |conn, from, to| Box::pin(fetch_blocks(conn, from, to)),
-            |ch, rows| Box::pin(async move { ch.write_blocks(&rows).await }),
-        ).await?;
+        while current <= pg_max {
+            let batch_end = (current + BACKFILL_BLOCK_BATCH - 1).min(pg_max);
 
-        backfill_table(
-            &self.pool, ch, "txs", pg_max,
-            |conn, from, to| Box::pin(fetch_txs(conn, from, to)),
-            |ch, rows| Box::pin(async move { ch.write_txs(&rows).await }),
-        ).await?;
+            // Short-lived connection per batch — no long transactions
+            let conn = self.pool.get().await?;
 
-        backfill_table(
-            &self.pool, ch, "logs", pg_max,
-            |conn, from, to| Box::pin(fetch_logs(conn, from, to)),
-            |ch, rows| Box::pin(async move { ch.write_logs(&rows).await }),
-        ).await?;
+            let blocks = fetch_blocks(&conn, current, batch_end).await?;
+            let txs = fetch_txs(&conn, current, batch_end).await?;
+            let logs = fetch_logs(&conn, current, batch_end).await?;
+            let receipts = fetch_receipts(&conn, current, batch_end).await?;
+            drop(conn); // release connection immediately
 
-        backfill_table(
-            &self.pool, ch, "receipts", pg_max,
-            |conn, from, to| Box::pin(fetch_receipts(conn, from, to)),
-            |ch, rows| Box::pin(async move { ch.write_receipts(&rows).await }),
-        ).await?;
+            let block_count = blocks.len() as i64;
+
+            // Write all tables for this range
+            if !blocks.is_empty() {
+                ch.write_blocks(&blocks).await?;
+            }
+            if !txs.is_empty() {
+                ch.write_txs(&txs).await?;
+            }
+            if !logs.is_empty() {
+                ch.write_logs(&logs).await?;
+            }
+            if !receipts.is_empty() {
+                ch.write_receipts(&receipts).await?;
+            }
+
+            // Advance cursor only after all tables written successfully
+            save_ch_backfill_cursor(&self.pool, chain_id, batch_end).await?;
+
+            blocks_written += block_count;
+            if blocks_written % 100_000 < block_count {
+                let pct = (((current - from_block + 1) as f64 / total as f64) * 100.0) as u64;
+                info!(
+                    blocks_written,
+                    pct,
+                    batch_end,
+                    "ClickHouse backfill progress"
+                );
+            }
+
+            current = batch_end + 1;
+        }
 
         let elapsed = start.elapsed();
         if blocks_written > 0 {
@@ -148,66 +190,33 @@ async fn pg_max_block_num(pool: &Pool) -> Result<Option<i64>> {
     Ok(row.get::<_, Option<i64>>(0))
 }
 
-/// Generic backfill: queries CH for per-table high-water mark, then pages through
-/// PG data in block-range batches. Each query is autocommit (no long transactions).
-/// Returns the number of rows written.
-async fn backfill_table<T, F, W>(
-    pool: &Pool,
-    ch: &ClickHouseSink,
-    table: &str,
-    pg_max: i64,
-    fetch_fn: F,
-    write_fn: W,
-) -> Result<i64>
-where
-    T: Send + 'static,
-    F: Fn(&deadpool_postgres::Object, i64, i64) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Vec<T>>> + Send + '_>>,
-    W: Fn(&ClickHouseSink, Vec<T>) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + '_>>,
-{
-    let ch_max = ch.max_block_in_table(table).await?;
+/// Load the CH backfill cursor for a chain. Returns 0 if no row exists.
+async fn load_ch_backfill_cursor(pool: &Pool, chain_id: u64) -> Result<i64> {
+    let conn = pool.get().await?;
+    let row = conn
+        .query_opt(
+            "SELECT ch_backfill_block FROM sync_state WHERE chain_id = $1",
+            &[&(chain_id as i64)],
+        )
+        .await?;
+    Ok(row.map(|r| r.get::<_, i64>(0)).unwrap_or(0))
+}
 
-    let from_block = match ch_max {
-        Some(n) if n >= pg_max => {
-            info!(table, ch_max = n, pg_max, "ClickHouse {table} is up to date");
-            return Ok(0);
-        }
-        Some(n) => n + 1,
-        None => 1,
-    };
-
-    let total = pg_max - from_block + 1;
-    info!(table, from_block, pg_max, total_blocks = total, "Backfilling ClickHouse table");
-
-    let mut written: i64 = 0;
-    let mut current = from_block;
-
-    while current <= pg_max {
-        let batch_end = (current + BACKFILL_BLOCK_BATCH - 1).min(pg_max);
-
-        // Short-lived connection per batch — no long transactions
-        let conn = pool.get().await?;
-        let rows = fetch_fn(&conn, current, batch_end).await?;
-        drop(conn); // release connection immediately
-
-        let count = rows.len() as i64;
-        if count > 0 {
-            write_fn(ch, rows).await?;
-            written += count;
-
-            if written % 100_000 < count {
-                let pct = (((current - from_block + 1) as f64 / total as f64) * 100.0) as u64;
-                info!(table, rows_written = written, pct, "ClickHouse backfill progress");
-            }
-        }
-
-        current = batch_end + 1;
-    }
-
-    if written > 0 {
-        info!(table, rows = written, "ClickHouse backfill: {table} complete");
-    }
-
-    Ok(written)
+/// Save the CH backfill cursor for a chain (upsert, only advances).
+async fn save_ch_backfill_cursor(pool: &Pool, chain_id: u64, block: i64) -> Result<()> {
+    let conn = pool.get().await?;
+    conn.execute(
+        r#"
+        INSERT INTO sync_state (chain_id, ch_backfill_block)
+        VALUES ($1, $2)
+        ON CONFLICT (chain_id) DO UPDATE SET
+            ch_backfill_block = GREATEST(sync_state.ch_backfill_block, EXCLUDED.ch_backfill_block),
+            updated_at = NOW()
+        "#,
+        &[&(chain_id as i64), &block],
+    )
+    .await?;
+    Ok(())
 }
 
 // ── PG fetch functions (one query per batch, no cursors) ──────────────────

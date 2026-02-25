@@ -794,6 +794,7 @@ async fn test_case_insensitive_table_reference() {
 // ============================================================================
 
 const SINK_DB: &str = "tidx_sink_test";
+const TEST_CHAIN_ID: u64 = 99999;
 
 /// Helper: create a ClickHouseSink pointed at the test instance, with a clean DB.
 async fn setup_sink() -> Option<(ClickHouseSink, TestClickHouse)> {
@@ -1500,7 +1501,7 @@ async fn test_backfill_pg_to_empty_clickhouse() {
     assert_eq!(ch.table_count("blocks").await.unwrap(), 0);
 
     // Run backfill
-    sinks.backfill_clickhouse().await.expect("backfill failed");
+    sinks.backfill_clickhouse(TEST_CHAIN_ID).await.expect("backfill failed");
 
     // Verify CH now has matching data
     assert_eq!(ch.table_count("blocks").await.unwrap(), 10);
@@ -1542,7 +1543,7 @@ async fn test_backfill_resumes_from_highwater_mark() {
     assert_eq!(ch.table_count("blocks").await.unwrap(), 10);
 
     // Run backfill — should only copy blocks 11-20
-    sinks.backfill_clickhouse().await.expect("backfill failed");
+    sinks.backfill_clickhouse(TEST_CHAIN_ID).await.expect("backfill failed");
 
     assert_eq!(ch.table_count("blocks").await.unwrap(), 20);
     assert_eq!(ch.table_count("txs").await.unwrap(), 20);
@@ -1568,7 +1569,7 @@ async fn test_backfill_noop_when_up_to_date() {
     assert_eq!(ch.table_count("blocks").await.unwrap(), 5);
 
     // Run backfill — should detect CH is current and skip
-    sinks.backfill_clickhouse().await.expect("backfill failed");
+    sinks.backfill_clickhouse(TEST_CHAIN_ID).await.expect("backfill failed");
 
     // Count should remain 5 (no duplicates)
     assert_eq!(ch.table_count("blocks").await.unwrap(), 5);
@@ -1583,7 +1584,7 @@ async fn test_backfill_noop_when_pg_empty() {
     };
 
     // PG is empty (truncated in setup), CH is empty
-    sinks.backfill_clickhouse().await.expect("backfill failed");
+    sinks.backfill_clickhouse(TEST_CHAIN_ID).await.expect("backfill failed");
 
     assert_eq!(ch.table_count("blocks").await.unwrap(), 0);
 }
@@ -1630,7 +1631,7 @@ async fn test_backfill_per_table_independent_highwater() {
 
     // Run backfill — blocks should skip (already up to date),
     // txs should fill 6-10, logs/receipts should fill 1-10
-    sinks.backfill_clickhouse().await.expect("backfill failed");
+    sinks.backfill_clickhouse(TEST_CHAIN_ID).await.expect("backfill failed");
 
     assert_eq!(ch.table_count("blocks").await.unwrap(), 10);
     assert_eq!(ch.table_count("txs").await.unwrap(), 20); // 10 old + 10 new
@@ -1658,7 +1659,7 @@ async fn test_backfill_multi_batch_pagination() {
     assert_eq!(ch.table_count("blocks").await.unwrap(), 0);
 
     // Run backfill
-    sinks.backfill_clickhouse().await.expect("backfill failed");
+    sinks.backfill_clickhouse(TEST_CHAIN_ID).await.expect("backfill failed");
 
     assert_eq!(ch.table_count("blocks").await.unwrap(), block_count as u64);
 
@@ -1695,15 +1696,15 @@ async fn test_backfill_idempotent() {
 
     // First backfill
     sinks
-        .backfill_clickhouse()
+        .backfill_clickhouse(TEST_CHAIN_ID)
         .await
         .expect("first backfill failed");
     assert_eq!(ch.table_count("blocks").await.unwrap(), 10);
     assert_eq!(ch.table_count("txs").await.unwrap(), 10);
 
-    // Second backfill — should be a no-op (per-table high-water marks match)
+    // Second backfill — should be a no-op (cursor already advanced)
     sinks
-        .backfill_clickhouse()
+        .backfill_clickhouse(TEST_CHAIN_ID)
         .await
         .expect("second backfill failed");
     assert_eq!(ch.table_count("blocks").await.unwrap(), 10);
