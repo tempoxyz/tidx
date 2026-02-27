@@ -2,6 +2,7 @@ use anyhow::Result;
 use tracing::info;
 
 use crate::db::Pool;
+use crate::metrics;
 use crate::types::{BlockRow, LogRow, ReceiptRow, TxRow};
 
 use super::ch_sink::ClickHouseSink;
@@ -167,6 +168,10 @@ impl SinkSet {
             save_ch_backfill_cursor(&self.pool, chain_id, batch_end).await?;
 
             blocks_written += block_count;
+            let remaining = pg_max - batch_end;
+            metrics::set_backfill_block(chain_id, "clickhouse", batch_end as u64);
+            metrics::set_backfill_remaining(chain_id, "clickhouse", remaining as u64);
+
             if blocks_written % 100_000 < block_count {
                 let pct = (((batch_end - from_block + 1) as f64 / total as f64) * 100.0) as u64;
                 info!(

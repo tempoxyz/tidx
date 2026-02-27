@@ -33,13 +33,13 @@ pub fn set_sync_lag(chain_id: u64, lag: u64) {
     gauge!("tidx_sync_lag_blocks", &labels).set(lag as f64);
 }
 
-pub fn set_backfill_block(chain_id: u64, block_num: u64) {
-    let labels = [("chain_id", chain_id.to_string())];
+pub fn set_backfill_block(chain_id: u64, sink: &str, block_num: u64) {
+    let labels = [("chain_id", chain_id.to_string()), ("sink", sink.to_string())];
     gauge!("tidx_backfill_block", &labels).set(block_num as f64);
 }
 
-pub fn set_backfill_remaining(chain_id: u64, remaining: u64) {
-    let labels = [("chain_id", chain_id.to_string())];
+pub fn set_backfill_remaining(chain_id: u64, sink: &str, remaining: u64) {
+    let labels = [("chain_id", chain_id.to_string()), ("sink", sink.to_string())];
     gauge!("tidx_backfill_remaining_blocks", &labels).set(remaining as f64);
 }
 
@@ -99,8 +99,8 @@ impl SyncProgress {
 
     pub fn report_backfill(&mut self, current_block: u64, target_block: u64, blocks_synced: u64) {
         self.blocks_since_report += blocks_synced;
-        set_backfill_block(self.chain_id, current_block);
-        set_backfill_remaining(self.chain_id, current_block.saturating_sub(target_block));
+        set_backfill_block(self.chain_id, "postgres", current_block);
+        set_backfill_remaining(self.chain_id, "postgres", current_block.saturating_sub(target_block));
 
         let elapsed = self.last_report.elapsed();
         if elapsed.as_secs() >= 5 {
