@@ -892,6 +892,8 @@ async fn tick_gapfill_parallel(
         "Gap sync: processing with parallel workers (throttled)"
     );
 
+    metrics::set_backfill_remaining(chain_id, "postgres", total_gap_blocks);
+
     // Process batches with N concurrent workers using JoinSet
     // Each worker acquires a semaphore permit before getting a DB connection
     let mut join_set = tokio::task::JoinSet::new();
@@ -947,7 +949,8 @@ async fn tick_gapfill_parallel(
                 completed += batch_count;
                 lowest_block = lowest_block.min(start);
                 metrics::record_blocks_indexed(chain_id, batch_count);
-                progress.report_backfill(start, 0, batch_count);
+                metrics::set_backfill_remaining(chain_id, "postgres", total_gap_blocks.saturating_sub(completed));
+                progress.report_backfill(completed, total_gap_blocks, batch_count);
 
                 debug!(
                     from = start,
@@ -1118,6 +1121,8 @@ async fn tick_gapfill_parallel_no_throttle(
         "Backfill: processing with parallel workers"
     );
 
+    metrics::set_backfill_remaining(chain_id, "postgres", total_gap_blocks);
+
     // Process batches with N concurrent workers using JoinSet
     let mut join_set = tokio::task::JoinSet::new();
     let mut batch_iter = batch_ranges.into_iter();
@@ -1146,7 +1151,8 @@ async fn tick_gapfill_parallel_no_throttle(
                 completed += batch_count;
                 lowest_block = lowest_block.min(start);
                 metrics::record_blocks_indexed(chain_id, batch_count);
-                progress.report_backfill(start, 0, batch_count);
+                metrics::set_backfill_remaining(chain_id, "postgres", total_gap_blocks.saturating_sub(completed));
+                progress.report_backfill(completed, total_gap_blocks, batch_count);
 
                 debug!(
                     from = start,
