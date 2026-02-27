@@ -340,17 +340,29 @@ fn spawn_sync_engine(
 
         // Auto-backfill ClickHouse from PostgreSQL in background (non-blocking).
         // SyncEngine starts immediately so new blocks are indexed while CH catches up.
+        // Retries indefinitely with exponential backoff on failure.
         {
             let backfill_sinks = sinks.clone();
             let backfill_chain_name = chain.name.clone();
             let backfill_chain_id = chain.chain_id;
             tokio::spawn(async move {
-                if let Err(e) = backfill_sinks.backfill_clickhouse(backfill_chain_id).await {
-                    error!(
-                        error = %e,
-                        chain = %backfill_chain_name,
-                        "ClickHouse backfill failed (CH will catch up during sync)"
-                    );
+                let mut attempt: u32 = 0;
+                loop {
+                    match backfill_sinks.backfill_clickhouse(backfill_chain_id).await {
+                        Ok(()) => break,
+                        Err(e) => {
+                            attempt += 1;
+                            let delay_secs = 10u64.min(2u64.saturating_pow(attempt));
+                            error!(
+                                error = %e,
+                                chain = %backfill_chain_name,
+                                attempt,
+                                retry_in_secs = delay_secs,
+                                "ClickHouse backfill failed, retrying"
+                            );
+                            tokio::time::sleep(std::time::Duration::from_secs(delay_secs)).await;
+                        }
+                    }
                 }
             });
         }
