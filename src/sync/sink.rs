@@ -110,10 +110,12 @@ impl SinkSet {
                 pg_max,
                 "ClickHouse backfill up to date"
             );
+            metrics::set_backfill_remaining(chain_id, "clickhouse", 0);
             return Ok(());
         }
 
         let total = pg_max - from_block + 1;
+        metrics::set_backfill_remaining(chain_id, "clickhouse", total as u64);
         info!(chain_id, from_block, pg_max, total_blocks = total, "Starting ClickHouse backfill");
 
         let start = std::time::Instant::now();

@@ -48,6 +48,21 @@ pub fn set_sync_rate(chain_id: u64, blocks_per_sec: f64) {
     gauge!("tidx_sync_blocks_per_second", &labels).set(blocks_per_sec);
 }
 
+pub fn set_synced(chain_id: u64, synced: bool) {
+    let labels = [("chain_id", chain_id.to_string())];
+    gauge!("tidx_synced", &labels).set(if synced { 1.0 } else { 0.0 });
+}
+
+pub fn set_gap_blocks(chain_id: u64, sink: &str, blocks: u64) {
+    let labels = [("chain_id", chain_id.to_string()), ("sink", sink.to_string())];
+    gauge!("tidx_gap_blocks", &labels).set(blocks as f64);
+}
+
+pub fn set_gap_count(chain_id: u64, sink: &str, count: u64) {
+    let labels = [("chain_id", chain_id.to_string()), ("sink", sink.to_string())];
+    gauge!("tidx_gap_count", &labels).set(count as f64);
+}
+
 pub fn record_rpc_request(method: &str, duration: std::time::Duration, success: bool) {
     let labels = [
         ("method", method.to_string()),

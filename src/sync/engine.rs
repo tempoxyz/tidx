@@ -851,6 +851,9 @@ async fn tick_gapfill_parallel(
 
     if gaps.is_empty() {
         // No gaps - fully synced from genesis to tip
+        metrics::set_gap_blocks(chain_id, "postgres", 0);
+        metrics::set_gap_count(chain_id, "postgres", 0);
+        metrics::set_synced(chain_id, realtime_lag == 0);
         if state.synced_num < state.tip_num {
             update_synced_num(pool, chain_id, state.tip_num).await?;
             info!(synced_num = state.tip_num, "Gap sync: fully synced");
@@ -861,6 +864,9 @@ async fn tick_gapfill_parallel(
 
     let total_gap_blocks: u64 = gaps.iter().map(|(s, e)| e - s + 1).sum();
     let gap_count = gaps.len();
+    metrics::set_gap_blocks(chain_id, "postgres", total_gap_blocks);
+    metrics::set_gap_count(chain_id, "postgres", gap_count as u64);
+    metrics::set_synced(chain_id, false);
 
     // Collect all batch ranges to process (from most recent gaps first)
     let mut batch_ranges: Vec<(u64, u64)> = Vec::new();
