@@ -56,8 +56,11 @@ impl RateLimiter {
         }
     }
 
-    /// Check if request has a valid API key via Authorization: Bearer header.
+    /// Check if request has a valid API key via Authorization header.
+    /// Supports both `Bearer <key>` and `Basic <base64>` schemes.
     pub async fn has_valid_api_key(&self, headers: &HeaderMap) -> bool {
+        use base64::Engine as _;
+
         let api_keys = &self.get_http_config().await.api_keys;
         if api_keys.is_empty() {
             return false;
@@ -66,6 +69,13 @@ impl RateLimiter {
         if let Some(auth) = headers.get("authorization").and_then(|v| v.to_str().ok()) {
             if let Some(key) = auth.strip_prefix("Bearer ") {
                 return api_keys.contains(&key.to_string());
+            }
+            if let Some(encoded) = auth.strip_prefix("Basic ") {
+                if let Ok(decoded) = base64::engine::general_purpose::STANDARD.decode(encoded) {
+                    if let Ok(key) = String::from_utf8(decoded) {
+                        return api_keys.contains(&key);
+                    }
+                }
             }
         }
 
