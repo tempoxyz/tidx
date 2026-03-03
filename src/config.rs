@@ -34,17 +34,9 @@ pub struct HttpConfig {
     #[serde(default = "default_bind")]
     pub bind: String,
 
-    /// API keys that bypass rate limiting (optional)
-    #[serde(default)]
-    pub api_keys: Vec<String>,
-
     /// Trusted CIDRs for admin operations (e.g., `100.64.0.0/10` for Tailscale)
     #[serde(default)]
     pub trusted_cidrs: Vec<String>,
-
-    /// Rate limiting configuration
-    #[serde(default)]
-    pub rate_limit: RateLimitConfig,
 }
 
 impl Default for HttpConfig {
@@ -53,53 +45,9 @@ impl Default for HttpConfig {
             enabled: true,
             port: 8080,
             bind: "0.0.0.0".to_string(),
-            api_keys: Vec::new(),
             trusted_cidrs: Vec::new(),
-            rate_limit: RateLimitConfig::default(),
         }
     }
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct RateLimitConfig {
-    /// Enable rate limiting (default: true)
-    #[serde(default = "default_true")]
-    pub enabled: bool,
-
-    /// Maximum requests per window for unauthenticated requests (default: 100)
-    #[serde(default = "default_rate_limit_requests")]
-    pub requests_per_window: u32,
-
-    /// Rate limit window in seconds (default: 60)
-    #[serde(default = "default_rate_limit_window")]
-    pub window_secs: u64,
-
-    /// Maximum concurrent SSE connections per IP (default: 5)
-    #[serde(default = "default_max_sse_connections")]
-    pub max_sse_connections: u32,
-}
-
-impl Default for RateLimitConfig {
-    fn default() -> Self {
-        Self {
-            enabled: true,
-            requests_per_window: 100,
-            window_secs: 60,
-            max_sse_connections: 5,
-        }
-    }
-}
-
-fn default_rate_limit_requests() -> u32 {
-    100
-}
-
-fn default_rate_limit_window() -> u64 {
-    60
-}
-
-fn default_max_sse_connections() -> u32 {
-    5
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -391,15 +339,6 @@ mod tests {
         let config: Config = toml::from_str(toml_str).unwrap();
 
         assert_eq!(config.chains.len(), 2);
-    }
-
-    #[test]
-    fn test_rate_limit_config_default() {
-        let config = RateLimitConfig::default();
-        assert!(config.enabled);
-        assert_eq!(config.requests_per_window, 100);
-        assert_eq!(config.window_secs, 60);
-        assert_eq!(config.max_sse_connections, 5);
     }
 
     #[test]

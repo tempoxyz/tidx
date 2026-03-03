@@ -1,4 +1,3 @@
-mod rate_limit;
 mod views;
 
 use std::collections::HashMap;
@@ -9,9 +8,8 @@ use std::sync::Arc;
 use tokio::sync::RwLock;
 
 use axum::{
-    extract::{ConnectInfo, Query, State},
+    extract::{Query, State},
     http::{header, Method, StatusCode},
-    middleware,
     response::{
         sse::{Event as SseEvent, KeepAlive, KeepAliveStream},
         IntoResponse, Response, Sse,
@@ -26,11 +24,9 @@ use tower_http::trace::TraceLayer;
 
 use crate::broadcast::Broadcaster;
 use crate::clickhouse::ClickHouseEngine;
-use crate::config::{HttpConfig, SharedHttpConfig};
+use crate::config::HttpConfig;
 use crate::db::Pool;
 use crate::service::{QueryOptions, QueryResult, SyncStatus};
-
-pub use rate_limit::{RateLimiter, SseConnectionGuard};
 
 pub type SharedPools = Arc<RwLock<HashMap<u64, Pool>>>;
 pub type SharedClickHouseEngines = Arc<RwLock<HashMap<u64, Arc<ClickHouseEngine>>>>;
@@ -54,8 +50,6 @@ pub struct AppState {
     pub broadcaster: Arc<Broadcaster>,
     /// Per-chain ClickHouse configuration (hot-reloadable)
     pub clickhouse_configs: SharedClickHouseConfigs,
-    /// Rate limiter for request throttling
-    pub rate_limiter: RateLimiter,
     /// ClickHouse engines for OLAP queries (per chain)
     pub clickhouse_engines: SharedClickHouseEngines,
     /// Parsed trusted CIDRs for admin operations
@@ -133,13 +127,6 @@ pub fn router_with_options(
     clickhouse_configs: HashMap<u64, ChainClickHouseConfig>,
     http_config: &HttpConfig,
 ) -> Router<()> {
-    let rate_limiter = RateLimiter::new(
-        http_config.rate_limit.clone(),
-        http_config.api_keys.clone(),
-    );
-
-    rate_limit::spawn_cleanup_task(rate_limiter.clone());
-
     let trusted_cidrs = Arc::new(parse_cidrs(&http_config.trusted_cidrs));
 
     let state = AppState {
@@ -147,12 +134,11 @@ pub fn router_with_options(
         default_chain_id,
         broadcaster,
         clickhouse_configs: Arc::new(RwLock::new(clickhouse_configs)),
-        rate_limiter: rate_limiter.clone(),
         clickhouse_engines: Arc::new(RwLock::new(HashMap::new())),
         trusted_cidrs,
     };
 
-    build_router(state, rate_limiter)
+    build_router(state)
 }
 
 pub fn router_shared(
@@ -160,29 +146,24 @@ pub fn router_shared(
     default_chain_id: u64,
     broadcaster: Arc<Broadcaster>,
     clickhouse_configs: SharedClickHouseConfigs,
-    http_config: SharedHttpConfig,
     clickhouse_engines: SharedClickHouseEngines,
     trusted_cidrs: Vec<String>,
 ) -> Router<()> {
-    let rate_limiter = RateLimiter::new_shared(http_config);
     let trusted_cidrs = Arc::new(parse_cidrs(&trusted_cidrs));
-
-    rate_limit::spawn_cleanup_task(rate_limiter.clone());
 
     let state = AppState {
         pools,
         default_chain_id,
         broadcaster,
         clickhouse_configs,
-        rate_limiter: rate_limiter.clone(),
         clickhouse_engines,
         trusted_cidrs,
     };
 
-    build_router(state, rate_limiter)
+    build_router(state)
 }
 
-fn build_router(state: AppState, rate_limiter: RateLimiter) -> Router<()> {
+fn build_router(state: AppState) -> Router<()> {
     let cors = CorsLayer::new()
         .allow_methods([Method::GET, Method::POST, Method::DELETE, Method::OPTIONS])
         .allow_headers([header::CONTENT_TYPE, header::AUTHORIZATION])
@@ -194,10 +175,6 @@ fn build_router(state: AppState, rate_limiter: RateLimiter) -> Router<()> {
         .route("/query", get(handle_query))
         .route("/views", get(views::list_views).post(views::create_view))
         .route("/views/{name}", get(views::get_view).delete(views::delete_view))
-        .layer(middleware::from_fn_with_state(
-            rate_limiter,
-            rate_limit::rate_limit_middleware,
-        ))
         .layer(cors)
         .layer(TraceLayer::new_for_http())
         .with_state(state)
@@ -308,8 +285,6 @@ struct QueryResponse {
 
 async fn handle_query(
     State(state): State<AppState>,
-    ConnectInfo(addr): ConnectInfo<SocketAddr>,
-    headers: axum::http::HeaderMap,
     uri: axum::http::Uri,
     Query(params): Query<QueryParams>,
 ) -> Response {
@@ -321,7 +296,7 @@ async fn handle_query(
                 "engine=clickhouse is not supported with live=true (use PostgreSQL for real-time streaming)".to_string()
             ).into_response();
         }
-        handle_query_live(state, params, signatures, addr, headers).await.into_response()
+        handle_query_live(state, params, signatures).await.into_response()
     } else {
         handle_query_once(state, params, signatures).await.into_response()
     }
@@ -396,32 +371,7 @@ async fn handle_query_live(
     state: AppState,
     params: QueryParams,
     signatures: Vec<String>,
-    addr: SocketAddr,
-    headers: axum::http::HeaderMap,
 ) -> Sse<KeepAliveStream<SseStream>> {
-    let ip = rate_limit::extract_client_ip(&headers, Some(&addr));
-    let has_api_key = state.rate_limiter.has_valid_api_key(&headers).await;
-
-    let connection_guard = if has_api_key {
-        Some(SseConnectionGuard::new_unlimited())
-    } else {
-        match state.rate_limiter.acquire_sse_connection(ip).await {
-            Ok(guard) => Some(guard),
-            Err(()) => {
-                let stream: SseStream = Box::pin(async_stream::stream! {
-                    yield Ok(SseEvent::default()
-                        .event("error")
-                        .json_data(serde_json::json!({
-                            "ok": false,
-                            "error": "Too many SSE connections from this IP"
-                        }))
-                        .unwrap());
-                });
-                return Sse::new(stream).keep_alive(KeepAlive::default());
-            }
-        }
-    };
-
     let pool = match state.get_pool(Some(params.chain_id)).await {
         Some(p) => p,
         None => {
@@ -443,8 +393,6 @@ async fn handle_query_live(
     };
 
     let stream = async_stream::stream! {
-        // Keep guard alive for the lifetime of the stream
-        let _guard = connection_guard;
         let mut last_block_num: u64 = 0;
         let sigs: Vec<&str> = signatures.iter().map(String::as_str).collect();
 

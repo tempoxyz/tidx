@@ -22,7 +22,7 @@ fn make_pools(pool: tidx::db::Pool) -> (HashMap<u64, tidx::db::Pool>, u64) {
     (pools, chain_id)
 }
 
-/// Create a test service that includes ConnectInfo (required by rate limit middleware).
+/// Create a test service that includes ConnectInfo.
 async fn make_test_service(
     pools: HashMap<u64, tidx::db::Pool>,
     chain_id: u64,

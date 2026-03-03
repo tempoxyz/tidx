@@ -96,11 +96,6 @@ enabled = true
 port = {http_port}
 bind = "0.0.0.0"
 
-[http.rate_limit]
-enabled = true
-requests_per_window = 100
-window_secs = 60
-
 [prometheus]
 enabled = true
 port = 9090

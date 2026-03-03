@@ -1,4 +1,3 @@
-pub mod api_key;
 pub mod init;
 pub mod query;
 pub mod status;
@@ -29,8 +28,6 @@ pub enum Commands {
     Query(query::Args),
     /// Manage ClickHouse materialized views
     Views(views::Args),
-    /// Generate a new API key and add it to config
-    ApiKey(api_key::Args),
     /// Update tidx to the latest version
     Upgrade,
 }

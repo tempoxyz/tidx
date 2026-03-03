@@ -30,7 +30,6 @@ async fn main() -> Result<()> {
         Commands::Status(args) => cli::status::run(args).await,
         Commands::Query(args) => cli::query::run(args).await,
         Commands::Views(args) => cli::views::run(args).await,
-        Commands::ApiKey(args) => cli::api_key::run(args),
         Commands::Upgrade => cli::upgrade::run(),
     }
 }

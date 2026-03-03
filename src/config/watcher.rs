@@ -115,16 +115,6 @@ async fn reload_config(
 
     {
         let mut http = http_config.write().await;
-        if http.api_keys != new_config.http.api_keys {
-            info!(
-                old_count = http.api_keys.len(),
-                new_count = new_config.http.api_keys.len(),
-                "API keys updated"
-            );
-        }
-        if http.rate_limit != new_config.http.rate_limit {
-            info!("Rate limit config updated");
-        }
         *http = new_config.http.clone();
     }
 
