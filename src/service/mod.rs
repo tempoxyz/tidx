@@ -174,7 +174,7 @@ pub async fn execute_query_postgres(
             .iter()
             .map(|sig| sig.to_cte_sql_postgres_filtered(filter))
             .collect();
-        format!("WITH {} {sql}", ctes.join(", "))
+        crate::query::merge_ctes_into_query(&sql, &ctes)
     } else {
         sql.to_string()
     };
@@ -502,4 +502,3 @@ mod tests {
     }
 
 }
-

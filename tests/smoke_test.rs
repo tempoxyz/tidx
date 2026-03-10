@@ -933,6 +933,66 @@ async fn test_query_logs_with_event_signature() {
 
 #[tokio::test]
 #[serial(db)]
+async fn test_query_with_user_cte_succeeds_without_signature() {
+    let db = TestDb::empty().await;
+    let opts = default_options();
+
+    let result = execute_query_postgres(
+        &db.pool,
+        "WITH numbers AS (SELECT 1 AS n) SELECT n FROM numbers",
+        &[],
+        &opts,
+    )
+    .await
+    .expect("Query with user CTE failed");
+
+    assert_eq!(result.engine.as_deref(), Some("postgres"));
+    assert_eq!(result.row_count, 1);
+    assert_eq!(result.columns, vec!["n".to_string()]);
+}
+
+#[tokio::test]
+#[serial(db)]
+async fn test_query_with_signature_and_user_cte_succeeds() {
+    let db = TestDb::empty().await;
+    let opts = default_options();
+
+    let result = execute_query_postgres(
+        &db.pool,
+        "WITH numbers AS (SELECT 1 AS n) SELECT n FROM numbers",
+        &["Transfer(address indexed from, address indexed to, uint256 value)"],
+        &opts,
+    )
+    .await
+    .expect("Query with signature + user CTE should succeed");
+
+    assert_eq!(result.engine.as_deref(), Some("postgres"));
+    assert_eq!(result.row_count, 1);
+    assert_eq!(result.columns, vec!["n".to_string()]);
+}
+
+#[tokio::test]
+#[serial(db)]
+async fn test_query_with_signature_and_multiple_user_ctes_succeeds() {
+    let db = TestDb::empty().await;
+    let opts = default_options();
+
+    let result = execute_query_postgres(
+        &db.pool,
+        "WITH first_cte AS (SELECT 1 AS n), second_cte AS (SELECT n + 1 AS n FROM first_cte) SELECT n FROM second_cte",
+        &["Transfer(address indexed from, address indexed to, uint256 value)"],
+        &opts,
+    )
+    .await
+    .expect("Query with signature + multiple user CTEs should succeed");
+
+    assert_eq!(result.engine.as_deref(), Some("postgres"));
+    assert_eq!(result.row_count, 1);
+    assert_eq!(result.columns, vec!["n".to_string()]);
+}
+
+#[tokio::test]
+#[serial(db)]
 async fn test_query_receipts() {
     let db = TestDb::new().await;
     let opts = default_options();
@@ -1284,5 +1344,3 @@ async fn test_query_daily_stats_pattern() {
     assert!(result.columns.contains(&"day".to_string()));
     assert!(result.columns.contains(&"transfer_count".to_string()));
 }
-
-
