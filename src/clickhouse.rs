@@ -103,7 +103,7 @@ impl ClickHouseEngine {
             }
 
             let ctes: Vec<String> = sigs.iter().map(|sig| sig.to_cte_sql_clickhouse()).collect();
-            format!("WITH {} {sql}", ctes.join(", "))
+            crate::query::merge_ctes_into_query(&sql, &ctes)
         } else {
             sql.to_string()
         };

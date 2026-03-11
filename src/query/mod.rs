@@ -24,3 +24,77 @@ pub fn convert_hex_literals_postgres(sql: &str) -> String {
         .replace_all(sql, r"'\x$1'")
         .into_owned()
 }
+
+/// Merge generated CTE definitions into a user query.
+///
+/// If query already starts with a WITH clause, generated CTEs are prepended
+/// to the existing CTE list. Otherwise, a new WITH clause is added.
+pub fn merge_ctes_into_query(sql: &str, generated_ctes: &[String]) -> String {
+    if generated_ctes.is_empty() {
+        return sql.to_string();
+    }
+
+    let ctes = generated_ctes.join(", ");
+    let trimmed = sql.trim_start();
+    let leading_ws = &sql[..sql.len() - trimmed.len()];
+
+    if starts_with_keyword(trimmed, "WITH RECURSIVE") {
+        let rest = trimmed["WITH RECURSIVE".len()..].trim_start();
+        return format!("{leading_ws}WITH RECURSIVE {ctes}, {rest}");
+    }
+
+    if starts_with_keyword(trimmed, "WITH") {
+        let rest = trimmed["WITH".len()..].trim_start();
+        return format!("{leading_ws}WITH {ctes}, {rest}");
+    }
+
+    format!("{leading_ws}WITH {ctes} {trimmed}")
+}
+
+fn starts_with_keyword(input: &str, keyword: &str) -> bool {
+    input.len() >= keyword.len()
+        && input[..keyword.len()].eq_ignore_ascii_case(keyword)
+        && input[keyword.len()..]
+            .chars()
+            .next()
+            .is_none_or(|c| c.is_ascii_whitespace())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::merge_ctes_into_query;
+
+    #[test]
+    fn test_merge_ctes_into_plain_select() {
+        let merged = merge_ctes_into_query(
+            "SELECT n FROM numbers",
+            &["Transfer AS (SELECT 1)".to_string()],
+        );
+        assert_eq!(merged, "WITH Transfer AS (SELECT 1) SELECT n FROM numbers");
+    }
+
+    #[test]
+    fn test_merge_ctes_into_existing_with() {
+        let merged = merge_ctes_into_query(
+            "WITH numbers AS (SELECT 1 AS n) SELECT n FROM numbers",
+            &["Transfer AS (SELECT 1)".to_string()],
+        );
+        assert_eq!(
+            merged,
+            "WITH Transfer AS (SELECT 1), numbers AS (SELECT 1 AS n) SELECT n FROM numbers"
+        );
+    }
+
+    #[test]
+    fn test_merge_ctes_into_existing_with_recursive() {
+        let merged = merge_ctes_into_query(
+            "WITH RECURSIVE r AS (SELECT 1) SELECT * FROM r",
+            &["Transfer AS (SELECT 1)".to_string()],
+        );
+        assert_eq!(
+            merged,
+            "WITH RECURSIVE Transfer AS (SELECT 1), r AS (SELECT 1) SELECT * FROM r"
+        );
+    }
+
+}

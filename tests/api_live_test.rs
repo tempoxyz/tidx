@@ -237,6 +237,73 @@ async fn test_query_with_signature_cte() {
 
 #[tokio::test]
 #[serial(db)]
+async fn test_query_with_user_cte_succeeds_without_signature() {
+    let db = TestDb::empty().await;
+    let broadcaster = Arc::new(Broadcaster::new());
+    let (pools, chain_id) = make_pools(db.pool.clone());
+    let mut app = make_test_service(pools, chain_id, broadcaster).await;
+
+    let response = app
+        .call(
+            Request::builder()
+                .method("GET")
+                .uri("/query?sql=WITH%20numbers%20AS%20%28SELECT%201%20AS%20n%29%20SELECT%20n%20FROM%20numbers&chainId=1")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+    assert_eq!(json["ok"], true);
+    assert_eq!(json["columns"], serde_json::json!(["n"]));
+    assert_eq!(json["row_count"], 1);
+}
+
+#[tokio::test]
+#[serial(db)]
+async fn test_query_with_signature_and_user_cte_succeeds() {
+    let db = TestDb::empty().await;
+    let broadcaster = Arc::new(Broadcaster::new());
+    let (pools, chain_id) = make_pools(db.pool.clone());
+    let mut app = make_test_service(pools, chain_id, broadcaster).await;
+
+    let sig = "Transfer(address%20indexed%20from%2Caddress%20indexed%20to%2Cuint256%20value)";
+    let uri = format!(
+        "/query?sql=WITH%20numbers%20AS%20%28SELECT%201%20AS%20n%29%20SELECT%20n%20FROM%20numbers&chainId=1&signature={sig}"
+    );
+
+    let response = app
+        .call(
+            Request::builder()
+                .method("GET")
+                .uri(&uri)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+    assert_eq!(json["ok"], true);
+    assert_eq!(json["columns"], serde_json::json!(["n"]));
+    assert_eq!(json["row_count"], 1);
+}
+
+#[tokio::test]
+#[serial(db)]
 async fn test_query_rejects_non_select() {
     let db = TestDb::empty().await;
     let broadcaster = Arc::new(Broadcaster::new());

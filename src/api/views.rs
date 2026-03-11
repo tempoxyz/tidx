@@ -178,10 +178,12 @@ pub async fn create_view(
         )));
     }
 
-    // Validate SQL is SELECT only
-    let sql_upper = req.sql.trim().to_uppercase();
-    if !sql_upper.starts_with("SELECT") {
-        return Err(ApiError::BadRequest("SQL must be a SELECT statement".to_string()));
+    // Validate SQL is query-only (SELECT or WITH ... SELECT)
+    let sql_upper = req.sql.trim_start().to_uppercase();
+    if !sql_upper.starts_with("SELECT") && !sql_upper.starts_with("WITH") {
+        return Err(ApiError::BadRequest(
+            "SQL must be a SELECT statement (CTEs with WITH are allowed)".to_string(),
+        ));
     }
 
     // Parse signature if provided
@@ -209,8 +211,8 @@ pub async fn create_view(
     let sql = if let Some(ref sig) = signature {
         let sql = sig.normalize_table_references(&req.sql);
         let sql = sig.rewrite_filters_for_pushdown(&sql);
-        let cte = sig.to_cte_sql_clickhouse();
-        format!("WITH {} {}", cte, sql)
+        let ctes = vec![sig.to_cte_sql_clickhouse()];
+        crate::query::merge_ctes_into_query(&sql, &ctes)
     } else {
         req.sql.clone()
     };
