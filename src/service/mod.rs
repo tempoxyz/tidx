@@ -5,7 +5,10 @@ use std::time::Instant;
 
 use crate::db::Pool;
 use crate::metrics;
-use crate::query::{extract_column_references, validate_query, EventSignature, HARD_LIMIT_MAX};
+use crate::query::{
+    extract_column_references, extract_raw_column_predicates, validate_query, EventSignature,
+    HARD_LIMIT_MAX,
+};
 
 #[derive(Debug, Clone, Serialize)]
 pub struct SyncStatus {
@@ -170,9 +173,10 @@ pub async fn execute_query_postgres(
         } else {
             Some(&used_columns)
         };
+        let pushdown = extract_raw_column_predicates(&sql);
         let ctes: Vec<String> = sigs
             .iter()
-            .map(|sig| sig.to_cte_sql_postgres_filtered(filter))
+            .map(|sig| sig.to_cte_sql_postgres_with_pushdown(filter, &pushdown))
             .collect();
         format!("WITH {} {sql}", ctes.join(", "))
     } else {

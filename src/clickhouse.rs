@@ -12,7 +12,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use tracing::{error, warn};
 
 use crate::config::ClickHouseConfig;
-use crate::query::EventSignature;
+use crate::query::{extract_raw_column_predicates, EventSignature};
 
 /// A single ClickHouse instance (connection + URL).
 struct Instance {
@@ -102,7 +102,11 @@ impl ClickHouseEngine {
                 sql = sig.rewrite_filters_for_pushdown(&sql);
             }
 
-            let ctes: Vec<String> = sigs.iter().map(|sig| sig.to_cte_sql_clickhouse()).collect();
+            let pushdown = extract_raw_column_predicates(&sql);
+            let ctes: Vec<String> = sigs
+                .iter()
+                .map(|sig| sig.to_cte_sql_clickhouse_with_pushdown(None, &pushdown))
+                .collect();
             format!("WITH {} {sql}", ctes.join(", "))
         } else {
             sql.to_string()

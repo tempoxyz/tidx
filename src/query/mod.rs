@@ -4,7 +4,7 @@ mod validator;
 
 pub use parser::{
     extract_column_references, extract_equality_filters, extract_group_by_columns,
-    extract_order_by_columns, AbiParam, AbiType, EventSignature,
+    extract_order_by_columns, extract_raw_column_predicates, AbiParam, AbiType, EventSignature,
 };
 pub use router::QueryEngine;
 pub use validator::{validate_query, HARD_LIMIT_MAX};

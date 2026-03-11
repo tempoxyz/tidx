@@ -6,6 +6,16 @@ use sqlparser::parser::Parser;
 use std::collections::{HashMap, HashSet};
 use std::ops::ControlFlow;
 
+/// Raw columns on the `logs` table that can be safely pushed down into CTEs.
+const RAW_PUSHDOWN_COLUMNS: &[&str] = &[
+    "block_num",
+    "block_timestamp",
+    "address",
+    "tx_hash",
+    "log_idx",
+    "tx_idx",
+];
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EventSignature {
     pub name: String,
@@ -80,6 +90,16 @@ impl EventSignature {
     /// Generate PostgreSQL-compatible CTE SQL, only including columns used in the query.
     /// If `used_columns` is None, includes all decoded columns.
     pub fn to_cte_sql_postgres_filtered(&self, used_columns: Option<&HashSet<String>>) -> String {
+        self.to_cte_sql_postgres_with_pushdown(used_columns, &[])
+    }
+
+    /// Generate PostgreSQL-compatible CTE SQL with raw column predicates pushed
+    /// into the inner WHERE clause for index utilization.
+    pub fn to_cte_sql_postgres_with_pushdown(
+        &self,
+        used_columns: Option<&HashSet<String>>,
+        pushdown_predicates: &[String],
+    ) -> String {
         let selects = self.build_select_expressions_postgres(used_columns);
 
         let select_clause = if selects.is_empty() {
@@ -88,15 +108,22 @@ impl EventSignature {
             format!(", {}", selects.join(", "))
         };
 
+        let extra_where = if pushdown_predicates.is_empty() {
+            String::new()
+        } else {
+            format!(" AND {}", pushdown_predicates.join(" AND "))
+        };
+
         format!(
             r#"{name} AS (
     SELECT block_num, block_timestamp, log_idx, tx_idx, tx_hash, address, selector, topic1, topic2, topic3, data{select_clause}
     FROM logs
-    WHERE selector = '\x{topic0}'
+    WHERE selector = '\x{topic0}'{extra_where}
 )"#,
             name = self.name,
             select_clause = select_clause,
             topic0 = self.topic0_hex(),
+            extra_where = extra_where,
         )
     }
 
@@ -112,6 +139,16 @@ impl EventSignature {
     /// 
     /// For output columns, we convert to '0x...' format for standard Ethereum hex representation.
     pub fn to_cte_sql_clickhouse_filtered(&self, used_columns: Option<&HashSet<String>>) -> String {
+        self.to_cte_sql_clickhouse_with_pushdown(used_columns, &[])
+    }
+
+    /// Generate ClickHouse-compatible CTE SQL with raw column predicates pushed
+    /// into the inner WHERE clause for index utilization.
+    pub fn to_cte_sql_clickhouse_with_pushdown(
+        &self,
+        used_columns: Option<&HashSet<String>>,
+        pushdown_predicates: &[String],
+    ) -> String {
         let selects = self.build_select_expressions_clickhouse(used_columns);
 
         let select_clause = if selects.is_empty() {
@@ -124,6 +161,12 @@ impl EventSignature {
         let tx_hash_col = r"concat('0x', lower(substring(tx_hash, 3))) AS tx_hash";
         let address_col = r"concat('0x', lower(substring(address, 3))) AS address";
 
+        let extra_where = if pushdown_predicates.is_empty() {
+            String::new()
+        } else {
+            format!(" AND {}", pushdown_predicates.join(" AND "))
+        };
+
         // selector is stored as '0xABCD...' string via direct-write
         format!(
             r#"{name} AS (
@@ -131,13 +174,14 @@ impl EventSignature {
            {tx_hash_col},
            {address_col}, selector, topic1, topic2, topic3, data{select_clause}
     FROM logs
-    WHERE selector = '0x{topic0}'
+    WHERE selector = '0x{topic0}'{extra_where}
 )"#,
             name = self.name,
             tx_hash_col = tx_hash_col,
             address_col = address_col,
             select_clause = select_clause,
             topic0 = self.topic0_hex(),
+            extra_where = extra_where,
         )
     }
 
@@ -524,6 +568,146 @@ fn extract_ident_from_expr(expr: &Expr, columns: &mut HashSet<String>) {
             }
         }
         _ => {}
+    }
+}
+
+/// Extract WHERE predicates on raw `logs` columns that can be pushed into the CTE.
+///
+/// Returns SQL fragments like `block_num >= 100`, `address = '0x...'` etc.
+/// Only extracts simple comparisons (=, >=, <=, >, <) and IN lists on known
+/// raw columns. Decoded event columns are NOT extracted.
+pub fn extract_raw_column_predicates(sql: &str) -> Vec<String> {
+    let mut predicates = Vec::new();
+
+    let dialect = GenericDialect {};
+    let Ok(statements) = Parser::parse_sql(&dialect, sql) else {
+        return predicates;
+    };
+
+    for stmt in &statements {
+        let _ = visit_expressions(stmt, |expr| {
+            extract_raw_predicate(expr, &mut predicates);
+            ControlFlow::<()>::Continue(())
+        });
+    }
+
+    predicates
+}
+
+/// Extract a single raw-column predicate from an expression.
+fn extract_raw_predicate(expr: &Expr, predicates: &mut Vec<String>) {
+    match expr {
+        // col op literal  or  literal op col
+        Expr::BinaryOp { left, op, right } => {
+            let valid_ops = [
+                BinaryOperator::Eq,
+                BinaryOperator::GtEq,
+                BinaryOperator::LtEq,
+                BinaryOperator::Gt,
+                BinaryOperator::Lt,
+            ];
+            if !valid_ops.contains(op) {
+                return;
+            }
+
+            if let Some(pred) = try_raw_comparison(left, op, right) {
+                predicates.push(pred);
+            } else if let Some(pred) = try_raw_comparison_reversed(left, op, right) {
+                predicates.push(pred);
+            }
+        }
+        // col IN (literal, literal, ...)
+        Expr::InList {
+            expr: list_expr,
+            list,
+            negated,
+        } => {
+            if *negated {
+                return;
+            }
+            let col_name = match list_expr.as_ref() {
+                Expr::Identifier(ident) => ident.value.to_lowercase(),
+                _ => return,
+            };
+            if !RAW_PUSHDOWN_COLUMNS.contains(&col_name.as_str()) {
+                return;
+            }
+            let mut values = Vec::new();
+            for item in list {
+                if let Expr::Value(v) = item {
+                    match &v.value {
+                        Value::SingleQuotedString(s) => values.push(format!("'{s}'")),
+                        Value::Number(n, _) => values.push(n.clone()),
+                        _ => return,
+                    }
+                } else {
+                    return;
+                }
+            }
+            if !values.is_empty() {
+                predicates.push(format!("{col_name} IN ({})", values.join(", ")));
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Try to extract `column op literal` where column is a raw logs column.
+fn try_raw_comparison(left: &Expr, op: &BinaryOperator, right: &Expr) -> Option<String> {
+    let col_name = match left {
+        Expr::Identifier(ident) => ident.value.to_lowercase(),
+        _ => return None,
+    };
+    if !RAW_PUSHDOWN_COLUMNS.contains(&col_name.as_str()) {
+        return None;
+    }
+    let value = expr_to_sql_literal(right)?;
+    let op_str = binary_op_to_str(op)?;
+    Some(format!("{col_name} {op_str} {value}"))
+}
+
+/// Try to extract `literal op column` (reversed) where column is a raw logs column.
+fn try_raw_comparison_reversed(left: &Expr, op: &BinaryOperator, right: &Expr) -> Option<String> {
+    let col_name = match right {
+        Expr::Identifier(ident) => ident.value.to_lowercase(),
+        _ => return None,
+    };
+    if !RAW_PUSHDOWN_COLUMNS.contains(&col_name.as_str()) {
+        return None;
+    }
+    let value = expr_to_sql_literal(left)?;
+    // Flip the operator: 5 >= col  →  col <= 5
+    let flipped_op = match op {
+        BinaryOperator::Gt => BinaryOperator::Lt,
+        BinaryOperator::Lt => BinaryOperator::Gt,
+        BinaryOperator::GtEq => BinaryOperator::LtEq,
+        BinaryOperator::LtEq => BinaryOperator::GtEq,
+        BinaryOperator::Eq => BinaryOperator::Eq,
+        _ => return None,
+    };
+    let op_str = binary_op_to_str(&flipped_op)?;
+    Some(format!("{col_name} {op_str} {value}"))
+}
+
+fn expr_to_sql_literal(expr: &Expr) -> Option<String> {
+    match expr {
+        Expr::Value(v) => match &v.value {
+            Value::SingleQuotedString(s) => Some(format!("'{s}'")),
+            Value::Number(n, _) => Some(n.clone()),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+fn binary_op_to_str(op: &BinaryOperator) -> Option<&'static str> {
+    match op {
+        BinaryOperator::Eq => Some("="),
+        BinaryOperator::Gt => Some(">"),
+        BinaryOperator::Lt => Some("<"),
+        BinaryOperator::GtEq => Some(">="),
+        BinaryOperator::LtEq => Some("<="),
+        _ => None,
     }
 }
 
@@ -1247,6 +1431,105 @@ mod tests {
         let sql = r#"SELECT * FROM Transfer WHERE "value" = '1000000'"#;
         let rewritten = sig.rewrite_filters_for_pushdown(sql);
         assert_eq!(sql, rewritten);
+    }
+
+    // ========================================================================
+    // Raw Column Predicate Pushdown Tests
+    // ========================================================================
+
+    #[test]
+    fn test_extract_raw_predicates_block_num_range() {
+        let preds = extract_raw_column_predicates(
+            "SELECT * FROM OrderFilled WHERE address = '0xABC' AND block_num >= 100 AND block_num <= 200"
+        );
+        assert!(preds.contains(&"address = '0xABC'".to_string()));
+        assert!(preds.contains(&"block_num >= 100".to_string()));
+        assert!(preds.contains(&"block_num <= 200".to_string()));
+        assert_eq!(preds.len(), 3);
+    }
+
+    #[test]
+    fn test_extract_raw_predicates_ignores_decoded_columns() {
+        let preds = extract_raw_column_predicates(
+            r#"SELECT * FROM Transfer WHERE "from" = '0xABC' AND block_num > 50"#
+        );
+        // "from" is not a raw column, should not be extracted
+        assert!(!preds.iter().any(|p| p.contains("from")));
+        assert!(preds.contains(&"block_num > 50".to_string()));
+    }
+
+    #[test]
+    fn test_extract_raw_predicates_in_list() {
+        let preds = extract_raw_column_predicates(
+            "SELECT * FROM txs WHERE tx_hash IN ('0xabc', '0xdef')"
+        );
+        assert_eq!(preds.len(), 1);
+        assert!(preds[0].contains("tx_hash IN"));
+    }
+
+    #[test]
+    fn test_extract_raw_predicates_reversed_comparison() {
+        let preds = extract_raw_column_predicates(
+            "SELECT * FROM OrderFilled WHERE 100 <= block_num"
+        );
+        assert!(preds.contains(&"block_num >= 100".to_string()));
+    }
+
+    #[test]
+    fn test_extract_raw_predicates_empty_for_no_raw_columns() {
+        let preds = extract_raw_column_predicates(
+            r#"SELECT * FROM Transfer WHERE "to" = '0xABC' AND "value" > 1000"#
+        );
+        assert!(preds.is_empty());
+    }
+
+    #[test]
+    fn test_cte_postgres_with_pushdown() {
+        let sig = EventSignature::parse(
+            "OrderFilled(uint128 indexed orderId, address indexed maker, address indexed taker, uint128 amountFilled, bool partialFill)",
+        ).unwrap();
+
+        let pushdown = vec![
+            "block_num >= 100".to_string(),
+            "block_num <= 200".to_string(),
+            "address = '0xABC'".to_string(),
+        ];
+        assert_snapshot!(sig.to_cte_sql_postgres_with_pushdown(None, &pushdown));
+    }
+
+    #[test]
+    fn test_cte_clickhouse_with_pushdown() {
+        let sig = EventSignature::parse(
+            "OrderFilled(uint128 indexed orderId, address indexed maker, address indexed taker, uint128 amountFilled, bool partialFill)",
+        ).unwrap();
+
+        let pushdown = vec![
+            "block_num >= 100".to_string(),
+            "block_num <= 200".to_string(),
+            "address = '0xABC'".to_string(),
+        ];
+        assert_snapshot!(sig.to_cte_sql_clickhouse_with_pushdown(None, &pushdown));
+    }
+
+    #[test]
+    fn test_cte_postgres_no_pushdown() {
+        let sig = EventSignature::parse(
+            "Transfer(address indexed from, address indexed to, uint256 value)",
+        ).unwrap();
+        // Empty pushdown should produce identical output to _filtered
+        let without = sig.to_cte_sql_postgres_filtered(None);
+        let with = sig.to_cte_sql_postgres_with_pushdown(None, &[]);
+        assert_eq!(without, with);
+    }
+
+    #[test]
+    fn test_cte_clickhouse_no_pushdown() {
+        let sig = EventSignature::parse(
+            "Transfer(address indexed from, address indexed to, uint256 value)",
+        ).unwrap();
+        let without = sig.to_cte_sql_clickhouse_filtered(None);
+        let with = sig.to_cte_sql_clickhouse_with_pushdown(None, &[]);
+        assert_eq!(without, with);
     }
 
 }

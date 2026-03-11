@@ -1,0 +1,9 @@
+---
+source: src/query/parser.rs
+expression: "sig.to_cte_sql_postgres_with_pushdown(None, &pushdown)"
+---
+OrderFilled AS (
+    SELECT block_num, block_timestamp, log_idx, tx_idx, tx_hash, address, selector, topic1, topic2, topic3, data, abi_uint(topic1) AS "orderId", abi_address(topic2) AS "maker", abi_address(topic3) AS "taker", abi_uint(substring(data FROM 1 FOR 32)) AS "amountFilled", abi_bool(substring(data FROM 33 FOR 32)) AS "partialFill"
+    FROM logs
+    WHERE selector = '\x16c08f8f2c17b3c8879b3e3cf5efdbdcdfdbd0fcb3890f9d3086f470cd601ddd' AND block_num >= 100 AND block_num <= 200 AND address = '0xABC'
+)
