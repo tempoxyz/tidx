@@ -1394,8 +1394,8 @@ async fn tick_receipt_backfill(
     let ranges = group_consecutive_blocks(&blocks_missing);
 
     for (from, to) in ranges {
-        // Fetch receipts for this range
-        let receipts = match rpc.get_receipts_batch(from..=to).await {
+        // Fetch receipts for this range, splitting on "too large" errors
+        let receipts = match fetch_receipts_adaptive(rpc, chain_id, from, to).await {
             Ok(r) => r,
             Err(e) => {
                 error!(chain_id, from, to, error = %e, "Receipt backfill: failed to fetch receipts");
@@ -1477,6 +1477,41 @@ async fn tick_receipt_backfill(
     }
 
     Ok(())
+}
+
+/// Fetch receipts for a block range, adaptively splitting on "too large" errors.
+///
+/// When the RPC rejects a batch as too large, the range is split in half and
+/// retried recursively until individual blocks are fetched. This handles
+/// receipt-heavy blocks that exceed RPC response size limits.
+fn fetch_receipts_adaptive<'a>(
+    rpc: &'a RpcClient,
+    chain_id: u64,
+    from: u64,
+    to: u64,
+) -> futures::future::BoxFuture<'a, Result<Vec<Vec<crate::tempo::Receipt>>>> {
+    Box::pin(async move {
+        match rpc.get_receipts_batch(from..=to).await {
+            Ok(r) => Ok(r),
+            Err(e) if e.to_string().contains("too large") => {
+                if from == to {
+                    anyhow::bail!("Single block {from} receipts exceed RPC response size limit");
+                }
+
+                let mid = from + (to - from) / 2;
+                debug!(
+                    chain_id,
+                    from, to, mid, "Receipt backfill: response too large, splitting range"
+                );
+
+                let mut left = fetch_receipts_adaptive(rpc, chain_id, from, mid).await?;
+                let right = fetch_receipts_adaptive(rpc, chain_id, mid + 1, to).await?;
+                left.extend(right);
+                Ok(left)
+            }
+            Err(e) => Err(e),
+        }
+    })
 }
 
 /// Group consecutive block numbers into ranges for batch fetching.
