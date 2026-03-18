@@ -30,6 +30,7 @@ async fn main() -> Result<()> {
         Commands::Status(args) => cli::status::run(args).await,
         Commands::Query(args) => cli::query::run(args).await,
         Commands::Views(args) => cli::views::run(args).await,
+        Commands::BackfillReceiptData(args) => cli::backfill_receipt_data::run(args).await,
         Commands::Upgrade => cli::upgrade::run(),
     }
 }
