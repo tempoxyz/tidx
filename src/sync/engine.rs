@@ -1482,6 +1482,9 @@ async fn tick_receipt_backfill(
 /// Group consecutive block numbers into ranges for batch fetching.
 /// Input: [100, 99, 98, 50, 49, 10] (descending)
 /// Output: [(98, 100), (49, 50), (10, 10)]
+/// Max blocks per range to avoid RPC "batch response too large" errors.
+const MAX_RANGE_SIZE: u64 = 10;
+
 fn group_consecutive_blocks(blocks: &[u64]) -> Vec<(u64, u64)> {
     if blocks.is_empty() {
         return Vec::new();
@@ -1495,7 +1498,7 @@ fn group_consecutive_blocks(blocks: &[u64]) -> Vec<(u64, u64)> {
     let mut end = sorted[0];
 
     for &num in &sorted[1..] {
-        if num == end + 1 {
+        if num == end + 1 && end - start + 1 < MAX_RANGE_SIZE {
             end = num;
         } else {
             ranges.push((start, end));
@@ -1547,5 +1550,18 @@ mod tests {
             group_consecutive_blocks(&[5, 1, 3, 2, 4]),
             vec![(1, 5)]
         );
+    }
+
+    #[test]
+    fn test_group_consecutive_blocks_splits_large_ranges() {
+        // 20 consecutive blocks should be split into ranges of MAX_RANGE_SIZE
+        let blocks: Vec<u64> = (1..=20).collect();
+        let ranges = group_consecutive_blocks(&blocks);
+        assert_eq!(ranges, vec![(1, 10), (11, 20)]);
+
+        // 25 blocks → 10 + 10 + 5
+        let blocks: Vec<u64> = (1..=25).collect();
+        let ranges = group_consecutive_blocks(&blocks);
+        assert_eq!(ranges, vec![(1, 10), (11, 20), (21, 25)]);
     }
 }
