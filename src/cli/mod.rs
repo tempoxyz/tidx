@@ -1,3 +1,4 @@
+pub mod backfill_receipt_data;
 pub mod init;
 pub mod query;
 pub mod status;
@@ -28,6 +29,8 @@ pub enum Commands {
     Query(query::Args),
     /// Manage ClickHouse materialized views
     Views(views::Args),
+    /// Backfill txs.gas_used and txs.fee_payer from receipts
+    BackfillReceiptData(backfill_receipt_data::Args),
     /// Update tidx to the latest version
     Upgrade,
 }

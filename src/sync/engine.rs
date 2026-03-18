@@ -11,7 +11,7 @@ use crate::db::{Pool, ThrottledPool};
 use crate::metrics::{self, SyncProgress};
 use crate::types::SyncState;
 
-use super::decoder::{decode_block, decode_log, decode_receipt, decode_transaction, timestamp_from_secs};
+use super::decoder::{decode_block, decode_log, decode_receipt, decode_transaction, enrich_txs_from_receipts, timestamp_from_secs};
 use super::fetcher::RpcClient;
 use super::sink::SinkSet;
 use super::writer::{
@@ -575,7 +575,7 @@ impl SyncEngine {
 
         let block_rows: Vec<_> = blocks.iter().map(decode_block).collect();
 
-        let all_txs: Vec<_> = blocks
+        let mut all_txs: Vec<_> = blocks
             .iter()
             .flat_map(|block| {
                 block
@@ -608,6 +608,8 @@ impl SyncEngine {
             })
             .collect();
 
+        enrich_txs_from_receipts(&mut all_txs, &all_receipts);
+
         Ok((blocks, block_rows, all_txs, all_logs, all_receipts))
     }
 
@@ -633,27 +635,29 @@ impl SyncEngine {
         let block_ts = timestamp_from_secs(block.header.timestamp);
         self.sinks.write_blocks(std::slice::from_ref(&block_row)).await?;
 
-        let txs: Vec<_> = block
+        let mut txs: Vec<_> = block
             .transactions
             .txns()
             .enumerate()
             .map(|(i, tx)| decode_transaction(tx, &block, i as u32))
             .collect();
 
-        self.sinks.write_txs(&txs).await?;
-
         // Extract logs from receipts
         let log_rows: Vec<_> = receipts
             .iter()
             .flat_map(|r| r.inner.logs().iter().map(|log| decode_log(log, block_ts)))
             .collect();
-        self.sinks.write_logs(&log_rows).await?;
 
         // Extract receipt rows
         let receipt_rows: Vec<_> = receipts
             .iter()
             .map(|r| decode_receipt(r, block_ts))
             .collect();
+
+        enrich_txs_from_receipts(&mut txs, &receipt_rows);
+
+        self.sinks.write_txs(&txs).await?;
+        self.sinks.write_logs(&log_rows).await?;
         self.sinks.write_receipts(&receipt_rows).await?;
 
         // Update sync state
@@ -1268,7 +1272,7 @@ async fn sync_range_standalone(
     to: u64,
 ) -> Result<()> {
     use alloy::network::ReceiptResponse;
-    use super::decoder::{decode_block, decode_log, decode_receipt, decode_transaction, timestamp_from_secs};
+    use super::decoder::{decode_block, decode_log, decode_receipt, decode_transaction, enrich_txs_from_receipts, timestamp_from_secs};
 
     let (blocks, receipts) = tokio::try_join!(
         rpc.get_blocks_batch(from..=to),
@@ -1282,7 +1286,7 @@ async fn sync_range_standalone(
 
     let block_rows: Vec<_> = blocks.iter().map(decode_block).collect();
 
-    let all_txs: Vec<_> = blocks
+    let mut all_txs: Vec<_> = blocks
         .iter()
         .flat_map(|block| {
             block
@@ -1314,6 +1318,8 @@ async fn sync_range_standalone(
             block_timestamps.get(&block_num).map(|&ts| decode_receipt(receipt, ts))
         })
         .collect();
+
+    enrich_txs_from_receipts(&mut all_txs, &all_receipts);
 
     sinks.write_blocks(&block_rows).await?;
     sinks.write_txs(&all_txs).await?;
@@ -1444,6 +1450,19 @@ async fn tick_receipt_backfill(
         // Write to all sinks
         sinks.write_logs(&all_logs).await?;
         sinks.write_receipts(&all_receipts).await?;
+
+        // Batch-update txs with gas_used and fee_payer from receipts
+        if !all_receipts.is_empty() {
+            conn.execute(
+                "UPDATE txs SET gas_used = r.gas_used, fee_payer = r.fee_payer \
+                 FROM receipts r \
+                 WHERE txs.block_num = r.block_num AND txs.idx = r.tx_idx \
+                   AND txs.block_num >= $1 AND txs.block_num <= $2 \
+                   AND txs.gas_used IS NULL",
+                &[&(from as i64), &(to as i64)],
+            )
+            .await?;
+        }
 
         metrics::record_logs_indexed(chain_id, log_count as u64);
 
