@@ -1451,11 +1451,15 @@ async fn tick_receipt_backfill(
         sinks.write_logs(&all_logs).await?;
         sinks.write_receipts(&all_receipts).await?;
 
-        // Update txs with gas_used and fee_payer from receipts
-        for r in &all_receipts {
+        // Batch-update txs with gas_used and fee_payer from receipts
+        if !all_receipts.is_empty() {
             conn.execute(
-                "UPDATE txs SET gas_used = $1, fee_payer = $2 WHERE block_num = $3 AND idx = $4",
-                &[&r.gas_used, &r.fee_payer, &r.block_num, &r.tx_idx],
+                "UPDATE txs SET gas_used = r.gas_used, fee_payer = r.fee_payer \
+                 FROM receipts r \
+                 WHERE txs.block_num = r.block_num AND txs.idx = r.tx_idx \
+                   AND txs.block_num >= $1 AND txs.block_num <= $2 \
+                   AND txs.gas_used IS NULL",
+                &[&(from as i64), &(to as i64)],
             )
             .await?;
         }
