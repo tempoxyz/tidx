@@ -1393,6 +1393,9 @@ async fn tick_receipt_backfill(
     // Group consecutive blocks into ranges for batch fetching
     let ranges = group_consecutive_blocks(&blocks_missing);
 
+    let mut min_block: Option<u64> = None;
+    let mut max_block: Option<u64> = None;
+
     for (from, to) in ranges {
         // Fetch receipts for this range, splitting on "too large" errors
         let receipts = match fetch_receipts_adaptive(rpc, chain_id, from, to).await {
@@ -1451,17 +1454,9 @@ async fn tick_receipt_backfill(
         sinks.write_logs(&all_logs).await?;
         sinks.write_receipts(&all_receipts).await?;
 
-        // Batch-update txs with gas_used and fee_payer from receipts
-        if !all_receipts.is_empty() {
-            conn.execute(
-                "UPDATE txs SET gas_used = r.gas_used, fee_payer = r.fee_payer \
-                 FROM receipts r \
-                 WHERE txs.block_num = r.block_num AND txs.idx = r.tx_idx \
-                   AND txs.block_num >= $1 AND txs.block_num <= $2 \
-                   AND txs.gas_used IS NULL",
-                &[&(from as i64), &(to as i64)],
-            )
-            .await?;
+        if receipt_count > 0 {
+            min_block = Some(min_block.map_or(from, |m: u64| m.min(from)));
+            max_block = Some(max_block.map_or(to, |m: u64| m.max(to)));
         }
 
         metrics::record_logs_indexed(chain_id, log_count as u64);
@@ -1474,6 +1469,20 @@ async fn tick_receipt_backfill(
             logs = log_count,
             "Receipt backfill: wrote receipts+logs"
         );
+    }
+
+    // Single UPDATE txs covering all processed ranges (instead of per-range)
+    if let (Some(lo), Some(hi)) = (min_block, max_block) {
+        let conn = pool.get().await?;
+        conn.execute(
+            "UPDATE txs SET gas_used = r.gas_used, fee_payer = r.fee_payer \
+             FROM receipts r \
+             WHERE txs.block_num = r.block_num AND txs.idx = r.tx_idx \
+               AND txs.block_num >= $1 AND txs.block_num <= $2 \
+               AND txs.gas_used IS NULL",
+            &[&(lo as i64), &(hi as i64)],
+        )
+        .await?;
     }
 
     Ok(())
