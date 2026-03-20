@@ -19,10 +19,10 @@ pub async fn write_blocks(pool: &Pool, blocks: &[BlockRow]) -> Result<()> {
     }
 
     let start = Instant::now();
-    let conn = pool.get().await?;
+    let mut conn = pool.get().await?;
+    let tx = conn.transaction().await?;
 
-    conn.execute("BEGIN", &[]).await?;
-    conn.execute(
+    tx.execute(
         "CREATE TEMP TABLE _staging_blocks (LIKE blocks INCLUDING DEFAULTS) ON COMMIT DROP",
         &[],
     )
@@ -40,7 +40,7 @@ pub async fn write_blocks(pool: &Pool, blocks: &[BlockRow]) -> Result<()> {
         Type::BYTEA,       // extra_data
     ];
 
-    let sink = conn
+    let sink = tx
         .copy_in(
             "COPY _staging_blocks (num, hash, parent_hash, timestamp, timestamp_ms, gas_limit, gas_used, miner, extra_data) FROM STDIN BINARY",
         )
@@ -68,12 +68,12 @@ pub async fn write_blocks(pool: &Pool, blocks: &[BlockRow]) -> Result<()> {
 
     pinned_writer.as_mut().finish().await?;
 
-    conn.execute(
+    tx.execute(
         "INSERT INTO blocks SELECT * FROM _staging_blocks ON CONFLICT (timestamp, num) DO NOTHING",
         &[],
     )
     .await?;
-    conn.execute("COMMIT", &[]).await?;
+    tx.commit().await?;
 
     metrics::record_sink_write_duration("postgres", "blocks", start.elapsed());
     metrics::record_sink_write_rows("postgres", "blocks", blocks.len() as u64);
@@ -93,13 +93,14 @@ pub async fn write_txs(pool: &Pool, txs: &[TxRow]) -> Result<()> {
     }
 
     let start = Instant::now();
-    let conn = pool.get().await?;
-    conn.execute("SET statement_timeout = 0", &[]).await?;
+    let mut conn = pool.get().await?;
+    let tx = conn.transaction().await?;
+    tx.execute("SET LOCAL statement_timeout = 0", &[]).await?;
 
     // Get block range and delete existing rows before COPY
     let min_block = txs.iter().map(|t| t.block_num).min().unwrap();
     let max_block = txs.iter().map(|t| t.block_num).max().unwrap();
-    conn.execute(
+    tx.execute(
         "DELETE FROM txs WHERE block_num >= $1 AND block_num <= $2",
         &[&min_block, &max_block],
     )
@@ -130,7 +131,7 @@ pub async fn write_txs(pool: &Pool, txs: &[TxRow]) -> Result<()> {
         Type::INT2,       // signature_type
     ];
 
-    let sink = conn
+    let sink = tx
         .copy_in(
             r#"COPY txs (block_num, block_timestamp, idx, hash, type, "from", "to", value, input,
                 gas_limit, max_fee_per_gas, max_priority_fee_per_gas, gas_used,
@@ -173,6 +174,7 @@ pub async fn write_txs(pool: &Pool, txs: &[TxRow]) -> Result<()> {
     }
 
     pinned_writer.as_mut().finish().await?;
+    tx.commit().await?;
 
     metrics::record_sink_write_duration("postgres", "txs", start.elapsed());
     metrics::record_sink_write_rows("postgres", "txs", txs.len() as u64);
@@ -191,13 +193,14 @@ pub async fn write_logs(pool: &Pool, logs: &[LogRow]) -> Result<()> {
     }
 
     let start = Instant::now();
-    let conn = pool.get().await?;
-    conn.execute("SET statement_timeout = 0", &[]).await?;
+    let mut conn = pool.get().await?;
+    let tx = conn.transaction().await?;
+    tx.execute("SET LOCAL statement_timeout = 0", &[]).await?;
 
     // Get block range and delete existing rows before COPY
     let min_block = logs.iter().map(|l| l.block_num).min().unwrap();
     let max_block = logs.iter().map(|l| l.block_num).max().unwrap();
-    conn.execute(
+    tx.execute(
         "DELETE FROM logs WHERE block_num >= $1 AND block_num <= $2",
         &[&min_block, &max_block],
     )
@@ -218,7 +221,7 @@ pub async fn write_logs(pool: &Pool, logs: &[LogRow]) -> Result<()> {
         Type::BYTEA,      // data
     ];
 
-    let sink = conn
+    let sink = tx
         .copy_in(
             "COPY logs (block_num, block_timestamp, log_idx, tx_idx, tx_hash, address, selector, topic0, topic1, topic2, topic3, data) FROM STDIN BINARY",
         )
@@ -248,6 +251,7 @@ pub async fn write_logs(pool: &Pool, logs: &[LogRow]) -> Result<()> {
     }
 
     pinned_writer.as_mut().finish().await?;
+    tx.commit().await?;
 
     metrics::record_sink_write_duration("postgres", "logs", start.elapsed());
     metrics::record_sink_write_rows("postgres", "logs", logs.len() as u64);
@@ -266,13 +270,14 @@ pub async fn write_receipts(pool: &Pool, receipts: &[ReceiptRow]) -> Result<()> 
     }
 
     let start = Instant::now();
-    let conn = pool.get().await?;
-    conn.execute("SET statement_timeout = 0", &[]).await?;
+    let mut conn = pool.get().await?;
+    let tx = conn.transaction().await?;
+    tx.execute("SET LOCAL statement_timeout = 0", &[]).await?;
 
     // Get block range and delete existing rows before COPY
     let min_block = receipts.iter().map(|r| r.block_num).min().unwrap();
     let max_block = receipts.iter().map(|r| r.block_num).max().unwrap();
-    conn.execute(
+    tx.execute(
         "DELETE FROM receipts WHERE block_num >= $1 AND block_num <= $2",
         &[&min_block, &max_block],
     )
@@ -293,7 +298,7 @@ pub async fn write_receipts(pool: &Pool, receipts: &[ReceiptRow]) -> Result<()> 
         Type::BYTEA,       // fee_payer
     ];
 
-    let sink = conn
+    let sink = tx
         .copy_in(
             r#"COPY receipts (block_num, block_timestamp, tx_idx, tx_hash, "from", "to",
                 contract_address, gas_used, cumulative_gas_used, effective_gas_price,
@@ -325,6 +330,7 @@ pub async fn write_receipts(pool: &Pool, receipts: &[ReceiptRow]) -> Result<()> 
     }
 
     pinned_writer.as_mut().finish().await?;
+    tx.commit().await?;
 
     metrics::record_sink_write_duration("postgres", "receipts", start.elapsed());
     metrics::record_sink_write_rows("postgres", "receipts", receipts.len() as u64);
