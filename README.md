@@ -176,6 +176,8 @@ pg_password_env = "TIDX_PG_PASSWORD"
 ├── rpc_url                 string    (required)     JSON-RPC endpoint URL
 ├── pg_url                  string    (required)     PostgreSQL connection string
 ├── pg_password_env         string    (optional)     Env var name for PostgreSQL password
+├── api_pg_url              string    (optional)     Separate PostgreSQL URL for API (e.g., read replica)
+├── api_pg_password_env     string    (optional)     Env var name for API PostgreSQL password
 ├── batch_size              u64       = 100          Blocks per RPC batch request
 └── [clickhouse]                                     ClickHouse OLAP settings
     ├── enabled             bool      = false        Enable ClickHouse OLAP queries
