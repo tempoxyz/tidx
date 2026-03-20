@@ -16,7 +16,7 @@ CREATE TABLE IF NOT EXISTS receipts (
 
 CREATE INDEX IF NOT EXISTS idx_receipts_tx_hash ON receipts (tx_hash);
 CREATE INDEX IF NOT EXISTS idx_receipts_block_num ON receipts (block_num DESC);
-CREATE INDEX IF NOT EXISTS idx_receipts_block_num_asc ON receipts (block_num ASC);
+DROP INDEX IF EXISTS idx_receipts_block_num_asc;
 CREATE INDEX IF NOT EXISTS idx_receipts_from ON receipts ("from", block_timestamp DESC);
 CREATE INDEX IF NOT EXISTS idx_receipts_fee_payer ON receipts (fee_payer, block_timestamp DESC) WHERE fee_payer IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_receipts_contract_address ON receipts (contract_address) WHERE contract_address IS NOT NULL;
