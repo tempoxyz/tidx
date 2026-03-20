@@ -85,6 +85,29 @@ impl SinkSet {
         Ok(())
     }
 
+
+    /// Write all four tables in a single PG transaction, with CH writes concurrent.
+    pub async fn write_all(
+        &self,
+        blocks: &[BlockRow],
+        txs: &[TxRow],
+        logs: &[LogRow],
+        receipts: &[ReceiptRow],
+    ) -> Result<()> {
+        if let Some(ch) = &self.ch {
+            tokio::try_join!(
+                writer::write_batch(&self.pool, blocks, txs, logs, receipts),
+                ch.write_blocks(blocks),
+                ch.write_txs(txs),
+                ch.write_logs(logs),
+                ch.write_receipts(receipts),
+            )?;
+        } else {
+            writer::write_batch(&self.pool, blocks, txs, logs, receipts).await?;
+        }
+        Ok(())
+    }
+
     /// Delete all data from a given block number onwards (reorg support).
     /// Returns the number of blocks deleted from PostgreSQL.
     pub async fn delete_from(&self, block_num: u64) -> Result<u64> {
