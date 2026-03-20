@@ -294,17 +294,10 @@ pub fn format_column_json(row: &tokio_postgres::Row, idx: usize) -> serde_json::
             .try_get::<_, i64>(idx)
             .ok()
             .map_or(serde_json::Value::Null, |v| serde_json::Value::Number(v.into())),
-        "numeric" => {
-            // rust_decimal::Decimal panics (not errors) for values exceeding its
-            // 96-bit mantissa (~28 digits). Postgres NUMERIC is arbitrary precision
-            // (e.g. abi_uint() on uint256 = 78 digits), so catch the panic.
-            match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                row.try_get::<_, rust_decimal::Decimal>(idx)
-            })) {
-                Ok(Ok(v)) => serde_json::Value::String(v.to_string()),
-                _ => serde_json::Value::Null,
-            }
-        }
+        "numeric" => row
+            .try_get::<_, PgNumeric>(idx)
+            .ok()
+            .map_or(serde_json::Value::Null, |v| serde_json::Value::String(v.0)),
         "float4" | "float8" => row
             .try_get::<_, f64>(idx)
             .ok()
@@ -327,6 +320,112 @@ pub fn format_column_json(row: &tokio_postgres::Row, idx: usize) -> serde_json::
             .ok()
             .map_or(serde_json::Value::Null, serde_json::Value::Bool),
         _ => serde_json::Value::Null,
+    }
+}
+
+/// Wrapper that decodes PostgreSQL NUMERIC binary format directly into a String,
+/// avoiding `rust_decimal::Decimal` which panics on values exceeding its 96-bit
+/// mantissa (~28 digits). Postgres NUMERIC is arbitrary precision (e.g. abi_uint()
+/// on uint256 produces 78-digit values).
+struct PgNumeric(String);
+
+impl<'a> postgres_types::FromSql<'a> for PgNumeric {
+    fn from_sql(
+        _ty: &postgres_types::Type,
+        raw: &'a [u8],
+    ) -> Result<Self, Box<dyn std::error::Error + Sync + Send>> {
+        if raw.len() < 8 {
+            return Err("NUMERIC binary too short".into());
+        }
+        let ndigits = u16::from_be_bytes([raw[0], raw[1]]) as usize;
+        let weight = i16::from_be_bytes([raw[2], raw[3]]);
+        let sign = u16::from_be_bytes([raw[4], raw[5]]);
+        let dscale = u16::from_be_bytes([raw[6], raw[7]]) as usize;
+
+        const SIGN_POS: u16 = 0x0000;
+        const SIGN_NEG: u16 = 0x4000;
+        const SIGN_NAN: u16 = 0xC000;
+        const SIGN_PINF: u16 = 0xD000;
+        const SIGN_NINF: u16 = 0xF000;
+
+        match sign {
+            SIGN_NAN => return Ok(PgNumeric("NaN".to_string())),
+            SIGN_PINF => return Ok(PgNumeric("Infinity".to_string())),
+            SIGN_NINF => return Ok(PgNumeric("-Infinity".to_string())),
+            SIGN_POS | SIGN_NEG => {}
+            _ => return Err("invalid NUMERIC sign".into()),
+        }
+
+        if ndigits == 0 {
+            return Ok(PgNumeric(if dscale > 0 {
+                format!("0.{}", "0".repeat(dscale))
+            } else {
+                "0".to_string()
+            }));
+        }
+
+        let expected_len = ndigits
+            .checked_mul(2)
+            .and_then(|n| n.checked_add(8))
+            .ok_or("NUMERIC length overflow")?;
+        if raw.len() < expected_len {
+            return Err("NUMERIC binary truncated".into());
+        }
+
+        let mut digits = Vec::with_capacity(ndigits);
+        for i in 0..ndigits {
+            let off = 8 + i * 2;
+            let d = u16::from_be_bytes([raw[off], raw[off + 1]]);
+            if d > 9999 {
+                return Err("invalid NUMERIC digit".into());
+            }
+            digits.push(d);
+        }
+
+        let mut s = String::new();
+        if sign == SIGN_NEG {
+            s.push('-');
+        }
+
+        // Integer part: digit groups at positions 0..=weight
+        let weight_i = i32::from(weight);
+        let int_groups = (weight_i + 1).max(0) as usize;
+        if int_groups == 0 {
+            s.push('0');
+        } else {
+            for i in 0..int_groups {
+                let d = if i < ndigits { digits[i] } else { 0 };
+                if i == 0 {
+                    s.push_str(&d.to_string());
+                } else {
+                    s.push_str(&format!("{d:04}"));
+                }
+            }
+        }
+
+        // Fractional part
+        if dscale > 0 {
+            s.push('.');
+            let mut frac = String::new();
+            // Leading zero groups for weight < -1 (e.g. 0.00000042 has weight=-2)
+            let frac_leading_zero_groups = (-weight_i - 1).max(0) as usize;
+            for _ in 0..frac_leading_zero_groups {
+                frac.push_str("0000");
+            }
+            for i in int_groups..ndigits {
+                frac.push_str(&format!("{:04}", digits[i]));
+            }
+            while frac.len() < dscale {
+                frac.push('0');
+            }
+            s.push_str(&frac[..dscale]);
+        }
+
+        Ok(PgNumeric(s))
+    }
+
+    fn accepts(ty: &postgres_types::Type) -> bool {
+        *ty == postgres_types::Type::NUMERIC
     }
 }
 
@@ -375,6 +474,7 @@ mod tests {
     use super::*;
     use crate::query::EventSignature;
     use insta::assert_snapshot;
+    use postgres_types::FromSql;
 
     // ========================================================================
     // Event CTE SQL Generation Tests (Both Engines)
@@ -513,5 +613,122 @@ mod tests {
         assert!(sanitized.ends_with("..."));
     }
 
+    // ========================================================================
+    // PgNumeric Wire Format Decoding Tests
+    // ========================================================================
+
+    fn encode_pg_numeric(ndigits: i16, weight: i16, sign: u16, dscale: u16, digits: &[u16]) -> Vec<u8> {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&ndigits.to_be_bytes());
+        buf.extend_from_slice(&weight.to_be_bytes());
+        buf.extend_from_slice(&sign.to_be_bytes());
+        buf.extend_from_slice(&dscale.to_be_bytes());
+        for &d in digits {
+            buf.extend_from_slice(&d.to_be_bytes());
+        }
+        buf
+    }
+
+    #[test]
+    fn test_pg_numeric_zero() {
+        let raw = encode_pg_numeric(0, 0, 0, 0, &[]);
+        let v = PgNumeric::from_sql(&postgres_types::Type::NUMERIC, &raw).unwrap();
+        assert_eq!(v.0, "0");
+    }
+
+    #[test]
+    fn test_pg_numeric_small_int() {
+        // 42 = weight=0, digits=[42]
+        let raw = encode_pg_numeric(1, 0, 0, 0, &[42]);
+        let v = PgNumeric::from_sql(&postgres_types::Type::NUMERIC, &raw).unwrap();
+        assert_eq!(v.0, "42");
+    }
+
+    #[test]
+    fn test_pg_numeric_large_int() {
+        // 1_000_000 = weight=1, digits=[100, 0]
+        let raw = encode_pg_numeric(2, 1, 0, 0, &[100, 0]);
+        let v = PgNumeric::from_sql(&postgres_types::Type::NUMERIC, &raw).unwrap();
+        assert_eq!(v.0, "1000000");
+    }
+
+    #[test]
+    fn test_pg_numeric_negative() {
+        let raw = encode_pg_numeric(1, 0, 0x4000, 0, &[123]);
+        let v = PgNumeric::from_sql(&postgres_types::Type::NUMERIC, &raw).unwrap();
+        assert_eq!(v.0, "-123");
+    }
+
+    #[test]
+    fn test_pg_numeric_nan() {
+        let raw = encode_pg_numeric(0, 0, 0xC000, 0, &[]);
+        let v = PgNumeric::from_sql(&postgres_types::Type::NUMERIC, &raw).unwrap();
+        assert_eq!(v.0, "NaN");
+    }
+
+    #[test]
+    fn test_pg_numeric_decimal() {
+        // 3.14 = weight=0, dscale=2, digits=[3, 1400]
+        let raw = encode_pg_numeric(2, 0, 0, 2, &[3, 1400]);
+        let v = PgNumeric::from_sql(&postgres_types::Type::NUMERIC, &raw).unwrap();
+        assert_eq!(v.0, "3.14");
+    }
+
+    #[test]
+    fn test_pg_numeric_uint256_max() {
+        // 2^256 - 1 = 115792089237316195423570985008687907853269984665640564039457584007913129639935
+        // This is a 78-digit number that would panic with rust_decimal::Decimal.
+        // PG NUMERIC base-10000 encoding: weight=19 (20 groups for integer part)
+        let digits: Vec<u16> = vec![
+            11, 5792, 892, 3731, 6195, 4235, 7098, 5008,
+            6879, 785, 3269, 9846, 6564, 564, 394, 5758,
+            4007, 9131, 2963, 9935,
+        ];
+        let raw = encode_pg_numeric(20, 19, 0, 0, &digits);
+        let v = PgNumeric::from_sql(&postgres_types::Type::NUMERIC, &raw).unwrap();
+        assert_eq!(v.0, "115792089237316195423570985008687907853269984665640564039457584007913129639935");
+    }
+
+    #[test]
+    fn test_pg_numeric_fractional_only() {
+        // 0.0042 = weight=-1, dscale=4, digits=[42]
+        let raw = encode_pg_numeric(1, -1, 0, 4, &[42]);
+        let v = PgNumeric::from_sql(&postgres_types::Type::NUMERIC, &raw).unwrap();
+        assert_eq!(v.0, "0.0042");
+    }
+
+    #[test]
+    fn test_pg_numeric_deep_fraction() {
+        // 0.00000042 = weight=-2, dscale=8, digits=[42]
+        let raw = encode_pg_numeric(1, -2, 0, 8, &[42]);
+        let v = PgNumeric::from_sql(&postgres_types::Type::NUMERIC, &raw).unwrap();
+        assert_eq!(v.0, "0.00000042");
+    }
+
+    #[test]
+    fn test_pg_numeric_infinity() {
+        let raw = encode_pg_numeric(0, 0, 0xD000, 0, &[]);
+        let v = PgNumeric::from_sql(&postgres_types::Type::NUMERIC, &raw).unwrap();
+        assert_eq!(v.0, "Infinity");
+    }
+
+    #[test]
+    fn test_pg_numeric_neg_infinity() {
+        let raw = encode_pg_numeric(0, 0, 0xF000, 0, &[]);
+        let v = PgNumeric::from_sql(&postgres_types::Type::NUMERIC, &raw).unwrap();
+        assert_eq!(v.0, "-Infinity");
+    }
+
+    #[test]
+    fn test_pg_numeric_invalid_digit() {
+        let raw = encode_pg_numeric(1, 0, 0, 0, &[10000]);
+        assert!(PgNumeric::from_sql(&postgres_types::Type::NUMERIC, &raw).is_err());
+    }
+
+    #[test]
+    fn test_pg_numeric_invalid_sign() {
+        let raw = encode_pg_numeric(1, 0, 0x1234, 0, &[42]);
+        assert!(PgNumeric::from_sql(&postgres_types::Type::NUMERIC, &raw).is_err());
+    }
 }
 

@@ -70,7 +70,7 @@ clickhouse = { version = "0.14", features = ["lz4", "chrono", "rustls-tls"] }
 
 # Hex encoding
 hex = "0.4"
-rust_decimal = { version = "1.40.0", features = ["db-tokio-postgres"] }
+
 
 # Random
 rand = "0.9"
