@@ -42,19 +42,37 @@ use tokio::sync::Semaphore;
 /// must acquire a semaphore permit before getting a connection.
 /// This ensures backfill can't starve realtime/API, and when backfill
 /// completes, all connections are available for other workloads.
+///
+/// ## Connection budget (with parallel writes)
+///
+/// Each write operation uses up to 4 PG connections concurrently (one per table
+/// via `tokio::try_join!` in `SinkSet` + `sync_range_standalone`). The budget:
+///
+/// | Worker               | Max connections         |
+/// |----------------------|-------------------------|
+/// | Realtime (1)         | 4 tables = 4            |
+/// | Gap-fill (4 workers) | 4 × 4 tables = 16      |
+/// | Receipt backfill (1) | 2                       |
+/// | API queries          | ~8                      |
+/// | Sync state / gaps    | 2                       |
+/// | **Total peak**       | **~32**                 |
+///
+/// Backfill semaphore (6 permits) caps gap-fill to 6 × 4 = 24 connections,
+/// keeping total peak within pool_size=48.
 #[derive(Clone)]
 pub struct ThrottledPool {
-    /// Shared connection pool (16 connections)
     pub pool: Pool,
-    /// Semaphore limiting concurrent backfill operations (default: 6)
-    /// Leaves headroom for realtime (2) and API (8)
+    /// Semaphore limiting concurrent backfill operations.
+    /// Each operation may use up to 4 connections (parallel table writes),
+    /// so effective max backfill connections = backfill_limit × 4.
     pub backfill_semaphore: Arc<Semaphore>,
 }
 
 impl ThrottledPool {
     pub async fn new(database_url: &str) -> Result<Self> {
-        // Keep headroom: pool 20, backfill 10 (leaves 10 for realtime/API)
-        Self::with_limits(database_url, 20, 10).await
+        // Pool 48: backfill 6×4=24 + realtime 4 + receipts 2 + API 8 + overhead 10
+        // Backfill 6: 6 concurrent operations × 4 connections each = 24 max
+        Self::with_limits(database_url, 48, 6).await
     }
 
     /// Create with custom pool size and backfill limit.
