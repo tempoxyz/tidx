@@ -851,6 +851,16 @@ async fn tick_gapfill_parallel(
         return Ok(());
     }
 
+    // Fast path: if synced_num == tip_num, we're fully synced — skip the
+    // expensive full-table window function scan entirely.
+    if state.synced_num >= state.tip_num && state.tip_num > 0 {
+        metrics::set_gap_blocks(chain_id, "postgres", 0);
+        metrics::set_gap_count(chain_id, "postgres", 0);
+        metrics::set_synced(chain_id, realtime_lag == 0);
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        return Ok(());
+    }
+
     // Detect ALL gaps including from genesis, sorted by end DESC (most recent first)
     let gaps = detect_all_gaps(pool, state.tip_num).await?;
 
