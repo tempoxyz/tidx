@@ -23,7 +23,10 @@ pub async fn write_blocks(pool: &Pool, blocks: &[BlockRow]) -> Result<()> {
     let tx = conn.transaction().await?;
 
     tx.execute(
-        "CREATE TEMP TABLE _staging_blocks (LIKE blocks INCLUDING DEFAULTS) ON COMMIT DROP",
+        "CREATE TEMP TABLE _staging_blocks (
+            num INT8, hash BYTEA, parent_hash BYTEA, timestamp TIMESTAMPTZ,
+            timestamp_ms INT8, gas_limit INT8, gas_used INT8, miner BYTEA, extra_data BYTEA
+        ) ON COMMIT DROP",
         &[],
     )
     .await?;
@@ -96,7 +99,14 @@ pub async fn write_txs(pool: &Pool, txs: &[TxRow]) -> Result<()> {
     let mut conn = pool.get().await?;
     let tx = conn.transaction().await?;
     tx.execute(
-        "CREATE TEMP TABLE _staging_txs (LIKE txs INCLUDING DEFAULTS) ON COMMIT DROP",
+        "CREATE TEMP TABLE _staging_txs (
+            block_num INT8, block_timestamp TIMESTAMPTZ, idx INT4, hash BYTEA,
+            type INT2, \"from\" BYTEA, \"to\" BYTEA, value TEXT, input BYTEA,
+            gas_limit INT8, max_fee_per_gas TEXT, max_priority_fee_per_gas TEXT,
+            gas_used INT8, nonce_key BYTEA, nonce INT8, fee_token BYTEA,
+            fee_payer BYTEA, calls JSONB, call_count INT2, valid_before INT8,
+            valid_after INT8, signature_type INT2
+        ) ON COMMIT DROP",
         &[],
     )
     .await?;
@@ -193,7 +203,11 @@ pub async fn write_logs(pool: &Pool, logs: &[LogRow]) -> Result<()> {
     let mut conn = pool.get().await?;
     let tx = conn.transaction().await?;
     tx.execute(
-        "CREATE TEMP TABLE _staging_logs (LIKE logs INCLUDING DEFAULTS) ON COMMIT DROP",
+        "CREATE TEMP TABLE _staging_logs (
+            block_num INT8, block_timestamp TIMESTAMPTZ, log_idx INT4, tx_idx INT4,
+            tx_hash BYTEA, address BYTEA, selector BYTEA, topic0 BYTEA,
+            topic1 BYTEA, topic2 BYTEA, topic3 BYTEA, data BYTEA
+        ) ON COMMIT DROP",
         &[],
     )
     .await?;
@@ -267,7 +281,12 @@ pub async fn write_receipts(pool: &Pool, receipts: &[ReceiptRow]) -> Result<()> 
     let mut conn = pool.get().await?;
     let tx = conn.transaction().await?;
     tx.execute(
-        "CREATE TEMP TABLE _staging_receipts (LIKE receipts INCLUDING DEFAULTS) ON COMMIT DROP",
+        "CREATE TEMP TABLE _staging_receipts (
+            block_num INT8, block_timestamp TIMESTAMPTZ, tx_idx INT4, tx_hash BYTEA,
+            \"from\" BYTEA, \"to\" BYTEA, contract_address BYTEA, gas_used INT8,
+            cumulative_gas_used INT8, effective_gas_price TEXT, status INT2,
+            fee_payer BYTEA
+        ) ON COMMIT DROP",
         &[],
     )
     .await?;
