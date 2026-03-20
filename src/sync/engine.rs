@@ -617,10 +617,12 @@ impl SyncEngine {
         let (_blocks, block_rows, all_txs, all_logs, all_receipts) =
             self.fetch_range(from, to).await?;
 
-        self.sinks.write_blocks(&block_rows).await?;
-        self.sinks.write_txs(&all_txs).await?;
-        self.sinks.write_logs(&all_logs).await?;
-        self.sinks.write_receipts(&all_receipts).await?;
+        tokio::try_join!(
+            self.sinks.write_blocks(&block_rows),
+            self.sinks.write_txs(&all_txs),
+            self.sinks.write_logs(&all_logs),
+            self.sinks.write_receipts(&all_receipts),
+        )?;
 
         Ok(())
     }
@@ -633,8 +635,6 @@ impl SyncEngine {
 
         let block_row = decode_block(&block);
         let block_ts = timestamp_from_secs(block.header.timestamp);
-        self.sinks.write_blocks(std::slice::from_ref(&block_row)).await?;
-
         let mut txs: Vec<_> = block
             .transactions
             .txns()
@@ -642,13 +642,11 @@ impl SyncEngine {
             .map(|(i, tx)| decode_transaction(tx, &block, i as u32))
             .collect();
 
-        // Extract logs from receipts
         let log_rows: Vec<_> = receipts
             .iter()
             .flat_map(|r| r.inner.logs().iter().map(|log| decode_log(log, block_ts)))
             .collect();
 
-        // Extract receipt rows
         let receipt_rows: Vec<_> = receipts
             .iter()
             .map(|r| decode_receipt(r, block_ts))
@@ -656,9 +654,12 @@ impl SyncEngine {
 
         enrich_txs_from_receipts(&mut txs, &receipt_rows);
 
-        self.sinks.write_txs(&txs).await?;
-        self.sinks.write_logs(&log_rows).await?;
-        self.sinks.write_receipts(&receipt_rows).await?;
+        tokio::try_join!(
+            self.sinks.write_blocks(std::slice::from_ref(&block_row)),
+            self.sinks.write_txs(&txs),
+            self.sinks.write_logs(&log_rows),
+            self.sinks.write_receipts(&receipt_rows),
+        )?;
 
         // Update sync state
         let state = load_sync_state(self.pool(), self.chain_id).await?.unwrap_or_default();
@@ -1321,10 +1322,12 @@ async fn sync_range_standalone(
 
     enrich_txs_from_receipts(&mut all_txs, &all_receipts);
 
-    sinks.write_blocks(&block_rows).await?;
-    sinks.write_txs(&all_txs).await?;
-    sinks.write_logs(&all_logs).await?;
-    sinks.write_receipts(&all_receipts).await?;
+    tokio::try_join!(
+        sinks.write_blocks(&block_rows),
+        sinks.write_txs(&all_txs),
+        sinks.write_logs(&all_logs),
+        sinks.write_receipts(&all_receipts),
+    )?;
 
     Ok(())
 }
