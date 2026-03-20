@@ -2,7 +2,7 @@ mod common;
 
 use common::testdb::TestDb;
 
-use tidx::sync::writer::{detect_all_gaps, detect_gaps};
+use tidx::sync::writer::{detect_all_gaps, detect_gaps, has_gaps};
 use serial_test::serial;
 
 // ============================================================================
@@ -486,4 +486,219 @@ async fn test_fully_synced_returns_empty_gaps() {
     let gaps = detect_all_gaps(&db.pool, 100).await.expect("Failed to detect gaps");
 
     assert!(gaps.is_empty(), "Fully synced chain should have no gaps");
+}
+
+// ============================================================================
+// has_gaps tests - fast COUNT-based gap detection
+// ============================================================================
+
+#[tokio::test]
+#[serial(db)]
+async fn test_has_gaps_empty_table() {
+    let db = TestDb::empty().await;
+    db.truncate_all().await;
+
+    // Empty table should report gaps for any non-empty range
+    assert!(has_gaps(&db.pool, 1, 100).await.unwrap());
+}
+
+#[tokio::test]
+#[serial(db)]
+async fn test_has_gaps_empty_range() {
+    let db = TestDb::empty().await;
+    db.truncate_all().await;
+
+    // to < from should report no gaps
+    assert!(!has_gaps(&db.pool, 100, 1).await.unwrap());
+}
+
+#[tokio::test]
+#[serial(db)]
+async fn test_has_gaps_fully_synced() {
+    let db = TestDb::empty().await;
+    db.truncate_all().await;
+
+    let conn = db.pool.get().await.unwrap();
+
+    // Insert contiguous blocks 1-100
+    for num in 1i64..=100 {
+        conn.execute(
+            r#"INSERT INTO blocks (num, hash, parent_hash, timestamp, timestamp_ms, gas_limit, gas_used, miner)
+               VALUES ($1, $2, $3, NOW(), $4, 1000000, 100000, $5)"#,
+            &[
+                &num,
+                &vec![(num % 256) as u8; 32],
+                &vec![((num - 1) % 256) as u8; 32],
+                &(num * 1000),
+                &vec![0u8; 20],
+            ],
+        )
+        .await
+        .unwrap();
+    }
+
+    // No gaps in [1, 100]
+    assert!(!has_gaps(&db.pool, 1, 100).await.unwrap());
+
+    // Subrange also has no gaps
+    assert!(!has_gaps(&db.pool, 50, 75).await.unwrap());
+}
+
+#[tokio::test]
+#[serial(db)]
+async fn test_has_gaps_with_gap() {
+    let db = TestDb::empty().await;
+    db.truncate_all().await;
+
+    let conn = db.pool.get().await.unwrap();
+
+    // Insert blocks 1-5 and 10-15 (gap at 6-9)
+    for num in (1i64..=5).chain(10..=15) {
+        conn.execute(
+            r#"INSERT INTO blocks (num, hash, parent_hash, timestamp, timestamp_ms, gas_limit, gas_used, miner)
+               VALUES ($1, $2, $3, NOW(), $4, 1000000, 100000, $5)"#,
+            &[
+                &num,
+                &vec![(num % 256) as u8; 32],
+                &vec![((num - 1) % 256) as u8; 32],
+                &(num * 1000),
+                &vec![0u8; 20],
+            ],
+        )
+        .await
+        .unwrap();
+    }
+
+    // Full range has gaps
+    assert!(has_gaps(&db.pool, 1, 15).await.unwrap());
+
+    // Range covering the gap
+    assert!(has_gaps(&db.pool, 4, 12).await.unwrap());
+
+    // Range entirely before the gap — no gaps
+    assert!(!has_gaps(&db.pool, 1, 5).await.unwrap());
+
+    // Range entirely after the gap — no gaps
+    assert!(!has_gaps(&db.pool, 10, 15).await.unwrap());
+}
+
+#[tokio::test]
+#[serial(db)]
+async fn test_has_gaps_single_missing_block() {
+    let db = TestDb::empty().await;
+    db.truncate_all().await;
+
+    let conn = db.pool.get().await.unwrap();
+
+    // Insert blocks 1-10 except block 5
+    for num in (1i64..=4).chain(6..=10) {
+        conn.execute(
+            r#"INSERT INTO blocks (num, hash, parent_hash, timestamp, timestamp_ms, gas_limit, gas_used, miner)
+               VALUES ($1, $2, $3, NOW(), $4, 1000000, 100000, $5)"#,
+            &[
+                &num,
+                &vec![num as u8; 32],
+                &vec![(num - 1) as u8; 32],
+                &(num * 1000),
+                &vec![0u8; 20],
+            ],
+        )
+        .await
+        .unwrap();
+    }
+
+    // Full range detects the gap
+    assert!(has_gaps(&db.pool, 1, 10).await.unwrap());
+
+    // Range not including block 5 — no gaps
+    assert!(!has_gaps(&db.pool, 1, 4).await.unwrap());
+    assert!(!has_gaps(&db.pool, 6, 10).await.unwrap());
+}
+
+#[tokio::test]
+#[serial(db)]
+async fn test_has_gaps_agrees_with_detect_all_gaps() {
+    let db = TestDb::empty().await;
+    db.truncate_all().await;
+
+    let conn = db.pool.get().await.unwrap();
+
+    // Insert blocks: 0, 1, 2, 5, 6, 10, 11, 12 (gaps at 3-4 and 7-9)
+    for num in [0i64, 1, 2, 5, 6, 10, 11, 12] {
+        conn.execute(
+            r#"INSERT INTO blocks (num, hash, parent_hash, timestamp, timestamp_ms, gas_limit, gas_used, miner)
+               VALUES ($1, $2, $3, NOW(), $4, 1000000, 100000, $5)"#,
+            &[
+                &num,
+                &vec![num as u8; 32],
+                &if num == 0 { vec![0u8; 32] } else { vec![(num - 1) as u8; 32] },
+                &(num * 1000),
+                &vec![0u8; 20],
+            ],
+        )
+        .await
+        .unwrap();
+    }
+
+    // has_gaps and detect_all_gaps should agree
+    let gaps = detect_all_gaps(&db.pool, 12).await.unwrap();
+    let has = has_gaps(&db.pool, 1, 12).await.unwrap();
+
+    assert!(!gaps.is_empty(), "detect_all_gaps should find gaps");
+    assert!(has, "has_gaps should agree: gaps exist");
+
+    // Now fill in all missing blocks
+    for num in [3i64, 4, 7, 8, 9] {
+        conn.execute(
+            r#"INSERT INTO blocks (num, hash, parent_hash, timestamp, timestamp_ms, gas_limit, gas_used, miner)
+               VALUES ($1, $2, $3, NOW(), $4, 1000000, 100000, $5)"#,
+            &[
+                &num,
+                &vec![num as u8; 32],
+                &vec![(num - 1) as u8; 32],
+                &(num * 1000),
+                &vec![0u8; 20],
+            ],
+        )
+        .await
+        .unwrap();
+    }
+
+    let gaps = detect_all_gaps(&db.pool, 12).await.unwrap();
+    let has = has_gaps(&db.pool, 1, 12).await.unwrap();
+
+    assert!(gaps.is_empty(), "detect_all_gaps should find no gaps");
+    assert!(!has, "has_gaps should agree: no gaps");
+}
+
+#[tokio::test]
+#[serial(db)]
+async fn test_has_gaps_beyond_indexed_range() {
+    let db = TestDb::empty().await;
+    db.truncate_all().await;
+
+    let conn = db.pool.get().await.unwrap();
+
+    // Insert blocks 1-10
+    for num in 1i64..=10 {
+        conn.execute(
+            r#"INSERT INTO blocks (num, hash, parent_hash, timestamp, timestamp_ms, gas_limit, gas_used, miner)
+               VALUES ($1, $2, $3, NOW(), $4, 1000000, 100000, $5)"#,
+            &[
+                &num,
+                &vec![num as u8; 32],
+                &vec![(num - 1) as u8; 32],
+                &(num * 1000),
+                &vec![0u8; 20],
+            ],
+        )
+        .await
+        .unwrap();
+    }
+
+    // Asking about range [1, 20] when only 1-10 exist — has gaps
+    assert!(has_gaps(&db.pool, 1, 20).await.unwrap());
+
+    // Asking about exactly the indexed range — no gaps
+    assert!(!has_gaps(&db.pool, 1, 10).await.unwrap());
 }
