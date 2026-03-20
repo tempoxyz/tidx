@@ -80,7 +80,6 @@ pub async fn write_txs(pool: &Pool, txs: &[TxRow]) -> Result<()> {
 
     let start = Instant::now();
     let conn = pool.get().await?;
-    conn.execute("SET statement_timeout = 0", &[]).await?;
 
     // Get block range and delete existing rows before COPY
     let min_block = txs.iter().map(|t| t.block_num).min().unwrap();
@@ -178,7 +177,6 @@ pub async fn write_logs(pool: &Pool, logs: &[LogRow]) -> Result<()> {
 
     let start = Instant::now();
     let conn = pool.get().await?;
-    conn.execute("SET statement_timeout = 0", &[]).await?;
 
     // Get block range and delete existing rows before COPY
     let min_block = logs.iter().map(|l| l.block_num).min().unwrap();
@@ -253,7 +251,6 @@ pub async fn write_receipts(pool: &Pool, receipts: &[ReceiptRow]) -> Result<()> 
 
     let start = Instant::now();
     let conn = pool.get().await?;
-    conn.execute("SET statement_timeout = 0", &[]).await?;
 
     // Get block range and delete existing rows before COPY
     let min_block = receipts.iter().map(|r| r.block_num).min().unwrap();

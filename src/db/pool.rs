@@ -13,10 +13,11 @@ pub async fn create_pool_with_size(database_url: &str, max_size: usize) -> Resul
     ensure_database_exists(database_url).await?;
 
     // Kill idle-in-transaction connections after 60s to prevent lock contention on restart
+    // Disable statement timeout so large COPY/DELETE batches aren't killed
     let url_with_timeout = if database_url.contains('?') {
-        format!("{}&options=-c%20idle_in_transaction_session_timeout%3D60000", database_url)
+        format!("{}&options=-c%20idle_in_transaction_session_timeout%3D60000%20-c%20statement_timeout%3D0", database_url)
     } else {
-        format!("{}?options=-c%20idle_in_transaction_session_timeout%3D60000", database_url)
+        format!("{}?options=-c%20idle_in_transaction_session_timeout%3D60000%20-c%20statement_timeout%3D0", database_url)
     };
 
     let mut config = Config::new();
