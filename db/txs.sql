@@ -29,5 +29,6 @@ CREATE INDEX IF NOT EXISTS idx_txs_block_num ON txs (block_num DESC);
 DROP INDEX IF EXISTS idx_txs_block_num_asc;
 CREATE INDEX IF NOT EXISTS idx_txs_from ON txs ("from", block_timestamp DESC);
 CREATE INDEX IF NOT EXISTS idx_txs_to ON txs ("to", block_timestamp DESC);
-CREATE INDEX IF NOT EXISTS idx_txs_calls ON txs USING GIN (calls);
-CREATE INDEX IF NOT EXISTS idx_txs_selector ON txs (substring(input, 1, 4)) WHERE input IS NOT NULL AND octet_length(input) >= 4;
+DROP INDEX IF EXISTS idx_txs_calls;
+CREATE INDEX IF NOT EXISTS idx_txs_calls_partial ON txs USING GIN (calls) WHERE calls IS NOT NULL AND call_count > 1;
+DROP INDEX IF EXISTS idx_txs_selector;
