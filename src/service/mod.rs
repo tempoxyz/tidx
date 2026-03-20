@@ -294,10 +294,17 @@ pub fn format_column_json(row: &tokio_postgres::Row, idx: usize) -> serde_json::
             .try_get::<_, i64>(idx)
             .ok()
             .map_or(serde_json::Value::Null, |v| serde_json::Value::Number(v.into())),
-        "numeric" => row
-            .try_get::<_, rust_decimal::Decimal>(idx)
-            .ok()
-            .map_or(serde_json::Value::Null, |v| serde_json::Value::String(v.to_string())),
+        "numeric" => {
+            // rust_decimal::Decimal panics (not errors) for values exceeding its
+            // 96-bit mantissa (~28 digits). Postgres NUMERIC is arbitrary precision
+            // (e.g. abi_uint() on uint256 = 78 digits), so catch the panic.
+            match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                row.try_get::<_, rust_decimal::Decimal>(idx)
+            })) {
+                Ok(Ok(v)) => serde_json::Value::String(v.to_string()),
+                _ => serde_json::Value::Null,
+            }
+        }
         "float4" | "float8" => row
             .try_get::<_, f64>(idx)
             .ok()
