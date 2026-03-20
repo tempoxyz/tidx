@@ -124,31 +124,33 @@ impl RpcClient {
             .await?;
 
         let status = response.status();
-        let body = response.text().await?;
+        let bytes = response.bytes().await?;
 
         if !status.is_success() {
+            let body_preview: String = String::from_utf8_lossy(&bytes[..bytes.len().min(500)]).into();
             tracing::error!(
                 status = %status,
-                body_preview = %body.chars().take(500).collect::<String>(),
+                body_preview = %body_preview,
                 from = %range.start(),
                 to = %range.end(),
                 "RPC request failed"
             );
-            anyhow::bail!("RPC request failed with status {}: {}", status, body.chars().take(200).collect::<String>());
+            anyhow::bail!("RPC request failed with status {}: {}", status, String::from_utf8_lossy(&bytes[..bytes.len().min(200)]));
         }
 
         // Check if the RPC returned a single error object instead of an array
-        if let Ok(single_error) = serde_json::from_str::<RpcResponse<serde_json::Value>>(&body) {
+        if let Ok(single_error) = serde_json::from_slice::<RpcResponse<serde_json::Value>>(&bytes) {
             if let Some(err) = single_error.error {
                 anyhow::bail!("RPC batch error: {}", err.message);
             }
         }
 
-        let responses: Vec<RpcResponse<Block>> = serde_json::from_str(&body)
+        let responses: Vec<RpcResponse<Block>> = serde_json::from_slice(&bytes)
             .map_err(|e| {
+                let body_preview: String = String::from_utf8_lossy(&bytes[..bytes.len().min(500)]).into();
                 tracing::error!(
                     error = %e,
-                    body_preview = %body.chars().take(500).collect::<String>(),
+                    body_preview = %body_preview,
                     from = %range.start(),
                     to = %range.end(),
                     "Failed to decode blocks response"
@@ -202,32 +204,34 @@ impl RpcClient {
             .await?;
 
         let status = response.status();
-        let body = response.text().await?;
+        let bytes = response.bytes().await?;
 
         if !status.is_success() {
+            let body_preview: String = String::from_utf8_lossy(&bytes[..bytes.len().min(500)]).into();
             tracing::error!(
                 status = %status,
-                body_preview = %body.chars().take(500).collect::<String>(),
+                body_preview = %body_preview,
                 from = %range.start(),
                 to = %range.end(),
                 "RPC receipts request failed"
             );
-            anyhow::bail!("RPC receipts request failed with status {}: {}", status, body.chars().take(200).collect::<String>());
+            anyhow::bail!("RPC receipts request failed with status {}: {}", status, String::from_utf8_lossy(&bytes[..bytes.len().min(200)]));
         }
 
         // Check if the RPC returned a single error object instead of an array
         // This happens when the entire batch request fails (e.g., response too large)
-        if let Ok(single_error) = serde_json::from_str::<RpcResponse<serde_json::Value>>(&body) {
+        if let Ok(single_error) = serde_json::from_slice::<RpcResponse<serde_json::Value>>(&bytes) {
             if let Some(err) = single_error.error {
                 anyhow::bail!("RPC batch error: {}", err.message);
             }
         }
 
-        let responses: Vec<RpcResponse<Vec<Receipt>>> = serde_json::from_str(&body)
+        let responses: Vec<RpcResponse<Vec<Receipt>>> = serde_json::from_slice(&bytes)
             .map_err(|e| {
+                let body_preview: String = String::from_utf8_lossy(&bytes[..bytes.len().min(500)]).into();
                 tracing::error!(
                     error = %e,
-                    body_preview = %body.chars().take(500).collect::<String>(),
+                    body_preview = %body_preview,
                     from = %range.start(),
                     to = %range.end(),
                     "Failed to decode receipts response"

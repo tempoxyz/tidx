@@ -1,6 +1,7 @@
 use anyhow::Result;
-use std::fmt::Write;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Mutex;
 use std::time::Instant;
 use tokio_postgres::binary_copy::BinaryCopyInWriter;
 use tokio_postgres::types::Type;
@@ -9,11 +10,94 @@ use crate::db::Pool;
 use crate::metrics;
 use crate::types::{BlockRow, LogRow, ReceiptRow, SyncState, TxRow};
 
+/// Coalesces sync_state updates, flushing at most every N seconds.
+/// Reduces PG roundtrips from dozens/sec to ~1 every 2 seconds.
+pub struct SyncStateWriter {
+    chain_id: u64,
+    tip_num: AtomicU64,
+    synced_num: AtomicU64,
+    head_num: AtomicU64,
+    last_flush: Mutex<Instant>,
+}
+
+const SYNC_STATE_FLUSH_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
+
+impl SyncStateWriter {
+    pub fn new(chain_id: u64) -> Self {
+        Self {
+            chain_id,
+            tip_num: AtomicU64::new(0),
+            synced_num: AtomicU64::new(0),
+            head_num: AtomicU64::new(0),
+            last_flush: Mutex::new(Instant::now()),
+        }
+    }
+
+    /// Record a tip_num update (non-blocking, just stores the value)
+    pub fn set_tip(&self, tip_num: u64, head_num: u64) {
+        self.tip_num.fetch_max(tip_num, Ordering::Relaxed);
+        self.head_num.fetch_max(head_num, Ordering::Relaxed);
+    }
+
+    /// Record a synced_num update (non-blocking)
+    pub fn set_synced(&self, synced_num: u64) {
+        self.synced_num.fetch_max(synced_num, Ordering::Relaxed);
+    }
+
+    /// Flush to PG if enough time has elapsed. Returns true if flushed.
+    pub async fn maybe_flush(&self, pool: &Pool) -> Result<bool> {
+        {
+            let last = self.last_flush.lock().unwrap();
+            if last.elapsed() < SYNC_STATE_FLUSH_INTERVAL {
+                return Ok(false);
+            }
+        }
+
+        let tip = self.tip_num.load(Ordering::Relaxed);
+        let head = self.head_num.load(Ordering::Relaxed);
+        let synced = self.synced_num.load(Ordering::Relaxed);
+
+        if tip == 0 && synced == 0 {
+            return Ok(false);
+        }
+
+        let conn = pool.get().await?;
+        conn.execute(
+            r#"
+            INSERT INTO sync_state (chain_id, head_num, tip_num, synced_num, started_at, updated_at)
+            VALUES ($1, $2, $3, $4, NOW(), NOW())
+            ON CONFLICT (chain_id) DO UPDATE SET
+                head_num = GREATEST(sync_state.head_num, EXCLUDED.head_num),
+                tip_num = GREATEST(sync_state.tip_num, EXCLUDED.tip_num),
+                synced_num = GREATEST(sync_state.synced_num, EXCLUDED.synced_num),
+                updated_at = NOW()
+            "#,
+            &[
+                &(self.chain_id as i64),
+                &(head as i64),
+                &(tip as i64),
+                &(synced as i64),
+            ],
+        )
+        .await?;
+
+        *self.last_flush.lock().unwrap() = Instant::now();
+        Ok(true)
+    }
+
+    /// Force flush (for shutdown or end of round)
+    pub async fn flush(&self, pool: &Pool) -> Result<()> {
+        *self.last_flush.lock().unwrap() = Instant::now() - SYNC_STATE_FLUSH_INTERVAL;
+        self.maybe_flush(pool).await?;
+        Ok(())
+    }
+}
+
 pub async fn write_block(pool: &Pool, block: &BlockRow) -> Result<()> {
     write_blocks(pool, std::slice::from_ref(block)).await
 }
 
-/// Batch insert multiple blocks in a single query
+/// Batch insert blocks using COPY BINARY via a staging temp table
 pub async fn write_blocks(pool: &Pool, blocks: &[BlockRow]) -> Result<()> {
     if blocks.is_empty() {
         return Ok(());
@@ -22,44 +106,59 @@ pub async fn write_blocks(pool: &Pool, blocks: &[BlockRow]) -> Result<()> {
     let start = Instant::now();
     let conn = pool.get().await?;
 
-    // Build multi-row VALUES clause
-    let mut query = String::from(
-        "INSERT INTO blocks (num, hash, parent_hash, timestamp, timestamp_ms, gas_limit, gas_used, miner, extra_data) VALUES ",
-    );
+    conn.execute("BEGIN", &[]).await?;
+    conn.execute(
+        "CREATE TEMP TABLE _staging_blocks (LIKE blocks INCLUDING DEFAULTS) ON COMMIT DROP",
+        &[],
+    )
+    .await?;
 
-    for (i, _block) in blocks.iter().enumerate() {
-        if i > 0 {
-            query.push_str(", ");
-        }
-        let base = i * 9;
-        write!(
-            &mut query,
-            "(${}, ${}, ${}, ${}, ${}, ${}, ${}, ${}, ${})",
-            base + 1, base + 2, base + 3, base + 4, base + 5, base + 6, base + 7, base + 8, base + 9
-        )?;
+    let types = &[
+        Type::INT8,        // num
+        Type::BYTEA,       // hash
+        Type::BYTEA,       // parent_hash
+        Type::TIMESTAMPTZ, // timestamp
+        Type::INT8,        // timestamp_ms
+        Type::INT8,        // gas_limit
+        Type::INT8,        // gas_used
+        Type::BYTEA,       // miner
+        Type::BYTEA,       // extra_data
+    ];
+
+    let sink = conn
+        .copy_in(
+            "COPY _staging_blocks (num, hash, parent_hash, timestamp, timestamp_ms, gas_limit, gas_used, miner, extra_data) FROM STDIN BINARY",
+        )
+        .await?;
+
+    let writer = BinaryCopyInWriter::new(sink, types);
+    let mut pinned_writer: Pin<Box<BinaryCopyInWriter>> = Box::pin(writer);
+
+    for block in blocks {
+        pinned_writer
+            .as_mut()
+            .write(&[
+                &block.num,
+                &block.hash,
+                &block.parent_hash,
+                &block.timestamp,
+                &block.timestamp_ms,
+                &block.gas_limit,
+                &block.gas_used,
+                &block.miner,
+                &block.extra_data as &(dyn tokio_postgres::types::ToSql + Sync),
+            ])
+            .await?;
     }
 
-    query.push_str(" ON CONFLICT (timestamp, num) DO NOTHING");
+    pinned_writer.as_mut().finish().await?;
 
-    // Collect params - need to store values to extend lifetime
-    let param_values: Vec<_> = blocks
-        .iter()
-        .flat_map(|b| {
-            vec![
-                &b.num as &(dyn tokio_postgres::types::ToSql + Sync),
-                &b.hash,
-                &b.parent_hash,
-                &b.timestamp,
-                &b.timestamp_ms,
-                &b.gas_limit,
-                &b.gas_used,
-                &b.miner,
-                &b.extra_data,
-            ]
-        })
-        .collect();
-
-    conn.execute(&query, &param_values).await?;
+    conn.execute(
+        "INSERT INTO blocks SELECT * FROM _staging_blocks ON CONFLICT (timestamp, num) DO NOTHING",
+        &[],
+    )
+    .await?;
+    conn.execute("COMMIT", &[]).await?;
 
     metrics::record_sink_write_duration("postgres", "blocks", start.elapsed());
     metrics::record_sink_write_rows("postgres", "blocks", blocks.len() as u64);
@@ -72,7 +171,7 @@ pub async fn write_blocks(pool: &Pool, blocks: &[BlockRow]) -> Result<()> {
     Ok(())
 }
 
-/// Batch insert transactions using DELETE + COPY for maximum throughput
+/// Batch insert transactions using staging table + ON CONFLICT DO NOTHING
 pub async fn write_txs(pool: &Pool, txs: &[TxRow]) -> Result<()> {
     if txs.is_empty() {
         return Ok(());
@@ -80,14 +179,11 @@ pub async fn write_txs(pool: &Pool, txs: &[TxRow]) -> Result<()> {
 
     let start = Instant::now();
     let conn = pool.get().await?;
-    conn.execute("SET statement_timeout = 0", &[]).await?;
 
-    // Get block range and delete existing rows before COPY
-    let min_block = txs.iter().map(|t| t.block_num).min().unwrap();
-    let max_block = txs.iter().map(|t| t.block_num).max().unwrap();
+    conn.execute("BEGIN", &[]).await?;
     conn.execute(
-        "DELETE FROM txs WHERE block_num >= $1 AND block_num <= $2",
-        &[&min_block, &max_block],
+        "CREATE TEMP TABLE _staging_txs (LIKE txs INCLUDING DEFAULTS) ON COMMIT DROP",
+        &[],
     )
     .await?;
 
@@ -118,7 +214,7 @@ pub async fn write_txs(pool: &Pool, txs: &[TxRow]) -> Result<()> {
 
     let sink = conn
         .copy_in(
-            r#"COPY txs (block_num, block_timestamp, idx, hash, type, "from", "to", value, input,
+            r#"COPY _staging_txs (block_num, block_timestamp, idx, hash, type, "from", "to", value, input,
                 gas_limit, max_fee_per_gas, max_priority_fee_per_gas, gas_used,
                 nonce_key, nonce, fee_token, fee_payer, calls, call_count,
                 valid_before, valid_after, signature_type) FROM STDIN BINARY"#,
@@ -160,6 +256,9 @@ pub async fn write_txs(pool: &Pool, txs: &[TxRow]) -> Result<()> {
 
     pinned_writer.as_mut().finish().await?;
 
+    conn.execute("INSERT INTO txs SELECT * FROM _staging_txs ON CONFLICT DO NOTHING", &[]).await?;
+    conn.execute("COMMIT", &[]).await?;
+
     metrics::record_sink_write_duration("postgres", "txs", start.elapsed());
     metrics::record_sink_write_rows("postgres", "txs", txs.len() as u64);
     metrics::increment_sink_row_count("postgres", "txs", txs.len() as u64);
@@ -170,7 +269,7 @@ pub async fn write_txs(pool: &Pool, txs: &[TxRow]) -> Result<()> {
     Ok(())
 }
 
-/// Batch insert logs using DELETE + COPY for maximum throughput
+/// Batch insert logs using staging table + ON CONFLICT DO NOTHING
 pub async fn write_logs(pool: &Pool, logs: &[LogRow]) -> Result<()> {
     if logs.is_empty() {
         return Ok(());
@@ -178,14 +277,11 @@ pub async fn write_logs(pool: &Pool, logs: &[LogRow]) -> Result<()> {
 
     let start = Instant::now();
     let conn = pool.get().await?;
-    conn.execute("SET statement_timeout = 0", &[]).await?;
 
-    // Get block range and delete existing rows before COPY
-    let min_block = logs.iter().map(|l| l.block_num).min().unwrap();
-    let max_block = logs.iter().map(|l| l.block_num).max().unwrap();
+    conn.execute("BEGIN", &[]).await?;
     conn.execute(
-        "DELETE FROM logs WHERE block_num >= $1 AND block_num <= $2",
-        &[&min_block, &max_block],
+        "CREATE TEMP TABLE _staging_logs (LIKE logs INCLUDING DEFAULTS) ON COMMIT DROP",
+        &[],
     )
     .await?;
 
@@ -206,7 +302,7 @@ pub async fn write_logs(pool: &Pool, logs: &[LogRow]) -> Result<()> {
 
     let sink = conn
         .copy_in(
-            "COPY logs (block_num, block_timestamp, log_idx, tx_idx, tx_hash, address, selector, topic0, topic1, topic2, topic3, data) FROM STDIN BINARY",
+            "COPY _staging_logs (block_num, block_timestamp, log_idx, tx_idx, tx_hash, address, selector, topic0, topic1, topic2, topic3, data) FROM STDIN BINARY",
         )
         .await?;
 
@@ -235,6 +331,9 @@ pub async fn write_logs(pool: &Pool, logs: &[LogRow]) -> Result<()> {
 
     pinned_writer.as_mut().finish().await?;
 
+    conn.execute("INSERT INTO logs SELECT * FROM _staging_logs ON CONFLICT DO NOTHING", &[]).await?;
+    conn.execute("COMMIT", &[]).await?;
+
     metrics::record_sink_write_duration("postgres", "logs", start.elapsed());
     metrics::record_sink_write_rows("postgres", "logs", logs.len() as u64);
     metrics::increment_sink_row_count("postgres", "logs", logs.len() as u64);
@@ -245,7 +344,7 @@ pub async fn write_logs(pool: &Pool, logs: &[LogRow]) -> Result<()> {
     Ok(())
 }
 
-/// Batch insert receipts using DELETE + COPY for maximum throughput
+/// Batch insert receipts using staging table + ON CONFLICT DO NOTHING
 pub async fn write_receipts(pool: &Pool, receipts: &[ReceiptRow]) -> Result<()> {
     if receipts.is_empty() {
         return Ok(());
@@ -253,14 +352,11 @@ pub async fn write_receipts(pool: &Pool, receipts: &[ReceiptRow]) -> Result<()> 
 
     let start = Instant::now();
     let conn = pool.get().await?;
-    conn.execute("SET statement_timeout = 0", &[]).await?;
 
-    // Get block range and delete existing rows before COPY
-    let min_block = receipts.iter().map(|r| r.block_num).min().unwrap();
-    let max_block = receipts.iter().map(|r| r.block_num).max().unwrap();
+    conn.execute("BEGIN", &[]).await?;
     conn.execute(
-        "DELETE FROM receipts WHERE block_num >= $1 AND block_num <= $2",
-        &[&min_block, &max_block],
+        "CREATE TEMP TABLE _staging_receipts (LIKE receipts INCLUDING DEFAULTS) ON COMMIT DROP",
+        &[],
     )
     .await?;
 
@@ -281,7 +377,7 @@ pub async fn write_receipts(pool: &Pool, receipts: &[ReceiptRow]) -> Result<()> 
 
     let sink = conn
         .copy_in(
-            r#"COPY receipts (block_num, block_timestamp, tx_idx, tx_hash, "from", "to",
+            r#"COPY _staging_receipts (block_num, block_timestamp, tx_idx, tx_hash, "from", "to",
                 contract_address, gas_used, cumulative_gas_used, effective_gas_price,
                 status, fee_payer) FROM STDIN BINARY"#,
         )
@@ -311,6 +407,19 @@ pub async fn write_receipts(pool: &Pool, receipts: &[ReceiptRow]) -> Result<()> 
     }
 
     pinned_writer.as_mut().finish().await?;
+
+    conn.execute("INSERT INTO receipts SELECT * FROM _staging_receipts ON CONFLICT DO NOTHING", &[]).await?;
+
+    // Mark blocks as having receipts
+    let block_nums: Vec<i64> = receipts.iter().map(|r| r.block_num).collect::<std::collections::HashSet<_>>().into_iter().collect();
+    if !block_nums.is_empty() {
+        conn.execute(
+            "UPDATE blocks SET has_receipts = true WHERE num = ANY($1)",
+            &[&block_nums],
+        ).await?;
+    }
+
+    conn.execute("COMMIT", &[]).await?;
 
     metrics::record_sink_write_duration("postgres", "receipts", start.elapsed());
     metrics::record_sink_write_rows("postgres", "receipts", receipts.len() as u64);
@@ -469,8 +578,9 @@ pub async fn get_block_hash(pool: &Pool, block_num: u64) -> Result<Option<Vec<u8
 }
 
 /// Detect gaps in the block sequence (between existing blocks only)
-/// Returns a list of (start, end) ranges that are missing
-pub async fn detect_gaps(pool: &Pool) -> Result<Vec<(u64, u64)>> {
+/// Returns a list of (start, end) ranges that are missing.
+/// `below` bounds the scan to `num <= below`, avoiding a full-table scan.
+pub async fn detect_gaps(pool: &Pool, below: u64) -> Result<Vec<(u64, u64)>> {
     let conn = pool.get().await?;
 
     let rows = conn
@@ -479,12 +589,13 @@ pub async fn detect_gaps(pool: &Pool) -> Result<Vec<(u64, u64)>> {
             WITH numbered AS (
                 SELECT num, LAG(num) OVER (ORDER BY num) as prev_num
                 FROM blocks
+                WHERE num <= $1
             )
             SELECT prev_num + 1 as gap_start, num - 1 as gap_end
             FROM numbered
             WHERE num - prev_num > 1
             "#,
-            &[],
+            &[&(below as i64)],
         )
         .await?;
 
@@ -502,19 +613,13 @@ pub async fn detect_gaps(pool: &Pool) -> Result<Vec<(u64, u64)>> {
 /// Detect blocks that have no receipts (for deferred receipt backfill).
 /// Returns block numbers that exist in blocks table but have no receipts.
 /// Limited to a batch size and ordered by block_num DESC (most recent first).
+/// Uses the partial index on `has_receipts = false` for O(1) lookup.
 pub async fn detect_blocks_missing_receipts(pool: &Pool, limit: i64) -> Result<Vec<u64>> {
     let conn = pool.get().await?;
 
     let rows = conn
         .query(
-            r#"
-            SELECT b.num
-            FROM blocks b
-            LEFT JOIN receipts r ON r.block_num = b.num
-            WHERE r.block_num IS NULL
-            ORDER BY b.num DESC
-            LIMIT $1
-            "#,
+            "SELECT num FROM blocks WHERE has_receipts = false ORDER BY num DESC LIMIT $1",
             &[&limit],
         )
         .await?;
@@ -533,7 +638,7 @@ pub async fn detect_all_gaps(pool: &Pool, tip_num: u64) -> Result<Vec<(u64, u64)
         .await?
         .get(0);
 
-    let mut gaps = detect_gaps(pool).await?;
+    let mut gaps = detect_gaps(pool, tip_num).await?;
 
     // Add gap from block 1 to first block (if we have any blocks and min > 1)
     // Block 0 is typically empty/genesis, so we start from block 1

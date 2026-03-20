@@ -12,6 +12,9 @@ CREATE TABLE IF NOT EXISTS blocks (
 );
 
 CREATE INDEX IF NOT EXISTS idx_blocks_num ON blocks (num DESC);
-CREATE INDEX IF NOT EXISTS idx_blocks_num_asc ON blocks (num ASC);
+DROP INDEX IF EXISTS idx_blocks_num_asc;
 CREATE INDEX IF NOT EXISTS idx_blocks_hash ON blocks (hash);
 CREATE INDEX IF NOT EXISTS idx_blocks_timestamp ON blocks (timestamp);
+
+ALTER TABLE blocks ADD COLUMN IF NOT EXISTS has_receipts BOOLEAN NOT NULL DEFAULT false;
+CREATE INDEX IF NOT EXISTS idx_blocks_missing_receipts ON blocks (num DESC) WHERE has_receipts = false;

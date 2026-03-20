@@ -397,7 +397,7 @@ async fn test_gap_detection() {
         .expect("Failed to insert block");
     }
 
-    let gaps = detect_gaps(&db.pool).await.expect("Failed to detect gaps");
+    let gaps = detect_gaps(&db.pool, u64::MAX).await.expect("Failed to detect gaps");
 
     assert_eq!(gaps.len(), 1, "Should detect one gap");
     assert_eq!(gaps[0], (4, 4), "Gap should be block 4");
@@ -428,7 +428,7 @@ async fn test_gap_detection_multiple_gaps() {
         .expect("Failed to insert block");
     }
 
-    let gaps = detect_gaps(&db.pool).await.expect("Failed to detect gaps");
+    let gaps = detect_gaps(&db.pool, u64::MAX).await.expect("Failed to detect gaps");
 
     assert_eq!(gaps.len(), 2, "Should detect two gaps");
     assert_eq!(gaps[0], (3, 4), "First gap should be blocks 3-4");
@@ -442,7 +442,7 @@ async fn test_gap_detection_empty_table() {
     db.truncate_all().await;
 
     // Empty table should have no gaps
-    let gaps = detect_gaps(&db.pool).await.expect("Failed to detect gaps");
+    let gaps = detect_gaps(&db.pool, u64::MAX).await.expect("Failed to detect gaps");
 
     assert!(gaps.is_empty(), "Empty table should have no gaps");
 }
@@ -643,7 +643,7 @@ async fn test_gap_fill_scenario_multiple_restarts() {
     }
 
     // Detect all gaps
-    let gaps = detect_gaps(&db.pool).await.expect("Failed to detect gaps");
+    let gaps = detect_gaps(&db.pool, u64::MAX).await.expect("Failed to detect gaps");
 
     // Should have 2 gaps:
     // Gap 1: 101-289 (between run 1 and run 2)
@@ -682,7 +682,7 @@ async fn test_gap_detection_single_block_gaps() {
         .expect("Failed to insert block");
     }
 
-    let gaps = detect_gaps(&db.pool).await.expect("Failed to detect gaps");
+    let gaps = detect_gaps(&db.pool, u64::MAX).await.expect("Failed to detect gaps");
 
     assert_eq!(gaps.len(), 4, "Should detect four single-block gaps");
     assert_eq!(gaps[0], (2, 2), "Gap at block 2");
@@ -716,7 +716,7 @@ async fn test_gap_detection_contiguous_blocks() {
         .expect("Failed to insert block");
     }
 
-    let gaps = detect_gaps(&db.pool).await.expect("Failed to detect gaps");
+    let gaps = detect_gaps(&db.pool, u64::MAX).await.expect("Failed to detect gaps");
 
     assert!(gaps.is_empty(), "Contiguous blocks should have no gaps");
 }
