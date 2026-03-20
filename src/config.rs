@@ -138,9 +138,8 @@ pub struct ChainConfig {
     pub api_pg_url: Option<String>,
 
     /// Environment variable name containing the API PostgreSQL password.
-    /// When set together with `api_pg_url`, replaces the password in that URL.
-    /// When set without `api_pg_url`, derives an API URL from `pg_url` using
-    /// the `tidx_api` username and this password.
+    /// When set, replaces the password in `api_pg_url` with the env var value.
+    /// Has no effect without `api_pg_url`.
     #[serde(default)]
     pub api_pg_password_env: Option<String>,
 
@@ -248,15 +247,15 @@ impl ChainConfig {
     }
 
     /// Returns a separate API database URL for read-only queries.
-    ///
-    /// Priority:
-    /// 1. `api_pg_url` — used as-is (with optional password from `api_pg_password_env`)
-    /// 2. `api_pg_password_env` alone — derives URL from `pg_url` with `tidx_api` user
-    /// 3. Neither set — returns `None` (API uses the main pool)
+    /// Returns `None` if `api_pg_url` is not set (API uses the main pool).
     pub fn resolved_api_pg_url(&self) -> Result<Option<String>> {
-        match (&self.api_pg_url, &self.api_pg_password_env) {
-            // Explicit API URL provided
-            (Some(api_url), Some(pass_env)) => {
+        let api_url = match &self.api_pg_url {
+            Some(url) => url,
+            None => return Ok(None),
+        };
+
+        match &self.api_pg_password_env {
+            Some(pass_env) => {
                 let password = std::env::var(pass_env).with_context(|| {
                     format!(
                         "api_pg_password_env '{pass_env}' is set but environment variable not found"
@@ -268,24 +267,7 @@ impl ChainConfig {
                     .map_err(|()| anyhow::anyhow!("Failed to set password in api_pg_url"))?;
                 Ok(Some(url.to_string()))
             }
-            (Some(api_url), None) => Ok(Some(api_url.clone())),
-            // Legacy: derive from pg_url with tidx_api user
-            (None, Some(pass_env)) => {
-                let password = std::env::var(pass_env).with_context(|| {
-                    format!(
-                        "api_pg_password_env '{pass_env}' is set but environment variable not found"
-                    )
-                })?;
-                let base_url = self.resolved_pg_url()?;
-                let mut url = url::Url::parse(&base_url)
-                    .with_context(|| format!("Invalid pg_url: {}", self.pg_url))?;
-                url.set_username("tidx_api")
-                    .map_err(|()| anyhow::anyhow!("Failed to set API username in pg_url"))?;
-                url.set_password(Some(&password))
-                    .map_err(|()| anyhow::anyhow!("Failed to set API password in pg_url"))?;
-                Ok(Some(url.to_string()))
-            }
-            (None, None) => Ok(None),
+            None => Ok(Some(api_url.clone())),
         }
     }
 }
