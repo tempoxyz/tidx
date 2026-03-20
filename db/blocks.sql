@@ -12,6 +12,6 @@ CREATE TABLE IF NOT EXISTS blocks (
 );
 
 CREATE INDEX IF NOT EXISTS idx_blocks_num ON blocks (num DESC);
-CREATE INDEX IF NOT EXISTS idx_blocks_num_asc ON blocks (num ASC);
+DROP INDEX IF EXISTS idx_blocks_num_asc;
 CREATE INDEX IF NOT EXISTS idx_blocks_hash ON blocks (hash);
 CREATE INDEX IF NOT EXISTS idx_blocks_timestamp ON blocks (timestamp);
