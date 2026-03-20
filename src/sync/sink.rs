@@ -38,33 +38,49 @@ impl SinkSet {
     }
 
     pub async fn write_blocks(&self, blocks: &[BlockRow]) -> Result<()> {
-        writer::write_blocks(&self.pool, blocks).await?;
         if let Some(ch) = &self.ch {
-            ch.write_blocks(blocks).await?;
+            tokio::try_join!(
+                writer::write_blocks(&self.pool, blocks),
+                ch.write_blocks(blocks),
+            )?;
+        } else {
+            writer::write_blocks(&self.pool, blocks).await?;
         }
         Ok(())
     }
 
     pub async fn write_txs(&self, txs: &[TxRow]) -> Result<()> {
-        writer::write_txs(&self.pool, txs).await?;
         if let Some(ch) = &self.ch {
-            ch.write_txs(txs).await?;
+            tokio::try_join!(
+                writer::write_txs(&self.pool, txs),
+                ch.write_txs(txs),
+            )?;
+        } else {
+            writer::write_txs(&self.pool, txs).await?;
         }
         Ok(())
     }
 
     pub async fn write_logs(&self, logs: &[LogRow]) -> Result<()> {
-        writer::write_logs(&self.pool, logs).await?;
         if let Some(ch) = &self.ch {
-            ch.write_logs(logs).await?;
+            tokio::try_join!(
+                writer::write_logs(&self.pool, logs),
+                ch.write_logs(logs),
+            )?;
+        } else {
+            writer::write_logs(&self.pool, logs).await?;
         }
         Ok(())
     }
 
     pub async fn write_receipts(&self, receipts: &[ReceiptRow]) -> Result<()> {
-        writer::write_receipts(&self.pool, receipts).await?;
         if let Some(ch) = &self.ch {
-            ch.write_receipts(receipts).await?;
+            tokio::try_join!(
+                writer::write_receipts(&self.pool, receipts),
+                ch.write_receipts(receipts),
+            )?;
+        } else {
+            writer::write_receipts(&self.pool, receipts).await?;
         }
         Ok(())
     }
@@ -72,11 +88,15 @@ impl SinkSet {
     /// Delete all data from a given block number onwards (reorg support).
     /// Returns the number of blocks deleted from PostgreSQL.
     pub async fn delete_from(&self, block_num: u64) -> Result<u64> {
-        let deleted = writer::delete_blocks_from(&self.pool, block_num).await?;
         if let Some(ch) = &self.ch {
-            ch.delete_from(block_num).await?;
+            let (deleted, _) = tokio::try_join!(
+                writer::delete_blocks_from(&self.pool, block_num),
+                ch.delete_from(block_num),
+            )?;
+            Ok(deleted)
+        } else {
+            writer::delete_blocks_from(&self.pool, block_num).await
         }
-        Ok(deleted)
     }
 
     /// Automatically backfill ClickHouse from PostgreSQL if CH is behind.
