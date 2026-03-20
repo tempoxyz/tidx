@@ -1,5 +1,4 @@
 use anyhow::Result;
-use std::fmt::Write;
 use std::pin::Pin;
 use std::time::Instant;
 use tokio_postgres::binary_copy::BinaryCopyInWriter;
@@ -13,7 +12,7 @@ pub async fn write_block(pool: &Pool, block: &BlockRow) -> Result<()> {
     write_blocks(pool, std::slice::from_ref(block)).await
 }
 
-/// Batch insert multiple blocks in a single query
+/// Batch insert blocks using COPY BINARY via a staging temp table
 pub async fn write_blocks(pool: &Pool, blocks: &[BlockRow]) -> Result<()> {
     if blocks.is_empty() {
         return Ok(());
@@ -22,44 +21,59 @@ pub async fn write_blocks(pool: &Pool, blocks: &[BlockRow]) -> Result<()> {
     let start = Instant::now();
     let conn = pool.get().await?;
 
-    // Build multi-row VALUES clause
-    let mut query = String::from(
-        "INSERT INTO blocks (num, hash, parent_hash, timestamp, timestamp_ms, gas_limit, gas_used, miner, extra_data) VALUES ",
-    );
+    conn.execute("BEGIN", &[]).await?;
+    conn.execute(
+        "CREATE TEMP TABLE _staging_blocks (LIKE blocks INCLUDING DEFAULTS) ON COMMIT DROP",
+        &[],
+    )
+    .await?;
 
-    for (i, _block) in blocks.iter().enumerate() {
-        if i > 0 {
-            query.push_str(", ");
-        }
-        let base = i * 9;
-        write!(
-            &mut query,
-            "(${}, ${}, ${}, ${}, ${}, ${}, ${}, ${}, ${})",
-            base + 1, base + 2, base + 3, base + 4, base + 5, base + 6, base + 7, base + 8, base + 9
-        )?;
+    let types = &[
+        Type::INT8,        // num
+        Type::BYTEA,       // hash
+        Type::BYTEA,       // parent_hash
+        Type::TIMESTAMPTZ, // timestamp
+        Type::INT8,        // timestamp_ms
+        Type::INT8,        // gas_limit
+        Type::INT8,        // gas_used
+        Type::BYTEA,       // miner
+        Type::BYTEA,       // extra_data
+    ];
+
+    let sink = conn
+        .copy_in(
+            "COPY _staging_blocks (num, hash, parent_hash, timestamp, timestamp_ms, gas_limit, gas_used, miner, extra_data) FROM STDIN BINARY",
+        )
+        .await?;
+
+    let writer = BinaryCopyInWriter::new(sink, types);
+    let mut pinned_writer: Pin<Box<BinaryCopyInWriter>> = Box::pin(writer);
+
+    for block in blocks {
+        pinned_writer
+            .as_mut()
+            .write(&[
+                &block.num,
+                &block.hash,
+                &block.parent_hash,
+                &block.timestamp,
+                &block.timestamp_ms,
+                &block.gas_limit,
+                &block.gas_used,
+                &block.miner,
+                &block.extra_data as &(dyn tokio_postgres::types::ToSql + Sync),
+            ])
+            .await?;
     }
 
-    query.push_str(" ON CONFLICT (timestamp, num) DO NOTHING");
+    pinned_writer.as_mut().finish().await?;
 
-    // Collect params - need to store values to extend lifetime
-    let param_values: Vec<_> = blocks
-        .iter()
-        .flat_map(|b| {
-            vec![
-                &b.num as &(dyn tokio_postgres::types::ToSql + Sync),
-                &b.hash,
-                &b.parent_hash,
-                &b.timestamp,
-                &b.timestamp_ms,
-                &b.gas_limit,
-                &b.gas_used,
-                &b.miner,
-                &b.extra_data,
-            ]
-        })
-        .collect();
-
-    conn.execute(&query, &param_values).await?;
+    conn.execute(
+        "INSERT INTO blocks SELECT * FROM _staging_blocks ON CONFLICT (timestamp, num) DO NOTHING",
+        &[],
+    )
+    .await?;
+    conn.execute("COMMIT", &[]).await?;
 
     metrics::record_sink_write_duration("postgres", "blocks", start.elapsed());
     metrics::record_sink_write_rows("postgres", "blocks", blocks.len() as u64);
