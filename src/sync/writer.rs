@@ -479,6 +479,24 @@ pub async fn get_block_hash(pool: &Pool, block_num: u64) -> Result<Option<Vec<u8
     Ok(row.map(|r| r.get(0)))
 }
 
+/// Fast check: are there any gaps in [from, to]?
+/// Uses COUNT + btree index scan — O(range) not O(table).
+pub async fn has_gaps(pool: &Pool, from: u64, to: u64) -> Result<bool> {
+    if to < from {
+        return Ok(false);
+    }
+    let conn = pool.get().await?;
+    let row = conn
+        .query_one(
+            "SELECT COUNT(*) FROM blocks WHERE num >= $1 AND num <= $2",
+            &[&(from as i64), &(to as i64)],
+        )
+        .await?;
+    let count: i64 = row.get(0);
+    let expected = (to - from + 1) as i64;
+    Ok(count != expected)
+}
+
 /// Detect gaps in the block sequence (between existing blocks only)
 /// Returns a list of (start, end) ranges that are missing.
 /// `below` bounds the scan to `num <= below`, avoiding a full-table scan.

@@ -16,8 +16,8 @@ use super::fetcher::RpcClient;
 use super::sink::SinkSet;
 use super::writer::{
     detect_all_gaps, detect_blocks_missing_receipts, find_fork_point,
-    get_block_hash, load_sync_state, save_sync_state, update_sync_rate, update_synced_num,
-    update_tip_num,
+    get_block_hash, has_gaps, load_sync_state, save_sync_state, update_sync_rate,
+    update_synced_num, update_tip_num,
 };
 
 /// RPC concurrency limits
@@ -851,17 +851,23 @@ async fn tick_gapfill_parallel(
         return Ok(());
     }
 
-    // Fast path: if synced_num == tip_num, we're fully synced — skip the
-    // expensive full-table window function scan entirely.
-    if state.synced_num >= state.tip_num && state.tip_num > 0 {
+    // Fast path: use COUNT-based check (btree index scan) to see if there
+    // are any gaps at all. Only fall back to the expensive LAG() window
+    // function when gaps actually exist and we need their exact ranges.
+    // With 0.5s block time, tip_num races ahead of synced_num constantly,
+    // so we check the range [1, tip_num] cheaply via COUNT vs expected.
+    if state.tip_num > 0 && !has_gaps(pool, 1, state.tip_num).await? {
         metrics::set_gap_blocks(chain_id, "postgres", 0);
         metrics::set_gap_count(chain_id, "postgres", 0);
         metrics::set_synced(chain_id, realtime_lag == 0);
+        if state.synced_num < state.tip_num {
+            update_synced_num(pool, chain_id, state.tip_num).await?;
+        }
         tokio::time::sleep(Duration::from_secs(2)).await;
         return Ok(());
     }
 
-    // Detect ALL gaps including from genesis, sorted by end DESC (most recent first)
+    // Gaps exist — run the expensive window function to find exact ranges
     let gaps = detect_all_gaps(pool, state.tip_num).await?;
 
     if gaps.is_empty() {
