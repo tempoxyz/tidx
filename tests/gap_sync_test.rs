@@ -296,7 +296,7 @@ async fn test_detect_gaps_vs_detect_all_gaps() {
     }
 
     // detect_gaps only finds gaps between existing blocks
-    let gaps = detect_gaps(&db.pool).await.expect("Failed");
+    let gaps = detect_gaps(&db.pool, u64::MAX).await.expect("Failed");
     assert_eq!(gaps.len(), 1, "detect_gaps only finds middle gaps");
     assert_eq!(gaps[0], (7, 9), "detect_gaps should find 7-9");
 

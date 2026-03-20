@@ -466,8 +466,9 @@ pub async fn get_block_hash(pool: &Pool, block_num: u64) -> Result<Option<Vec<u8
 }
 
 /// Detect gaps in the block sequence (between existing blocks only)
-/// Returns a list of (start, end) ranges that are missing
-pub async fn detect_gaps(pool: &Pool) -> Result<Vec<(u64, u64)>> {
+/// Returns a list of (start, end) ranges that are missing.
+/// `below` bounds the scan to `num <= below`, avoiding a full-table scan.
+pub async fn detect_gaps(pool: &Pool, below: u64) -> Result<Vec<(u64, u64)>> {
     let conn = pool.get().await?;
 
     let rows = conn
@@ -476,12 +477,13 @@ pub async fn detect_gaps(pool: &Pool) -> Result<Vec<(u64, u64)>> {
             WITH numbered AS (
                 SELECT num, LAG(num) OVER (ORDER BY num) as prev_num
                 FROM blocks
+                WHERE num <= $1
             )
             SELECT prev_num + 1 as gap_start, num - 1 as gap_end
             FROM numbered
             WHERE num - prev_num > 1
             "#,
-            &[],
+            &[&(below as i64)],
         )
         .await?;
 
@@ -530,7 +532,7 @@ pub async fn detect_all_gaps(pool: &Pool, tip_num: u64) -> Result<Vec<(u64, u64)
         .await?
         .get(0);
 
-    let mut gaps = detect_gaps(pool).await?;
+    let mut gaps = detect_gaps(pool, tip_num).await?;
 
     // Add gap from block 1 to first block (if we have any blocks and min > 1)
     // Block 0 is typically empty/genesis, so we start from block 1
