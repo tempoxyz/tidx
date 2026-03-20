@@ -1,6 +1,8 @@
 use anyhow::Result;
 use std::fmt::Write;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Mutex;
 use std::time::Instant;
 use tokio_postgres::binary_copy::BinaryCopyInWriter;
 use tokio_postgres::types::Type;
@@ -8,6 +10,89 @@ use tokio_postgres::types::Type;
 use crate::db::Pool;
 use crate::metrics;
 use crate::types::{BlockRow, LogRow, ReceiptRow, SyncState, TxRow};
+
+/// Coalesces sync_state updates, flushing at most every N seconds.
+/// Reduces PG roundtrips from dozens/sec to ~1 every 2 seconds.
+pub struct SyncStateWriter {
+    chain_id: u64,
+    tip_num: AtomicU64,
+    synced_num: AtomicU64,
+    head_num: AtomicU64,
+    last_flush: Mutex<Instant>,
+}
+
+const SYNC_STATE_FLUSH_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
+
+impl SyncStateWriter {
+    pub fn new(chain_id: u64) -> Self {
+        Self {
+            chain_id,
+            tip_num: AtomicU64::new(0),
+            synced_num: AtomicU64::new(0),
+            head_num: AtomicU64::new(0),
+            last_flush: Mutex::new(Instant::now()),
+        }
+    }
+
+    /// Record a tip_num update (non-blocking, just stores the value)
+    pub fn set_tip(&self, tip_num: u64, head_num: u64) {
+        self.tip_num.fetch_max(tip_num, Ordering::Relaxed);
+        self.head_num.fetch_max(head_num, Ordering::Relaxed);
+    }
+
+    /// Record a synced_num update (non-blocking)
+    pub fn set_synced(&self, synced_num: u64) {
+        self.synced_num.fetch_max(synced_num, Ordering::Relaxed);
+    }
+
+    /// Flush to PG if enough time has elapsed. Returns true if flushed.
+    pub async fn maybe_flush(&self, pool: &Pool) -> Result<bool> {
+        {
+            let last = self.last_flush.lock().unwrap();
+            if last.elapsed() < SYNC_STATE_FLUSH_INTERVAL {
+                return Ok(false);
+            }
+        }
+
+        let tip = self.tip_num.load(Ordering::Relaxed);
+        let head = self.head_num.load(Ordering::Relaxed);
+        let synced = self.synced_num.load(Ordering::Relaxed);
+
+        if tip == 0 && synced == 0 {
+            return Ok(false);
+        }
+
+        let conn = pool.get().await?;
+        conn.execute(
+            r#"
+            INSERT INTO sync_state (chain_id, head_num, tip_num, synced_num, started_at, updated_at)
+            VALUES ($1, $2, $3, $4, NOW(), NOW())
+            ON CONFLICT (chain_id) DO UPDATE SET
+                head_num = GREATEST(sync_state.head_num, EXCLUDED.head_num),
+                tip_num = GREATEST(sync_state.tip_num, EXCLUDED.tip_num),
+                synced_num = GREATEST(sync_state.synced_num, EXCLUDED.synced_num),
+                updated_at = NOW()
+            "#,
+            &[
+                &(self.chain_id as i64),
+                &(head as i64),
+                &(tip as i64),
+                &(synced as i64),
+            ],
+        )
+        .await?;
+
+        *self.last_flush.lock().unwrap() = Instant::now();
+        Ok(true)
+    }
+
+    /// Force flush (for shutdown or end of round)
+    pub async fn flush(&self, pool: &Pool) -> Result<()> {
+        *self.last_flush.lock().unwrap() = Instant::now() - SYNC_STATE_FLUSH_INTERVAL;
+        self.maybe_flush(pool).await?;
+        Ok(())
+    }
+}
 
 pub async fn write_block(pool: &Pool, block: &BlockRow) -> Result<()> {
     write_blocks(pool, std::slice::from_ref(block)).await
