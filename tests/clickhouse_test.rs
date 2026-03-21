@@ -1456,12 +1456,28 @@ async fn setup_backfill() -> Option<(tidx::db::Pool, SinkSet, TestClickHouse)> {
 
     // Truncate PG tables for clean state
     let conn = pool.get().await.expect("Failed to get PG connection");
-    conn.batch_execute("TRUNCATE blocks, txs, logs, receipts CASCADE")
+    conn.batch_execute("TRUNCATE blocks, txs, logs, receipts, sync_state CASCADE")
         .await
         .expect("Failed to truncate PG tables");
 
     let sinks = SinkSet::new(pool.clone()).with_clickhouse(ch_sink);
     Some((pool, sinks, ch))
+}
+
+async fn set_ch_backfill_cursor(pool: &tidx::db::Pool, chain_id: u64, block: i64) {
+    let conn = pool.get().await.expect("Failed to get PG connection");
+    conn.execute(
+        r#"
+        INSERT INTO sync_state (chain_id, ch_backfill_block)
+        VALUES ($1, $2)
+        ON CONFLICT (chain_id) DO UPDATE SET
+            ch_backfill_block = EXCLUDED.ch_backfill_block,
+            updated_at = NOW()
+        "#,
+        &[&(chain_id as i64), &block],
+    )
+    .await
+    .expect("Failed to set CH backfill cursor");
 }
 
 /// Backfill should copy all blocks/txs/logs/receipts from PG to an empty CH.
@@ -1501,7 +1517,10 @@ async fn test_backfill_pg_to_empty_clickhouse() {
     assert_eq!(ch.table_count("blocks").await.unwrap(), 0);
 
     // Run backfill
-    sinks.backfill_clickhouse(TEST_CHAIN_ID).await.expect("backfill failed");
+    sinks
+        .backfill_clickhouse(TEST_CHAIN_ID)
+        .await
+        .expect("backfill failed");
 
     // Verify CH now has matching data
     assert_eq!(ch.table_count("blocks").await.unwrap(), 10);
@@ -1510,7 +1529,7 @@ async fn test_backfill_pg_to_empty_clickhouse() {
     assert_eq!(ch.table_count("receipts").await.unwrap(), 20);
 }
 
-/// Backfill should be resumable — only copy blocks CH doesn't have yet.
+/// Backfill should resume from the persisted PG cursor.
 #[tokio::test]
 #[serial(clickhouse)]
 async fn test_backfill_resumes_from_highwater_mark() {
@@ -1539,17 +1558,21 @@ async fn test_backfill_resumes_from_highwater_mark() {
         .collect();
     ch_sink.write_blocks(&first_10).await.unwrap();
     ch_sink.write_txs(&first_10_txs).await.unwrap();
+    set_ch_backfill_cursor(&pool, TEST_CHAIN_ID, 10).await;
 
     assert_eq!(ch.table_count("blocks").await.unwrap(), 10);
 
     // Run backfill — should only copy blocks 11-20
-    sinks.backfill_clickhouse(TEST_CHAIN_ID).await.expect("backfill failed");
+    sinks
+        .backfill_clickhouse(TEST_CHAIN_ID)
+        .await
+        .expect("backfill failed");
 
     assert_eq!(ch.table_count("blocks").await.unwrap(), 20);
     assert_eq!(ch.table_count("txs").await.unwrap(), 20);
 }
 
-/// Backfill should be a no-op when CH is already up to date.
+/// Backfill should be a no-op when the persisted cursor is already up to date.
 #[tokio::test]
 #[serial(clickhouse)]
 async fn test_backfill_noop_when_up_to_date() {
@@ -1565,11 +1588,15 @@ async fn test_backfill_noop_when_up_to_date() {
 
     let ch_sink = ClickHouseSink::new(&ch.url, SINK_DB, None, None).unwrap();
     ch_sink.write_blocks(&blocks).await.unwrap();
+    set_ch_backfill_cursor(&pool, TEST_CHAIN_ID, 5).await;
 
     assert_eq!(ch.table_count("blocks").await.unwrap(), 5);
 
-    // Run backfill — should detect CH is current and skip
-    sinks.backfill_clickhouse(TEST_CHAIN_ID).await.expect("backfill failed");
+    // Run backfill — cursor should make this a no-op
+    sinks
+        .backfill_clickhouse(TEST_CHAIN_ID)
+        .await
+        .expect("backfill failed");
 
     // Count should remain 5 (no duplicates)
     assert_eq!(ch.table_count("blocks").await.unwrap(), 5);
@@ -1584,13 +1611,16 @@ async fn test_backfill_noop_when_pg_empty() {
     };
 
     // PG is empty (truncated in setup), CH is empty
-    sinks.backfill_clickhouse(TEST_CHAIN_ID).await.expect("backfill failed");
+    sinks
+        .backfill_clickhouse(TEST_CHAIN_ID)
+        .await
+        .expect("backfill failed");
 
     assert_eq!(ch.table_count("blocks").await.unwrap(), 0);
 }
 
-/// Per-table backfill: blocks present in CH but txs/logs/receipts missing.
-/// Each table should backfill independently from its own high-water mark.
+/// If CH is partially populated but the cursor was never advanced, backfill
+/// should safely replay the full range and converge after deduplication.
 #[tokio::test]
 #[serial(clickhouse)]
 async fn test_backfill_per_table_independent_highwater() {
@@ -1629,14 +1659,18 @@ async fn test_backfill_per_table_independent_highwater() {
     assert_eq!(ch.table_count("logs").await.unwrap(), 0);
     assert_eq!(ch.table_count("receipts").await.unwrap(), 0);
 
-    // Run backfill — blocks should skip (already up to date),
-    // txs should fill 6-10, logs/receipts should fill 1-10
-    sinks.backfill_clickhouse(TEST_CHAIN_ID).await.expect("backfill failed");
+    // Run backfill — with a zero cursor, the implementation replays the full
+    // range for all tables. ReplacingMergeTree should converge to the correct
+    // deduplicated result.
+    sinks
+        .backfill_clickhouse(TEST_CHAIN_ID)
+        .await
+        .expect("backfill failed");
 
-    assert_eq!(ch.table_count("blocks").await.unwrap(), 10);
-    assert_eq!(ch.table_count("txs").await.unwrap(), 20); // 10 old + 10 new
-    assert_eq!(ch.table_count("logs").await.unwrap(), 30);
-    assert_eq!(ch.table_count("receipts").await.unwrap(), 20);
+    assert_eq!(ch.table_count_final("blocks").await.unwrap(), 10);
+    assert_eq!(ch.table_count_final("txs").await.unwrap(), 20);
+    assert_eq!(ch.table_count_final("logs").await.unwrap(), 30);
+    assert_eq!(ch.table_count_final("receipts").await.unwrap(), 20);
 }
 
 /// Backfill with >5000 blocks to exercise multi-batch range pagination.
@@ -1659,7 +1693,10 @@ async fn test_backfill_multi_batch_pagination() {
     assert_eq!(ch.table_count("blocks").await.unwrap(), 0);
 
     // Run backfill
-    sinks.backfill_clickhouse(TEST_CHAIN_ID).await.expect("backfill failed");
+    sinks
+        .backfill_clickhouse(TEST_CHAIN_ID)
+        .await
+        .expect("backfill failed");
 
     assert_eq!(ch.table_count("blocks").await.unwrap(), block_count as u64);
 

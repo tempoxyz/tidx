@@ -1,4 +1,4 @@
-use tidx::db::{create_pool, run_migrations, Pool, ThrottledPool};
+use tidx::db::{Pool, ThrottledPool, create_pool, run_migrations};
 use tidx::sync::engine::SyncEngine;
 use tidx::sync::sink::SinkSet;
 use tokio::sync::{Mutex, MutexGuard, OnceCell};
@@ -45,7 +45,10 @@ impl TestDb {
             })
             .await;
 
-        Self { pool, _guard: guard }
+        Self {
+            pool,
+            _guard: guard,
+        }
     }
 
     async fn ensure_seeded(&self) {
@@ -55,20 +58,29 @@ impl TestDb {
         }
 
         println!("Seeding test database...");
-        
+
         let tempo = TempoNode::from_env();
-        if tempo.wait_for_ready().await.is_err() {
-            println!("Warning: Tempo node not ready, skipping seed");
-            return;
-        }
+        tempo.wait_for_ready().await.unwrap_or_else(|e| {
+            panic!(
+                "Tempo node is required for seeded tests but was not reachable at {}: {e}. \
+Start the docker services with `docker compose -f docker/local/docker-compose.yml up -d postgres tempo` \
+and ensure DATABASE_URL points at the Postgres container (for example \
+`postgresql://tidx:tidx@localhost:5433/tidx`).",
+                tempo.rpc_url
+            )
+        });
 
         // Wait for some blocks
         tempo.wait_for_block(50).await.ok();
 
         let sinks = SinkSet::new(self.pool.clone());
-        let engine = SyncEngine::new(ThrottledPool::from_pool(self.pool.clone()), sinks, &tempo.rpc_url)
-            .await
-            .expect("Failed to create sync engine");
+        let engine = SyncEngine::new(
+            ThrottledPool::from_pool(self.pool.clone()),
+            sinks,
+            &tempo.rpc_url,
+        )
+        .await
+        .expect("Failed to create sync engine");
 
         let head = tempo.block_number().await.unwrap_or(50).min(100);
         for block_num in 1..=head {

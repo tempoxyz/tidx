@@ -22,16 +22,16 @@ impl TestClickHouse {
         let http_client = reqwest::Client::builder()
             .pool_max_idle_per_host(4)
             .build()?;
-        
+
         let ch = Self {
             url,
             database: database.to_string(),
             http_client,
         };
-        
+
         Ok(ch)
     }
-    
+
     /// Wait for ClickHouse to be ready (for CI/docker startup).
     pub async fn wait_for_ready(&self) -> Result<()> {
         for i in 0..30 {
@@ -47,75 +47,84 @@ impl TestClickHouse {
         }
         Ok(())
     }
-    
+
     /// Create the test database if it doesn't exist.
     pub async fn ensure_database(&self) -> Result<()> {
-        self.query_raw(&format!("CREATE DATABASE IF NOT EXISTS {}", self.database)).await?;
+        self.query_raw(&format!("CREATE DATABASE IF NOT EXISTS {}", self.database))
+            .await?;
         Ok(())
     }
-    
+
     /// Drop and recreate the test database for clean state.
     pub async fn reset_database(&self) -> Result<()> {
-        self.query_raw(&format!("DROP DATABASE IF EXISTS {}", self.database)).await?;
-        self.query_raw(&format!("CREATE DATABASE {}", self.database)).await?;
+        self.query_raw(&format!("DROP DATABASE IF EXISTS {}", self.database))
+            .await?;
+        self.query_raw(&format!("CREATE DATABASE {}", self.database))
+            .await?;
         Ok(())
     }
-    
+
     /// Execute a query without database context (for DDL).
     pub async fn query_raw(&self, sql: &str) -> Result<String> {
-        let resp = self.http_client
+        let resp = self
+            .http_client
             .post(&self.url)
             .body(sql.to_string())
             .send()
             .await?;
-        
+
         if !resp.status().is_success() {
             let error = resp.text().await.unwrap_or_default();
             return Err(anyhow::anyhow!("ClickHouse query failed: {error}"));
         }
-        
+
         resp.text().await.map_err(Into::into)
     }
-    
+
     /// Execute a query in the test database context.
     pub async fn query(&self, sql: &str) -> Result<String> {
         let url = format!("{}/?database={}", self.url, self.database);
-        let resp = self.http_client
+        let resp = self
+            .http_client
             .post(&url)
             .body(sql.to_string())
             .send()
             .await?;
-        
+
         if !resp.status().is_success() {
             let error = resp.text().await.unwrap_or_default();
             return Err(anyhow::anyhow!("ClickHouse query failed: {error}"));
         }
-        
+
         resp.text().await.map_err(Into::into)
     }
-    
+
     /// Execute a query and return JSON results.
     pub async fn query_json(&self, sql: &str) -> Result<serde_json::Value> {
-        let url = format!("{}/?database={}&default_format=JSON", self.url, self.database);
-        let resp = self.http_client
+        let url = format!(
+            "{}/?database={}&default_format=JSON",
+            self.url, self.database
+        );
+        let resp = self
+            .http_client
             .post(&url)
             .body(sql.to_string())
             .send()
             .await?;
-        
+
         if !resp.status().is_success() {
             let error = resp.text().await.unwrap_or_default();
             return Err(anyhow::anyhow!("ClickHouse query failed: {error}"));
         }
-        
+
         let text = resp.text().await?;
         if text.trim().is_empty() {
             return Ok(serde_json::Value::Null);
         }
-        
+
         serde_json::from_str(&text).map_err(Into::into)
     }
-    
+
     /// Create a mock logs table for testing CTE generation.
     /// Matches the direct-write schema from db/clickhouse/logs.sql.
     pub async fn create_mock_logs_table(&self) -> Result<()> {
@@ -144,7 +153,7 @@ impl TestClickHouse {
         self.query(sql).await?;
         Ok(())
     }
-    
+
     /// Insert mock log data using '0x'-prefixed hex strings (direct-write format).
     #[allow(clippy::too_many_arguments)]
     pub async fn insert_mock_log(
@@ -162,14 +171,22 @@ impl TestClickHouse {
     ) -> Result<()> {
         let sql = format!(
             r#"INSERT INTO logs (block_num, block_timestamp, log_idx, tx_idx, tx_hash, address, selector, topic0, topic1, topic2, topic3, data) VALUES ({}, now(), {}, {}, '{}', '{}', '{}', '{}', '{}', '{}', '{}', '{}')"#,
-            block_num, log_idx, tx_idx, 
-            tx_hash, address, selector, 
-            selector, topic1, topic2, topic3, data
+            block_num,
+            log_idx,
+            tx_idx,
+            tx_hash,
+            address,
+            selector,
+            selector,
+            topic1,
+            topic2,
+            topic3,
+            data
         );
         self.query(&sql).await?;
         Ok(())
     }
-    
+
     /// Insert a Transfer event log with proper encoding (0x-prefixed).
     pub async fn insert_transfer_log(
         &self,
@@ -179,11 +196,14 @@ impl TestClickHouse {
         to: &str,
         value: u128,
     ) -> Result<()> {
-        let from_padded = format!("0x000000000000000000000000{}", from.trim_start_matches("0x"));
+        let from_padded = format!(
+            "0x000000000000000000000000{}",
+            from.trim_start_matches("0x")
+        );
         let to_padded = format!("0x000000000000000000000000{}", to.trim_start_matches("0x"));
         let value_hex = format!("{:064x}", value);
         let data = format!("0x{}", value_hex);
-        
+
         self.insert_mock_log(
             block_num,
             log_idx,
@@ -195,9 +215,10 @@ impl TestClickHouse {
             &to_padded,
             "0x0000000000000000000000000000000000000000000000000000000000000000",
             &data,
-        ).await
+        )
+        .await
     }
-    
+
     /// Create a mock blocks table for testing.
     pub async fn create_mock_blocks_table(&self) -> Result<()> {
         let sql = r#"
@@ -217,10 +238,20 @@ impl TestClickHouse {
         self.query(sql).await?;
         Ok(())
     }
-    
+
     /// Get table row count.
     pub async fn table_count(&self, table: &str) -> Result<u64> {
-        let result = self.query(&format!("SELECT count() FROM {}", table)).await?;
+        let result = self
+            .query(&format!("SELECT count() FROM {}", table))
+            .await?;
+        result.trim().parse().map_err(Into::into)
+    }
+
+    /// Get table row count after ReplacingMergeTree deduplication.
+    pub async fn table_count_final(&self, table: &str) -> Result<u64> {
+        let result = self
+            .query(&format!("SELECT count() FROM {} FINAL", table))
+            .await?;
         result.trim().parse().map_err(Into::into)
     }
 }

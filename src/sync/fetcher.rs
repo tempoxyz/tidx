@@ -1,8 +1,9 @@
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
+use futures::future::BoxFuture;
 use serde::{Deserialize, Serialize};
 use std::ops::RangeInclusive;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 use tokio::sync::Semaphore;
 
@@ -80,9 +81,7 @@ impl RpcClient {
     }
 
     pub async fn latest_block_number(&self) -> Result<u64> {
-        let resp: RpcResponse<String> = self
-            .call("eth_blockNumber", serde_json::json!([]))
-            .await?;
+        let resp: RpcResponse<String> = self.call("eth_blockNumber", serde_json::json!([])).await?;
         let hex = resp
             .result
             .ok_or_else(|| anyhow!("No result for eth_blockNumber"))?;
@@ -96,13 +95,15 @@ impl RpcClient {
                 serde_json::json!([format!("0x{:x}", num), full_txs]),
             )
             .await?;
-        resp.result
-            .ok_or_else(|| anyhow!("Block {num} not found"))
+        resp.result.ok_or_else(|| anyhow!("Block {num} not found"))
     }
 
     pub async fn get_blocks_batch(&self, range: RangeInclusive<u64>) -> Result<Vec<Block>> {
         // Acquire permit (batch counts as one request for concurrency limiting)
-        let _permit = self.concurrency_limiter.acquire().await
+        let _permit = self
+            .concurrency_limiter
+            .acquire()
+            .await
             .map_err(|_| anyhow!("RPC semaphore closed"))?;
 
         let batch: Vec<_> = range
@@ -116,12 +117,7 @@ impl RpcClient {
             })
             .collect();
 
-        let response = self
-            .client
-            .post(&self.url)
-            .json(&batch)
-            .send()
-            .await?;
+        let response = self.client.post(&self.url).json(&batch).send().await?;
 
         let status = response.status();
         let body = response.text().await?;
@@ -134,7 +130,11 @@ impl RpcClient {
                 to = %range.end(),
                 "RPC request failed"
             );
-            anyhow::bail!("RPC request failed with status {}: {}", status, body.chars().take(200).collect::<String>());
+            anyhow::bail!(
+                "RPC request failed with status {}: {}",
+                status,
+                body.chars().take(200).collect::<String>()
+            );
         }
 
         // Check if the RPC returned a single error object instead of an array
@@ -144,17 +144,16 @@ impl RpcClient {
             }
         }
 
-        let responses: Vec<RpcResponse<Block>> = serde_json::from_str(&body)
-            .map_err(|e| {
-                tracing::error!(
-                    error = %e,
-                    body_preview = %body.chars().take(500).collect::<String>(),
-                    from = %range.start(),
-                    to = %range.end(),
-                    "Failed to decode blocks response"
-                );
-                anyhow!("Failed to decode blocks response: {}", e)
-            })?;
+        let responses: Vec<RpcResponse<Block>> = serde_json::from_str(&body).map_err(|e| {
+            tracing::error!(
+                error = %e,
+                body_preview = %body.chars().take(500).collect::<String>(),
+                from = %range.start(),
+                to = %range.end(),
+                "Failed to decode blocks response"
+            );
+            anyhow!("Failed to decode blocks response: {}", e)
+        })?;
 
         responses
             .into_iter()
@@ -178,9 +177,15 @@ impl RpcClient {
     }
 
     /// Fetch receipts for multiple blocks in a batch
-    pub async fn get_receipts_batch(&self, range: RangeInclusive<u64>) -> Result<Vec<Vec<Receipt>>> {
+    pub async fn get_receipts_batch(
+        &self,
+        range: RangeInclusive<u64>,
+    ) -> Result<Vec<Vec<Receipt>>> {
         // Acquire permit (batch counts as one request for concurrency limiting)
-        let _permit = self.concurrency_limiter.acquire().await
+        let _permit = self
+            .concurrency_limiter
+            .acquire()
+            .await
             .map_err(|_| anyhow!("RPC semaphore closed"))?;
 
         let batch: Vec<_> = range
@@ -194,12 +199,7 @@ impl RpcClient {
             })
             .collect();
 
-        let response = self
-            .client
-            .post(&self.url)
-            .json(&batch)
-            .send()
-            .await?;
+        let response = self.client.post(&self.url).json(&batch).send().await?;
 
         let status = response.status();
         let body = response.text().await?;
@@ -212,7 +212,11 @@ impl RpcClient {
                 to = %range.end(),
                 "RPC receipts request failed"
             );
-            anyhow::bail!("RPC receipts request failed with status {}: {}", status, body.chars().take(200).collect::<String>());
+            anyhow::bail!(
+                "RPC receipts request failed with status {}: {}",
+                status,
+                body.chars().take(200).collect::<String>()
+            );
         }
 
         // Check if the RPC returned a single error object instead of an array
@@ -223,8 +227,8 @@ impl RpcClient {
             }
         }
 
-        let responses: Vec<RpcResponse<Vec<Receipt>>> = serde_json::from_str(&body)
-            .map_err(|e| {
+        let responses: Vec<RpcResponse<Vec<Receipt>>> =
+            serde_json::from_str(&body).map_err(|e| {
                 tracing::error!(
                     error = %e,
                     body_preview = %body.chars().take(500).collect::<String>(),
@@ -239,6 +243,43 @@ impl RpcClient {
             .into_iter()
             .map(|r| Ok(r.result.unwrap_or_default()))
             .collect()
+    }
+
+    /// Fetch receipts for a range, recursively splitting when the batch
+    /// response is too large for the RPC to serve in one request.
+    pub fn get_receipts_batch_adaptive(
+        &self,
+        range: RangeInclusive<u64>,
+    ) -> BoxFuture<'_, Result<Vec<Vec<Receipt>>>> {
+        Box::pin(async move {
+            let from = *range.start();
+            let to = *range.end();
+
+            match self.get_receipts_batch(range).await {
+                Ok(receipts) => Ok(receipts),
+                Err(e) if Self::is_receipts_batch_too_large(&e) => {
+                    if from == to {
+                        anyhow::bail!(
+                            "Single block {from} receipts exceed RPC response size limit"
+                        );
+                    }
+
+                    let mid = from + (to - from) / 2;
+                    tracing::debug!(
+                        from,
+                        to,
+                        mid,
+                        "RPC receipts batch too large, splitting range"
+                    );
+
+                    let mut left = self.get_receipts_batch_adaptive(from..=mid).await?;
+                    let right = self.get_receipts_batch_adaptive((mid + 1)..=to).await?;
+                    left.extend(right);
+                    Ok(left)
+                }
+                Err(e) => Err(e),
+            }
+        })
     }
 
     #[allow(dead_code)]
@@ -305,7 +346,10 @@ impl RpcClient {
             let after_range = after_range.trim_start_matches(|c: char| !c.is_ascii_digit());
 
             // Parse start number
-            let start_str: String = after_range.chars().take_while(|c| c.is_ascii_digit()).collect();
+            let start_str: String = after_range
+                .chars()
+                .take_while(|c| c.is_ascii_digit())
+                .collect();
             let start: u64 = start_str.parse().ok()?;
 
             // Find and skip the dash
@@ -329,13 +373,21 @@ impl RpcClient {
         message.contains("exceeds max results") || message.contains("block range")
     }
 
+    fn is_receipts_batch_too_large(err: &anyhow::Error) -> bool {
+        let message = err.to_string().to_lowercase();
+        message.contains("too large") || message.contains("response size exceeded")
+    }
+
     async fn call<T: for<'de> Deserialize<'de>>(
         &self,
         method: &str,
         params: serde_json::Value,
     ) -> Result<RpcResponse<T>> {
         // Acquire permit before making request (limits concurrent RPC calls)
-        let _permit = self.concurrency_limiter.acquire().await
+        let _permit = self
+            .concurrency_limiter
+            .acquire()
+            .await
             .map_err(|_| anyhow!("RPC semaphore closed"))?;
 
         let req = RpcRequest {
@@ -360,5 +412,90 @@ impl RpcClient {
         metrics::record_rpc_request(method, duration, success);
 
         Ok(result?)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::{Json, Router, extract::State, response::IntoResponse, routing::post};
+    use serde_json::{Value, json};
+    use std::sync::Arc;
+    use tokio::sync::Mutex;
+
+    #[derive(Clone)]
+    struct TestState {
+        request_sizes: Arc<Mutex<Vec<usize>>>,
+    }
+
+    async fn rpc_handler(
+        State(state): State<TestState>,
+        Json(body): Json<Value>,
+    ) -> impl IntoResponse {
+        let requests = body.as_array().expect("expected batch request");
+        let batch_size = requests.len();
+        state.request_sizes.lock().await.push(batch_size);
+
+        if batch_size > 2 {
+            Json(json!({
+                "jsonrpc": "2.0",
+                "id": 0,
+                "error": {
+                    "code": -32000,
+                    "message": "response size exceeded"
+                }
+            }))
+        } else {
+            let responses: Vec<Value> = requests
+                .iter()
+                .map(|req| {
+                    json!({
+                        "jsonrpc": "2.0",
+                        "id": req["id"].as_u64().unwrap(),
+                        "result": []
+                    })
+                })
+                .collect();
+            Json(Value::Array(responses))
+        }
+    }
+
+    #[tokio::test]
+    async fn test_get_receipts_batch_adaptive_splits_and_preserves_order() {
+        let request_sizes = Arc::new(Mutex::new(Vec::new()));
+        let state = TestState {
+            request_sizes: request_sizes.clone(),
+        };
+
+        let app = Router::new()
+            .route("/", post(rpc_handler))
+            .with_state(state);
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("Failed to bind test RPC server");
+        let addr = listener.local_addr().unwrap();
+
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("RPC server failed");
+        });
+
+        let client = RpcClient::new(&format!("http://127.0.0.1:{}", addr.port()));
+        let receipts = client
+            .get_receipts_batch_adaptive(1..=5)
+            .await
+            .expect("adaptive receipt fetch should succeed");
+
+        assert_eq!(
+            receipts.len(),
+            5,
+            "should return one receipt vector per block"
+        );
+        assert!(receipts.iter().all(Vec::is_empty));
+
+        let sizes = request_sizes.lock().await.clone();
+        assert_eq!(sizes, vec![5, 3, 2, 1, 2]);
+
+        server.abort();
     }
 }
