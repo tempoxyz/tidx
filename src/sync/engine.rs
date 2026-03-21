@@ -347,8 +347,7 @@ impl SyncEngine {
             let sinks = self.sinks.clone();
             let write_future = async move {
                 let write_start = std::time::Instant::now();
-                sinks.write_blocks(&block_rows).await?;
-                sinks.write_txs(&all_txs).await?;
+                sinks.write_all(&block_rows, &all_txs, &[], &[]).await?;
                 let write_ms = write_start.elapsed().as_millis();
                 Ok::<_, anyhow::Error>(write_ms)
             };
