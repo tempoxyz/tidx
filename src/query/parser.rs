@@ -115,7 +115,7 @@ impl EventSignature {
         };
 
         format!(
-            r#"{name} AS (
+            r#""{name}" AS (
     SELECT block_num, block_timestamp, log_idx, tx_idx, tx_hash, address, selector, topic1, topic2, topic3, data{select_clause}
     FROM logs
     WHERE selector = '\x{topic0}'{extra_where}
@@ -169,7 +169,7 @@ impl EventSignature {
 
         // selector is stored as '0xABCD...' string via direct-write
         format!(
-            r#"{name} AS (
+            r#""{name}" AS (
     SELECT block_num, block_timestamp, log_idx, tx_idx, 
            {tx_hash_col},
            {address_col}, selector, topic1, topic2, topic3, data{select_clause}
