@@ -2,7 +2,7 @@
 source: src/service/mod.rs
 expression: sig.to_cte_sql_postgres()
 ---
-RoleGranted AS (
+"RoleGranted" AS (
     SELECT block_num, block_timestamp, log_idx, tx_idx, tx_hash, address, selector, topic1, topic2, topic3, data, topic1 AS "role", abi_address(topic2) AS "account", abi_address(topic3) AS "sender"
     FROM logs
     WHERE selector = '\x2f8788117e7eff1d82e926ec794901d17c78024a50270940304540a733656f0d'

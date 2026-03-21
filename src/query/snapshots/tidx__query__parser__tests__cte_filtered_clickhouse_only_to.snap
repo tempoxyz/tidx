@@ -2,7 +2,7 @@
 source: src/query/parser.rs
 expression: sig.to_cte_sql_clickhouse_filtered(Some(&used_cols))
 ---
-Transfer AS (
+"Transfer" AS (
     SELECT block_num, block_timestamp, log_idx, tx_idx, 
            concat('0x', lower(substring(tx_hash, 3))) AS tx_hash,
            concat('0x', lower(substring(address, 3))) AS address, selector, topic1, topic2, topic3, data, concat('0x', lower(substring(topic2, 27))) AS "to"

@@ -2,7 +2,7 @@
 source: src/service/mod.rs
 expression: sig.to_cte_sql_postgres()
 ---
-Paused AS (
+"Paused" AS (
     SELECT block_num, block_timestamp, log_idx, tx_idx, tx_hash, address, selector, topic1, topic2, topic3, data, abi_bool(substring(data FROM 1 FOR 32)) AS "paused"
     FROM logs
     WHERE selector = '\x0e2fb031ee032dc02d8011dc50b816eb450cf856abd8261680dac74f72165bd2'
