@@ -88,6 +88,10 @@ async fn test_status_endpoint() {
     let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
 
     assert_eq!(json["ok"], true);
+    assert!(json["version"].is_string());
+    assert!(!json["version"].as_str().unwrap().is_empty());
+    assert!(json["rev"].is_string());
+    assert!(!json["rev"].as_str().unwrap().is_empty());
     assert!(json["chains"].is_array());
 }
 

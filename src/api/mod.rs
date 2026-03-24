@@ -187,8 +187,13 @@ async fn handle_health() -> &'static str {
 #[derive(Serialize)]
 struct StatusResponse {
     ok: bool,
+    version: &'static str,
+    rev: &'static str,
     chains: Vec<SyncStatus>,
 }
+
+const VERSION: &str = env!("CARGO_PKG_VERSION");
+const GIT_REV: &str = if let Some(rev) = option_env!("GIT_REV") { rev } else { "dev" };
 
 async fn handle_status(State(state): State<AppState>) -> Result<Json<StatusResponse>, ApiError> {
     let mut all_chains = Vec::new();
@@ -233,6 +238,8 @@ async fn handle_status(State(state): State<AppState>) -> Result<Json<StatusRespo
 
     Ok(Json(StatusResponse {
         ok: true,
+        version: VERSION,
+        rev: GIT_REV,
         chains: all_chains,
     }))
 }

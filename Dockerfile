@@ -15,6 +15,8 @@ COPY src ./src
 COPY db ./db
 COPY benches ./benches
 
+ARG GIT_REV=dev
+ENV GIT_REV=${GIT_REV}
 RUN cargo build --release
 
 FROM ubuntu:24.04
