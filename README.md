@@ -152,7 +152,7 @@ url = "http://clickhouse:8123"
 [[chains]]
 name = "moderato"
 chain_id = 42431
-rpc_url = "https://rpc.moderato.tempo.xyz"
+rpc_url = "https://rpc.testnet.tempo.xyz"
 pg_url = "postgres://user@tidx.example.com:5432/tidx_moderato"
 pg_password_env = "TIDX_PG_PASSWORD"
 ```

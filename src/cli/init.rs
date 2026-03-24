@@ -16,9 +16,8 @@ pub struct Args {
 }
 
 const TEMPO_NETWORKS: &[(&str, u64, &str)] = &[
-    ("Presto (mainnet)", 4217, "https://rpc.tempo.xyz"),
-    ("Andantino (testnet)", 42429, "https://rpc.testnet.tempo.xyz"),
-    ("Moderato", 42431, "https://rpc.moderato.tempo.xyz"),
+    ("Presto (mainnet)", 4217, "https://rpc.mainnet.tempo.xyz"),
+    ("Moderato (testnet)", 42431, "https://rpc.testnet.tempo.xyz"),
     ("Custom", 0, ""),
 ];
 

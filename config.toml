@@ -12,7 +12,7 @@ port = 9090
 [[chains]]
 name = "moderato"
 chain_id = 42431
-rpc_url = "https://eng:aphex-twin-jeff-mills@rpc.moderato.tempo.xyz"
+rpc_url = "https://eng:aphex-twin-jeff-mills@rpc.testnet.tempo.xyz"
 pg_url = "postgres://tidx:tidx@postgres:5432/tidx_moderato"
 backfill = true
 batch_size = 500
