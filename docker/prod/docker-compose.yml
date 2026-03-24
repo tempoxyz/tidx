@@ -54,8 +54,7 @@ services:
 
   tidx:
     platform: linux/amd64
-    # TODO: use latest tag
-    image: ghcr.io/tempoxyz/tidx:6cb137c
+    image: ghcr.io/tempoxyz/tidx:latest
     command:
       - up
       - --config
