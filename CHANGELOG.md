@@ -1,5 +1,11 @@
 # Changelog
 
+## `tidx@0.5.1`
+
+### Patch Changes
+
+- feat: /status endpoint & remove Andantino references (by @o-az, [#149](https://github.com/tempoxyz/tidx/pull/149))
+
 ## `tidx@0.5.0`
 
 ### Minor Changes
