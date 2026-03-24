@@ -252,12 +252,14 @@ Arguments:
   <SQL>  SQL query (SELECT only). Use event name from --signature as table
 
 Options:
-  -c, --config <CONFIG>        Path to config file [default: config.toml]
+  -u, --url <URL>              TIDX HTTP API URL (e.g., http://localhost:8080)
+  -n, --chain-id <CHAIN_ID>   Chain ID to query (uses first chain if not specified)
+  -e, --engine <ENGINE>        Force query engine (postgres, clickhouse)
+  -f, --format <FORMAT>        Output format (table, json, csv, toon) [default: table]
+  -l, --limit <LIMIT>          Maximum rows to return [default: 10000]
   -s, --signature <SIGNATURE>  Event signature to create a CTE
-      --chain <CHAIN>          Chain name to query (uses first chain if not specified)
-      --format <FORMAT>        Output format (table, json, csv) [default: table]
-      --timeout <TIMEOUT>      Query timeout in milliseconds [default: 30000]
-      --limit <LIMIT>          Maximum rows to return [default: 10000]
+  -t, --timeout <TIMEOUT>      Query timeout in milliseconds [default: 30000]
+  -c, --config <CONFIG>        Path to config file [default: config.toml]
   -h, --help                   Print help
 ```
 

@@ -1523,9 +1523,8 @@ async fn tick_receipt_backfill(sinks: &SinkSet, rpc: &RpcClient, chain_id: u64) 
         let log_count = all_logs.len();
         let receipt_count = all_receipts.len();
 
-        // Write to all sinks
-        sinks.write_logs(&all_logs).await?;
-        sinks.write_receipts(&all_receipts).await?;
+        // Write logs + receipts atomically in a single transaction
+        sinks.write_all(&[], &[], &all_logs, &all_receipts).await?;
 
         if receipt_count > 0 {
             min_block = Some(min_block.map_or(from, |m: u64| m.min(from)));
