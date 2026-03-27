@@ -17,7 +17,7 @@ const ALLOWED_TABLES: &[&str] = &[
 
 const MAX_QUERY_LENGTH: usize = 65_536;
 const MAX_SUBQUERY_DEPTH: usize = 4;
-pub const HARD_LIMIT_MAX: i64 = 10_000;
+pub const HARD_LIMIT_MAX: i64 = 100_000;
 
 /// Validates that a SQL query is safe to execute.
 ///
@@ -914,13 +914,13 @@ mod tests {
     #[test]
     fn test_rejects_excessive_limit() {
         assert!(validate_query("SELECT * FROM blocks LIMIT 100000000").is_err());
-        assert!(validate_query("SELECT * FROM blocks LIMIT 10001").is_err());
+        assert!(validate_query("SELECT * FROM blocks LIMIT 100001").is_err());
     }
 
     #[test]
     fn test_allows_reasonable_limit() {
         assert!(validate_query("SELECT * FROM blocks LIMIT 100").is_ok());
-        assert!(validate_query("SELECT * FROM blocks LIMIT 10000").is_ok());
+        assert!(validate_query("SELECT * FROM blocks LIMIT 100000").is_ok());
         assert!(validate_query("SELECT * FROM blocks LIMIT 1 OFFSET 5").is_ok());
     }
 

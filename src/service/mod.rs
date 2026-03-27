@@ -470,7 +470,7 @@ mod tests {
     fn test_query_options_default() {
         let options = QueryOptions::default();
         assert_eq!(options.timeout_ms, 5000);
-        assert_eq!(options.limit, 10000);
+        assert_eq!(options.limit, 100000);
     }
 
     // ========================================================================
