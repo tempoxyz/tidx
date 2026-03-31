@@ -17,6 +17,7 @@ const ALLOWED_TABLES: &[&str] = &[
 
 const MAX_QUERY_LENGTH: usize = 65_536;
 const MAX_SUBQUERY_DEPTH: usize = 4;
+const MAX_EXPR_DEPTH: usize = 64;
 pub const HARD_LIMIT_MAX: i64 = 10_000;
 
 /// Validates that a SQL query is safe to execute.
@@ -114,7 +115,7 @@ fn validate_query_ast(query: &Query, cte_names: &HashSet<String>, depth: usize) 
         match &order_by.kind {
             sqlparser::ast::OrderByKind::Expressions(exprs) => {
                 for order_expr in exprs {
-                    validate_expr(&order_expr.expr, &all_cte_names, depth)?;
+                    validate_expr(&order_expr.expr, &all_cte_names, depth + 1)?;
                 }
             }
             sqlparser::ast::OrderByKind::All(_) => {}
@@ -199,24 +200,24 @@ fn validate_set_expr(
                 if let sqlparser::ast::SelectItem::UnnamedExpr(expr)
                 | sqlparser::ast::SelectItem::ExprWithAlias { expr, .. } = item
                 {
-                    validate_expr(expr, cte_names, depth)?;
+                    validate_expr(expr, cte_names, depth + 1)?;
                 }
             }
 
             if let Some(selection) = &select.selection {
-                validate_expr(selection, cte_names, depth)?;
+                validate_expr(selection, cte_names, depth + 1)?;
             }
 
             // Validate GROUP BY expressions
             if let sqlparser::ast::GroupByExpr::Expressions(exprs, _) = &select.group_by {
                 for expr in exprs {
-                    validate_expr(expr, cte_names, depth)?;
+                    validate_expr(expr, cte_names, depth + 1)?;
                 }
             }
 
             // Validate HAVING
             if let Some(having) = &select.having {
-                validate_expr(having, cte_names, depth)?;
+                validate_expr(having, cte_names, depth + 1)?;
             }
 
             Ok(())
@@ -229,7 +230,7 @@ fn validate_set_expr(
         SetExpr::Values(values) => {
             for row in &values.rows {
                 for expr in row {
-                    validate_expr(expr, cte_names, depth)?;
+                    validate_expr(expr, cte_names, depth + 1)?;
                 }
             }
             Ok(())
@@ -268,7 +269,7 @@ fn validate_table_with_joins(
             _ => None,
         };
         if let Some(sqlparser::ast::JoinConstraint::On(expr)) = constraint {
-            validate_expr(expr, cte_names, depth)?;
+            validate_expr(expr, cte_names, depth + 1)?;
         }
     }
     Ok(())
@@ -352,6 +353,9 @@ fn validate_table_name(name: &ObjectName, cte_names: &HashSet<String>) -> Result
 /// Reject-by-default expression validation.
 /// Only explicitly allowed expression types are permitted.
 fn validate_expr(expr: &Expr, cte_names: &HashSet<String>, depth: usize) -> Result<()> {
+    if depth > MAX_EXPR_DEPTH {
+        return Err(anyhow!("Expression nesting too deep (max {} levels)", MAX_EXPR_DEPTH));
+    }
     match expr {
         // Safe leaf nodes
         Expr::Identifier(_) | Expr::CompoundIdentifier(_) => Ok(()),
@@ -360,32 +364,32 @@ fn validate_expr(expr: &Expr, cte_names: &HashSet<String>, depth: usize) -> Resu
         Expr::Wildcard(_) | Expr::QualifiedWildcard(_, _) => Ok(()),
 
         // Function calls (validated against allowlist)
-        Expr::Function(func) => validate_function(func, cte_names, depth),
+        Expr::Function(func) => validate_function(func, cte_names, depth + 1),
 
         // Subqueries (increment depth)
         Expr::Subquery(q) => validate_query_ast(q, cte_names, depth + 1),
         Expr::InSubquery {
             expr, subquery, ..
         } => {
-            validate_expr(expr, cte_names, depth)?;
+            validate_expr(expr, cte_names, depth + 1)?;
             validate_query_ast(subquery, cte_names, depth + 1)
         }
         Expr::Exists { subquery, .. } => validate_query_ast(subquery, cte_names, depth + 1),
 
         // Binary / unary operations
         Expr::BinaryOp { left, right, .. } => {
-            validate_expr(left, cte_names, depth)?;
-            validate_expr(right, cte_names, depth)
+            validate_expr(left, cte_names, depth + 1)?;
+            validate_expr(right, cte_names, depth + 1)
         }
-        Expr::UnaryOp { expr, .. } => validate_expr(expr, cte_names, depth),
+        Expr::UnaryOp { expr, .. } => validate_expr(expr, cte_names, depth + 1),
 
         // Range expressions
         Expr::Between {
             expr, low, high, ..
         } => {
-            validate_expr(expr, cte_names, depth)?;
-            validate_expr(low, cte_names, depth)?;
-            validate_expr(high, cte_names, depth)
+            validate_expr(expr, cte_names, depth + 1)?;
+            validate_expr(low, cte_names, depth + 1)?;
+            validate_expr(high, cte_names, depth + 1)
         }
 
         // CASE WHEN
@@ -396,27 +400,27 @@ fn validate_expr(expr: &Expr, cte_names: &HashSet<String>, depth: usize) -> Resu
             ..
         } => {
             if let Some(op) = operand {
-                validate_expr(op, cte_names, depth)?;
+                validate_expr(op, cte_names, depth + 1)?;
             }
             for case_when in conditions {
-                validate_expr(&case_when.condition, cte_names, depth)?;
-                validate_expr(&case_when.result, cte_names, depth)?;
+                validate_expr(&case_when.condition, cte_names, depth + 1)?;
+                validate_expr(&case_when.result, cte_names, depth + 1)?;
             }
             if let Some(else_r) = else_result {
-                validate_expr(else_r, cte_names, depth)?;
+                validate_expr(else_r, cte_names, depth + 1)?;
             }
             Ok(())
         }
 
         // Type casting
-        Expr::Cast { expr, .. } => validate_expr(expr, cte_names, depth),
-        Expr::Nested(e) => validate_expr(e, cte_names, depth),
+        Expr::Cast { expr, .. } => validate_expr(expr, cte_names, depth + 1),
+        Expr::Nested(e) => validate_expr(e, cte_names, depth + 1),
 
         // IN list
         Expr::InList { expr, list, .. } => {
-            validate_expr(expr, cte_names, depth)?;
+            validate_expr(expr, cte_names, depth + 1)?;
             for item in list {
-                validate_expr(item, cte_names, depth)?;
+                validate_expr(item, cte_names, depth + 1)?;
             }
             Ok(())
         }
@@ -429,74 +433,75 @@ fn validate_expr(expr: &Expr, cte_names: &HashSet<String>, depth: usize) -> Resu
         | Expr::IsNotTrue(e)
         | Expr::IsNotFalse(e)
         | Expr::IsUnknown(e)
-        | Expr::IsNotUnknown(e) => validate_expr(e, cte_names, depth),
+        | Expr::IsNotUnknown(e) => validate_expr(e, cte_names, depth + 1),
 
         // Pattern matching
         Expr::Like { expr, pattern, .. } | Expr::ILike { expr, pattern, .. } => {
-            validate_expr(expr, cte_names, depth)?;
-            validate_expr(pattern, cte_names, depth)
+            validate_expr(expr, cte_names, depth + 1)?;
+            validate_expr(pattern, cte_names, depth + 1)
         }
         Expr::SimilarTo { expr, pattern, .. } => {
-            validate_expr(expr, cte_names, depth)?;
-            validate_expr(pattern, cte_names, depth)
+            validate_expr(expr, cte_names, depth + 1)?;
+            validate_expr(pattern, cte_names, depth + 1)
         }
 
         // ANY/ALL operators
-        Expr::AnyOp { right, .. } | Expr::AllOp { right, .. } => {
-            validate_expr(right, cte_names, depth)
+        Expr::AnyOp { left, right, .. } | Expr::AllOp { left, right, .. } => {
+            validate_expr(left, cte_names, depth + 1)?;
+            validate_expr(right, cte_names, depth + 1)
         }
 
         // IS DISTINCT FROM
         Expr::IsDistinctFrom(a, b) | Expr::IsNotDistinctFrom(a, b) => {
-            validate_expr(a, cte_names, depth)?;
-            validate_expr(b, cte_names, depth)
+            validate_expr(a, cte_names, depth + 1)?;
+            validate_expr(b, cte_names, depth + 1)
         }
 
         // SQL builtins parsed as dedicated Expr variants (not Function)
-        Expr::Extract { expr, .. } => validate_expr(expr, cte_names, depth),
+        Expr::Extract { expr, .. } => validate_expr(expr, cte_names, depth + 1),
         Expr::Substring { expr, substring_from, substring_for, .. } => {
-            validate_expr(expr, cte_names, depth)?;
+            validate_expr(expr, cte_names, depth + 1)?;
             if let Some(from) = substring_from {
-                validate_expr(from, cte_names, depth)?;
+                validate_expr(from, cte_names, depth + 1)?;
             }
             if let Some(for_expr) = substring_for {
-                validate_expr(for_expr, cte_names, depth)?;
+                validate_expr(for_expr, cte_names, depth + 1)?;
             }
             Ok(())
         }
         Expr::Trim { expr, trim_what, .. } => {
-            validate_expr(expr, cte_names, depth)?;
+            validate_expr(expr, cte_names, depth + 1)?;
             if let Some(what) = trim_what {
-                validate_expr(what, cte_names, depth)?;
+                validate_expr(what, cte_names, depth + 1)?;
             }
             Ok(())
         }
         Expr::Ceil { expr, .. } | Expr::Floor { expr, .. } => {
-            validate_expr(expr, cte_names, depth)
+            validate_expr(expr, cte_names, depth + 1)
         }
         Expr::Position { expr, r#in, .. } => {
-            validate_expr(expr, cte_names, depth)?;
-            validate_expr(r#in, cte_names, depth)
+            validate_expr(expr, cte_names, depth + 1)?;
+            validate_expr(r#in, cte_names, depth + 1)
         }
         Expr::Overlay { expr, overlay_what, overlay_from, overlay_for, .. } => {
-            validate_expr(expr, cte_names, depth)?;
-            validate_expr(overlay_what, cte_names, depth)?;
-            validate_expr(overlay_from, cte_names, depth)?;
+            validate_expr(expr, cte_names, depth + 1)?;
+            validate_expr(overlay_what, cte_names, depth + 1)?;
+            validate_expr(overlay_from, cte_names, depth + 1)?;
             if let Some(for_expr) = overlay_for {
-                validate_expr(for_expr, cte_names, depth)?;
+                validate_expr(for_expr, cte_names, depth + 1)?;
             }
             Ok(())
         }
-        Expr::Collate { expr, .. } => validate_expr(expr, cte_names, depth),
+        Expr::Collate { expr, .. } => validate_expr(expr, cte_names, depth + 1),
         Expr::AtTimeZone { timestamp, time_zone, .. } => {
-            validate_expr(timestamp, cte_names, depth)?;
-            validate_expr(time_zone, cte_names, depth)
+            validate_expr(timestamp, cte_names, depth + 1)?;
+            validate_expr(time_zone, cte_names, depth + 1)
         }
 
         // Tuple / row constructors
         Expr::Tuple(exprs) => {
             for e in exprs {
-                validate_expr(e, cte_names, depth)?;
+                validate_expr(e, cte_names, depth + 1)?;
             }
             Ok(())
         }
@@ -504,7 +509,7 @@ fn validate_expr(expr: &Expr, cte_names: &HashSet<String>, depth: usize) -> Resu
         // Array literal
         Expr::Array(arr) => {
             for e in &arr.elem {
-                validate_expr(e, cte_names, depth)?;
+                validate_expr(e, cte_names, depth + 1)?;
             }
             Ok(())
         }
@@ -625,28 +630,37 @@ fn validate_function(func: &Function, cte_names: &HashSet<String>, depth: usize)
                 ..
             } = arg
             {
-                validate_expr(expr, cte_names, depth)?;
+                validate_expr(expr, cte_names, depth + 1)?;
+            }
+        }
+
+        // Validate ORDER BY inside aggregate functions (e.g. string_agg(x, ',' ORDER BY y))
+        for clause in &arg_list.clauses {
+            if let sqlparser::ast::FunctionArgumentClause::OrderBy(order_exprs) = clause {
+                for order_expr in order_exprs {
+                    validate_expr(&order_expr.expr, cte_names, depth + 1)?;
+                }
             }
         }
     }
 
     // Validate FILTER (WHERE ...) clause
     if let Some(filter) = &func.filter {
-        validate_expr(filter, cte_names, depth)?;
+        validate_expr(filter, cte_names, depth + 1)?;
     }
 
     // Validate WITHIN GROUP (ORDER BY ...) clause
     for order_expr in &func.within_group {
-        validate_expr(&order_expr.expr, cte_names, depth)?;
+        validate_expr(&order_expr.expr, cte_names, depth + 1)?;
     }
 
     // Validate window function OVER clause
     if let Some(sqlparser::ast::WindowType::WindowSpec(spec)) = &func.over {
         for expr in &spec.partition_by {
-            validate_expr(expr, cte_names, depth)?;
+            validate_expr(expr, cte_names, depth + 1)?;
         }
         for order_expr in &spec.order_by {
-            validate_expr(&order_expr.expr, cte_names, depth)?;
+            validate_expr(&order_expr.expr, cte_names, depth + 1)?;
         }
     }
 
@@ -1013,5 +1027,30 @@ mod tests {
         assert!(
             validate_query("SELECT * FROM blocks FETCH FIRST 10 ROWS ONLY").is_err()
         );
+    }
+
+    #[test]
+    fn test_rejects_deep_expression_nesting() {
+        // 100 levels of nested parentheses
+        let deep = format!(
+            "SELECT {} 1 {} FROM blocks",
+            "(".repeat(100),
+            ")".repeat(100),
+        );
+        assert!(validate_query(&deep).is_err());
+    }
+
+    #[test]
+    fn test_rejects_dangerous_function_in_any_left() {
+        assert!(validate_query(
+            "SELECT * FROM blocks WHERE pg_sleep(1) = ANY(ARRAY[1])"
+        ).is_err());
+    }
+
+    #[test]
+    fn test_rejects_dangerous_function_in_aggregate_order_by() {
+        assert!(validate_query(
+            "SELECT string_agg(hash, ',' ORDER BY pg_sleep(1)) FROM blocks"
+        ).is_err());
     }
 }

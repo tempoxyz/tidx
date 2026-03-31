@@ -70,7 +70,7 @@ impl AppState {
     /// Check if an IP address is in the trusted CIDRs
     pub fn is_trusted_ip(&self, addr: &SocketAddr) -> bool {
         if self.trusted_cidrs.is_empty() {
-            return true;
+            return false;
         }
         let ip = addr.ip();
         self.trusted_cidrs.iter().any(|(network, prefix)| ip_in_cidr(&ip, network, *prefix))
@@ -84,10 +84,28 @@ pub fn parse_cidrs(cidrs: &[String]) -> Vec<(IpAddr, u8)> {
         .filter_map(|cidr| {
             let parts: Vec<&str> = cidr.split('/').collect();
             if parts.len() != 2 {
+                tracing::warn!(cidr = %cidr, "Ignoring malformed CIDR (missing /prefix)");
                 return None;
             }
-            let ip: IpAddr = parts[0].parse().ok()?;
-            let prefix: u8 = parts[1].parse().ok()?;
+            let ip: IpAddr = match parts[0].parse() {
+                Ok(ip) => ip,
+                Err(_) => {
+                    tracing::warn!(cidr = %cidr, "Ignoring malformed CIDR (invalid IP)");
+                    return None;
+                }
+            };
+            let prefix: u8 = match parts[1].parse() {
+                Ok(p) => p,
+                Err(_) => {
+                    tracing::warn!(cidr = %cidr, "Ignoring malformed CIDR (invalid prefix)");
+                    return None;
+                }
+            };
+            let max_prefix = if ip.is_ipv4() { 32 } else { 128 };
+            if prefix > max_prefix {
+                tracing::warn!(cidr = %cidr, "Ignoring malformed CIDR (prefix out of range)");
+                return None;
+            }
             Some((ip, prefix))
         })
         .collect()
@@ -164,10 +182,16 @@ pub fn router_shared(
 }
 
 fn build_router(state: AppState) -> Router<()> {
-    let cors = CorsLayer::new()
-        .allow_methods([Method::GET, Method::POST, Method::DELETE, Method::OPTIONS])
-        .allow_headers([header::CONTENT_TYPE, header::AUTHORIZATION])
-        .allow_origin(tower_http::cors::Any);
+    let cors = if state.trusted_cidrs.is_empty() {
+        CorsLayer::new()
+            .allow_methods([Method::GET, Method::POST, Method::DELETE, Method::OPTIONS])
+            .allow_headers([header::CONTENT_TYPE, header::AUTHORIZATION])
+            .allow_origin(tower_http::cors::Any)
+    } else {
+        CorsLayer::new()
+            .allow_methods([Method::GET, Method::POST, Method::DELETE, Method::OPTIONS])
+            .allow_headers([header::CONTENT_TYPE, header::AUTHORIZATION])
+    };
 
     Router::new()
         .route("/health", get(handle_health))
@@ -343,16 +367,30 @@ async fn handle_query_once(
                 params.chain_id
             )))?;
 
-        clickhouse.query(&params.sql, &sigs)
-            .await
-            .map(|r| QueryResult {
+        // Build final SQL (with CTE rewrites for signatures) so we validate what actually executes
+        let prepared_sql = crate::clickhouse::ClickHouseEngine::prepare_sql(&params.sql, &sigs)
+            .map_err(|e| ApiError::BadRequest(e.to_string()))?;
+
+        // Validate the final SQL
+        crate::query::validate_query(&prepared_sql)
+            .map_err(|e| ApiError::BadRequest(e.to_string()))?;
+
+        // Enforce LIMIT if not present
+        let prepared_sql = crate::service::append_limit_if_missing(&prepared_sql, options.limit);
+
+        // Execute with timeout
+        let timeout = std::time::Duration::from_millis(options.timeout_ms + 100);
+        match tokio::time::timeout(timeout, clickhouse.query(&prepared_sql, &[])).await {
+            Ok(Ok(r)) => QueryResult {
                 columns: r.columns,
                 rows: r.rows,
                 row_count: r.row_count,
                 engine: r.engine,
                 query_time_ms: r.query_time_ms,
-            })
-            .map_err(|e| ApiError::QueryError(e.to_string()))?
+            },
+            Ok(Err(e)) => return Err(ApiError::QueryError(e.to_string())),
+            Err(_) => return Err(ApiError::Timeout),
+        }
     } else {
         // Use PostgreSQL
         crate::service::execute_query_postgres(&pool, &params.sql, &sigs, &options)

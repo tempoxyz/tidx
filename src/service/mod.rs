@@ -263,7 +263,7 @@ pub async fn execute_query_postgres(
     })
 }
 
-fn append_limit_if_missing(sql: &str, limit: i64) -> String {
+pub fn append_limit_if_missing(sql: &str, limit: i64) -> String {
     use sqlparser::dialect::GenericDialect;
     use sqlparser::parser::Parser;
 

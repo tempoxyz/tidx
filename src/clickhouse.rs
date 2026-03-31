@@ -84,13 +84,11 @@ impl ClickHouseEngine {
         &self.database
     }
 
-    /// Execute a query and return results as JSON values.
-    /// On connection failure the engine automatically retries with the next
-    /// instance (failover). Only connection-level errors trigger failover;
-    /// ClickHouse query errors (syntax, missing table, etc.) are returned
-    /// immediately.
-    pub async fn query(&self, sql: &str, signatures: &[&str]) -> Result<QueryResult> {
-        let sql = if !signatures.is_empty() {
+    /// Prepare the final SQL by applying signature-based CTE rewrites.
+    /// This is the same transformation that `query()` applies internally,
+    /// extracted so callers can validate the final SQL before execution.
+    pub fn prepare_sql(sql: &str, signatures: &[&str]) -> Result<String> {
+        if !signatures.is_empty() {
             let sigs: Vec<EventSignature> = signatures
                 .iter()
                 .map(|s| EventSignature::parse(s))
@@ -107,10 +105,19 @@ impl ClickHouseEngine {
                 .iter()
                 .map(|sig| sig.to_cte_sql_clickhouse_with_pushdown(None, &pushdown))
                 .collect();
-            format!("WITH {} {sql}", ctes.join(", "))
+            Ok(format!("WITH {} {sql}", ctes.join(", ")))
         } else {
-            sql.to_string()
-        };
+            Ok(sql.to_string())
+        }
+    }
+
+    /// Execute a query and return results as JSON values.
+    /// On connection failure the engine automatically retries with the next
+    /// instance (failover). Only connection-level errors trigger failover;
+    /// ClickHouse query errors (syntax, missing table, etc.) are returned
+    /// immediately.
+    pub async fn query(&self, sql: &str, signatures: &[&str]) -> Result<QueryResult> {
+        let sql = Self::prepare_sql(sql, signatures)?;
 
         let start = std::time::Instant::now();
         let n = self.instances.len();
