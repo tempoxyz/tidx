@@ -1259,6 +1259,29 @@ mod tests {
     }
 
     #[test]
+    fn test_rejects_deeply_nested_abi_array_type() {
+        // 20 levels of nesting exceeds MAX_ABI_TYPE_DEPTH (16)
+        let deep_type = "uint256".to_string() + &"[]".repeat(20);
+        let sig_str = format!("Evil({deep_type})");
+        let err = EventSignature::parse(&sig_str).unwrap_err();
+        assert!(
+            err.to_string().contains("nesting too deep"),
+            "Expected depth error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_allows_moderate_abi_array_nesting() {
+        // 3 levels is fine
+        let sig = EventSignature::parse("SomeEvent(uint256[][][])").unwrap();
+        assert_eq!(sig.params[0].ty, AbiType::DynamicArray(Box::new(
+            AbiType::DynamicArray(Box::new(
+                AbiType::DynamicArray(Box::new(AbiType::Uint(256)))
+            ))
+        )));
+    }
+
+    #[test]
     fn test_cte_filtered_clickhouse_only_to() {
         let sig = EventSignature::parse(
             "Transfer(address indexed from, address indexed to, uint256 value)",
