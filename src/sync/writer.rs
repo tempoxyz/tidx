@@ -779,6 +779,27 @@ pub async fn update_tip_num(pool: &Pool, chain_id: u64, tip_num: u64, head_num: 
     Ok(())
 }
 
+/// Roll back tip_num during a reorg. Unlike `update_tip_num` which uses
+/// GREATEST (monotonic), this unconditionally sets tip_num and head_num
+/// to the fork point so the sync engine re-fetches the canonical chain.
+pub async fn rollback_tip_num(pool: &Pool, chain_id: u64, fork_block: u64) -> Result<()> {
+    let conn = pool.get().await?;
+
+    conn.execute(
+        r#"
+        UPDATE sync_state
+        SET tip_num = $1,
+            head_num = $1,
+            updated_at = NOW()
+        WHERE chain_id = $2
+        "#,
+        &[&(fork_block as i64), &(chain_id as i64)],
+    )
+    .await?;
+
+    Ok(())
+}
+
 /// Update only synced_num (for gap-fill sync - avoids clobbering tip_num)
 pub async fn update_synced_num(pool: &Pool, chain_id: u64, synced_num: u64) -> Result<()> {
     let conn = pool.get().await?;

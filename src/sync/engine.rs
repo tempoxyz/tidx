@@ -19,7 +19,8 @@ use super::fetcher::RpcClient;
 use super::sink::SinkSet;
 use super::writer::{
     detect_all_gaps, detect_blocks_missing_receipts, find_fork_point, get_block_hash, has_gaps,
-    load_sync_state, save_sync_state, update_sync_rate, update_synced_num, update_tip_num,
+    load_sync_state, rollback_tip_num, save_sync_state, update_sync_rate, update_synced_num,
+    update_tip_num,
 };
 
 /// RPC concurrency limits
@@ -508,8 +509,10 @@ impl SyncEngine {
                     "Reorg handled: deleted orphaned blocks"
                 );
 
-                // Update tip_num to fork point so realtime sync continues from there
-                update_tip_num(self.pool(), self.chain_id, fork_block, fork_block).await?;
+                // Roll back tip_num to fork point so realtime sync continues from there.
+                // Uses rollback_tip_num (direct SET) instead of update_tip_num (GREATEST)
+                // because tip_num must decrease during a reorg.
+                rollback_tip_num(self.pool(), self.chain_id, fork_block).await?;
 
                 Ok(())
             }

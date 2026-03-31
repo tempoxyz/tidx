@@ -7,7 +7,7 @@ use tidx::db::ThrottledPool;
 use tidx::query::EventSignature;
 use tidx::sync::engine::SyncEngine;
 use tidx::sync::sink::SinkSet;
-use tidx::sync::writer::{detect_gaps, get_block_hash, load_sync_state, save_sync_state, update_synced_num, update_tip_num};
+use tidx::sync::writer::{detect_gaps, get_block_hash, load_sync_state, rollback_tip_num, save_sync_state, update_synced_num, update_tip_num};
 use tidx::types::SyncState;
 use serial_test::serial;
 
@@ -513,6 +513,78 @@ async fn test_sync_state_only_increases() {
     assert_eq!(state.tip_num, 100, "tip_num should not decrease");
     assert_eq!(state.synced_num, 50, "synced_num should not decrease");
     assert_eq!(state.head_num, 100, "head_num should not decrease");
+}
+
+#[tokio::test]
+#[serial(db)]
+async fn test_rollback_tip_num_decreases_during_reorg() {
+    let db = TestDb::empty().await;
+    db.truncate_all().await;
+
+    let chain_id = 88881u64;
+
+    // Establish initial state at block 200
+    update_tip_num(&db.pool, chain_id, 200, 200).await.expect("Failed");
+
+    let state = load_sync_state(&db.pool, chain_id).await.expect("Failed").unwrap();
+    assert_eq!(state.tip_num, 200);
+    assert_eq!(state.head_num, 200);
+
+    // Simulate reorg: roll back tip to fork point at block 180
+    rollback_tip_num(&db.pool, chain_id, 180).await.expect("Failed to rollback");
+
+    let state = load_sync_state(&db.pool, chain_id).await.expect("Failed").unwrap();
+    assert_eq!(state.tip_num, 180, "tip_num must decrease to fork point during reorg");
+    assert_eq!(state.head_num, 180, "head_num must decrease to fork point during reorg");
+}
+
+#[tokio::test]
+#[serial(db)]
+async fn test_update_tip_num_still_monotonic_forward() {
+    let db = TestDb::empty().await;
+    db.truncate_all().await;
+
+    let chain_id = 88882u64;
+
+    // Normal forward sync: tip advances
+    update_tip_num(&db.pool, chain_id, 100, 100).await.expect("Failed");
+    update_tip_num(&db.pool, chain_id, 200, 200).await.expect("Failed");
+
+    let state = load_sync_state(&db.pool, chain_id).await.expect("Failed").unwrap();
+    assert_eq!(state.tip_num, 200, "tip_num should advance to 200");
+
+    // update_tip_num with lower value should NOT decrease (GREATEST still works)
+    update_tip_num(&db.pool, chain_id, 150, 150).await.expect("Failed");
+
+    let state = load_sync_state(&db.pool, chain_id).await.expect("Failed").unwrap();
+    assert_eq!(state.tip_num, 200, "tip_num should remain at 200 via GREATEST");
+}
+
+#[tokio::test]
+#[serial(db)]
+async fn test_rollback_then_forward_sync_resumes() {
+    let db = TestDb::empty().await;
+    db.truncate_all().await;
+
+    let chain_id = 88883u64;
+
+    // Initial state at block 500
+    update_tip_num(&db.pool, chain_id, 500, 500).await.expect("Failed");
+    update_synced_num(&db.pool, chain_id, 400).await.expect("Failed");
+
+    // Reorg rolls tip back to fork point 450
+    rollback_tip_num(&db.pool, chain_id, 450).await.expect("Failed");
+
+    let state = load_sync_state(&db.pool, chain_id).await.expect("Failed").unwrap();
+    assert_eq!(state.tip_num, 450, "tip_num should be at fork point");
+    assert_eq!(state.synced_num, 400, "synced_num should be unchanged");
+
+    // Forward sync resumes from fork point, advances past old tip
+    update_tip_num(&db.pool, chain_id, 510, 520).await.expect("Failed");
+
+    let state = load_sync_state(&db.pool, chain_id).await.expect("Failed").unwrap();
+    assert_eq!(state.tip_num, 510, "tip_num should advance past old value");
+    assert_eq!(state.head_num, 520, "head_num should reflect new chain head");
 }
 
 #[tokio::test]
