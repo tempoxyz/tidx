@@ -102,6 +102,37 @@ async fn test_status_includes_postgres_watermarks() {
     );
 }
 
+#[tokio::test]
+#[serial(db)]
+async fn test_status_includes_configured_chain_when_sync_state_is_empty() {
+    let db = TestDb::empty().await;
+    db.truncate_all().await;
+    let broadcaster = Arc::new(Broadcaster::new());
+    let (pools, chain_id) = make_pools(db.pool.clone());
+    let mut app = make_test_service(pools, chain_id, broadcaster).await;
+
+    let response = app
+        .call(
+            Request::builder()
+                .uri("/status")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+    let chains = json["chains"].as_array().expect("chains should be array");
+    assert_eq!(chains.len(), 1, "expected configured chain to be present");
+    assert_eq!(chains[0]["chain_id"], 1);
+}
+
 // ============================================================================
 // CLI HTTP proxy: when a real HTTP server is running, status is fetched via HTTP
 // ============================================================================
