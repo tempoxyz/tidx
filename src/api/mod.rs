@@ -200,9 +200,13 @@ async fn handle_status(State(state): State<AppState>) -> Result<Json<StatusRespo
     let mut all_chains = Vec::new();
     let pools = state.pools.read().await;
     for (chain_id, pool) in pools.iter() {
-        match crate::service::get_all_status(pool).await {
-            Ok(chains) if !chains.is_empty() => all_chains.extend(chains),
-            Ok(_) | Err(_) => all_chains.push(empty_status(*chain_id)),
+        let chains = crate::service::get_all_status(pool)
+            .await
+            .map_err(|e| ApiError::QueryError(format!("Failed to load status for chain {chain_id}: {e}")))?;
+        if chains.is_empty() {
+            all_chains.push(empty_status(*chain_id));
+        } else {
+            all_chains.extend(chains);
         }
     }
     all_chains.sort_by_key(|chain| chain.chain_id);
