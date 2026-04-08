@@ -113,7 +113,7 @@ fn print_http_status(resp: &serde_json::Value) -> Result<()> {
         let name = chain["name"].as_str().unwrap_or("unknown");
         let chain_id = chain["chain_id"].as_i64().unwrap_or(0);
         let head_num = chain["head_num"].as_i64().unwrap_or(0);
-        let synced_num = chain["synced_num"].as_i64().unwrap_or(0);
+        let _synced_num = chain["synced_num"].as_i64().unwrap_or(0);
         let lag = chain["lag"].as_i64().unwrap_or(0);
 
         println!("┌─ {} (chain_id: {}) ─────────────────────", name, chain_id);
@@ -257,7 +257,7 @@ async fn print_json_status(config: &Config) -> Result<()> {
                 Ok(pool) => {
                     let state = load_sync_state(&pool, chain.chain_id).await.ok().flatten();
                     let tip = state.as_ref().map(|s| s.tip_num).unwrap_or(0);
-                    let gaps = detect_all_gaps(&pool, tip).await.unwrap_or_default();
+                    let gaps = detect_all_gaps(&pool, tip, chain.start_block).await.unwrap_or_default();
                     (state, gaps)
                 }
                 Err(_) => (None, vec![]),

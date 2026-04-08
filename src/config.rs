@@ -107,6 +107,11 @@ pub struct ChainConfig {
     #[serde(default)]
     pub pg_password_env: Option<String>,
 
+    /// Starting block number for indexing (default: 0 = genesis).
+    /// When set, backfill will stop at this block instead of going to genesis.
+    #[serde(default)]
+    pub start_block: u64,
+
     /// Enable backfill to genesis (default: true)
     #[serde(default = "default_backfill")]
     pub backfill: bool,
@@ -314,6 +319,22 @@ mod tests {
         assert!(config.backfill);
         assert_eq!(config.batch_size, 100);
         assert_eq!(config.concurrency, 4);
+        assert_eq!(config.start_block, 0);
+    }
+
+    #[test]
+    fn test_chain_config_with_start_block() {
+        let toml_str = r#"
+            name = "test"
+            chain_id = 1
+            rpc_url = "http://localhost:8545"
+            pg_url = "postgres://localhost/test"
+            start_block = 1000
+        "#;
+
+        let config: ChainConfig = toml::from_str(toml_str).unwrap();
+
+        assert_eq!(config.start_block, 1000);
     }
 
     #[test]
@@ -403,6 +424,7 @@ mod tests {
             rpc_url: "http://localhost:8545".to_string(),
             pg_url: "postgres://user:pass@localhost/db".to_string(),
             pg_password_env: None,
+            start_block: 0,
             backfill: true,
             batch_size: 100,
             concurrency: 4,
@@ -428,6 +450,7 @@ mod tests {
             rpc_url: "http://localhost:8545".to_string(),
             pg_url: "postgres://user:placeholder@localhost/db".to_string(),
             pg_password_env: Some("PATH".to_string()),
+            start_block: 0,
             backfill: true,
             batch_size: 100,
             concurrency: 4,
@@ -452,6 +475,7 @@ mod tests {
             rpc_url: "http://localhost:8545".to_string(),
             pg_url: "postgres://user:placeholder@localhost/db".to_string(),
             pg_password_env: Some("NONEXISTENT_VAR_XYZ_999".to_string()),
+            start_block: 0,
             backfill: true,
             batch_size: 100,
             concurrency: 4,

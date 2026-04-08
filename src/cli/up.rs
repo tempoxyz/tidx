@@ -269,6 +269,7 @@ fn spawn_sync_engine(
         chain = %chain.name,
         chain_id = chain.chain_id,
         rpc = %chain.rpc_url,
+        start_block = chain.start_block,
         backfill_limit = throttled_pool.backfill_semaphore.available_permits(),
         "Starting sync for chain (throttled pool: 16 connections, backfill limited)"
     );
@@ -374,7 +375,8 @@ fn spawn_sync_engine(
                         .with_batch_size(chain.batch_size)
                         .with_concurrency(chain.concurrency)
                         .with_backfill_first(backfill_first)
-                        .with_trust_rpc(trust_rpc);
+                        .with_trust_rpc(trust_rpc)
+                        .with_start_block(chain.start_block);
                 }
                 Err(e) => {
                     warn!(error = %e, chain = %chain.name, "Failed to create sync engine, retrying in 10s");

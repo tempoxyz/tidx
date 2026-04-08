@@ -42,6 +42,8 @@ pub struct SyncEngine {
     backfill_first: bool,
     /// Skip parent hash validation (trust RPC for reorg handling)
     trust_rpc: bool,
+    /// Starting block for indexing (0 = genesis)
+    start_block: u64,
 }
 
 impl SyncEngine {
@@ -70,6 +72,7 @@ impl SyncEngine {
             concurrency: 4,
             backfill_first: false,
             trust_rpc: false,
+            start_block: 0,
         })
     }
 
@@ -95,6 +98,11 @@ impl SyncEngine {
 
     pub fn with_trust_rpc(mut self, trust_rpc: bool) -> Self {
         self.trust_rpc = trust_rpc;
+        self
+    }
+
+    pub fn with_start_block(mut self, start_block: u64) -> Self {
+        self.start_block = start_block;
         self
     }
 
@@ -149,7 +157,7 @@ impl SyncEngine {
             update_tip_num(self.pool(), self.chain_id, remote_head, remote_head).await?;
 
             // Check for gaps
-            let gaps = detect_all_gaps(self.pool(), remote_head).await?;
+            let gaps = detect_all_gaps(self.pool(), remote_head, self.start_block).await?;
             if gaps.is_empty() {
                 info!(
                     chain_id = self.chain_id,
@@ -175,6 +183,7 @@ impl SyncEngine {
                 self.chain_id,
                 self.batch_size,
                 self.concurrency,
+                self.start_block,
                 &mut progress,
             )
             .await
@@ -232,6 +241,7 @@ impl SyncEngine {
         let gapfill_chain_id = self.chain_id;
         let gapfill_batch_size = self.batch_size;
         let gapfill_concurrency = self.concurrency;
+        let gapfill_start_block = self.start_block;
         let gapfill_handle = tokio::spawn(async move {
             run_gapfill_loop(
                 gapfill_sinks,
@@ -240,6 +250,7 @@ impl SyncEngine {
                 gapfill_chain_id,
                 gapfill_batch_size,
                 gapfill_concurrency,
+                gapfill_start_block,
                 gapfill_shutdown,
             )
             .await
@@ -526,7 +537,7 @@ impl SyncEngine {
         let state = load_sync_state(self.pool(), self.chain_id)
             .await?
             .unwrap_or_default();
-        let gaps = detect_all_gaps(self.pool(), state.tip_num).await?;
+        let gaps = detect_all_gaps(self.pool(), state.tip_num, self.start_block).await?;
         let mut filled = 0;
 
         for (start, end) in gaps {
@@ -668,6 +679,7 @@ impl SyncEngine {
             synced_num: num,
             tip_num: num,
             backfill_num: state.backfill_num,
+            start_block: self.start_block,
             sync_rate: state.sync_rate,
             started_at: state.started_at,
         };
@@ -752,9 +764,13 @@ impl SyncEngine {
             current_end = current_start.saturating_sub(1);
         }
 
-        // Mark complete if we reached genesis
-        if state.backfill_num == Some(to) && to == 0 {
-            info!("Backfill complete to genesis");
+        // Mark complete if we reached the target
+        if state.backfill_num == Some(to) {
+            if to == 0 {
+                info!("Backfill complete to genesis");
+            } else {
+                info!(start_block = to, "Backfill complete to start_block");
+            }
         }
 
         Ok(synced)
@@ -789,6 +805,7 @@ async fn run_gapfill_loop(
     chain_id: u64,
     batch_size: u64,
     concurrency: usize,
+    start_block: u64,
     mut shutdown: broadcast::Receiver<()>,
 ) -> Result<()> {
     let state = load_sync_state(sinks.pool(), chain_id)
@@ -800,6 +817,7 @@ async fn run_gapfill_loop(
         chain_id = chain_id,
         batch_size = batch_size,
         concurrency = concurrency,
+        start_block = start_block,
         backfill_limit = backfill_semaphore.available_permits(),
         "Gap-fill: starting with parallel workers (throttled)"
     );
@@ -812,7 +830,7 @@ async fn run_gapfill_loop(
                 info!("Gap-fill: shutting down");
                 break;
             }
-            result = tick_gapfill_parallel(&sinks, &backfill_semaphore, &rpc, chain_id, batch_size, concurrency, &mut progress) => {
+            result = tick_gapfill_parallel(&sinks, &backfill_semaphore, &rpc, chain_id, batch_size, concurrency, start_block, &mut progress) => {
                 if let Err(e) = result {
                     error!(error = %e, "Gap-fill sync tick failed");
                     tokio::time::sleep(Duration::from_secs(1)).await;
@@ -834,6 +852,7 @@ async fn tick_gapfill_parallel(
     chain_id: u64,
     batch_size: u64,
     concurrency: usize,
+    start_block: u64,
     progress: &mut SyncProgress,
 ) -> Result<()> {
     let pool = sinks.pool();
@@ -859,9 +878,8 @@ async fn tick_gapfill_parallel(
     // Fast path: use COUNT-based check (btree index scan) to see if there
     // are any gaps at all. Only fall back to the expensive LAG() window
     // function when gaps actually exist and we need their exact ranges.
-    // With 0.5s block time, tip_num races ahead of synced_num constantly,
-    // so we check the range [1, tip_num] cheaply via COUNT vs expected.
-    if state.tip_num > 0 && !has_gaps(pool, 1, state.tip_num).await? {
+    let lower_bound = start_block.max(1);
+    if state.tip_num >= lower_bound && !has_gaps(pool, lower_bound, state.tip_num).await? {
         metrics::set_gap_blocks(chain_id, "postgres", 0);
         metrics::set_gap_count(chain_id, "postgres", 0);
         metrics::set_synced(chain_id, realtime_lag == 0);
@@ -873,10 +891,10 @@ async fn tick_gapfill_parallel(
     }
 
     // Gaps exist — run the expensive window function to find exact ranges
-    let gaps = detect_all_gaps(pool, state.tip_num).await?;
+    let gaps = detect_all_gaps(pool, state.tip_num, start_block).await?;
 
     if gaps.is_empty() {
-        // No gaps - fully synced from genesis to tip
+        // No gaps - fully synced from start_block to tip
         metrics::set_gap_blocks(chain_id, "postgres", 0);
         metrics::set_gap_count(chain_id, "postgres", 0);
         metrics::set_synced(chain_id, realtime_lag == 0);
@@ -1143,13 +1161,14 @@ async fn tick_gapfill_parallel_no_throttle(
     chain_id: u64,
     batch_size: u64,
     concurrency: usize,
+    start_block: u64,
     progress: &mut SyncProgress,
 ) -> Result<()> {
     let pool = sinks.pool();
     let state = load_sync_state(pool, chain_id).await?.unwrap_or_default();
 
-    // Detect ALL gaps including from genesis, sorted by end DESC (most recent first)
-    let gaps = detect_all_gaps(pool, state.tip_num).await?;
+    // Detect ALL gaps including from start_block, sorted by end DESC (most recent first)
+    let gaps = detect_all_gaps(pool, state.tip_num, start_block).await?;
 
     if gaps.is_empty() {
         if state.synced_num < state.tip_num {
@@ -1321,10 +1340,10 @@ async fn tick_gapfill_parallel_no_throttle(
     Ok(())
 }
 
-/// Check if fully synced (no gaps from genesis to tip)
+/// Check if fully synced (no gaps from start_block to tip)
 #[allow(dead_code)]
-async fn is_fully_synced(pool: &Pool, tip_num: u64) -> Result<bool> {
-    let gaps = detect_all_gaps(pool, tip_num).await?;
+async fn is_fully_synced(pool: &Pool, tip_num: u64, start_block: u64) -> Result<bool> {
+    let gaps = detect_all_gaps(pool, tip_num, start_block).await?;
     Ok(gaps.is_empty())
 }
 

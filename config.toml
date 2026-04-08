@@ -14,6 +14,7 @@ name = "moderato"
 chain_id = 42431
 rpc_url = "https://eng:aphex-twin-jeff-mills@rpc.testnet.tempo.xyz"
 pg_url = "postgres://tidx:tidx@postgres:5432/tidx_moderato"
+# start_block = 0       # Starting block for indexing (default: 0 = genesis)
 backfill = true
 batch_size = 500
 concurrency = 8

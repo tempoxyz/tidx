@@ -397,7 +397,7 @@ async fn test_gap_detection() {
         .expect("Failed to insert block");
     }
 
-    let gaps = detect_gaps(&db.pool, u64::MAX).await.expect("Failed to detect gaps");
+    let gaps = detect_gaps(&db.pool, i64::MAX as u64).await.expect("Failed to detect gaps");
 
     assert_eq!(gaps.len(), 1, "Should detect one gap");
     assert_eq!(gaps[0], (4, 4), "Gap should be block 4");
@@ -428,7 +428,7 @@ async fn test_gap_detection_multiple_gaps() {
         .expect("Failed to insert block");
     }
 
-    let gaps = detect_gaps(&db.pool, u64::MAX).await.expect("Failed to detect gaps");
+    let gaps = detect_gaps(&db.pool, i64::MAX as u64).await.expect("Failed to detect gaps");
 
     assert_eq!(gaps.len(), 2, "Should detect two gaps");
     assert_eq!(gaps[0], (3, 4), "First gap should be blocks 3-4");
@@ -442,7 +442,7 @@ async fn test_gap_detection_empty_table() {
     db.truncate_all().await;
 
     // Empty table should have no gaps
-    let gaps = detect_gaps(&db.pool, u64::MAX).await.expect("Failed to detect gaps");
+    let gaps = detect_gaps(&db.pool, i64::MAX as u64).await.expect("Failed to detect gaps");
 
     assert!(gaps.is_empty(), "Empty table should have no gaps");
 }
@@ -529,6 +529,7 @@ async fn test_sync_state_save_and_load() {
         synced_num: 800,
         tip_num: 950,
         backfill_num: Some(100),
+        start_block: 0,
         sync_rate: None,
         started_at: Some(chrono::Utc::now()),
     };
@@ -552,6 +553,7 @@ async fn test_sync_state_methods() {
         synced_num: 800,
         tip_num: 950,
         backfill_num: Some(100),
+        start_block: 0,
         sync_rate: None,
         started_at: None,
     };
@@ -576,6 +578,80 @@ async fn test_sync_state_methods() {
     };
     assert!(complete.backfill_complete(), "Backfill complete when backfill_num = 0");
     assert_eq!(complete.backfill_remaining(), 0);
+}
+
+#[tokio::test]
+#[serial(db)]
+async fn test_sync_state_start_block_persistence() {
+    let db = TestDb::empty().await;
+    db.truncate_all().await;
+
+    let chain_id = 88888u64;
+
+    let state = SyncState {
+        chain_id,
+        head_num: 5000,
+        synced_num: 3000,
+        tip_num: 4500,
+        backfill_num: Some(1500),
+        start_block: 1000,
+        sync_rate: None,
+        started_at: Some(chrono::Utc::now()),
+    };
+
+    save_sync_state(&db.pool, &state).await.expect("Failed to save");
+
+    let loaded = load_sync_state(&db.pool, chain_id).await.expect("Failed to load").unwrap();
+    assert_eq!(loaded.start_block, 1000, "start_block should round-trip through DB");
+    assert_eq!(loaded.backfill_num, Some(1500));
+    assert!(!loaded.backfill_complete(), "Not complete: backfill_num(1500) > start_block(1000)");
+    assert_eq!(loaded.backfill_remaining(), 500, "1500 - 1000 = 500 blocks remaining");
+
+    // Update: backfill reaches start_block
+    let done = SyncState {
+        backfill_num: Some(1000),
+        ..state.clone()
+    };
+    save_sync_state(&db.pool, &done).await.expect("Failed to save");
+
+    let loaded = load_sync_state(&db.pool, chain_id).await.expect("Failed to load").unwrap();
+    assert!(loaded.backfill_complete(), "Complete: backfill_num == start_block");
+    assert_eq!(loaded.backfill_remaining(), 0);
+}
+
+#[tokio::test]
+#[serial(db)]
+async fn test_sync_state_start_block_update() {
+    let db = TestDb::empty().await;
+    db.truncate_all().await;
+
+    let chain_id = 99999u64;
+
+    // First save with start_block=0
+    let state = SyncState {
+        chain_id,
+        head_num: 100,
+        synced_num: 100,
+        tip_num: 100,
+        backfill_num: None,
+        start_block: 0,
+        sync_rate: None,
+        started_at: None,
+    };
+    save_sync_state(&db.pool, &state).await.expect("Failed to save");
+
+    let loaded = load_sync_state(&db.pool, chain_id).await.expect("Failed").unwrap();
+    assert_eq!(loaded.start_block, 0);
+
+    // Update with start_block=500 (user changed config)
+    let updated = SyncState {
+        start_block: 500,
+        ..state.clone()
+    };
+    save_sync_state(&db.pool, &updated).await.expect("Failed to save");
+
+    let loaded = load_sync_state(&db.pool, chain_id).await.expect("Failed").unwrap();
+    assert_eq!(loaded.start_block, 500, "start_block should update on conflict");
 }
 
 #[tokio::test]
@@ -643,7 +719,7 @@ async fn test_gap_fill_scenario_multiple_restarts() {
     }
 
     // Detect all gaps
-    let gaps = detect_gaps(&db.pool, u64::MAX).await.expect("Failed to detect gaps");
+    let gaps = detect_gaps(&db.pool, i64::MAX as u64).await.expect("Failed to detect gaps");
 
     // Should have 2 gaps:
     // Gap 1: 101-289 (between run 1 and run 2)
@@ -682,7 +758,7 @@ async fn test_gap_detection_single_block_gaps() {
         .expect("Failed to insert block");
     }
 
-    let gaps = detect_gaps(&db.pool, u64::MAX).await.expect("Failed to detect gaps");
+    let gaps = detect_gaps(&db.pool, i64::MAX as u64).await.expect("Failed to detect gaps");
 
     assert_eq!(gaps.len(), 4, "Should detect four single-block gaps");
     assert_eq!(gaps[0], (2, 2), "Gap at block 2");
@@ -716,7 +792,7 @@ async fn test_gap_detection_contiguous_blocks() {
         .expect("Failed to insert block");
     }
 
-    let gaps = detect_gaps(&db.pool, u64::MAX).await.expect("Failed to detect gaps");
+    let gaps = detect_gaps(&db.pool, i64::MAX as u64).await.expect("Failed to detect gaps");
 
     assert!(gaps.is_empty(), "Contiguous blocks should have no gaps");
 }
