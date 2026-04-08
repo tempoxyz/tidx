@@ -841,10 +841,12 @@ pub async fn has_gaps(pool: &Pool, from: u64, to: u64) -> Result<bool> {
         return Ok(false);
     }
     let conn = pool.get().await?;
+    let from_i64 = i64::try_from(from).unwrap_or(i64::MAX);
+    let to_i64 = i64::try_from(to).unwrap_or(i64::MAX);
     let row = conn
         .query_one(
             "SELECT COUNT(*) FROM blocks WHERE num >= $1 AND num <= $2",
-            &[&(from as i64), &(to as i64)],
+            &[&from_i64, &to_i64],
         )
         .await?;
     let count: i64 = row.get(0);
@@ -858,6 +860,7 @@ pub async fn has_gaps(pool: &Pool, from: u64, to: u64) -> Result<bool> {
 pub async fn detect_gaps(pool: &Pool, below: u64) -> Result<Vec<(u64, u64)>> {
     let conn = pool.get().await?;
 
+    let below_i64 = i64::try_from(below).unwrap_or(i64::MAX);
     let rows = conn
         .query(
             r#"
@@ -870,7 +873,7 @@ pub async fn detect_gaps(pool: &Pool, below: u64) -> Result<Vec<(u64, u64)>> {
             FROM numbered
             WHERE num - prev_num > 1
             "#,
-            &[&(below as i64)],
+            &[&below_i64],
         )
         .await?;
 
