@@ -7,6 +7,10 @@ ignore = [
     "RUSTSEC-2025-0141",
     # https://rustsec.org/advisories/RUSTSEC-2026-0097 rand is unsound with a custom logger
     "RUSTSEC-2026-0097",
+    # https://rustsec.org/advisories/RUSTSEC-2024-0320 yaml-rust is unmaintained, transitive dep
+    "RUSTSEC-2024-0320",
+    # https://rustsec.org/advisories/RUSTSEC-2024-0388 derivative is unmaintained, transitive dep
+    "RUSTSEC-2024-0388",
 ]
 
 [licenses]
@@ -45,4 +49,5 @@ unknown-registry = "warn"
 unknown-git = "deny"
 allow-git = [
     "https://github.com/tempoxyz/tempo",
+    "https://github.com/paradigmxyz/reth",
 ]
