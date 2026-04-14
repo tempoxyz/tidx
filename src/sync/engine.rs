@@ -15,6 +15,7 @@ use super::decoder::{
     decode_block, decode_log, decode_receipt, decode_transaction, enrich_txs_from_receipts,
     timestamp_from_secs,
 };
+use crate::virtual_address::mark_virtual_forward_hops;
 use super::fetcher::RpcClient;
 use super::sink::SinkSet;
 use super::writer::{
@@ -576,7 +577,7 @@ impl SyncEngine {
             })
             .collect();
 
-        let all_logs: Vec<_> = receipts
+        let mut all_logs: Vec<_> = receipts
             .iter()
             .flatten()
             .flat_map(|receipt| {
@@ -608,6 +609,12 @@ impl SyncEngine {
 
         enrich_txs_from_receipts(&mut all_txs, &all_receipts);
 
+        // TIP-1022: mark virtual address forwarding hops
+        let forward_marks = mark_virtual_forward_hops(&all_logs);
+        for (log, is_forward) in all_logs.iter_mut().zip(forward_marks) {
+            log.is_virtual_forward = is_forward;
+        }
+
         Ok((blocks, block_rows, all_txs, all_logs, all_receipts))
     }
 
@@ -637,7 +644,7 @@ impl SyncEngine {
             .map(|(i, tx)| decode_transaction(tx, &block, i as u32))
             .collect();
 
-        let log_rows: Vec<_> = receipts
+        let mut log_rows: Vec<_> = receipts
             .iter()
             .flat_map(|r| r.inner.logs().iter().map(|log| decode_log(log, block_ts)))
             .collect();
@@ -648,6 +655,12 @@ impl SyncEngine {
             .collect();
 
         enrich_txs_from_receipts(&mut txs, &receipt_rows);
+
+        // TIP-1022: mark virtual address forwarding hops
+        let forward_marks = mark_virtual_forward_hops(&log_rows);
+        for (log, is_forward) in log_rows.iter_mut().zip(forward_marks) {
+            log.is_virtual_forward = is_forward;
+        }
 
         self.sinks
             .write_all(
@@ -1359,7 +1372,7 @@ async fn sync_range_standalone(sinks: &SinkSet, rpc: &RpcClient, from: u64, to: 
         })
         .collect();
 
-    let all_logs: Vec<_> = receipts
+    let mut all_logs: Vec<_> = receipts
         .iter()
         .flatten()
         .flat_map(|receipt| {
@@ -1390,6 +1403,12 @@ async fn sync_range_standalone(sinks: &SinkSet, rpc: &RpcClient, from: u64, to: 
         .collect();
 
     enrich_txs_from_receipts(&mut all_txs, &all_receipts);
+
+    // TIP-1022: mark virtual address forwarding hops
+    let forward_marks = mark_virtual_forward_hops(&all_logs);
+    for (log, is_forward) in all_logs.iter_mut().zip(forward_marks) {
+        log.is_virtual_forward = is_forward;
+    }
 
     sinks
         .write_all(&block_rows, &all_txs, &all_logs, &all_receipts)
@@ -1490,7 +1509,7 @@ async fn tick_receipt_backfill(sinks: &SinkSet, rpc: &RpcClient, chain_id: u64) 
             .collect();
 
         // Decode logs and receipts
-        let all_logs: Vec<_> = receipts
+        let mut all_logs: Vec<_> = receipts
             .iter()
             .flatten()
             .flat_map(|receipt| {
@@ -1519,6 +1538,12 @@ async fn tick_receipt_backfill(sinks: &SinkSet, rpc: &RpcClient, chain_id: u64) 
                     .map(|&ts| decode_receipt(receipt, ts))
             })
             .collect();
+
+        // TIP-1022: mark virtual address forwarding hops
+        let forward_marks = mark_virtual_forward_hops(&all_logs);
+        for (log, is_forward) in all_logs.iter_mut().zip(forward_marks) {
+            log.is_virtual_forward = is_forward;
+        }
 
         let log_count = all_logs.len();
         let receipt_count = all_receipts.len();

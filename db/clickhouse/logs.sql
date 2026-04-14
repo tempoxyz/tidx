@@ -11,6 +11,7 @@ CREATE TABLE IF NOT EXISTS logs (
     topic2          Nullable(String),
     topic3          Nullable(String),
     data            String,
+    is_virtual_forward UInt8 DEFAULT 0,
 
     INDEX idx_selector selector TYPE bloom_filter GRANULARITY 1,
     INDEX idx_address address TYPE bloom_filter GRANULARITY 1,

@@ -206,7 +206,8 @@ pub async fn write_logs(pool: &Pool, logs: &[LogRow]) -> Result<()> {
         "CREATE TEMP TABLE _staging_logs (
             block_num INT8, block_timestamp TIMESTAMPTZ, log_idx INT4, tx_idx INT4,
             tx_hash BYTEA, address BYTEA, selector BYTEA, topic0 BYTEA,
-            topic1 BYTEA, topic2 BYTEA, topic3 BYTEA, data BYTEA
+            topic1 BYTEA, topic2 BYTEA, topic3 BYTEA, data BYTEA,
+            is_virtual_forward BOOLEAN
         ) ON COMMIT DROP",
         &[],
     )
@@ -225,11 +226,12 @@ pub async fn write_logs(pool: &Pool, logs: &[LogRow]) -> Result<()> {
         Type::BYTEA,      // topic2
         Type::BYTEA,      // topic3
         Type::BYTEA,      // data
+        Type::BOOL,       // is_virtual_forward
     ];
 
     let sink = tx
         .copy_in(
-            "COPY _staging_logs (block_num, block_timestamp, log_idx, tx_idx, tx_hash, address, selector, topic0, topic1, topic2, topic3, data) FROM STDIN BINARY",
+            "COPY _staging_logs (block_num, block_timestamp, log_idx, tx_idx, tx_hash, address, selector, topic0, topic1, topic2, topic3, data, is_virtual_forward) FROM STDIN BINARY",
         )
         .await?;
 
@@ -252,6 +254,7 @@ pub async fn write_logs(pool: &Pool, logs: &[LogRow]) -> Result<()> {
                 &log.topic2,
                 &log.topic3,
                 &log.data,
+                &log.is_virtual_forward,
             ])
             .await?;
     }
@@ -519,7 +522,8 @@ pub async fn write_batch(
             "CREATE TEMP TABLE _staging_logs (
                 block_num INT8, block_timestamp TIMESTAMPTZ, log_idx INT4, tx_idx INT4,
                 tx_hash BYTEA, address BYTEA, selector BYTEA, topic0 BYTEA,
-                topic1 BYTEA, topic2 BYTEA, topic3 BYTEA, data BYTEA
+                topic1 BYTEA, topic2 BYTEA, topic3 BYTEA, data BYTEA,
+                is_virtual_forward BOOLEAN
             ) ON COMMIT DROP",
             &[],
         )
@@ -538,11 +542,12 @@ pub async fn write_batch(
             Type::BYTEA,       // topic2
             Type::BYTEA,       // topic3
             Type::BYTEA,       // data
+            Type::BOOL,        // is_virtual_forward
         ];
 
         let sink = tx
             .copy_in(
-                "COPY _staging_logs (block_num, block_timestamp, log_idx, tx_idx, tx_hash, address, selector, topic0, topic1, topic2, topic3, data) FROM STDIN BINARY",
+                "COPY _staging_logs (block_num, block_timestamp, log_idx, tx_idx, tx_hash, address, selector, topic0, topic1, topic2, topic3, data, is_virtual_forward) FROM STDIN BINARY",
             )
             .await?;
 
@@ -565,6 +570,7 @@ pub async fn write_batch(
                     &log.topic2,
                     &log.topic3,
                     &log.data,
+                    &log.is_virtual_forward,
                 ])
                 .await?;
         }

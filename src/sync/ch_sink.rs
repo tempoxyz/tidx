@@ -419,6 +419,7 @@ struct ChLogWire {
     topic2: Option<String>,
     topic3: Option<String>,
     data: String,
+    is_virtual_forward: u8,
 }
 
 impl ChLogWire {
@@ -440,6 +441,7 @@ impl ChLogWire {
             topic2: log.topic2.as_ref().map(|v| hex_encode(v)),
             topic3: log.topic3.as_ref().map(|v| hex_encode(v)),
             data: hex_encode(&log.data),
+            is_virtual_forward: log.is_virtual_forward as u8,
         }
     }
 }

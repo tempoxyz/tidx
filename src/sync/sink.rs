@@ -362,7 +362,7 @@ async fn fetch_logs(conn: &deadpool_postgres::Object, from: i64, to: i64) -> Res
     let rows = conn
         .query(
             "SELECT block_num, block_timestamp, log_idx, tx_idx, tx_hash, address, \
-             selector, topic0, topic1, topic2, topic3, data \
+             selector, topic0, topic1, topic2, topic3, data, is_virtual_forward \
              FROM logs WHERE block_num >= $1 AND block_num <= $2 ORDER BY block_num, log_idx",
             &[&from, &to],
         )
@@ -383,6 +383,7 @@ async fn fetch_logs(conn: &deadpool_postgres::Object, from: i64, to: i64) -> Res
             topic2: r.get(9),
             topic3: r.get(10),
             data: r.get(11),
+            is_virtual_forward: r.get(12),
         })
         .collect())
 }

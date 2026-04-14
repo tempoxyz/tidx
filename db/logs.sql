@@ -11,6 +11,7 @@ CREATE TABLE IF NOT EXISTS logs (
     topic2          BYTEA,
     topic3          BYTEA,
     data            BYTEA NOT NULL,
+    is_virtual_forward BOOLEAN NOT NULL DEFAULT FALSE,
     PRIMARY KEY (block_timestamp, block_num, log_idx)
 );
 

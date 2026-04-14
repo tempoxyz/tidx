@@ -102,6 +102,7 @@ pub fn decode_log(log: &Log, block_timestamp: DateTime<Utc>) -> LogRow {
         topic2: topics.get(2).map(|t| t.as_slice().to_vec()),
         topic3: topics.get(3).map(|t| t.as_slice().to_vec()),
         data: log.data().data.to_vec(),
+        is_virtual_forward: false,
     }
 }
 
