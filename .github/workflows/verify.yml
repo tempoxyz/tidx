@@ -34,3 +34,6 @@ jobs:
 
       - name: Run clippy
         run: make check
+
+      - name: Check advisories
+        run: cargo install cargo-deny --locked && cargo deny check
