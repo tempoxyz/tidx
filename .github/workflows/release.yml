@@ -14,11 +14,12 @@ jobs:
       published: ${{ steps.changelogs.outputs.published }}
       tag: ${{ steps.get-tag.outputs.tag }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
         with:
           fetch-depth: 0
+          persist-credentials: false
       - id: changelogs
-        uses: wevm/changelogs-rs@master
+        uses: wevm/changelogs-rs@b0179e7300997dfa5a631a6a7a2de248bf63310f # master
         with:
           conventional-commit: true
         env:
