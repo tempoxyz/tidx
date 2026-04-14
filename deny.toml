@@ -1,5 +1,4 @@
 [advisories]
-unmaintained = "workspace"
 yanked = "warn"
 ignore = [
     # https://rustsec.org/advisories/RUSTSEC-2024-0436 paste! is unmaintained
