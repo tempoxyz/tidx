@@ -4271,18 +4271,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f89776e4d69bb58bc6993e99ffa1d11f228b839984854c7daeb5d37f87cbe950"
 
 [[package]]
-name = "postgres-derive"
-version = "0.4.7"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "56df96f5394370d1b20e49de146f9e6c25aa9ae750f449c9d665eafecb3ccae6"
-dependencies = [
- "heck",
- "proc-macro2",
- "quote",
- "syn 2.0.114",
-]
-
-[[package]]
 name = "postgres-protocol"
 version = "0.6.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4309,7 +4297,6 @@ dependencies = [
  "bytes",
  "chrono",
  "fallible-iterator",
- "postgres-derive",
  "postgres-protocol",
  "serde_core",
  "serde_json",
@@ -6158,7 +6145,6 @@ dependencies = [
  "anyhow",
  "async-stream",
  "axum",
- "base64",
  "chrono",
  "clap",
  "clickhouse",
@@ -6167,14 +6153,12 @@ dependencies = [
  "dialoguer",
  "form_urlencoded",
  "futures",
- "glob",
  "hex",
  "hex-literal",
  "insta",
  "metrics",
  "metrics-exporter-prometheus",
  "notify",
- "postgres-types",
  "rand 0.9.2",
  "regex-lite",
  "reqwest",
@@ -6186,11 +6170,9 @@ dependencies = [
  "sqlparser",
  "tempfile",
  "tempo-alloy",
- "thiserror 2.0.18",
  "tokio",
  "tokio-postgres",
  "toml",
- "toml_edit 0.22.27",
  "toon-format",
  "tower",
  "tower-http",

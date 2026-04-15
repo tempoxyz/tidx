@@ -29,8 +29,6 @@ tower-http = { version = "0.6", features = ["cors", "trace"] }
 # Database
 tokio-postgres = { version = "0.7", features = ["with-chrono-0_4", "with-serde_json-1"] }
 deadpool-postgres = "0.14"
-postgres-types = { version = "0.2", features = ["derive"] }
-
 
 # Ethereum/Tempo primitives
 alloy = { version = "1", features = ["full"] }
@@ -43,8 +41,6 @@ form_urlencoded = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 toml = "0.8"
-toml_edit = "0.22"
-base64 = "0.22"
 toon-format = "0.4"
 
 # CLI
@@ -60,7 +56,6 @@ metrics-exporter-prometheus = { version = "0.16", default-features = false, feat
 sha3 = "0.10"
 
 # Error handling
-thiserror = "2"
 anyhow = "1"
 
 # Time
@@ -79,9 +74,6 @@ url = "2.5.8"
 
 # File watching
 notify = "8"
-
-# Glob patterns
-glob = "0.3"
 
 # Interactive prompts
 dialoguer = "0.11"
