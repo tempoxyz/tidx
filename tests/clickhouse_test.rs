@@ -15,8 +15,8 @@ use tidx::sync::ch_sink::ClickHouseSink;
 use tidx::sync::sink::SinkSet;
 use tidx::sync::writer;
 use tidx::types::{BlockRow, LogRow, ReceiptRow, TxRow};
-use tidx::view_presets::{
-    VIRTUAL_DEPOSITS_ENGINE, VIRTUAL_DEPOSITS_ORDER_BY, virtual_deposits_sql,
+use tidx::virtual_address::{
+    VIRTUAL_DEPOSITS_ENGINE, VIRTUAL_DEPOSITS_ORDER_BY, virtual_deposits_sql_clickhouse,
 };
 
 const TEST_DB: &str = "tidx_test";
@@ -491,7 +491,7 @@ async fn test_create_virtual_deposits_view() {
     .expect("write logs");
 
     let order_by = VIRTUAL_DEPOSITS_ORDER_BY.join(", ");
-    let sql = virtual_deposits_sql();
+    let sql = virtual_deposits_sql_clickhouse();
     ch.query(&format!(
         "CREATE TABLE virtual_deposits ENGINE = {} ORDER BY ({}) AS {} LIMIT 0",
         VIRTUAL_DEPOSITS_ENGINE, order_by, sql
