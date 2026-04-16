@@ -8,6 +8,20 @@ use crate::db::Pool;
 use crate::metrics;
 use crate::types::{BlockRow, LogRow, ReceiptRow, SyncState, TxRow};
 
+async fn delete_block_range(
+    tx: &tokio_postgres::Transaction<'_>,
+    table: &str,
+    min_block: i64,
+    max_block: i64,
+) -> Result<()> {
+    tx.execute(
+        &format!("DELETE FROM {table} WHERE block_num >= $1 AND block_num <= $2"),
+        &[&min_block, &max_block],
+    )
+    .await?;
+    Ok(())
+}
+
 pub async fn write_block(pool: &Pool, block: &BlockRow) -> Result<()> {
     write_blocks(pool, std::slice::from_ref(block)).await
 }
@@ -98,6 +112,11 @@ pub async fn write_txs(pool: &Pool, txs: &[TxRow]) -> Result<()> {
     let start = Instant::now();
     let mut conn = pool.get().await?;
     let tx = conn.transaction().await?;
+
+    let min_block = txs.iter().map(|tx| tx.block_num).min().unwrap_or_default();
+    let max_block = txs.iter().map(|tx| tx.block_num).max().unwrap_or_default();
+    delete_block_range(&tx, "txs", min_block, max_block).await?;
+
     tx.execute(
         "CREATE TEMP TABLE _staging_txs (
             block_num INT8, block_timestamp TIMESTAMPTZ, idx INT4, hash BYTEA,
@@ -202,6 +221,11 @@ pub async fn write_logs(pool: &Pool, logs: &[LogRow]) -> Result<()> {
     let start = Instant::now();
     let mut conn = pool.get().await?;
     let tx = conn.transaction().await?;
+
+    let min_block = logs.iter().map(|log| log.block_num).min().unwrap_or_default();
+    let max_block = logs.iter().map(|log| log.block_num).max().unwrap_or_default();
+    delete_block_range(&tx, "logs", min_block, max_block).await?;
+
     tx.execute(
         "CREATE TEMP TABLE _staging_logs (
             block_num INT8, block_timestamp TIMESTAMPTZ, log_idx INT4, tx_idx INT4,
@@ -283,6 +307,19 @@ pub async fn write_receipts(pool: &Pool, receipts: &[ReceiptRow]) -> Result<()> 
     let start = Instant::now();
     let mut conn = pool.get().await?;
     let tx = conn.transaction().await?;
+
+    let min_block = receipts
+        .iter()
+        .map(|receipt| receipt.block_num)
+        .min()
+        .unwrap_or_default();
+    let max_block = receipts
+        .iter()
+        .map(|receipt| receipt.block_num)
+        .max()
+        .unwrap_or_default();
+    delete_block_range(&tx, "receipts", min_block, max_block).await?;
+
     tx.execute(
         "CREATE TEMP TABLE _staging_receipts (
             block_num INT8, block_timestamp TIMESTAMPTZ, tx_idx INT4, tx_hash BYTEA,
@@ -431,6 +468,10 @@ pub async fn write_batch(
 
     // ── txs ───────────────────────────────────────────────────────────────
     if !txs.is_empty() {
+        let min_block = txs.iter().map(|tx| tx.block_num).min().unwrap_or_default();
+        let max_block = txs.iter().map(|tx| tx.block_num).max().unwrap_or_default();
+        delete_block_range(&tx, "txs", min_block, max_block).await?;
+
         tx.execute(
             "CREATE TEMP TABLE _staging_txs (
                 block_num INT8, block_timestamp TIMESTAMPTZ, idx INT4, hash BYTEA,
@@ -518,6 +559,10 @@ pub async fn write_batch(
 
     // ── logs ──────────────────────────────────────────────────────────────
     if !logs.is_empty() {
+        let min_block = logs.iter().map(|log| log.block_num).min().unwrap_or_default();
+        let max_block = logs.iter().map(|log| log.block_num).max().unwrap_or_default();
+        delete_block_range(&tx, "logs", min_block, max_block).await?;
+
         tx.execute(
             "CREATE TEMP TABLE _staging_logs (
                 block_num INT8, block_timestamp TIMESTAMPTZ, log_idx INT4, tx_idx INT4,
@@ -582,6 +627,18 @@ pub async fn write_batch(
 
     // ── receipts ──────────────────────────────────────────────────────────
     if !receipts.is_empty() {
+        let min_block = receipts
+            .iter()
+            .map(|receipt| receipt.block_num)
+            .min()
+            .unwrap_or_default();
+        let max_block = receipts
+            .iter()
+            .map(|receipt| receipt.block_num)
+            .max()
+            .unwrap_or_default();
+        delete_block_range(&tx, "receipts", min_block, max_block).await?;
+
         tx.execute(
             "CREATE TEMP TABLE _staging_receipts (
                 block_num INT8, block_timestamp TIMESTAMPTZ, tx_idx INT4, tx_hash BYTEA,
@@ -859,6 +916,7 @@ pub async fn has_gaps(pool: &Pool, from: u64, to: u64) -> Result<bool> {
 /// `below` bounds the scan to `num <= below`, avoiding a full-table scan.
 pub async fn detect_gaps(pool: &Pool, below: u64) -> Result<Vec<(u64, u64)>> {
     let conn = pool.get().await?;
+    let below = below.min(i64::MAX as u64) as i64;
 
     let rows = conn
         .query(
@@ -872,7 +930,7 @@ pub async fn detect_gaps(pool: &Pool, below: u64) -> Result<Vec<(u64, u64)>> {
             FROM numbered
             WHERE num - prev_num > 1
             "#,
-            &[&(below as i64)],
+            &[&below],
         )
         .await?;
 
@@ -938,7 +996,7 @@ pub async fn detect_all_gaps(pool: &Pool, tip_num: u64) -> Result<Vec<(u64, u64)
     gaps.retain(|(_, end)| *end <= tip_num);
 
     // Sort by end block descending (most recent gaps first)
-    gaps.sort_by(|a, b| b.1.cmp(&a.1));
+    gaps.sort_by_key(|b| std::cmp::Reverse(b.1));
 
     Ok(gaps)
 }
