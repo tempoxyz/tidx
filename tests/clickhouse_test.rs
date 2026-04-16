@@ -840,7 +840,7 @@ fn make_tx(block_num: i64, idx: i32) -> TxRow {
         idx,
         hash: {
             let mut h = vec![block_num as u8; 16];
-            h.extend_from_slice(&vec![idx as u8; 16]);
+            h.extend_from_slice(&[idx as u8; 16]);
             h
         },
         tx_type: 2,
@@ -881,6 +881,7 @@ fn make_log(block_num: i64, log_idx: i32) -> LogRow {
         topic2: Some(vec![0x22; 32]),
         topic3: None,
         data: vec![0x00; 32],
+        is_virtual_forward: false,
     }
 }
 
@@ -1279,6 +1280,7 @@ async fn test_cte_query_against_sink_data() {
         topic2: Some(to_addr),
         topic3: None,
         data: value_data,
+        is_virtual_forward: false,
     };
 
     sink.write_logs(&[log]).await.expect("write_logs failed");
@@ -1340,6 +1342,7 @@ async fn test_predicate_pushdown_against_sink_data() {
             topic2: Some(to_addr.clone()),
             topic3: None,
             data: value_data.clone(),
+            is_virtual_forward: false,
         });
     }
     // 3 logs from addr_b
@@ -1357,6 +1360,7 @@ async fn test_predicate_pushdown_against_sink_data() {
             topic2: Some(to_addr.clone()),
             topic3: None,
             data: value_data.clone(),
+            is_virtual_forward: false,
         });
     }
 

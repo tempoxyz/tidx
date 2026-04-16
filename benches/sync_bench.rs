@@ -68,6 +68,7 @@ fn generate_logs(count: usize, block_num: i64) -> Vec<LogRow> {
             topic2: Some(vec![2u8; 32]),
             topic3: None,
             data: vec![0u8; 64],
+            is_virtual_forward: false,
         })
         .collect()
 }
