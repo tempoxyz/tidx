@@ -2,6 +2,11 @@ use anyhow::Result;
 use clap::{Args as ClapArgs, Subcommand};
 use serde::{Deserialize, Serialize};
 
+use tidx::view_presets::{
+    VIRTUAL_DEPOSITS_ENGINE, VIRTUAL_DEPOSITS_ORDER_BY, VIRTUAL_DEPOSITS_VIEW,
+    virtual_deposits_sql,
+};
+
 #[derive(ClapArgs)]
 pub struct Args {
     /// TIDX HTTP API URL (required for views commands)
@@ -48,6 +53,15 @@ pub enum ViewsCommand {
         /// Event signature for automatic CTE generation (e.g., "Transfer(address indexed from, address indexed to, uint256 value)")
         #[arg(long)]
         signature: Option<String>,
+    },
+    /// Create a virtual_deposits materialized view for TIP-1022 deposit attribution
+    CreateVirtualDeposits {
+        /// Chain ID
+        #[arg(long)]
+        chain_id: u64,
+        /// View name
+        #[arg(long, default_value = VIRTUAL_DEPOSITS_VIEW)]
+        name: String,
     },
     /// Delete a view
     Delete {
@@ -174,6 +188,38 @@ pub async fn run(args: Args) -> Result<()> {
                 order_by,
                 engine,
                 signature,
+            };
+
+            let resp: CreateViewResponse = client
+                .post(&url)
+                .json(&req)
+                .send()
+                .await?
+                .json()
+                .await?;
+
+            if !resp.ok {
+                anyhow::bail!("{}", resp.error.unwrap_or_else(|| "Unknown error".to_string()));
+            }
+
+            println!("Created view: {}", name);
+            if let Some(rows) = resp.backfill_rows {
+                println!("Backfilled {} rows", rows);
+            }
+        }
+
+        ViewsCommand::CreateVirtualDeposits { chain_id, name } => {
+            let url = format!("{}/views", base_url);
+            let req = CreateViewRequest {
+                chain_id,
+                name: name.clone(),
+                sql: virtual_deposits_sql(),
+                order_by: VIRTUAL_DEPOSITS_ORDER_BY
+                    .iter()
+                    .map(|s: &&str| (*s).to_string())
+                    .collect::<Vec<String>>(),
+                engine: VIRTUAL_DEPOSITS_ENGINE.to_string(),
+                signature: None,
             };
 
             let resp: CreateViewResponse = client

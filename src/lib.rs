@@ -9,4 +9,5 @@ pub mod service;
 pub mod sync;
 pub mod tempo;
 pub mod types;
+pub mod view_presets;
 pub mod virtual_address;

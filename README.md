@@ -271,10 +271,11 @@ Manage ClickHouse materialized views
 Usage: tidx views --url <URL> <COMMAND>
 
 Commands:
-  list    List all views for a chain
-  get     Get view details
-  create  Create a new materialized view
-  delete  Delete a view
+  list                     List all views for a chain
+  get                      Get view details
+  create                   Create a new materialized view
+  create-virtual-deposits  Create a TIP-1022 virtual deposit attribution view
+  delete                   Delete a view
 
 Options:
       --url <URL>  TIDX HTTP API URL [env: TIDX_URL]
@@ -317,6 +318,10 @@ tidx views --url https://tidx.example.com create \
   --name top_holders \
   --sql "SELECT holder, SUM(balance) as total FROM balances GROUP BY holder" \
   --order-by holder
+
+# Create the built-in TIP-1022 virtual deposit attribution view
+tidx views --url https://tidx.example.com create-virtual-deposits \
+  --chain-id 4217
 
 # Self-update
 tidx upgrade
