@@ -11,6 +11,8 @@
 //! This module detects virtual addresses and identifies the two-hop
 //! Transfer event pairs so the indexer can annotate them.
 
+use std::collections::{HashMap, VecDeque};
+
 /// 10-byte magic value identifying virtual addresses (bytes [4:14]).
 const VIRTUAL_MAGIC: [u8; 10] = [0xFD; 10];
 
@@ -85,170 +87,52 @@ const TRANSFER_SELECTOR: [u8; 32] = {
 
 use crate::types::LogRow;
 
-pub const VIRTUAL_DEPOSITS_VIEW: &str = "virtual_deposits";
-pub const VIRTUAL_DEPOSITS_ENGINE: &str = "ReplacingMergeTree()";
-pub const VIRTUAL_DEPOSITS_ORDER_BY: &[&str] = &[
-    "virtual_address",
-    "token",
-    "block_num",
-    "attribution_log_idx",
-];
-
-/// ClickHouse SELECT used to build a `virtual_deposits` view from indexed TIP-1022
-/// Transfer log pairs. Each row represents the attribution hop annotated with the
-/// resolved master address from the forwarding hop.
-pub fn virtual_deposits_sql_clickhouse() -> String {
-    format!(
-        r#"WITH transfer_logs AS (
-    SELECT
-        block_num,
-        block_timestamp,
-        log_idx,
-        tx_idx,
-        concat('0x', lower(substring(tx_hash, 3))) AS tx_hash,
-        concat('0x', lower(substring(address, 3))) AS token,
-        concat('0x', lower(substring(topic1, 27))) AS transfer_from,
-        concat('0x', lower(substring(topic2, 27))) AS transfer_to,
-        reinterpretAsUInt256(reverse(unhex(substring(data, 3, 64)))) AS amount,
-        is_virtual_forward
-    FROM logs
-    WHERE selector = '0x{TRANSFER_SELECTOR_HEX}'
-      AND topic1 IS NOT NULL
-      AND topic2 IS NOT NULL
-      AND length(data) >= 66
-),
-first_hops AS (
-    SELECT
-        block_num,
-        block_timestamp,
-        log_idx AS attribution_log_idx,
-        tx_idx,
-        tx_hash,
-        token,
-        transfer_from AS sender,
-        transfer_to AS virtual_address,
-        amount,
-        concat('0x', lower(substring(transfer_to, 3, 8))) AS master_id,
-        concat('0x', lower(substring(transfer_to, 31, 12))) AS user_tag,
-        row_number() OVER (
-            PARTITION BY tx_hash, token, transfer_to, amount
-            ORDER BY log_idx
-        ) AS hop_ordinal
-    FROM transfer_logs
-    WHERE is_virtual_forward = 0
-      AND substring(transfer_to, 11, 20) = '{VIRTUAL_MAGIC_HEX}'
-),
-second_hops AS (
-    SELECT
-        tx_hash,
-        token,
-        log_idx AS forward_log_idx,
-        transfer_from AS virtual_address,
-        transfer_to AS master_address,
-        amount,
-        row_number() OVER (
-            PARTITION BY tx_hash, token, transfer_from, amount
-            ORDER BY log_idx
-        ) AS hop_ordinal
-    FROM transfer_logs
-    WHERE is_virtual_forward = 1
-)
-SELECT
-    first_hops.block_num,
-    first_hops.block_timestamp,
-    first_hops.tx_idx,
-    first_hops.tx_hash,
-    first_hops.token,
-    assumeNotNull(first_hops.sender) AS sender,
-    assumeNotNull(first_hops.virtual_address) AS virtual_address,
-    assumeNotNull(second_hops.master_address) AS master_address,
-    first_hops.amount,
-    assumeNotNull(first_hops.master_id) AS master_id,
-    assumeNotNull(first_hops.user_tag) AS user_tag,
-    first_hops.attribution_log_idx,
-    assumeNotNull(second_hops.forward_log_idx) AS forward_log_idx
-FROM first_hops
-INNER JOIN second_hops
-    ON first_hops.tx_hash = second_hops.tx_hash
-   AND first_hops.token = second_hops.token
-   AND first_hops.virtual_address = second_hops.virtual_address
-   AND first_hops.amount = second_hops.amount
-   AND first_hops.hop_ordinal = second_hops.hop_ordinal"#
-    )
-}
-
-const TRANSFER_SELECTOR_HEX: &str =
-    "ddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef";
-const VIRTUAL_MAGIC_HEX: &str = "fdfdfdfdfdfdfdfdfdfd";
+type PendingForwardKey = (Vec<u8>, Vec<u8>, [u8; 20], Vec<u8>);
 
 /// Identifies which log rows are part of a TIP-1022 virtual forwarding pair.
 ///
-/// A virtual forwarding pair is two consecutive Transfer events in the same tx where:
-/// 1. First Transfer: `Transfer(sender, virtualAddress, amount)` — the attribution hop
-/// 2. Second Transfer: `Transfer(virtualAddress, masterAddress, amount)` — the forwarding hop
+/// A virtual forwarding pair is made of:
+/// 1. `Transfer(sender, virtualAddress, amount)` — the attribution hop
+/// 2. `Transfer(virtualAddress, masterAddress, amount)` — the forwarding hop
 ///
 /// Both events have the same tx_hash, the same token (address), and the same amount.
-/// The "to" of the first matches the "from" of the second, and that address is virtual.
+/// The `to` of the first matches the `from` of the second, and that address is virtual.
 ///
 /// Returns a vec of booleans parallel to `logs`, where `true` means the log is the
-/// *forwarding hop* (second Transfer of the pair). Consumers can use this to:
-/// - Skip the forwarding hop when counting transfers
-/// - Show the virtual address → master forwarding in the UI
-/// - Avoid double-counting in holder/balance aggregations
+/// forwarding hop. This implementation does not require the two transfer logs to be
+/// adjacent; unrelated events may appear between them.
 pub fn mark_virtual_forward_hops(logs: &[LogRow]) -> Vec<bool> {
     let mut marks = vec![false; logs.len()];
+    let mut pending: HashMap<PendingForwardKey, VecDeque<usize>> = HashMap::new();
 
-    if logs.len() < 2 {
-        return marks;
-    }
-
-    let mut i = 0;
-    while i + 1 < logs.len() {
-        // Both must be Transfer events in the same tx and same token
-        if !is_transfer_log(&logs[i]) || !is_transfer_log(&logs[i + 1]) {
-            i += 1;
+    for (idx, log) in logs.iter().enumerate() {
+        if !is_transfer_log(log) {
             continue;
         }
 
-        if logs[i].tx_hash != logs[i + 1].tx_hash || logs[i].address != logs[i + 1].address {
-            i += 1;
+        let Some(from_addr) = extract_address_from_topic(&log.topic1) else {
             continue;
-        }
-
-        // Extract "to" from first log (topic2, padded to 32 bytes, address in last 20)
-        let first_to = match extract_address_from_topic(&logs[i].topic2) {
-            Some(addr) => addr,
-            None => {
-                i += 1;
-                continue;
-            }
+        };
+        let Some(to_addr) = extract_address_from_topic(&log.topic2) else {
+            continue;
         };
 
-        // Extract "from" from second log (topic1, padded to 32 bytes, address in last 20)
-        let second_from = match extract_address_from_topic(&logs[i + 1].topic1) {
-            Some(addr) => addr,
-            None => {
-                i += 1;
-                continue;
+        if is_virtual_address(&to_addr) {
+            pending
+                .entry((log.tx_hash.clone(), log.address.clone(), to_addr, log.data.clone()))
+                .or_default()
+                .push_back(idx);
+            continue;
+        }
+
+        if let Some(queue) = pending.get_mut(&(log.tx_hash.clone(), log.address.clone(), from_addr, log.data.clone())) {
+            if queue.pop_front().is_some() {
+                marks[idx] = true;
             }
-        };
-
-        // The intermediate address must be the same and must be virtual
-        if first_to != second_from || !is_virtual_address(&first_to) {
-            i += 1;
-            continue;
+            if queue.is_empty() {
+                pending.remove(&(log.tx_hash.clone(), log.address.clone(), from_addr, log.data.clone()));
+            }
         }
-
-        // Amounts must match (both in data field, uint256)
-        if logs[i].data != logs[i + 1].data {
-            i += 1;
-            continue;
-        }
-
-        // Mark the second log as the forwarding hop
-        marks[i + 1] = true;
-        // Skip past both logs
-        i += 2;
     }
 
     marks
@@ -442,11 +326,26 @@ mod tests {
     }
 
     #[test]
-    fn test_virtual_deposits_sql_includes_pairing_logic() {
-        let sql = virtual_deposits_sql_clickhouse();
-        assert!(sql.contains("is_virtual_forward = 0"));
-        assert!(sql.contains("is_virtual_forward = 1"));
-        assert!(sql.contains("INNER JOIN second_hops"));
-        assert!(sql.contains("substring(transfer_to, 11, 20)"));
+    fn test_intervening_event_still_marks_forward_hop() {
+        let sender = [0xAA; 20];
+        let master = [0xBB; 20];
+        let other = [0xCC; 20];
+        let vaddr = make_virtual_address([0x01, 0x02, 0x03, 0x04], [0x0A, 0x0B, 0x0C, 0x0D, 0x0E, 0x0F]);
+        let tx_hash = vec![0x11; 32];
+        let token = vec![0x20; 20];
+        let amount = vec![0u8; 32];
+
+        let mut approval_like = make_transfer_log(tx_hash.clone(), token.clone(), &sender, &other, amount.clone(), 1);
+        approval_like.topic0 = Some(vec![0x99; 32]);
+        approval_like.selector = Some(vec![0x99; 32]);
+
+        let logs = vec![
+            make_transfer_log(tx_hash.clone(), token.clone(), &sender, &vaddr, amount.clone(), 0),
+            approval_like,
+            make_transfer_log(tx_hash, token, &vaddr, &master, amount, 2),
+        ];
+
+        let marks = mark_virtual_forward_hops(&logs);
+        assert_eq!(marks, vec![false, false, true]);
     }
 }

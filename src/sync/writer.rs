@@ -1,4 +1,5 @@
 use anyhow::Result;
+use std::collections::BTreeSet;
 use std::pin::Pin;
 use std::time::Instant;
 use tokio_postgres::binary_copy::BinaryCopyInWriter;
@@ -8,18 +9,24 @@ use crate::db::Pool;
 use crate::metrics;
 use crate::types::{BlockRow, LogRow, ReceiptRow, SyncState, TxRow};
 
-async fn delete_block_range(
+async fn delete_blocks_exact(
     tx: &tokio_postgres::Transaction<'_>,
     table: &str,
-    min_block: i64,
-    max_block: i64,
+    block_nums: &[i64],
 ) -> Result<()> {
+    if block_nums.is_empty() {
+        return Ok(());
+    }
     tx.execute(
-        &format!("DELETE FROM {table} WHERE block_num >= $1 AND block_num <= $2"),
-        &[&min_block, &max_block],
+        &format!("DELETE FROM {table} WHERE block_num = ANY($1)"),
+        &[&block_nums],
     )
     .await?;
     Ok(())
+}
+
+fn exact_block_nums(nums: impl Iterator<Item = i64>) -> Vec<i64> {
+    nums.collect::<BTreeSet<_>>().into_iter().collect()
 }
 
 pub async fn write_block(pool: &Pool, block: &BlockRow) -> Result<()> {
@@ -113,9 +120,8 @@ pub async fn write_txs(pool: &Pool, txs: &[TxRow]) -> Result<()> {
     let mut conn = pool.get().await?;
     let tx = conn.transaction().await?;
 
-    let min_block = txs.iter().map(|tx| tx.block_num).min().unwrap_or_default();
-    let max_block = txs.iter().map(|tx| tx.block_num).max().unwrap_or_default();
-    delete_block_range(&tx, "txs", min_block, max_block).await?;
+    let block_nums = exact_block_nums(txs.iter().map(|tx| tx.block_num));
+    delete_blocks_exact(&tx, "txs", &block_nums).await?;
 
     tx.execute(
         "CREATE TEMP TABLE _staging_txs (
@@ -222,9 +228,8 @@ pub async fn write_logs(pool: &Pool, logs: &[LogRow]) -> Result<()> {
     let mut conn = pool.get().await?;
     let tx = conn.transaction().await?;
 
-    let min_block = logs.iter().map(|log| log.block_num).min().unwrap_or_default();
-    let max_block = logs.iter().map(|log| log.block_num).max().unwrap_or_default();
-    delete_block_range(&tx, "logs", min_block, max_block).await?;
+    let block_nums = exact_block_nums(logs.iter().map(|log| log.block_num));
+    delete_blocks_exact(&tx, "logs", &block_nums).await?;
 
     tx.execute(
         "CREATE TEMP TABLE _staging_logs (
@@ -308,17 +313,8 @@ pub async fn write_receipts(pool: &Pool, receipts: &[ReceiptRow]) -> Result<()> 
     let mut conn = pool.get().await?;
     let tx = conn.transaction().await?;
 
-    let min_block = receipts
-        .iter()
-        .map(|receipt| receipt.block_num)
-        .min()
-        .unwrap_or_default();
-    let max_block = receipts
-        .iter()
-        .map(|receipt| receipt.block_num)
-        .max()
-        .unwrap_or_default();
-    delete_block_range(&tx, "receipts", min_block, max_block).await?;
+    let block_nums = exact_block_nums(receipts.iter().map(|receipt| receipt.block_num));
+    delete_blocks_exact(&tx, "receipts", &block_nums).await?;
 
     tx.execute(
         "CREATE TEMP TABLE _staging_receipts (
@@ -468,9 +464,8 @@ pub async fn write_batch(
 
     // ── txs ───────────────────────────────────────────────────────────────
     if !txs.is_empty() {
-        let min_block = txs.iter().map(|tx| tx.block_num).min().unwrap_or_default();
-        let max_block = txs.iter().map(|tx| tx.block_num).max().unwrap_or_default();
-        delete_block_range(&tx, "txs", min_block, max_block).await?;
+        let block_nums = exact_block_nums(txs.iter().map(|tx| tx.block_num));
+        delete_blocks_exact(&tx, "txs", &block_nums).await?;
 
         tx.execute(
             "CREATE TEMP TABLE _staging_txs (
@@ -559,9 +554,8 @@ pub async fn write_batch(
 
     // ── logs ──────────────────────────────────────────────────────────────
     if !logs.is_empty() {
-        let min_block = logs.iter().map(|log| log.block_num).min().unwrap_or_default();
-        let max_block = logs.iter().map(|log| log.block_num).max().unwrap_or_default();
-        delete_block_range(&tx, "logs", min_block, max_block).await?;
+        let block_nums = exact_block_nums(logs.iter().map(|log| log.block_num));
+        delete_blocks_exact(&tx, "logs", &block_nums).await?;
 
         tx.execute(
             "CREATE TEMP TABLE _staging_logs (
@@ -627,17 +621,8 @@ pub async fn write_batch(
 
     // ── receipts ──────────────────────────────────────────────────────────
     if !receipts.is_empty() {
-        let min_block = receipts
-            .iter()
-            .map(|receipt| receipt.block_num)
-            .min()
-            .unwrap_or_default();
-        let max_block = receipts
-            .iter()
-            .map(|receipt| receipt.block_num)
-            .max()
-            .unwrap_or_default();
-        delete_block_range(&tx, "receipts", min_block, max_block).await?;
+        let block_nums = exact_block_nums(receipts.iter().map(|receipt| receipt.block_num));
+        delete_blocks_exact(&tx, "receipts", &block_nums).await?;
 
         tx.execute(
             "CREATE TEMP TABLE _staging_receipts (

@@ -164,7 +164,7 @@ pub async fn seed(pool: &Pool, config: &SeedConfig) -> Result<(u64, i64, u64)> {
                     format!("{}m {}s", remaining / 60, remaining % 60)
                 })
                 .unwrap_or_else(|| "calculating...".to_string());
-            let rate = elapsed.checked_div(elapsed).map_or(0, |_| txs_written / elapsed);
+            let rate = txs_written.checked_div(elapsed).unwrap_or(0);
 
             info!(
                 txs = txs_written,

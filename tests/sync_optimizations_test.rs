@@ -370,6 +370,49 @@ async fn test_delete_copy_handles_block_range() {
 
 #[tokio::test]
 #[serial(db)]
+async fn test_delete_copy_preserves_non_contiguous_blocks() {
+    let db = TestDb::empty().await;
+    db.truncate_all().await;
+
+    let blocks = generate_blocks(20, 73_000_000);
+    write_blocks(&db.pool, &blocks).await.unwrap();
+
+    let txs_first: Vec<_> = (0..20)
+        .flat_map(|i| generate_txs(10, 73_000_000 + i))
+        .collect();
+    write_txs(&db.pool, &txs_first).await.unwrap();
+
+    let txs_second: Vec<_> = [73_000_000, 73_000_010]
+        .into_iter()
+        .flat_map(|block_num| generate_txs(5, block_num))
+        .collect();
+    write_txs(&db.pool, &txs_second).await.unwrap();
+
+    let conn = db.pool.get().await.unwrap();
+
+    let count_middle: i64 = conn
+        .query_one(
+            "SELECT COUNT(*) FROM txs WHERE block_num > 73000000 AND block_num < 73000010",
+            &[],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(count_middle, 90, "blocks between sparse rewrites must be preserved");
+
+    let count_edges: i64 = conn
+        .query_one(
+            "SELECT COUNT(*) FROM txs WHERE block_num IN (73000000, 73000010)",
+            &[],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(count_edges, 10, "only explicitly rewritten blocks should be replaced");
+}
+
+#[tokio::test]
+#[serial(db)]
 async fn test_pipelined_sync() {
     let tempo = TempoNode::from_env();
     tempo.wait_for_ready().await.expect("Tempo node not ready");
