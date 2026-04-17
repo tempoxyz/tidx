@@ -1,0 +1,120 @@
+name: tidx-fork
+
+services:
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_DB: tidx
+      POSTGRES_USER: tidx
+      POSTGRES_PASSWORD: tidx
+      POSTGRES_HOST_AUTH_METHOD: md5
+    ports:
+      - "5410:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    command:
+      - postgres
+      - -c
+      - max_wal_size=4GB
+      - -c
+      - checkpoint_timeout=30min
+      - -c
+      - synchronous_commit=off
+      - -c
+      - wal_level=minimal
+      - -c
+      - max_wal_senders=0
+    healthcheck:
+      timeout: 5s
+      retries: 20
+      interval: 2s
+      test: ["CMD-SHELL", "pg_isready -U tidx -d tidx"]
+
+  anvil:
+    image: ghcr.io/foundry-rs/foundry:latest
+    entrypoint: ["sh", "-ec"]
+    command:
+      - |
+        BLOCK_NUMBER=$$(cast block-number --rpc-url https://rpc.testnet.tempo.xyz)
+        echo "Forking Tempo testnet from block $$BLOCK_NUMBER"
+        exec anvil \
+          --host 0.0.0.0 \
+          --port 8545 \
+          --fork-url https://rpc.testnet.tempo.xyz \
+          --fork-block-number "$$BLOCK_NUMBER" \
+          --chain-id 42431
+    ports:
+      - "8500:8545"
+    environment:
+      FOUNDRY_DISABLE_NIGHTLY_WARNING: "1"
+    healthcheck:
+      test: ["CMD-SHELL", "FOUNDRY_DISABLE_NIGHTLY_WARNING=1 cast block-number --rpc-url http://127.0.0.1:8545 >/dev/null"]
+      interval: 10s
+      timeout: 30s
+      retries: 10
+      start_period: 20s
+
+  clickhouse:
+    image: clickhouse/clickhouse-server:latest
+    ports:
+      - "8124:8123"
+      - "9001:9000"
+    volumes:
+      - clickhouse_data:/var/lib/clickhouse
+    environment:
+      CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: "1"
+    healthcheck:
+      test: ["CMD", "clickhouse-client", "--query", "SELECT 1"]
+      interval: 5s
+      timeout: 10s
+      retries: 20
+      start_period: 10s
+
+  tidx:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    entrypoint: ["sh", "-ec"]
+    command:
+      - |
+        cat >/tmp/config.toml <<'EOF'
+        [http]
+        enabled = true
+        port = 8080
+        bind = "0.0.0.0"
+
+        [prometheus]
+        enabled = true
+        port = 9090
+
+        [[chains]]
+        name = "local-testnet"
+        chain_id = 42431
+        rpc_url = "http://anvil:8545"
+        pg_url = "postgres://tidx:tidx@postgres:5432/tidx"
+        backfill = false
+        batch_size = 25
+        concurrency = 1
+
+        [chains.clickhouse]
+        enabled = true
+        url = "http://clickhouse:8123"
+        EOF
+        exec tidx up --config /tmp/config.toml
+    ports:
+      - "8080:8080"
+      - "9090:9090"
+    environment:
+      RUST_LOG: tidx=info
+    depends_on:
+      postgres:
+        condition: service_healthy
+      anvil:
+        condition: service_healthy
+      clickhouse:
+        condition: service_healthy
+    restart: on-failure
+
+volumes:
+  postgres_data:
+  clickhouse_data:
