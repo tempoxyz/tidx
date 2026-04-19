@@ -83,6 +83,9 @@ pub struct SyncState {
     pub tip_num: u64,
     /// Lowest block synced going backwards (None = not started, Some(0) = complete)
     pub backfill_num: Option<u64>,
+    /// Configured starting block for indexing (0 = genesis)
+    #[serde(default)]
+    pub start_block: u64,
     /// Current sync rate in blocks/second (rolling window)
     #[serde(default)]
     pub sync_rate: Option<f64>,
@@ -92,9 +95,12 @@ pub struct SyncState {
 }
 
 impl SyncState {
-    /// Returns true if backfill is complete (reached genesis)
+    /// Returns true if backfill is complete (reached start_block)
     pub fn backfill_complete(&self) -> bool {
-        self.backfill_num == Some(0)
+        match self.backfill_num {
+            Some(n) => n <= self.start_block,
+            None => false,
+        }
     }
 
     /// Returns true if backfill has started
@@ -105,9 +111,9 @@ impl SyncState {
     /// Returns the number of blocks remaining to backfill
     pub fn backfill_remaining(&self) -> u64 {
         match self.backfill_num {
-            None => self.tip_num,     // Haven't started, need to fill 0..tip_num
-            Some(0) => 0,             // Complete
-            Some(n) => n,             // Blocks 0..n remain
+            None => self.tip_num.saturating_sub(self.start_block), // Haven't started
+            Some(n) if n <= self.start_block => 0,                 // Complete
+            Some(n) => n.saturating_sub(self.start_block),         // Blocks start_block..n remain
         }
     }
 
@@ -160,5 +166,80 @@ impl SyncState {
         } else {
             None
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn state_with(start_block: u64, backfill_num: Option<u64>, tip_num: u64) -> SyncState {
+        SyncState {
+            chain_id: 1,
+            head_num: tip_num,
+            synced_num: tip_num,
+            tip_num,
+            backfill_num,
+            start_block,
+            sync_rate: None,
+            started_at: None,
+        }
+    }
+
+    #[test]
+    fn test_backfill_complete_with_start_block() {
+        // backfill_num at start_block => complete
+        let s = state_with(1000, Some(1000), 5000);
+        assert!(s.backfill_complete());
+
+        // backfill_num below start_block => also complete
+        let s = state_with(1000, Some(500), 5000);
+        assert!(s.backfill_complete());
+
+        // backfill_num above start_block => not complete
+        let s = state_with(1000, Some(1500), 5000);
+        assert!(!s.backfill_complete());
+
+        // backfill not started => not complete
+        let s = state_with(1000, None, 5000);
+        assert!(!s.backfill_complete());
+    }
+
+    #[test]
+    fn test_backfill_remaining_with_start_block() {
+        // In progress: 2000 blocks above start_block remain
+        let s = state_with(1000, Some(3000), 5000);
+        assert_eq!(s.backfill_remaining(), 2000);
+
+        // Complete: at start_block
+        let s = state_with(1000, Some(1000), 5000);
+        assert_eq!(s.backfill_remaining(), 0);
+
+        // Not started: tip_num - start_block
+        let s = state_with(1000, None, 5000);
+        assert_eq!(s.backfill_remaining(), 4000);
+    }
+
+    #[test]
+    fn test_backfill_remaining_genesis() {
+        // start_block=0 preserves original behavior
+        let s = state_with(0, Some(100), 5000);
+        assert_eq!(s.backfill_remaining(), 100);
+
+        let s = state_with(0, Some(0), 5000);
+        assert_eq!(s.backfill_remaining(), 0);
+
+        let s = state_with(0, None, 5000);
+        assert_eq!(s.backfill_remaining(), 5000);
+    }
+
+    #[test]
+    fn test_backfill_complete_genesis() {
+        // start_block=0 preserves original behavior (backfill_num=0 => complete)
+        let s = state_with(0, Some(0), 5000);
+        assert!(s.backfill_complete());
+
+        let s = state_with(0, Some(1), 5000);
+        assert!(!s.backfill_complete());
     }
 }

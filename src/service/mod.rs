@@ -60,7 +60,7 @@ pub async fn get_all_status(pool: &Pool) -> Result<Vec<SyncStatus>> {
 
     let rows = conn
         .query(
-            "SELECT chain_id, head_num, synced_num, tip_num, backfill_num, started_at, updated_at FROM sync_state ORDER BY chain_id",
+            "SELECT chain_id, head_num, synced_num, tip_num, backfill_num, started_at, updated_at, start_block FROM sync_state ORDER BY chain_id",
             &[],
         )
         .await?;
@@ -77,11 +77,12 @@ pub async fn get_all_status(pool: &Pool) -> Result<Vec<SyncStatus>> {
             let tip_num: i64 = row.get(3);
             let backfill_num: Option<i64> = row.get(4);
             let started_at: Option<DateTime<Utc>> = row.get(5);
+            let start_block: i64 = row.get(7);
 
             let backfill_remaining = match backfill_num {
-                None => synced_num.saturating_sub(1),
-                Some(0) => 0,
-                Some(n) => n,
+                None => synced_num.saturating_sub(start_block.max(1)),
+                Some(n) if n <= start_block => 0,
+                Some(n) => n.saturating_sub(start_block),
             };
 
             let sync_rate = started_at.and_then(|started| {

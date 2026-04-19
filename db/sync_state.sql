@@ -13,7 +13,10 @@ CREATE TABLE IF NOT EXISTS sync_state (
 -- Persisted in PG so it survives restarts and isn't fooled by realtime sync writing ahead.
 ALTER TABLE sync_state ADD COLUMN IF NOT EXISTS ch_backfill_block INT8 NOT NULL DEFAULT 0;
 
-COMMENT ON COLUMN sync_state.synced_num IS 'Highest contiguous block synced from genesis (no gaps up to here)';
+ALTER TABLE sync_state ADD COLUMN IF NOT EXISTS start_block INT8 NOT NULL DEFAULT 0;
+
+COMMENT ON COLUMN sync_state.start_block IS 'Configured starting block for indexing (0=genesis)';
+COMMENT ON COLUMN sync_state.synced_num IS 'Highest contiguous block synced from start_block (no gaps up to here)';
 COMMENT ON COLUMN sync_state.tip_num IS 'Highest block synced near chain head (may have gaps below)';
 COMMENT ON COLUMN sync_state.backfill_num IS 'Lowest block synced going backwards (NULL=not started, 0=complete)';
 COMMENT ON COLUMN sync_state.sync_rate IS 'Current sync rate in blocks/second (rolling 5s window)';

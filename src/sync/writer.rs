@@ -689,7 +689,7 @@ pub async fn load_sync_state(pool: &Pool, chain_id: u64) -> Result<Option<SyncSt
 
     let row = conn
         .query_opt(
-            "SELECT chain_id, head_num, synced_num, tip_num, backfill_num, sync_rate, started_at FROM sync_state WHERE chain_id = $1",
+            "SELECT chain_id, head_num, synced_num, tip_num, backfill_num, sync_rate, started_at, start_block FROM sync_state WHERE chain_id = $1",
             &[&(chain_id as i64)],
         )
         .await?;
@@ -702,6 +702,7 @@ pub async fn load_sync_state(pool: &Pool, chain_id: u64) -> Result<Option<SyncSt
         backfill_num: r.get::<_, Option<i64>>(4).map(|n| n as u64),
         sync_rate: r.get(5),
         started_at: r.get(6),
+        start_block: r.get::<_, i64>(7) as u64,
     }))
 }
 
@@ -711,7 +712,7 @@ pub async fn load_all_sync_states(pool: &Pool) -> Result<Vec<SyncState>> {
 
     let rows = conn
         .query(
-            "SELECT chain_id, head_num, synced_num, tip_num, backfill_num, sync_rate, started_at FROM sync_state ORDER BY chain_id",
+            "SELECT chain_id, head_num, synced_num, tip_num, backfill_num, sync_rate, started_at, start_block FROM sync_state ORDER BY chain_id",
             &[],
         )
         .await?;
@@ -726,6 +727,7 @@ pub async fn load_all_sync_states(pool: &Pool) -> Result<Vec<SyncState>> {
             backfill_num: r.get::<_, Option<i64>>(4).map(|n| n as u64),
             sync_rate: r.get(5),
             started_at: r.get(6),
+            start_block: r.get::<_, i64>(7) as u64,
         })
         .collect())
 }
@@ -735,13 +737,14 @@ pub async fn save_sync_state(pool: &Pool, state: &SyncState) -> Result<()> {
 
     conn.execute(
         r#"
-        INSERT INTO sync_state (chain_id, head_num, synced_num, tip_num, backfill_num, started_at, updated_at)
-        VALUES ($1, $2, $3, $4, $5, COALESCE($6, NOW()), NOW())
+        INSERT INTO sync_state (chain_id, head_num, synced_num, tip_num, backfill_num, start_block, started_at, updated_at)
+        VALUES ($1, $2, $3, $4, $5, $6, COALESCE($7, NOW()), NOW())
         ON CONFLICT (chain_id) DO UPDATE SET
             head_num = GREATEST(sync_state.head_num, EXCLUDED.head_num),
             synced_num = GREATEST(sync_state.synced_num, EXCLUDED.synced_num),
             tip_num = GREATEST(sync_state.tip_num, EXCLUDED.tip_num),
             backfill_num = COALESCE(EXCLUDED.backfill_num, sync_state.backfill_num),
+            start_block = EXCLUDED.start_block,
             started_at = COALESCE(sync_state.started_at, EXCLUDED.started_at),
             updated_at = NOW()
         "#,
@@ -751,6 +754,7 @@ pub async fn save_sync_state(pool: &Pool, state: &SyncState) -> Result<()> {
             &(state.synced_num as i64),
             &(state.tip_num as i64),
             &state.backfill_num.map(|n| n as i64),
+            &(state.start_block as i64),
             &state.started_at,
         ],
     )
@@ -837,10 +841,12 @@ pub async fn has_gaps(pool: &Pool, from: u64, to: u64) -> Result<bool> {
         return Ok(false);
     }
     let conn = pool.get().await?;
+    let from_i64 = i64::try_from(from).unwrap_or(i64::MAX);
+    let to_i64 = i64::try_from(to).unwrap_or(i64::MAX);
     let row = conn
         .query_one(
             "SELECT COUNT(*) FROM blocks WHERE num >= $1 AND num <= $2",
-            &[&(from as i64), &(to as i64)],
+            &[&from_i64, &to_i64],
         )
         .await?;
     let count: i64 = row.get(0);
@@ -854,6 +860,7 @@ pub async fn has_gaps(pool: &Pool, from: u64, to: u64) -> Result<bool> {
 pub async fn detect_gaps(pool: &Pool, below: u64) -> Result<Vec<(u64, u64)>> {
     let conn = pool.get().await?;
 
+    let below_i64 = i64::try_from(below).unwrap_or(i64::MAX);
     let rows = conn
         .query(
             r#"
@@ -866,7 +873,7 @@ pub async fn detect_gaps(pool: &Pool, below: u64) -> Result<Vec<(u64, u64)>> {
             FROM numbered
             WHERE num - prev_num > 1
             "#,
-            &[&(below as i64)],
+            &[&below_i64],
         )
         .await?;
 
@@ -904,10 +911,14 @@ pub async fn detect_blocks_missing_receipts(pool: &Pool, limit: i64) -> Result<V
     Ok(rows.iter().map(|r| r.get::<_, i64>(0) as u64).collect())
 }
 
-/// Detect ALL gaps including from genesis to first block
+/// Detect ALL gaps including from start_block to first block
 /// Returns gaps sorted by end block descending (most recent first)
-pub async fn detect_all_gaps(pool: &Pool, tip_num: u64) -> Result<Vec<(u64, u64)>> {
+pub async fn detect_all_gaps(pool: &Pool, tip_num: u64, start_block: u64) -> Result<Vec<(u64, u64)>> {
     let conn = pool.get().await?;
+
+    // The effective lower bound: at minimum block 1 (block 0 is genesis/empty),
+    // or start_block if configured higher
+    let lower_bound = start_block.max(1);
 
     // Get the lowest block number we have
     let min_block: Option<i64> = conn
@@ -917,19 +928,23 @@ pub async fn detect_all_gaps(pool: &Pool, tip_num: u64) -> Result<Vec<(u64, u64)
 
     let mut gaps = detect_gaps(pool, tip_num).await?;
 
-    // Add gap from block 1 to first block (if we have any blocks and min > 1)
-    // Block 0 is typically empty/genesis, so we start from block 1
+    // Add gap from lower_bound to first block (if we have any blocks and min > lower_bound)
     if let Some(min) = min_block {
-        if min > 1 {
-            gaps.push((1, min as u64 - 1));
+        if (min as u64) > lower_bound {
+            gaps.push((lower_bound, min as u64 - 1));
         }
-    } else if tip_num > 0 {
-        // No blocks at all - entire range is a gap (starting from 1)
-        gaps.push((1, tip_num));
+    } else if tip_num >= lower_bound {
+        // No blocks at all - entire range is a gap
+        gaps.push((lower_bound, tip_num));
     }
 
-    // Filter to only gaps up to tip_num
-    gaps.retain(|(_, end)| *end <= tip_num);
+    // Filter out gaps entirely below start_block and clamp partial overlaps
+    gaps.retain(|(_, end)| *end >= lower_bound && *end <= tip_num);
+    for gap in &mut gaps {
+        if gap.0 < lower_bound {
+            gap.0 = lower_bound;
+        }
+    }
 
     // Sort by end block descending (most recent gaps first)
     gaps.sort_by(|a, b| b.1.cmp(&a.1));
