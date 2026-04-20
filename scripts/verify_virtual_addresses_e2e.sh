@@ -12,6 +12,13 @@ AMOUNT="${AMOUNT:-123}"
 TIMEOUT_SECS="${TIMEOUT_SECS:-60}"
 POLL_SECS="${POLL_SECS:-2}"
 
+for bin in forge cast jq curl; do
+  if ! command -v "$bin" >/dev/null 2>&1; then
+    echo "Missing required dependency: $bin"
+    exit 1
+  fi
+done
+
 WORKDIR="/tmp/veproj"
 SOL="/tmp/VirtualEmitter.sol"
 ARTIFACT="$WORKDIR/out/VirtualEmitter.sol/VirtualEmitter.json"
@@ -58,7 +65,7 @@ fi
 
 echo "TX_HASH=$TX_HASH"
 
-SQL="SELECT block_num, tx_hash, log_idx, format_address(abi_address(topic1)) AS from_addr, format_address(abi_address(topic2)) AS to_addr, is_virtual_forward FROM logs WHERE tx_hash = '$TX_HASH' ORDER BY log_idx"
+SQL="SELECT block_num, tx_hash, log_idx, format_address(address) AS log_address, format_address(abi_address(topic1)) AS from_addr, format_address(abi_address(topic2)) AS to_addr, is_virtual_forward FROM logs WHERE tx_hash = '$TX_HASH' ORDER BY log_idx"
 ENC_SQL=$(printf '%s' "$SQL" | jq -sRr @uri)
 
 DEADLINE=$(( $(date +%s) + TIMEOUT_SECS ))
@@ -77,15 +84,18 @@ while true; do
   sleep "$POLL_SECS"
 done
 
-MATCH=$(printf '%s' "$RESP" | jq --arg sender "$SENDER" --arg vaddr "$VIRTUAL_ADDR" --arg master "$MASTER" '
+MATCH=$(printf '%s' "$RESP" | jq --arg contract "$CONTRACT_ADDR" --arg sender "$SENDER" --arg vaddr "$VIRTUAL_ADDR" --arg master "$MASTER" '
   [ .rows[]
-    | {from: .[3], to: .[4], forward: .[5]} ] as $rows
-  | any($rows[]; .from == $sender and .to == $vaddr and .forward == false)
+    | select(.[3] == $contract)
+    | {from: .[4], to: .[5], forward: .[6]} ] as $rows
+  | ($rows | length) >= 2
+    and ([ $rows[] | select(.forward == true) ] | length) == 1
+    and any($rows[]; .from == $sender and .to == $vaddr and .forward == false)
     and any($rows[]; .from == $vaddr and .to == $master and .forward == true)
 ')
 
 if [[ "$MATCH" != "true" ]]; then
-  echo "E2E verification failed: expected virtual pair not found"
+  echo "E2E verification failed: expected exact virtual pair shape not found"
   exit 1
 fi
 

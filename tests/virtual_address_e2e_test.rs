@@ -32,10 +32,12 @@ const EMIT_PAIR_CALLDATA: &str = "0xb0aa806c000000000000000000000000f39fd6e51aad
 
 #[tokio::test]
 #[serial(db)]
-#[ignore = "requires DATABASE_URL, foundry anvil in PATH, and network access to Tempo testnet RPC"]
+#[ignore = "requires DATABASE_URL, foundry anvil in PATH, network access to Tempo testnet RPC, and FORK_BLOCK_NUMBER for deterministic replay"]
 async fn test_virtual_address_forward_hop_e2e() {
     let port = reserve_port();
     let rpc_url = format!("http://127.0.0.1:{port}");
+
+    let fork_block = fork_block_number().expect("FORK_BLOCK_NUMBER must be set");
 
     let mut anvil = tokio::process::Command::new("anvil")
         .arg("--tempo")
@@ -45,6 +47,8 @@ async fn test_virtual_address_forward_hop_e2e() {
         .arg(port.to_string())
         .arg("--fork-url")
         .arg("https://rpc.testnet.tempo.xyz")
+        .arg("--fork-block-number")
+        .arg(fork_block.to_string())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
@@ -77,7 +81,8 @@ async fn run_virtual_address_e2e(rpc_url: &str) -> anyhow::Result<()> {
     )
     .await?;
 
-    let receipt: serde_json::Value = wait_for_receipt(rpc_url, &tx_hash, Duration::from_secs(10)).await?;
+    let receipt: serde_json::Value =
+        wait_for_receipt(rpc_url, &tx_hash, Duration::from_secs(10)).await?;
     let block_num = u64::from_str_radix(
         receipt["blockNumber"]
             .as_str()
@@ -101,6 +106,7 @@ async fn run_virtual_address_e2e(rpc_url: &str) -> anyhow::Result<()> {
                 block_num,
                 encode(tx_hash, 'hex') AS tx_hash,
                 log_idx,
+                format_address(address) AS log_address,
                 format_address(abi_address(topic1)) AS from_addr,
                 format_address(abi_address(topic2)) AS to_addr,
                 is_virtual_forward
@@ -114,28 +120,52 @@ async fn run_virtual_address_e2e(rpc_url: &str) -> anyhow::Result<()> {
 
     assert!(rows.len() >= 2, "expected at least 2 logs, got {}", rows.len());
 
-    let found_attribution = rows.iter().any(|r| {
-        let from_addr: String = r.get(3);
-        let to_addr: String = r.get(4);
-        let is_virtual_forward: bool = r.get(5);
+    let contract_rows: Vec<_> = rows
+        .iter()
+        .filter(|r| {
+            let log_address: String = r.get(3);
+            log_address.eq_ignore_ascii_case(ANVIL_ADDR)
+        })
+        .collect();
+
+    assert!(
+        contract_rows.len() >= 2,
+        "expected at least 2 logs from test contract, got {}",
+        contract_rows.len()
+    );
+
+    let found_attribution = contract_rows.iter().any(|r| {
+        let from_addr: String = r.get(4);
+        let to_addr: String = r.get(5);
+        let is_virtual_forward: bool = r.get(6);
         from_addr.eq_ignore_ascii_case(SENDER)
             && to_addr.eq_ignore_ascii_case(VIRTUAL_ADDR)
             && !is_virtual_forward
     });
 
-    let found_forward = rows.iter().any(|r| {
-        let from_addr: String = r.get(3);
-        let to_addr: String = r.get(4);
-        let is_virtual_forward: bool = r.get(5);
+    let found_forward = contract_rows.iter().any(|r| {
+        let from_addr: String = r.get(4);
+        let to_addr: String = r.get(5);
+        let is_virtual_forward: bool = r.get(6);
         from_addr.eq_ignore_ascii_case(VIRTUAL_ADDR)
             && to_addr.eq_ignore_ascii_case(MASTER)
             && is_virtual_forward
     });
 
+    let forward_count = contract_rows.iter().filter(|r| r.get::<_, bool>(6)).count();
+
+    assert_eq!(forward_count, 1, "expected exactly one marked forward hop");
     assert!(found_attribution, "missing attribution hop log");
     assert!(found_forward, "missing marked forwarding hop log");
 
     Ok(())
+}
+
+fn fork_block_number() -> anyhow::Result<u64> {
+    let value = std::env::var("FORK_BLOCK_NUMBER").map_err(|_| {
+        anyhow::anyhow!("FORK_BLOCK_NUMBER must be set for deterministic E2E replay")
+    })?;
+    Ok(value.parse()?)
 }
 
 fn reserve_port() -> u16 {
@@ -149,7 +179,10 @@ fn reserve_port() -> u16 {
 async fn wait_for_rpc(rpc_url: &str, timeout: Duration) -> anyhow::Result<()> {
     let started = Instant::now();
     while started.elapsed() < timeout {
-        if rpc_call::<String>(rpc_url, "eth_blockNumber", serde_json::json!([])).await.is_ok() {
+        if rpc_call::<String>(rpc_url, "eth_blockNumber", serde_json::json!([]))
+            .await
+            .is_ok()
+        {
             return Ok(());
         }
         tokio::time::sleep(Duration::from_millis(250)).await;

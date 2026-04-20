@@ -18,6 +18,8 @@ const TXS_SCHEMA: &str = include_str!("../../db/clickhouse/txs.sql");
 const LOGS_SCHEMA: &str = include_str!("../../db/clickhouse/logs.sql");
 const LOGS_MIGRATION_20260416: &str =
     include_str!("../../db/clickhouse/migrations/20260416_add_is_virtual_forward.sql");
+const LOGS_MIGRATION_20260417: &str =
+    include_str!("../../db/clickhouse/migrations/20260417_add_logs_virtual_forward_index.sql");
 const RECEIPTS_SCHEMA: &str = include_str!("../../db/clickhouse/receipts.sql");
 
 /// Max rows per ClickHouse INSERT to avoid unbounded memory growth during backfills.
@@ -105,6 +107,12 @@ impl ClickHouseSink {
             .execute()
             .await
             .map_err(|e| anyhow!("Failed to run ClickHouse logs migration 20260416: {e}"))?;
+
+        self.client
+            .query(LOGS_MIGRATION_20260417)
+            .execute()
+            .await
+            .map_err(|e| anyhow!("Failed to run ClickHouse logs migration 20260417: {e}"))?;
 
         info!(database = %self.database, "ClickHouse schema ready");
         Ok(())

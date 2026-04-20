@@ -24,3 +24,7 @@ CREATE INDEX IF NOT EXISTS idx_logs_address_topic1 ON logs (topic1, address, blo
 DROP INDEX IF EXISTS idx_logs_topic1;
 CREATE INDEX IF NOT EXISTS idx_logs_topic2 ON logs (topic2);
 CREATE INDEX IF NOT EXISTS idx_logs_topic3 ON logs (topic3);
+CREATE INDEX IF NOT EXISTS idx_logs_virtual_forward ON logs (block_num DESC, log_idx)
+WHERE is_virtual_forward = TRUE;
+CREATE INDEX IF NOT EXISTS idx_logs_tx_hash_virtual_forward ON logs (tx_hash, log_idx)
+WHERE is_virtual_forward = TRUE;

@@ -988,6 +988,27 @@ async fn test_sink_write_logs() {
 
 #[tokio::test]
 #[serial(clickhouse)]
+async fn test_sink_write_logs_roundtrips_virtual_forward_flag() {
+    let Some((sink, ch)) = setup_sink().await else {
+        return;
+    };
+
+    let mut logs: Vec<LogRow> = (1..=2).map(|b| make_log(b, 0)).collect();
+    logs[1].is_virtual_forward = true;
+    sink.write_logs(&logs).await.expect("write_logs failed");
+
+    let result = ch
+        .query_json("SELECT block_num, is_virtual_forward FROM logs ORDER BY block_num")
+        .await
+        .unwrap();
+    let rows = result["data"].as_array().unwrap();
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0]["is_virtual_forward"].as_u64(), Some(0));
+    assert_eq!(rows[1]["is_virtual_forward"].as_u64(), Some(1));
+}
+
+#[tokio::test]
+#[serial(clickhouse)]
 async fn test_sink_write_receipts() {
     let Some((sink, ch)) = setup_sink().await else {
         return;
