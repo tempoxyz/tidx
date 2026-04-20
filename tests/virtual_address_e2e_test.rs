@@ -34,6 +34,21 @@ const EMIT_PAIR_CALLDATA: &str = "0xb0aa806c000000000000000000000000f39fd6e51aad
 #[serial(db)]
 #[ignore = "requires DATABASE_URL, foundry anvil in PATH, network access to Tempo testnet RPC, and FORK_BLOCK_NUMBER for deterministic replay"]
 async fn test_virtual_address_forward_hop_e2e() {
+    run_with_forked_anvil(|rpc_url| async move { run_virtual_address_e2e(rpc_url).await }).await;
+}
+
+#[tokio::test]
+#[serial(db)]
+#[ignore = "requires DATABASE_URL, foundry anvil in PATH, network access to Tempo testnet RPC, and FORK_BLOCK_NUMBER for deterministic replay"]
+async fn test_virtual_address_forward_hop_sync_range_e2e() {
+    run_with_forked_anvil(|rpc_url| async move { run_virtual_address_e2e_via_sync_range(rpc_url).await }).await;
+}
+
+async fn run_with_forked_anvil<F, Fut>(f: F)
+where
+    F: FnOnce(String) -> Fut,
+    Fut: std::future::Future<Output = anyhow::Result<()>>,
+{
     let port = reserve_port();
     let rpc_url = format!("http://127.0.0.1:{port}");
 
@@ -54,24 +69,24 @@ async fn test_virtual_address_forward_hop_e2e() {
         .spawn()
         .expect("failed to spawn anvil --tempo");
 
-    let result = run_virtual_address_e2e(&rpc_url).await;
+    let result = f(rpc_url).await;
 
     let _ = anvil.kill().await;
     result.expect("virtual address E2E failed");
 }
 
-async fn run_virtual_address_e2e(rpc_url: &str) -> anyhow::Result<()> {
-    wait_for_rpc(rpc_url, Duration::from_secs(20)).await?;
+async fn run_virtual_address_e2e(rpc_url: String) -> anyhow::Result<()> {
+    wait_for_rpc(&rpc_url, Duration::from_secs(20)).await?;
 
     rpc_call::<serde_json::Value>(
-        rpc_url,
+        &rpc_url,
         "anvil_setCode",
         serde_json::json!([ANVIL_ADDR, VIRTUAL_EMITTER_RUNTIME]),
     )
     .await?;
 
     let tx_hash: String = rpc_call(
-        rpc_url,
+        &rpc_url,
         "eth_sendTransaction",
         serde_json::json!([{
             "from": SENDER,
@@ -82,7 +97,7 @@ async fn run_virtual_address_e2e(rpc_url: &str) -> anyhow::Result<()> {
     .await?;
 
     let receipt: serde_json::Value =
-        wait_for_receipt(rpc_url, &tx_hash, Duration::from_secs(10)).await?;
+        wait_for_receipt(&rpc_url, &tx_hash, Duration::from_secs(10)).await?;
     let block_num = u64::from_str_radix(
         receipt["blockNumber"]
             .as_str()
@@ -95,9 +110,54 @@ async fn run_virtual_address_e2e(rpc_url: &str) -> anyhow::Result<()> {
     db.truncate_all().await;
 
     let sinks = SinkSet::new(db.pool.clone());
-    let engine = SyncEngine::new(ThrottledPool::from_pool(db.pool.clone()), sinks, rpc_url).await?;
+    let engine = SyncEngine::new(ThrottledPool::from_pool(db.pool.clone()), sinks, &rpc_url).await?;
     engine.sync_block(block_num).await?;
 
+    assert_virtual_address_rows(&db, &tx_hash).await
+}
+
+async fn run_virtual_address_e2e_via_sync_range(rpc_url: String) -> anyhow::Result<()> {
+    wait_for_rpc(&rpc_url, Duration::from_secs(20)).await?;
+
+    rpc_call::<serde_json::Value>(
+        &rpc_url,
+        "anvil_setCode",
+        serde_json::json!([ANVIL_ADDR, VIRTUAL_EMITTER_RUNTIME]),
+    )
+    .await?;
+
+    let tx_hash: String = rpc_call(
+        &rpc_url,
+        "eth_sendTransaction",
+        serde_json::json!([{
+            "from": SENDER,
+            "to": ANVIL_ADDR,
+            "data": EMIT_PAIR_CALLDATA,
+        }]),
+    )
+    .await?;
+
+    let receipt: serde_json::Value =
+        wait_for_receipt(&rpc_url, &tx_hash, Duration::from_secs(10)).await?;
+    let block_num = u64::from_str_radix(
+        receipt["blockNumber"]
+            .as_str()
+            .expect("receipt blockNumber missing")
+            .trim_start_matches("0x"),
+        16,
+    )?;
+
+    let db = TestDb::empty().await;
+    db.truncate_all().await;
+
+    let sinks = SinkSet::new(db.pool.clone());
+    let engine = SyncEngine::new(ThrottledPool::from_pool(db.pool.clone()), sinks, &rpc_url).await?;
+    engine.sync_range(block_num, block_num).await?;
+
+    assert_virtual_address_rows(&db, &tx_hash).await
+}
+
+async fn assert_virtual_address_rows(db: &TestDb, tx_hash: &str) -> anyhow::Result<()> {
     let conn = db.pool.get().await?;
     let rows = conn
         .query(

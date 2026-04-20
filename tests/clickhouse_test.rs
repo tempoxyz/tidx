@@ -1554,6 +1554,36 @@ async fn test_backfill_pg_to_empty_clickhouse() {
     assert_eq!(ch.table_count("receipts").await.unwrap(), 20);
 }
 
+#[tokio::test]
+#[serial(clickhouse)]
+async fn test_backfill_pg_to_clickhouse_preserves_virtual_forward_flag() {
+    let Some((pool, sinks, ch)) = setup_backfill().await else {
+        return;
+    };
+
+    let blocks: Vec<BlockRow> = (1..=2).map(make_block).collect();
+    let txs: Vec<TxRow> = (1..=2).map(|b| make_tx(b, 0)).collect();
+    let mut logs: Vec<LogRow> = (1..=2).map(|b| make_log(b, 0)).collect();
+    logs[1].is_virtual_forward = true;
+    let receipts: Vec<ReceiptRow> = (1..=2).map(|b| make_receipt(b, 0)).collect();
+
+    writer::write_blocks(&pool, &blocks).await.unwrap();
+    writer::write_txs(&pool, &txs).await.unwrap();
+    writer::write_logs(&pool, &logs).await.unwrap();
+    writer::write_receipts(&pool, &receipts).await.unwrap();
+
+    sinks.backfill_clickhouse(TEST_CHAIN_ID).await.unwrap();
+
+    let result = ch
+        .query_json("SELECT block_num, is_virtual_forward FROM logs ORDER BY block_num")
+        .await
+        .unwrap();
+    let rows = result["data"].as_array().unwrap();
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0]["is_virtual_forward"].as_u64(), Some(0));
+    assert_eq!(rows[1]["is_virtual_forward"].as_u64(), Some(1));
+}
+
 /// Backfill should resume from the persisted PG cursor.
 #[tokio::test]
 #[serial(clickhouse)]

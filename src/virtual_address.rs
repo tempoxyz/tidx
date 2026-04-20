@@ -891,4 +891,40 @@ mod tests {
 
         assert_eq!(mark_virtual_forward_hops(&logs), vec![false, false]);
     }
+
+    #[test]
+    fn test_count_mismatch_fails_closed() {
+        let sender1 = [0xAA; 20];
+        let sender2 = [0xAB; 20];
+        let master = [0xBB; 20];
+        let vaddr = make_virtual_address(
+            [0x01, 0x02, 0x03, 0x04],
+            [0x0A, 0x0B, 0x0C, 0x0D, 0x0E, 0x0F],
+        );
+        let tx_hash = vec![0x11; 32];
+        let token = vec![0x20; 20];
+        let amount = vec![0u8; 32];
+
+        let logs = vec![
+            make_transfer_log(
+                tx_hash.clone(),
+                token.clone(),
+                &sender1,
+                &vaddr,
+                amount.clone(),
+                0,
+            ),
+            make_transfer_log(
+                tx_hash.clone(),
+                token.clone(),
+                &sender2,
+                &vaddr,
+                amount.clone(),
+                1,
+            ),
+            make_transfer_log(tx_hash, token, &vaddr, &master, amount, 2),
+        ];
+
+        assert_eq!(mark_virtual_forward_hops(&logs), vec![false, false, false]);
+    }
 }
