@@ -1,7 +1,22 @@
+use std::sync::Arc;
+
 use anyhow::{Context, Result};
 use deadpool_postgres::{Config, Pool, Runtime};
-use tokio_postgres::NoTls;
+use tokio_postgres_rustls::MakeRustlsConnect;
 use url::Url;
+
+fn make_tls_connector() -> MakeRustlsConnect {
+    let root_store: rustls::RootCertStore =
+        webpki_roots::TLS_SERVER_ROOTS.iter().cloned().collect();
+    let config = rustls::ClientConfig::builder_with_provider(Arc::new(
+        rustls::crypto::ring::default_provider(),
+    ))
+    .with_safe_default_protocol_versions()
+    .expect("valid TLS protocol versions")
+    .with_root_certificates(root_store)
+    .with_no_client_auth();
+    MakeRustlsConnect::new(config)
+}
 
 /// Default pool for general use (16 connections)
 pub async fn create_pool(database_url: &str) -> Result<Pool> {
@@ -29,13 +44,12 @@ pub async fn create_pool_with_size(database_url: &str, max_size: usize) -> Resul
         ..Default::default()
     });
 
-    let pool = config.create_pool(Some(Runtime::Tokio1), NoTls)?;
+    let pool = config.create_pool(Some(Runtime::Tokio1), make_tls_connector())?;
     let _ = pool.get().await?;
 
     Ok(pool)
 }
 
-use std::sync::Arc;
 use tokio::sync::Semaphore;
 
 /// Shared pool with backfill throttling.
@@ -154,7 +168,7 @@ async fn ensure_database_exists(database_url: &str) -> Result<()> {
     url.set_path("/postgres");
     let postgres_url = url.as_str();
 
-    let (client, connection) = match tokio_postgres::connect(postgres_url, NoTls).await {
+    let (client, connection) = match tokio_postgres::connect(postgres_url, make_tls_connector()).await {
         Ok(c) => c,
         Err(_) => return Ok(()), // Can't connect to postgres db, let the main connection fail with a better error
     };
