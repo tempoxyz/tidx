@@ -183,6 +183,7 @@ fn parse_transfer_candidate(log: &LogRow) -> Option<ParsedTransfer> {
 mod tests {
     use super::*;
     use alloy::primitives::FixedBytes;
+    use tempo_alloy::contracts::precompiles::PATH_USD_ADDRESS;
 
     struct Fx {
         vaddr: Address,
@@ -193,14 +194,16 @@ mod tests {
         amount: U256,
     }
 
-    fn fx() -> Fx {
-        Fx {
-            vaddr: Address::new_virtual(FixedBytes::random(), FixedBytes::random()),
-            sender: Address::random(),
-            master: Address::random(),
-            tx_hash: B256::repeat_byte(0x11),
-            token: Address::repeat_byte(0x20),
-            amount: U256::ZERO,
+    impl Fx {
+        fn random() -> Self {
+            Fx {
+                vaddr: Address::new_virtual(FixedBytes::random(), FixedBytes::random()),
+                sender: Address::random(),
+                master: Address::random(),
+                tx_hash: B256::random(),
+                token: PATH_USD_ADDRESS,
+                amount: U256::random(),
+            }
         }
     }
 
@@ -231,7 +234,7 @@ mod tests {
 
     #[test]
     fn test_mark_virtual_forward_pair() {
-        let f = fx();
+        let f = Fx::random();
         // Use a realistic TIP-20 token address rather than the default test token.
         let token = Address::from([
             0x20, 0xc0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
@@ -249,7 +252,7 @@ mod tests {
 
     #[test]
     fn test_normal_transfers_not_marked() {
-        let f = fx();
+        let f = Fx::random();
 
         let logs = vec![
             make_transfer_log(f.tx_hash, f.token, f.sender, f.master, f.amount, 0),
@@ -261,7 +264,7 @@ mod tests {
 
     #[test]
     fn test_different_amounts_not_marked() {
-        let f = fx();
+        let f = Fx::random();
         let amount1 = U256::from(100u64);
         let amount2 = U256::from(200u64);
 
@@ -275,7 +278,7 @@ mod tests {
 
     #[test]
     fn test_different_tx_not_marked() {
-        let f = fx();
+        let f = Fx::random();
 
         let logs = vec![
             make_transfer_log(
@@ -320,7 +323,7 @@ mod tests {
 
     #[test]
     fn test_intervening_event_still_marks_forward_hop() {
-        let f = fx();
+        let f = Fx::random();
         let other = Address::random();
 
         let mut approval_like = make_transfer_log(f.tx_hash, f.token, f.sender, other, f.amount, 1);
@@ -338,7 +341,7 @@ mod tests {
 
     #[test]
     fn test_ambiguous_multiple_forward_destinations_marks_none() {
-        let f = fx();
+        let f = Fx::random();
         let other = Address::random();
 
         let logs = vec![
@@ -352,7 +355,7 @@ mod tests {
 
     #[test]
     fn test_multiple_matching_pairs_same_tx_marks_both_forwards() {
-        let f = fx();
+        let f = Fx::random();
         let sender2 = Address::random();
 
         let logs = vec![
@@ -370,7 +373,7 @@ mod tests {
 
     #[test]
     fn test_multiple_attributions_before_multiple_forwards_marks_fifo() {
-        let f = fx();
+        let f = Fx::random();
         let sender2 = Address::random();
 
         let logs = vec![
@@ -388,7 +391,7 @@ mod tests {
 
     #[test]
     fn test_multiple_tokens_same_tx_are_isolated() {
-        let f = fx();
+        let f = Fx::random();
         let token_b = Address::repeat_byte(0x21);
 
         let logs = vec![
@@ -406,7 +409,7 @@ mod tests {
 
     #[test]
     fn test_mint_like_zero_sender_still_marks_forward_hop() {
-        let f = fx();
+        let f = Fx::random();
 
         let logs = vec![
             make_transfer_log(f.tx_hash, f.token, Address::ZERO, f.vaddr, f.amount, 0),
@@ -418,7 +421,7 @@ mod tests {
 
     #[test]
     fn test_mint_with_intervening_non_transfer_events_still_marks_forward_hop() {
-        let f = fx();
+        let f = Fx::random();
 
         let mut transfer_with_memo_like =
             make_transfer_log(f.tx_hash, f.token, Address::ZERO, f.vaddr, f.amount, 1);
@@ -445,7 +448,7 @@ mod tests {
 
     #[test]
     fn test_self_forwarding_marks_only_second_hop() {
-        let f = fx();
+        let f = Fx::random();
 
         let logs = vec![
             make_transfer_log(f.tx_hash, f.token, f.master, f.vaddr, f.amount, 0),
@@ -457,7 +460,7 @@ mod tests {
 
     #[test]
     fn test_malformed_topic_padding_is_rejected() {
-        let f = fx();
+        let f = Fx::random();
 
         let mut malformed = make_transfer_log(f.tx_hash, f.token, f.sender, f.vaddr, f.amount, 0);
         malformed.topic1 = Some({
@@ -476,7 +479,7 @@ mod tests {
 
     #[test]
     fn test_malformed_data_length_is_rejected() {
-        let f = fx();
+        let f = Fx::random();
 
         let mut log1 = make_transfer_log(f.tx_hash, f.token, f.sender, f.vaddr, f.amount, 0);
         log1.data = vec![0u8; 31]; // truncate to 31 bytes — must be rejected
@@ -488,7 +491,7 @@ mod tests {
 
     #[test]
     fn test_reverse_order_does_not_mark() {
-        let f = fx();
+        let f = Fx::random();
 
         let logs = vec![
             make_transfer_log(f.tx_hash, f.token, f.vaddr, f.master, f.amount, 0),
@@ -500,7 +503,7 @@ mod tests {
 
     #[test]
     fn test_missing_tx_hash_is_rejected() {
-        let f = fx();
+        let f = Fx::random();
 
         let mut log1 = make_transfer_log(f.tx_hash, f.token, f.sender, f.vaddr, f.amount, 0);
         let mut log2 = make_transfer_log(f.tx_hash, f.token, f.vaddr, f.master, f.amount, 1);
@@ -513,7 +516,7 @@ mod tests {
 
     #[test]
     fn test_count_mismatch_fails_closed() {
-        let f = fx();
+        let f = Fx::random();
         let sender2 = Address::random();
 
         let logs = vec![
