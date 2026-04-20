@@ -1623,8 +1623,8 @@ async fn test_backfill_resumes_from_highwater_mark() {
         .await
         .expect("backfill failed");
 
-    assert_eq!(ch.table_count("blocks").await.unwrap(), 20);
-    assert_eq!(ch.table_count("txs").await.unwrap(), 20);
+    assert_eq!(ch.table_count_final("blocks").await.unwrap(), 20);
+    assert_eq!(ch.table_count_final("txs").await.unwrap(), 20);
 }
 
 /// Backfill should be a no-op when the persisted cursor is already up to date.
@@ -1709,8 +1709,8 @@ async fn test_backfill_per_table_independent_highwater() {
     ch_sink.write_txs(&partial_txs).await.unwrap();
     // logs and receipts: nothing in CH
 
-    assert_eq!(ch.table_count("blocks").await.unwrap(), 10);
-    assert_eq!(ch.table_count("txs").await.unwrap(), 10); // only 5 blocks × 2 txs
+    assert_eq!(ch.table_count_final("blocks").await.unwrap(), 10);
+    assert_eq!(ch.table_count_final("txs").await.unwrap(), 10); // only 5 blocks × 2 txs
     assert_eq!(ch.table_count("logs").await.unwrap(), 0);
     assert_eq!(ch.table_count("receipts").await.unwrap(), 0);
 
@@ -1753,7 +1753,7 @@ async fn test_backfill_multi_batch_pagination() {
         .await
         .expect("backfill failed");
 
-    assert_eq!(ch.table_count("blocks").await.unwrap(), block_count as u64);
+    assert_eq!(ch.table_count_final("blocks").await.unwrap(), block_count as u64);
 
     // Verify first and last blocks roundtripped
     let result = ch

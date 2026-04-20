@@ -57,7 +57,7 @@ impl TestClickHouse {
 
     /// Drop and recreate the test database for clean state.
     pub async fn reset_database(&self) -> Result<()> {
-        self.query_raw(&format!("DROP DATABASE IF EXISTS {}", self.database))
+        self.query_raw(&format!("DROP DATABASE IF EXISTS {} SYNC", self.database))
             .await?;
         self.query_raw(&format!("CREATE DATABASE {}", self.database))
             .await?;
