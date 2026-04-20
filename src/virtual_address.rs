@@ -11,66 +11,36 @@
 //! This module detects virtual addresses and identifies the two-hop
 //! Transfer event pairs so the indexer can annotate them.
 
-use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
-
+use crate::types::LogRow;
 use alloy::{
-    primitives::{Address, B256, Bytes, LogData},
+    primitives::{Address, B256, U256},
     sol,
     sol_types::SolEvent,
 };
+use std::collections::{HashMap, HashSet};
 use tempo_primitives::TempoAddressExt;
-
-fn address_from_slice(address: &[u8]) -> Option<Address> {
-    Some(Address::from(<[u8; 20]>::try_from(address).ok()?))
-}
-
-/// Check whether a 20-byte address is a TIP-1022 virtual address.
-pub fn is_virtual_address(address: &[u8]) -> bool {
-    address_from_slice(address).is_some_and(|addr| addr.is_virtual())
-}
-
-/// Decoded components of a virtual address.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct VirtualAddressParts {
-    /// 4-byte master identifier (registry lookup key).
-    pub master_id: [u8; 4],
-    /// 6-byte opaque user tag for deposit attribution.
-    pub user_tag: [u8; 6],
-}
-
-/// Decode a virtual address into its components.
-/// Returns `None` if the address is not virtual.
-pub fn decode_virtual_address(address: &[u8]) -> Option<VirtualAddressParts> {
-    let (master_id, user_tag) = address_from_slice(address)?.decode_virtual()?;
-    Some(VirtualAddressParts {
-        master_id: *master_id,
-        user_tag: *user_tag,
-    })
-}
 
 sol! {
     event Transfer(address indexed from, address indexed to, uint256 amount);
 }
 
-use crate::types::LogRow;
-
-type TxHash = Vec<u8>;
-type BucketKey = (Vec<u8>, [u8; 20], [u8; 32]);
+type BucketKey = (Address, Address, U256);
 
 #[derive(Debug, Clone, Copy)]
 struct ParsedTransfer {
-    from: [u8; 20],
-    to: [u8; 20],
-    amount: [u8; 32],
+    from: Address,
+    to: Address,
+    amount: U256,
 }
 
 #[derive(Debug, Clone, Copy)]
 struct TransferCandidate {
     idx_in_logs: usize,
     log_idx: i32,
-    from: [u8; 20],
-    to: [u8; 20],
-    amount: [u8; 32],
+    token: Address,
+    from: Address,
+    to: Address,
+    amount: U256,
     is_attribution: bool,
     is_forward: bool,
 }
@@ -96,27 +66,31 @@ struct TransferCandidate {
 ///   than one destination in the same transaction
 pub fn mark_virtual_forward_hops(logs: &[LogRow]) -> Vec<bool> {
     let mut marks = vec![false; logs.len()];
-    let mut tx_groups: BTreeMap<TxHash, Vec<TransferCandidate>> = BTreeMap::new();
+    let mut tx_groups: HashMap<B256, Vec<TransferCandidate>> = HashMap::new();
 
     for (idx, log) in logs.iter().enumerate() {
+        let Ok(tx_hash) = B256::try_from(log.tx_hash.as_slice()) else {
+            continue;
+        };
         let Some(parsed) = parse_transfer_candidate(log) else {
             continue;
         };
-        if log.tx_hash.is_empty() {
+        let Ok(token_bytes) = <[u8; 20]>::try_from(log.address.as_slice()) else {
             continue;
-        }
+        };
 
         tx_groups
-            .entry(log.tx_hash.clone())
+            .entry(tx_hash)
             .or_default()
             .push(TransferCandidate {
                 idx_in_logs: idx,
                 log_idx: log.log_idx,
+                token: Address::from(token_bytes),
                 from: parsed.from,
                 to: parsed.to,
                 amount: parsed.amount,
-                is_attribution: Address::from(parsed.to).is_virtual(),
-                is_forward: Address::from(parsed.from).is_virtual(),
+                is_attribution: parsed.to.is_virtual(),
+                is_forward: parsed.from.is_virtual(),
             });
     }
 
@@ -125,18 +99,17 @@ pub fn mark_virtual_forward_hops(logs: &[LogRow]) -> Vec<bool> {
 
         let mut attribution_counts: HashMap<BucketKey, usize> = HashMap::new();
         let mut forward_counts: HashMap<BucketKey, usize> = HashMap::new();
-        let mut forward_destinations: HashMap<BucketKey, HashSet<[u8; 20]>> = HashMap::new();
+        let mut forward_destinations: HashMap<BucketKey, HashSet<Address>> = HashMap::new();
 
         for candidate in candidates.iter() {
-            let log = &logs[candidate.idx_in_logs];
             if candidate.is_attribution {
                 *attribution_counts
-                    .entry((log.address.clone(), candidate.to, candidate.amount))
+                    .entry((candidate.token, candidate.to, candidate.amount))
                     .or_default() += 1;
             }
             if candidate.is_forward {
-                let key = (log.address.clone(), candidate.from, candidate.amount);
-                *forward_counts.entry(key.clone()).or_default() += 1;
+                let key = (candidate.token, candidate.from, candidate.amount);
+                *forward_counts.entry(key).or_default() += 1;
                 forward_destinations
                     .entry(key)
                     .or_default()
@@ -144,13 +117,10 @@ pub fn mark_virtual_forward_hops(logs: &[LogRow]) -> Vec<bool> {
             }
         }
 
-        let mut pending: HashMap<BucketKey, VecDeque<usize>> = HashMap::new();
-
+        let mut pending: HashMap<BucketKey, Vec<usize>> = HashMap::new();
         for candidate in candidates.iter() {
-            let log = &logs[candidate.idx_in_logs];
-
             if candidate.is_attribution {
-                let key = (log.address.clone(), candidate.to, candidate.amount);
+                let key = (candidate.token, candidate.to, candidate.amount);
                 let forward_count = forward_counts.get(&key).copied().unwrap_or(0);
                 let forward_dests = forward_destinations
                     .get(&key)
@@ -159,15 +129,12 @@ pub fn mark_virtual_forward_hops(logs: &[LogRow]) -> Vec<bool> {
                 if forward_count == 0 || forward_dests != 1 {
                     continue;
                 }
-                pending
-                    .entry(key)
-                    .or_default()
-                    .push_back(candidate.idx_in_logs);
+                pending.entry(key).or_default().push(candidate.idx_in_logs);
                 continue;
             }
 
             if candidate.is_forward {
-                let key = (log.address.clone(), candidate.from, candidate.amount);
+                let key = (candidate.token, candidate.from, candidate.amount);
                 let attr_count = attribution_counts.get(&key).copied().unwrap_or(0);
                 let forward_count = forward_counts.get(&key).copied().unwrap_or(0);
                 let forward_dests = forward_destinations
@@ -180,8 +147,9 @@ pub fn mark_virtual_forward_hops(logs: &[LogRow]) -> Vec<bool> {
                 }
 
                 if let Some(queue) = pending.get_mut(&key)
-                    && queue.pop_front().is_some()
+                    && !queue.is_empty()
                 {
+                    queue.remove(0);
                     marks[candidate.idx_in_logs] = true;
                 }
             }
@@ -191,97 +159,57 @@ pub fn mark_virtual_forward_hops(logs: &[LogRow]) -> Vec<bool> {
     marks
 }
 
+/// Decode a 32-byte ABI-encoded address topic into an `Address`.
+/// Returns `None` if the slice is not exactly 32 bytes or the 12-byte
+/// zero-padding is violated.
+fn topic_to_address(topic: Option<&[u8]>) -> Option<Address> {
+    let bytes = topic?;
+    (bytes.len() == 32 && bytes[..12] == [0u8; 12]).then(|| Address::from_slice(&bytes[12..]))
+}
+
 fn parse_transfer_candidate(log: &LogRow) -> Option<ParsedTransfer> {
-    let topic0 = B256::from(<[u8; 32]>::try_from(log.topic0.as_deref()?).ok()?);
-    if topic0 != Transfer::SIGNATURE_HASH {
+    if log.topic0.as_deref()? != Transfer::SIGNATURE_HASH.as_slice() {
         return None;
     }
-
-    let topic1 = <[u8; 32]>::try_from(log.topic1.as_deref()?).ok()?;
-    let topic2 = <[u8; 32]>::try_from(log.topic2.as_deref()?).ok()?;
-
-    if topic1[..12].iter().any(|b| *b != 0) || topic2[..12].iter().any(|b| *b != 0) {
-        return None;
-    }
-
-    let log_data = LogData::new(
-        vec![topic0, B256::from(topic1), B256::from(topic2)],
-        Bytes::copy_from_slice(&log.data),
-    )?;
-    let transfer = Transfer::decode_log_data_validate(&log_data).ok()?;
 
     Some(ParsedTransfer {
-        from: transfer.from.into_array(),
-        to: transfer.to.into_array(),
-        amount: transfer.amount.to_be_bytes::<32>(),
+        from: topic_to_address(log.topic1.as_deref())?,
+        to: topic_to_address(log.topic2.as_deref())?,
+        amount: B256::try_from(log.data.as_slice()).ok()?.into(),
     })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use alloy::primitives::FixedBytes;
 
-    fn make_virtual_address(master_id: [u8; 4], user_tag: [u8; 6]) -> [u8; 20] {
-        Address::new_virtual(master_id.into(), user_tag.into()).into_array()
+    struct Fx {
+        vaddr: Address,
+        sender: Address,
+        master: Address,
+        tx_hash: B256,
+        token: Address,
+        amount: U256,
     }
 
-    #[test]
-    fn test_is_virtual_address() {
-        let vaddr = make_virtual_address(
-            [0x07, 0xA3, 0xB1, 0xC2],
-            [0xD4, 0xE5, 0xA7, 0xC3, 0xF1, 0x9E],
-        );
-        assert!(is_virtual_address(&vaddr));
-    }
-
-    #[test]
-    fn test_not_virtual_address() {
-        let normal = [0u8; 20];
-        assert!(!is_virtual_address(&normal));
-
-        let almost = {
-            let mut a = [0xFD; 20];
-            a[4..14].copy_from_slice(&<Address as TempoAddressExt>::VIRTUAL_MAGIC);
-            a[4] = 0x00; // break the magic
-            a
-        };
-        assert!(!is_virtual_address(&almost));
-    }
-
-    #[test]
-    fn test_decode_virtual_address() {
-        let master_id = [0x07, 0xA3, 0xB1, 0xC2];
-        let user_tag = [0xD4, 0xE5, 0xA7, 0xC3, 0xF1, 0x9E];
-        let vaddr = make_virtual_address(master_id, user_tag);
-
-        let parts = decode_virtual_address(&vaddr).unwrap();
-        assert_eq!(parts.master_id, master_id);
-        assert_eq!(parts.user_tag, user_tag);
-    }
-
-    #[test]
-    fn test_decode_normal_address_returns_none() {
-        assert!(decode_virtual_address(&[0u8; 20]).is_none());
-    }
-
-    fn pad_address(addr: &[u8; 20]) -> Vec<u8> {
-        let mut topic = vec![0u8; 32];
-        topic[12..32].copy_from_slice(addr);
-        topic
-    }
-
-    fn pad_address_with_prefix(addr: &[u8; 20], prefix: [u8; 12]) -> Vec<u8> {
-        let mut topic = prefix.to_vec();
-        topic.extend_from_slice(addr);
-        topic
+    fn fx() -> Fx {
+        Fx {
+            vaddr: Address::new_virtual(FixedBytes::random(), FixedBytes::random()),
+            sender: Address::random(),
+            master: Address::random(),
+            tx_hash: B256::repeat_byte(0x11),
+            token: Address::repeat_byte(0x20),
+            amount: U256::ZERO,
+        }
     }
 
     fn make_transfer_log(
-        tx_hash: Vec<u8>,
-        token: Vec<u8>,
-        from: &[u8; 20],
-        to: &[u8; 20],
-        amount: Vec<u8>,
+        tx_hash: B256,
+        token: Address,
+        from: Address,
+        to: Address,
+        amount: U256,
         log_idx: i32,
     ) -> LogRow {
         LogRow {
@@ -289,131 +217,86 @@ mod tests {
             block_timestamp: chrono::Utc::now(),
             log_idx,
             tx_idx: 0,
-            tx_hash,
-            address: token,
+            tx_hash: tx_hash.to_vec(),
+            address: token.to_vec(),
             selector: Some(Transfer::SIGNATURE_HASH.to_vec()),
             topic0: Some(Transfer::SIGNATURE_HASH.to_vec()),
-            topic1: Some(pad_address(from)),
-            topic2: Some(pad_address(to)),
+            topic1: Some(from.into_word().to_vec()),
+            topic2: Some(to.into_word().to_vec()),
             topic3: None,
-            data: amount,
+            data: amount.to_be_bytes::<32>().to_vec(),
             is_virtual_forward: false,
         }
     }
 
     #[test]
     fn test_mark_virtual_forward_pair() {
-        let sender = [0xAA; 20];
-        let master = [0xBB; 20];
-        let vaddr = make_virtual_address(
-            [0x01, 0x02, 0x03, 0x04],
-            [0x0A, 0x0B, 0x0C, 0x0D, 0x0E, 0x0F],
-        );
-        let tx_hash = vec![0x11; 32];
-        let token = vec![
+        let f = fx();
+        // Use a realistic TIP-20 token address rather than the default test token.
+        let token = Address::from([
             0x20, 0xc0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-        ];
-        let amount = vec![0u8; 32]; // 0 amount for simplicity
+        ]);
 
         let logs = vec![
             // Hop 1: sender → virtualAddress
-            make_transfer_log(
-                tx_hash.clone(),
-                token.clone(),
-                &sender,
-                &vaddr,
-                amount.clone(),
-                0,
-            ),
+            make_transfer_log(f.tx_hash, token.clone(), f.sender, f.vaddr, f.amount, 0),
             // Hop 2: virtualAddress → master
-            make_transfer_log(
-                tx_hash.clone(),
-                token.clone(),
-                &vaddr,
-                &master,
-                amount.clone(),
-                1,
-            ),
+            make_transfer_log(f.tx_hash, token, f.vaddr, f.master, f.amount, 1),
         ];
 
-        let marks = mark_virtual_forward_hops(&logs);
-        assert_eq!(marks, vec![false, true]);
+        assert_eq!(mark_virtual_forward_hops(&logs), vec![false, true]);
     }
 
     #[test]
     fn test_normal_transfers_not_marked() {
-        let a = [0xAA; 20];
-        let b = [0xBB; 20];
-        let tx_hash = vec![0x11; 32];
-        let token = vec![0x20; 20];
-        let amount = vec![0u8; 32];
+        let f = fx();
 
         let logs = vec![
-            make_transfer_log(tx_hash.clone(), token.clone(), &a, &b, amount.clone(), 0),
-            make_transfer_log(tx_hash.clone(), token.clone(), &b, &a, amount.clone(), 1),
+            make_transfer_log(f.tx_hash, f.token, f.sender, f.master, f.amount, 0),
+            make_transfer_log(f.tx_hash, f.token, f.master, f.sender, f.amount, 1),
         ];
 
-        let marks = mark_virtual_forward_hops(&logs);
-        assert_eq!(marks, vec![false, false]);
+        assert_eq!(mark_virtual_forward_hops(&logs), vec![false, false]);
     }
 
     #[test]
     fn test_different_amounts_not_marked() {
-        let sender = [0xAA; 20];
-        let master = [0xBB; 20];
-        let vaddr = make_virtual_address(
-            [0x01, 0x02, 0x03, 0x04],
-            [0x0A, 0x0B, 0x0C, 0x0D, 0x0E, 0x0F],
-        );
-        let tx_hash = vec![0x11; 32];
-        let token = vec![0x20; 20];
-
-        let mut amount1 = vec![0u8; 32];
-        amount1[31] = 100;
-        let mut amount2 = vec![0u8; 32];
-        amount2[31] = 200;
+        let f = fx();
+        let amount1 = U256::from(100u64);
+        let amount2 = U256::from(200u64);
 
         let logs = vec![
-            make_transfer_log(tx_hash.clone(), token.clone(), &sender, &vaddr, amount1, 0),
-            make_transfer_log(tx_hash.clone(), token.clone(), &vaddr, &master, amount2, 1),
+            make_transfer_log(f.tx_hash, f.token, f.sender, f.vaddr, amount1, 0),
+            make_transfer_log(f.tx_hash, f.token, f.vaddr, f.master, amount2, 1),
         ];
 
-        let marks = mark_virtual_forward_hops(&logs);
-        assert_eq!(marks, vec![false, false]);
+        assert_eq!(mark_virtual_forward_hops(&logs), vec![false, false]);
     }
 
     #[test]
     fn test_different_tx_not_marked() {
-        let sender = [0xAA; 20];
-        let master = [0xBB; 20];
-        let vaddr = make_virtual_address(
-            [0x01, 0x02, 0x03, 0x04],
-            [0x0A, 0x0B, 0x0C, 0x0D, 0x0E, 0x0F],
-        );
-        let token = vec![0x20; 20];
-        let amount = vec![0u8; 32];
+        let f = fx();
 
         let logs = vec![
             make_transfer_log(
-                vec![0x11; 32],
-                token.clone(),
-                &sender,
-                &vaddr,
-                amount.clone(),
+                B256::repeat_byte(0x11),
+                f.token,
+                f.sender,
+                f.vaddr,
+                f.amount,
                 0,
             ),
             make_transfer_log(
-                vec![0x22; 32],
-                token.clone(),
-                &vaddr,
-                &master,
-                amount.clone(),
+                B256::repeat_byte(0x22),
+                f.token,
+                f.vaddr,
+                f.master,
+                f.amount,
                 1,
             ),
         ];
 
-        let marks = mark_virtual_forward_hops(&logs);
-        assert_eq!(marks, vec![false, false]);
+        assert_eq!(mark_virtual_forward_hops(&logs), vec![false, false]);
     }
 
     #[test]
@@ -425,11 +308,11 @@ mod tests {
     #[test]
     fn test_single_log() {
         let log = make_transfer_log(
-            vec![0x11; 32],
-            vec![0x20; 20],
-            &[0xAA; 20],
-            &[0xBB; 20],
-            vec![0u8; 32],
+            B256::random(),
+            Address::random(),
+            Address::random(),
+            Address::random(),
+            U256::ZERO,
             0,
         );
         assert_eq!(mark_virtual_forward_hops(&[log]), vec![false]);
@@ -437,76 +320,31 @@ mod tests {
 
     #[test]
     fn test_intervening_event_still_marks_forward_hop() {
-        let sender = [0xAA; 20];
-        let master = [0xBB; 20];
-        let other = [0xCC; 20];
-        let vaddr = make_virtual_address(
-            [0x01, 0x02, 0x03, 0x04],
-            [0x0A, 0x0B, 0x0C, 0x0D, 0x0E, 0x0F],
-        );
-        let tx_hash = vec![0x11; 32];
-        let token = vec![0x20; 20];
-        let amount = vec![0u8; 32];
+        let f = fx();
+        let other = Address::random();
 
-        let mut approval_like = make_transfer_log(
-            tx_hash.clone(),
-            token.clone(),
-            &sender,
-            &other,
-            amount.clone(),
-            1,
-        );
+        let mut approval_like = make_transfer_log(f.tx_hash, f.token, f.sender, other, f.amount, 1);
         approval_like.topic0 = Some(vec![0x99; 32]);
         approval_like.selector = Some(vec![0x99; 32]);
 
         let logs = vec![
-            make_transfer_log(
-                tx_hash.clone(),
-                token.clone(),
-                &sender,
-                &vaddr,
-                amount.clone(),
-                0,
-            ),
+            make_transfer_log(f.tx_hash, f.token, f.sender, f.vaddr, f.amount, 0),
             approval_like,
-            make_transfer_log(tx_hash, token, &vaddr, &master, amount, 2),
+            make_transfer_log(f.tx_hash, f.token, f.vaddr, f.master, f.amount, 2),
         ];
 
-        let marks = mark_virtual_forward_hops(&logs);
-        assert_eq!(marks, vec![false, false, true]);
+        assert_eq!(mark_virtual_forward_hops(&logs), vec![false, false, true]);
     }
 
     #[test]
     fn test_ambiguous_multiple_forward_destinations_marks_none() {
-        let sender = [0xAA; 20];
-        let master = [0xBB; 20];
-        let other = [0xCC; 20];
-        let vaddr = make_virtual_address(
-            [0x01, 0x02, 0x03, 0x04],
-            [0x0A, 0x0B, 0x0C, 0x0D, 0x0E, 0x0F],
-        );
-        let tx_hash = vec![0x11; 32];
-        let token = vec![0x20; 20];
-        let amount = vec![0u8; 32];
+        let f = fx();
+        let other = Address::random();
 
         let logs = vec![
-            make_transfer_log(
-                tx_hash.clone(),
-                token.clone(),
-                &sender,
-                &vaddr,
-                amount.clone(),
-                0,
-            ),
-            make_transfer_log(
-                tx_hash.clone(),
-                token.clone(),
-                &vaddr,
-                &other,
-                amount.clone(),
-                1,
-            ),
-            make_transfer_log(tx_hash, token, &vaddr, &master, amount, 2),
+            make_transfer_log(f.tx_hash, f.token, f.sender, f.vaddr, f.amount, 0),
+            make_transfer_log(f.tx_hash, f.token, f.vaddr, other, f.amount, 1),
+            make_transfer_log(f.tx_hash, f.token, f.vaddr, f.master, f.amount, 2),
         ];
 
         assert_eq!(mark_virtual_forward_hops(&logs), vec![false, false, false]);
@@ -514,43 +352,14 @@ mod tests {
 
     #[test]
     fn test_multiple_matching_pairs_same_tx_marks_both_forwards() {
-        let sender1 = [0xAA; 20];
-        let sender2 = [0xAB; 20];
-        let master = [0xBB; 20];
-        let vaddr = make_virtual_address(
-            [0x01, 0x02, 0x03, 0x04],
-            [0x0A, 0x0B, 0x0C, 0x0D, 0x0E, 0x0F],
-        );
-        let tx_hash = vec![0x11; 32];
-        let token = vec![0x20; 20];
-        let amount = vec![0u8; 32];
+        let f = fx();
+        let sender2 = Address::random();
 
         let logs = vec![
-            make_transfer_log(
-                tx_hash.clone(),
-                token.clone(),
-                &sender1,
-                &vaddr,
-                amount.clone(),
-                0,
-            ),
-            make_transfer_log(
-                tx_hash.clone(),
-                token.clone(),
-                &vaddr,
-                &master,
-                amount.clone(),
-                1,
-            ),
-            make_transfer_log(
-                tx_hash.clone(),
-                token.clone(),
-                &sender2,
-                &vaddr,
-                amount.clone(),
-                2,
-            ),
-            make_transfer_log(tx_hash, token, &vaddr, &master, amount, 3),
+            make_transfer_log(f.tx_hash, f.token, f.sender, f.vaddr, f.amount, 0),
+            make_transfer_log(f.tx_hash, f.token, f.vaddr, f.master, f.amount, 1),
+            make_transfer_log(f.tx_hash, f.token, sender2, f.vaddr, f.amount, 2),
+            make_transfer_log(f.tx_hash, f.token, f.vaddr, f.master, f.amount, 3),
         ];
 
         assert_eq!(
@@ -561,43 +370,14 @@ mod tests {
 
     #[test]
     fn test_multiple_attributions_before_multiple_forwards_marks_fifo() {
-        let sender1 = [0xAA; 20];
-        let sender2 = [0xAB; 20];
-        let master = [0xBB; 20];
-        let vaddr = make_virtual_address(
-            [0x01, 0x02, 0x03, 0x04],
-            [0x0A, 0x0B, 0x0C, 0x0D, 0x0E, 0x0F],
-        );
-        let tx_hash = vec![0x11; 32];
-        let token = vec![0x20; 20];
-        let amount = vec![0u8; 32];
+        let f = fx();
+        let sender2 = Address::random();
 
         let logs = vec![
-            make_transfer_log(
-                tx_hash.clone(),
-                token.clone(),
-                &sender1,
-                &vaddr,
-                amount.clone(),
-                0,
-            ),
-            make_transfer_log(
-                tx_hash.clone(),
-                token.clone(),
-                &sender2,
-                &vaddr,
-                amount.clone(),
-                1,
-            ),
-            make_transfer_log(
-                tx_hash.clone(),
-                token.clone(),
-                &vaddr,
-                &master,
-                amount.clone(),
-                2,
-            ),
-            make_transfer_log(tx_hash, token, &vaddr, &master, amount, 3),
+            make_transfer_log(f.tx_hash, f.token, f.sender, f.vaddr, f.amount, 0),
+            make_transfer_log(f.tx_hash, f.token, sender2, f.vaddr, f.amount, 1),
+            make_transfer_log(f.tx_hash, f.token, f.vaddr, f.master, f.amount, 2),
+            make_transfer_log(f.tx_hash, f.token, f.vaddr, f.master, f.amount, 3),
         ];
 
         assert_eq!(
@@ -608,36 +388,14 @@ mod tests {
 
     #[test]
     fn test_multiple_tokens_same_tx_are_isolated() {
-        let sender = [0xAA; 20];
-        let master = [0xBB; 20];
-        let vaddr = make_virtual_address(
-            [0x01, 0x02, 0x03, 0x04],
-            [0x0A, 0x0B, 0x0C, 0x0D, 0x0E, 0x0F],
-        );
-        let tx_hash = vec![0x11; 32];
-        let token_a = vec![0x20; 20];
-        let token_b = vec![0x21; 20];
-        let amount = vec![0u8; 32];
+        let f = fx();
+        let token_b = Address::repeat_byte(0x21);
 
         let logs = vec![
-            make_transfer_log(
-                tx_hash.clone(),
-                token_a.clone(),
-                &sender,
-                &vaddr,
-                amount.clone(),
-                0,
-            ),
-            make_transfer_log(
-                tx_hash.clone(),
-                token_b.clone(),
-                &sender,
-                &vaddr,
-                amount.clone(),
-                1,
-            ),
-            make_transfer_log(tx_hash.clone(), token_b, &vaddr, &master, amount.clone(), 2),
-            make_transfer_log(tx_hash, token_a, &vaddr, &master, amount, 3),
+            make_transfer_log(f.tx_hash, f.token, f.sender, f.vaddr, f.amount, 0),
+            make_transfer_log(f.tx_hash, token_b, f.sender, f.vaddr, f.amount, 1),
+            make_transfer_log(f.tx_hash, token_b, f.vaddr, f.master, f.amount, 2),
+            make_transfer_log(f.tx_hash, f.token, f.vaddr, f.master, f.amount, 3),
         ];
 
         assert_eq!(
@@ -648,26 +406,11 @@ mod tests {
 
     #[test]
     fn test_mint_like_zero_sender_still_marks_forward_hop() {
-        let zero = [0u8; 20];
-        let master = [0xBB; 20];
-        let vaddr = make_virtual_address(
-            [0x01, 0x02, 0x03, 0x04],
-            [0x0A, 0x0B, 0x0C, 0x0D, 0x0E, 0x0F],
-        );
-        let tx_hash = vec![0x11; 32];
-        let token = vec![0x20; 20];
-        let amount = vec![0u8; 32];
+        let f = fx();
 
         let logs = vec![
-            make_transfer_log(
-                tx_hash.clone(),
-                token.clone(),
-                &zero,
-                &vaddr,
-                amount.clone(),
-                0,
-            ),
-            make_transfer_log(tx_hash, token, &vaddr, &master, amount, 1),
+            make_transfer_log(f.tx_hash, f.token, Address::ZERO, f.vaddr, f.amount, 0),
+            make_transfer_log(f.tx_hash, f.token, f.vaddr, f.master, f.amount, 1),
         ];
 
         assert_eq!(mark_virtual_forward_hops(&logs), vec![false, true]);
@@ -675,76 +418,38 @@ mod tests {
 
     #[test]
     fn test_mint_with_intervening_non_transfer_events_still_marks_forward_hop() {
-        let zero = [0u8; 20];
-        let master = [0xBB; 20];
-        let vaddr = make_virtual_address(
-            [0x01, 0x02, 0x03, 0x04],
-            [0x0A, 0x0B, 0x0C, 0x0D, 0x0E, 0x0F],
-        );
-        let tx_hash = vec![0x11; 32];
-        let token = vec![0x20; 20];
-        let amount = vec![0u8; 32];
+        let f = fx();
 
-        let mut transfer_with_memo_like = make_transfer_log(
-            tx_hash.clone(),
-            token.clone(),
-            &zero,
-            &vaddr,
-            amount.clone(),
-            1,
-        );
+        let mut transfer_with_memo_like =
+            make_transfer_log(f.tx_hash, f.token, Address::ZERO, f.vaddr, f.amount, 1);
         transfer_with_memo_like.topic0 = Some(vec![0x77; 32]);
         transfer_with_memo_like.selector = Some(vec![0x77; 32]);
 
-        let mut mint_like = make_transfer_log(
-            tx_hash.clone(),
-            token.clone(),
-            &zero,
-            &vaddr,
-            amount.clone(),
-            2,
-        );
+        let mut mint_like =
+            make_transfer_log(f.tx_hash, f.token, Address::ZERO, f.vaddr, f.amount, 2);
         mint_like.topic0 = Some(vec![0x88; 32]);
         mint_like.selector = Some(vec![0x88; 32]);
 
         let logs = vec![
-            make_transfer_log(
-                tx_hash.clone(),
-                token.clone(),
-                &zero,
-                &vaddr,
-                amount.clone(),
-                0,
-            ),
+            make_transfer_log(f.tx_hash, f.token, Address::ZERO, f.vaddr, f.amount, 0),
             transfer_with_memo_like,
             mint_like,
-            make_transfer_log(tx_hash, token, &vaddr, &master, amount, 3),
+            make_transfer_log(f.tx_hash, f.token, f.vaddr, f.master, f.amount, 3),
         ];
 
-        assert_eq!(mark_virtual_forward_hops(&logs), vec![false, false, false, true]);
+        assert_eq!(
+            mark_virtual_forward_hops(&logs),
+            vec![false, false, false, true]
+        );
     }
 
     #[test]
     fn test_self_forwarding_marks_only_second_hop() {
-        let master = [0xBB; 20];
-        let vaddr = make_virtual_address(
-            [0x01, 0x02, 0x03, 0x04],
-            [0x0A, 0x0B, 0x0C, 0x0D, 0x0E, 0x0F],
-        );
-        let tx_hash = vec![0x11; 32];
-        let token = vec![0x20; 20];
-        let amount = vec![0u8; 32];
+        let f = fx();
 
         let logs = vec![
-            make_transfer_log(
-                tx_hash.clone(),
-                token.clone(),
-                &master,
-                &vaddr,
-                amount.clone(),
-                0,
-            ),
-            make_transfer_log(tx_hash, token, &vaddr, &master, amount, 1),
+            make_transfer_log(f.tx_hash, f.token, f.master, f.vaddr, f.amount, 0),
+            make_transfer_log(f.tx_hash, f.token, f.vaddr, f.master, f.amount, 1),
         ];
 
         assert_eq!(mark_virtual_forward_hops(&logs), vec![false, true]);
@@ -752,29 +457,18 @@ mod tests {
 
     #[test]
     fn test_malformed_topic_padding_is_rejected() {
-        let sender = [0xAA; 20];
-        let master = [0xBB; 20];
-        let vaddr = make_virtual_address(
-            [0x01, 0x02, 0x03, 0x04],
-            [0x0A, 0x0B, 0x0C, 0x0D, 0x0E, 0x0F],
-        );
-        let tx_hash = vec![0x11; 32];
-        let token = vec![0x20; 20];
-        let amount = vec![0u8; 32];
+        let f = fx();
 
-        let mut malformed = make_transfer_log(
-            tx_hash.clone(),
-            token.clone(),
-            &sender,
-            &vaddr,
-            amount.clone(),
-            0,
-        );
-        malformed.topic1 = Some(pad_address_with_prefix(&sender, [0x01; 12]));
+        let mut malformed = make_transfer_log(f.tx_hash, f.token, f.sender, f.vaddr, f.amount, 0);
+        malformed.topic1 = Some({
+            let mut topic = [0x01u8; 12].to_vec();
+            topic.extend_from_slice(f.sender.as_slice());
+            topic
+        });
 
         let logs = vec![
             malformed,
-            make_transfer_log(tx_hash, token, &vaddr, &master, amount, 1),
+            make_transfer_log(f.tx_hash, f.token, f.vaddr, f.master, f.amount, 1),
         ];
 
         assert_eq!(mark_virtual_forward_hops(&logs), vec![false, false]);
@@ -782,52 +476,23 @@ mod tests {
 
     #[test]
     fn test_malformed_data_length_is_rejected() {
-        let sender = [0xAA; 20];
-        let master = [0xBB; 20];
-        let vaddr = make_virtual_address(
-            [0x01, 0x02, 0x03, 0x04],
-            [0x0A, 0x0B, 0x0C, 0x0D, 0x0E, 0x0F],
-        );
-        let tx_hash = vec![0x11; 32];
-        let token = vec![0x20; 20];
+        let f = fx();
 
-        let logs = vec![
-            make_transfer_log(
-                tx_hash.clone(),
-                token.clone(),
-                &sender,
-                &vaddr,
-                vec![0u8; 31],
-                0,
-            ),
-            make_transfer_log(tx_hash, token, &vaddr, &master, vec![0u8; 32], 1),
-        ];
+        let mut log1 = make_transfer_log(f.tx_hash, f.token, f.sender, f.vaddr, f.amount, 0);
+        log1.data = vec![0u8; 31]; // truncate to 31 bytes — must be rejected
+        let log2 = make_transfer_log(f.tx_hash, f.token, f.vaddr, f.master, f.amount, 1);
+        let logs = vec![log1, log2];
 
         assert_eq!(mark_virtual_forward_hops(&logs), vec![false, false]);
     }
 
     #[test]
     fn test_reverse_order_does_not_mark() {
-        let sender = [0xAA; 20];
-        let master = [0xBB; 20];
-        let vaddr = make_virtual_address(
-            [0x01, 0x02, 0x03, 0x04],
-            [0x0A, 0x0B, 0x0C, 0x0D, 0x0E, 0x0F],
-        );
-        let tx_hash = vec![0x11; 32];
-        let token = vec![0x20; 20];
-        let amount = vec![0u8; 32];
+        let f = fx();
 
         let logs = vec![
-            make_transfer_log(
-                tx_hash.clone(),
-                token.clone(),
-                &vaddr,
-                &master,
-                amount.clone(),
-                0,
-            ),
-            make_transfer_log(tx_hash, token, &sender, &vaddr, amount, 1),
+            make_transfer_log(f.tx_hash, f.token, f.vaddr, f.master, f.amount, 0),
+            make_transfer_log(f.tx_hash, f.token, f.sender, f.vaddr, f.amount, 1),
         ];
 
         assert_eq!(mark_virtual_forward_hops(&logs), vec![false, false]);
@@ -835,54 +500,26 @@ mod tests {
 
     #[test]
     fn test_missing_tx_hash_is_rejected() {
-        let sender = [0xAA; 20];
-        let master = [0xBB; 20];
-        let vaddr = make_virtual_address(
-            [0x01, 0x02, 0x03, 0x04],
-            [0x0A, 0x0B, 0x0C, 0x0D, 0x0E, 0x0F],
-        );
-        let token = vec![0x20; 20];
-        let amount = vec![0u8; 32];
+        let f = fx();
 
-        let logs = vec![
-            make_transfer_log(vec![], token.clone(), &sender, &vaddr, amount.clone(), 0),
-            make_transfer_log(vec![], token, &vaddr, &master, amount, 1),
-        ];
+        let mut log1 = make_transfer_log(f.tx_hash, f.token, f.sender, f.vaddr, f.amount, 0);
+        let mut log2 = make_transfer_log(f.tx_hash, f.token, f.vaddr, f.master, f.amount, 1);
+        log1.tx_hash = vec![];
+        log2.tx_hash = vec![];
+        let logs = vec![log1, log2];
 
         assert_eq!(mark_virtual_forward_hops(&logs), vec![false, false]);
     }
 
     #[test]
     fn test_count_mismatch_fails_closed() {
-        let sender1 = [0xAA; 20];
-        let sender2 = [0xAB; 20];
-        let master = [0xBB; 20];
-        let vaddr = make_virtual_address(
-            [0x01, 0x02, 0x03, 0x04],
-            [0x0A, 0x0B, 0x0C, 0x0D, 0x0E, 0x0F],
-        );
-        let tx_hash = vec![0x11; 32];
-        let token = vec![0x20; 20];
-        let amount = vec![0u8; 32];
+        let f = fx();
+        let sender2 = Address::random();
 
         let logs = vec![
-            make_transfer_log(
-                tx_hash.clone(),
-                token.clone(),
-                &sender1,
-                &vaddr,
-                amount.clone(),
-                0,
-            ),
-            make_transfer_log(
-                tx_hash.clone(),
-                token.clone(),
-                &sender2,
-                &vaddr,
-                amount.clone(),
-                1,
-            ),
-            make_transfer_log(tx_hash, token, &vaddr, &master, amount, 2),
+            make_transfer_log(f.tx_hash, f.token, f.sender, f.vaddr, f.amount, 0),
+            make_transfer_log(f.tx_hash, f.token, sender2, f.vaddr, f.amount, 1),
+            make_transfer_log(f.tx_hash, f.token, f.vaddr, f.master, f.amount, 2),
         ];
 
         assert_eq!(mark_virtual_forward_hops(&logs), vec![false, false, false]);
