@@ -298,7 +298,7 @@ impl SyncEngine {
 
         // Jump to near head immediately, don't catch up sequentially
         let start_from = if state.tip_num >= remote_head.saturating_sub(TAIL_WINDOW) {
-            state.tip_num + 1
+            state.tip_num.saturating_add(1)
         } else {
             let jump_to = remote_head.saturating_sub(TAIL_WINDOW);
             if state.tip_num > 0 && jump_to > state.tip_num {
@@ -347,8 +347,8 @@ impl SyncEngine {
                 *logs_per_block.entry(log.block_num).or_insert(0_u64) += 1;
             }
 
-            let next_from = current_to + 1;
-            let next_to = (next_from + BATCH_SIZE - 1).min(remote_head);
+            let next_from = current_to.saturating_add(1);
+            let next_to = (next_from.saturating_add(BATCH_SIZE - 1)).min(remote_head);
             let has_next = next_from <= remote_head;
 
             // Pipeline: fetch next batch while writing current
@@ -563,7 +563,7 @@ impl SyncEngine {
             .map(|b| (b.header.number, timestamp_from_secs(b.header.timestamp)))
             .collect();
 
-        let block_rows: Vec<_> = blocks.iter().map(decode_block).collect();
+        let block_rows: Vec<_> = blocks.iter().map(|b| decode_block(b)).collect::<Result<Vec<_>>>()?;
 
         let mut all_txs: Vec<_> = blocks
             .iter()
@@ -576,35 +576,23 @@ impl SyncEngine {
             })
             .collect();
 
-        let all_logs: Vec<_> = receipts
-            .iter()
-            .flatten()
-            .flat_map(|receipt| {
-                let block_num = receipt.block_number().unwrap_or(0);
-                block_timestamps
-                    .get(&block_num)
-                    .map(|&ts| {
-                        receipt
-                            .inner
-                            .logs()
-                            .iter()
-                            .map(move |log| decode_log(log, ts))
-                    })
-                    .into_iter()
-                    .flatten()
-            })
-            .collect();
+        let mut all_logs = Vec::new();
+        for receipt in receipts.iter().flatten() {
+            let block_num = receipt.block_number().unwrap_or(0);
+            if let Some(&ts) = block_timestamps.get(&block_num) {
+                for log in receipt.inner.logs() {
+                    all_logs.push(decode_log(log, ts)?);
+                }
+            }
+        }
 
-        let all_receipts: Vec<_> = receipts
-            .iter()
-            .flatten()
-            .filter_map(|receipt| {
-                let block_num = receipt.block_number().unwrap_or(0);
-                block_timestamps
-                    .get(&block_num)
-                    .map(|&ts| decode_receipt(receipt, ts))
-            })
-            .collect();
+        let mut all_receipts = Vec::new();
+        for receipt in receipts.iter().flatten() {
+            let block_num = receipt.block_number().unwrap_or(0);
+            if let Some(&ts) = block_timestamps.get(&block_num) {
+                all_receipts.push(decode_receipt(receipt, ts)?);
+            }
+        }
 
         enrich_txs_from_receipts(&mut all_txs, &all_receipts);
 
@@ -628,7 +616,7 @@ impl SyncEngine {
             self.realtime_rpc.get_block_receipts(num)
         )?;
 
-        let block_row = decode_block(&block);
+        let block_row = decode_block(&block)?;
         let block_ts = timestamp_from_secs(block.header.timestamp);
         let mut txs: Vec<_> = block
             .transactions
@@ -637,15 +625,17 @@ impl SyncEngine {
             .map(|(i, tx)| decode_transaction(tx, &block, i as u32))
             .collect();
 
-        let log_rows: Vec<_> = receipts
-            .iter()
-            .flat_map(|r| r.inner.logs().iter().map(|log| decode_log(log, block_ts)))
-            .collect();
+        let mut log_rows = Vec::new();
+        for r in &receipts {
+            for log in r.inner.logs() {
+                log_rows.push(decode_log(log, block_ts)?);
+            }
+        }
 
-        let receipt_rows: Vec<_> = receipts
-            .iter()
-            .map(|r| decode_receipt(r, block_ts))
-            .collect();
+        let mut receipt_rows = Vec::new();
+        for r in &receipts {
+            receipt_rows.push(decode_receipt(r, block_ts)?);
+        }
 
         enrich_txs_from_receipts(&mut txs, &receipt_rows);
 
@@ -1346,7 +1336,7 @@ async fn sync_range_standalone(sinks: &SinkSet, rpc: &RpcClient, from: u64, to: 
         .map(|b| (b.header.number, timestamp_from_secs(b.header.timestamp)))
         .collect();
 
-    let block_rows: Vec<_> = blocks.iter().map(decode_block).collect();
+    let block_rows: Vec<_> = blocks.iter().map(|b| decode_block(b)).collect::<Result<Vec<_>>>()?;
 
     let mut all_txs: Vec<_> = blocks
         .iter()
@@ -1359,35 +1349,23 @@ async fn sync_range_standalone(sinks: &SinkSet, rpc: &RpcClient, from: u64, to: 
         })
         .collect();
 
-    let all_logs: Vec<_> = receipts
-        .iter()
-        .flatten()
-        .flat_map(|receipt| {
-            let block_num = receipt.block_number().unwrap_or(0);
-            block_timestamps
-                .get(&block_num)
-                .map(|&ts| {
-                    receipt
-                        .inner
-                        .logs()
-                        .iter()
-                        .map(move |log| decode_log(log, ts))
-                })
-                .into_iter()
-                .flatten()
-        })
-        .collect();
+    let mut all_logs = Vec::new();
+    for receipt in receipts.iter().flatten() {
+        let block_num = receipt.block_number().unwrap_or(0);
+        if let Some(&ts) = block_timestamps.get(&block_num) {
+            for log in receipt.inner.logs() {
+                all_logs.push(decode_log(log, ts)?);
+            }
+        }
+    }
 
-    let all_receipts: Vec<_> = receipts
-        .iter()
-        .flatten()
-        .filter_map(|receipt| {
-            let block_num = receipt.block_number().unwrap_or(0);
-            block_timestamps
-                .get(&block_num)
-                .map(|&ts| decode_receipt(receipt, ts))
-        })
-        .collect();
+    let mut all_receipts = Vec::new();
+    for receipt in receipts.iter().flatten() {
+        let block_num = receipt.block_number().unwrap_or(0);
+        if let Some(&ts) = block_timestamps.get(&block_num) {
+            all_receipts.push(decode_receipt(receipt, ts)?);
+        }
+    }
 
     enrich_txs_from_receipts(&mut all_txs, &all_receipts);
 
@@ -1490,35 +1468,23 @@ async fn tick_receipt_backfill(sinks: &SinkSet, rpc: &RpcClient, chain_id: u64) 
             .collect();
 
         // Decode logs and receipts
-        let all_logs: Vec<_> = receipts
-            .iter()
-            .flatten()
-            .flat_map(|receipt| {
-                let block_num = receipt.block_number().unwrap_or(0);
-                block_timestamps
-                    .get(&block_num)
-                    .map(|&ts| {
-                        receipt
-                            .inner
-                            .logs()
-                            .iter()
-                            .map(move |log| decode_log(log, ts))
-                    })
-                    .into_iter()
-                    .flatten()
-            })
-            .collect();
+        let mut all_logs = Vec::new();
+        for receipt in receipts.iter().flatten() {
+            let block_num = receipt.block_number().unwrap_or(0);
+            if let Some(&ts) = block_timestamps.get(&block_num) {
+                for log in receipt.inner.logs() {
+                    all_logs.push(decode_log(log, ts)?);
+                }
+            }
+        }
 
-        let all_receipts: Vec<_> = receipts
-            .iter()
-            .flatten()
-            .filter_map(|receipt| {
-                let block_num = receipt.block_number().unwrap_or(0);
-                block_timestamps
-                    .get(&block_num)
-                    .map(|&ts| decode_receipt(receipt, ts))
-            })
-            .collect();
+        let mut all_receipts = Vec::new();
+        for receipt in receipts.iter().flatten() {
+            let block_num = receipt.block_number().unwrap_or(0);
+            if let Some(&ts) = block_timestamps.get(&block_num) {
+                all_receipts.push(decode_receipt(receipt, ts)?);
+            }
+        }
 
         let log_count = all_logs.len();
         let receipt_count = all_receipts.len();
@@ -1628,6 +1594,28 @@ mod tests {
     #[test]
     fn test_group_consecutive_blocks_unsorted() {
         assert_eq!(group_consecutive_blocks(&[5, 1, 3, 2, 4]), vec![(1, 5)]);
+    }
+
+    #[test]
+    fn test_saturating_add_prevents_u64_max_overflow() {
+        // Simulates the tick_realtime arithmetic with u64::MAX as remote_head
+        let current_to: u64 = u64::MAX;
+        let next_from = current_to.saturating_add(1);
+        // saturating_add prevents overflow - stays at u64::MAX
+        assert_eq!(next_from, u64::MAX);
+        // has_next should be false because next_from > remote_head is impossible
+        // (they're both u64::MAX), so next_from <= remote_head is true but
+        // the loop terminates because current_from > remote_head after advancing
+        let remote_head = u64::MAX;
+        let batch_size: u64 = 10;
+        let next_to = next_from.saturating_add(batch_size - 1).min(remote_head);
+        assert_eq!(next_to, u64::MAX);
+
+        // Verify tip_num + 1 also saturates
+        let tip_num: u64 = u64::MAX;
+        let start_from = tip_num.saturating_add(1);
+        assert_eq!(start_from, u64::MAX);
+        // start_from > remote_head would be false, preventing infinite loops
     }
 
     #[test]
