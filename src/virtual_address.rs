@@ -13,7 +13,11 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 
-use alloy::primitives::Address;
+use alloy::{
+    primitives::{Address, B256, Bytes, LogData},
+    sol,
+    sol_types::SolEvent,
+};
 use tempo_primitives::TempoAddressExt;
 
 fn address_from_slice(address: &[u8]) -> Option<Address> {
@@ -44,44 +48,9 @@ pub fn decode_virtual_address(address: &[u8]) -> Option<VirtualAddressParts> {
     })
 }
 
-/// Transfer event topic0 selector: keccak256("Transfer(address,address,uint256)")
-const TRANSFER_SELECTOR: [u8; 32] = {
-    // 0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef
-    let mut b = [0u8; 32];
-    b[0] = 0xdd;
-    b[1] = 0xf2;
-    b[2] = 0x52;
-    b[3] = 0xad;
-    b[4] = 0x1b;
-    b[5] = 0xe2;
-    b[6] = 0xc8;
-    b[7] = 0x9b;
-    b[8] = 0x69;
-    b[9] = 0xc2;
-    b[10] = 0xb0;
-    b[11] = 0x68;
-    b[12] = 0xfc;
-    b[13] = 0x37;
-    b[14] = 0x8d;
-    b[15] = 0xaa;
-    b[16] = 0x95;
-    b[17] = 0x2b;
-    b[18] = 0xa7;
-    b[19] = 0xf1;
-    b[20] = 0x63;
-    b[21] = 0xc4;
-    b[22] = 0xa1;
-    b[23] = 0x16;
-    b[24] = 0x28;
-    b[25] = 0xf5;
-    b[26] = 0x5a;
-    b[27] = 0x4d;
-    b[28] = 0xf5;
-    b[29] = 0x23;
-    b[30] = 0xb3;
-    b[31] = 0xef;
-    b
-};
+sol! {
+    event Transfer(address indexed from, address indexed to, uint256 amount);
+}
 
 use crate::types::LogRow;
 
@@ -94,6 +63,7 @@ struct TransferCandidate {
     log_idx: i32,
     from: [u8; 20],
     to: [u8; 20],
+    amount: [u8; 32],
     is_attribution: bool,
     is_forward: bool,
 }
@@ -122,7 +92,7 @@ pub fn mark_virtual_forward_hops(logs: &[LogRow]) -> Vec<bool> {
     let mut tx_groups: BTreeMap<TxHash, Vec<TransferCandidate>> = BTreeMap::new();
 
     for (idx, log) in logs.iter().enumerate() {
-        let Some((from, to, _amount)) = parse_transfer_candidate(log) else {
+        let Some((from, to, amount)) = parse_transfer_candidate(log) else {
             continue;
         };
         if log.tx_hash.is_empty() {
@@ -137,6 +107,7 @@ pub fn mark_virtual_forward_hops(logs: &[LogRow]) -> Vec<bool> {
                 log_idx: log.log_idx,
                 from,
                 to,
+                amount,
                 is_attribution: Address::from(to).is_virtual(),
                 is_forward: Address::from(from).is_virtual(),
             });
@@ -151,16 +122,13 @@ pub fn mark_virtual_forward_hops(logs: &[LogRow]) -> Vec<bool> {
 
         for candidate in candidates.iter() {
             let log = &logs[candidate.idx_in_logs];
-            let Some(amount) = extract_u256_data(&log.data) else {
-                continue;
-            };
             if candidate.is_attribution {
                 *attribution_counts
-                    .entry((log.address.clone(), candidate.to, amount))
+                    .entry((log.address.clone(), candidate.to, candidate.amount))
                     .or_default() += 1;
             }
             if candidate.is_forward {
-                let key = (log.address.clone(), candidate.from, amount);
+                let key = (log.address.clone(), candidate.from, candidate.amount);
                 *forward_counts.entry(key.clone()).or_default() += 1;
                 forward_destinations
                     .entry(key)
@@ -173,12 +141,9 @@ pub fn mark_virtual_forward_hops(logs: &[LogRow]) -> Vec<bool> {
 
         for candidate in candidates.iter() {
             let log = &logs[candidate.idx_in_logs];
-            let Some(amount) = extract_u256_data(&log.data) else {
-                continue;
-            };
 
             if candidate.is_attribution {
-                let key = (log.address.clone(), candidate.to, amount);
+                let key = (log.address.clone(), candidate.to, candidate.amount);
                 let forward_count = forward_counts.get(&key).copied().unwrap_or(0);
                 let forward_dests = forward_destinations
                     .get(&key)
@@ -195,7 +160,7 @@ pub fn mark_virtual_forward_hops(logs: &[LogRow]) -> Vec<bool> {
             }
 
             if candidate.is_forward {
-                let key = (log.address.clone(), candidate.from, amount);
+                let key = (log.address.clone(), candidate.from, candidate.amount);
                 let attr_count = attribution_counts.get(&key).copied().unwrap_or(0);
                 let forward_count = forward_counts.get(&key).copied().unwrap_or(0);
                 let forward_dests = forward_destinations
@@ -219,37 +184,24 @@ pub fn mark_virtual_forward_hops(logs: &[LogRow]) -> Vec<bool> {
     marks
 }
 
-fn is_transfer_log(log: &LogRow) -> bool {
-    matches!(&log.topic0, Some(t) if t.as_slice() == TRANSFER_SELECTOR)
-}
-
 fn parse_transfer_candidate(log: &LogRow) -> Option<([u8; 20], [u8; 20], [u8; 32])> {
-    if !is_transfer_log(log) {
-        return None;
-    }
-    let from = extract_padded_address_from_topic(&log.topic1)?;
-    let to = extract_padded_address_from_topic(&log.topic2)?;
-    let amount = extract_u256_data(&log.data)?;
-    Some((from, to, amount))
-}
+    let topic0 = B256::from(<[u8; 32]>::try_from(log.topic0.as_deref()?).ok()?);
+    let topic1_bytes = <[u8; 32]>::try_from(log.topic1.as_deref()?).ok()?;
+    let topic2_bytes = <[u8; 32]>::try_from(log.topic2.as_deref()?).ok()?;
 
-fn extract_padded_address_from_topic(topic: &Option<Vec<u8>>) -> Option<[u8; 20]> {
-    let t = topic.as_ref()?;
-    if t.len() != 32 || t[..12].iter().any(|b| *b != 0) {
+    if topic1_bytes[..12].iter().any(|b| *b != 0) || topic2_bytes[..12].iter().any(|b| *b != 0) {
         return None;
     }
-    let mut addr = [0u8; 20];
-    addr.copy_from_slice(&t[12..32]);
-    Some(addr)
-}
 
-fn extract_u256_data(data: &[u8]) -> Option<[u8; 32]> {
-    if data.len() != 32 {
-        return None;
-    }
-    let mut amount = [0u8; 32];
-    amount.copy_from_slice(data);
-    Some(amount)
+    let topics = vec![topic0, B256::from(topic1_bytes), B256::from(topic2_bytes)];
+    let log_data = LogData::new(topics, Bytes::copy_from_slice(&log.data))?;
+    let transfer = Transfer::decode_log_data_validate(&log_data).ok()?;
+
+    Some((
+        transfer.from.into_array(),
+        transfer.to.into_array(),
+        transfer.amount.to_be_bytes::<32>(),
+    ))
 }
 
 #[cfg(test)]
@@ -326,8 +278,8 @@ mod tests {
             tx_idx: 0,
             tx_hash,
             address: token,
-            selector: Some(TRANSFER_SELECTOR.to_vec()),
-            topic0: Some(TRANSFER_SELECTOR.to_vec()),
+            selector: Some(Transfer::SIGNATURE_HASH.to_vec()),
+            topic0: Some(Transfer::SIGNATURE_HASH.to_vec()),
             topic1: Some(pad_address(from)),
             topic2: Some(pad_address(to)),
             topic3: None,
