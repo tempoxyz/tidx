@@ -13,12 +13,16 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 
-/// 10-byte magic value identifying virtual addresses (bytes [4:14]).
-const VIRTUAL_MAGIC: [u8; 10] = [0xFD; 10];
+use alloy::primitives::Address;
+use tempo_primitives::TempoAddressExt;
+
+fn address_from_slice(address: &[u8]) -> Option<Address> {
+    Some(Address::from(<[u8; 20]>::try_from(address).ok()?))
+}
 
 /// Check whether a 20-byte address is a TIP-1022 virtual address.
 pub fn is_virtual_address(address: &[u8]) -> bool {
-    address.len() == 20 && address[4..14] == VIRTUAL_MAGIC
+    address_from_slice(address).is_some_and(|addr| addr.is_virtual())
 }
 
 /// Decoded components of a virtual address.
@@ -33,16 +37,10 @@ pub struct VirtualAddressParts {
 /// Decode a virtual address into its components.
 /// Returns `None` if the address is not virtual.
 pub fn decode_virtual_address(address: &[u8]) -> Option<VirtualAddressParts> {
-    if !is_virtual_address(address) {
-        return None;
-    }
-    let mut master_id = [0u8; 4];
-    master_id.copy_from_slice(&address[0..4]);
-    let mut user_tag = [0u8; 6];
-    user_tag.copy_from_slice(&address[14..20]);
+    let (master_id, user_tag) = address_from_slice(address)?.decode_virtual()?;
     Some(VirtualAddressParts {
-        master_id,
-        user_tag,
+        master_id: *master_id,
+        user_tag: *user_tag,
     })
 }
 
@@ -139,8 +137,8 @@ pub fn mark_virtual_forward_hops(logs: &[LogRow]) -> Vec<bool> {
                 log_idx: log.log_idx,
                 from,
                 to,
-                is_attribution: is_virtual_address(&to),
-                is_forward: is_virtual_address(&from),
+                is_attribution: Address::from(to).is_virtual(),
+                is_forward: Address::from(from).is_virtual(),
             });
     }
 
@@ -259,11 +257,7 @@ mod tests {
     use super::*;
 
     fn make_virtual_address(master_id: [u8; 4], user_tag: [u8; 6]) -> [u8; 20] {
-        let mut addr = [0u8; 20];
-        addr[0..4].copy_from_slice(&master_id);
-        addr[4..14].copy_from_slice(&VIRTUAL_MAGIC);
-        addr[14..20].copy_from_slice(&user_tag);
-        addr
+        Address::new_virtual(master_id.into(), user_tag.into()).into_array()
     }
 
     #[test]
@@ -282,6 +276,7 @@ mod tests {
 
         let almost = {
             let mut a = [0xFD; 20];
+            a[4..14].copy_from_slice(&<Address as TempoAddressExt>::VIRTUAL_MAGIC);
             a[4] = 0x00; // break the magic
             a
         };

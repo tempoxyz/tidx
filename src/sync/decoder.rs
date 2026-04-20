@@ -44,8 +44,8 @@ pub fn decode_transaction(tx: &Transaction, block: &Block, idx: u32) -> TxRow {
                 tempo_tx.fee_token.map(|a| a.as_slice().to_vec()),
                 serde_json::to_value(&tempo_tx.calls).ok(),
                 tempo_tx.calls.len() as i16,
-                tempo_tx.valid_before.map(|v| v as i64),
-                tempo_tx.valid_after.map(|v| v as i64),
+                tempo_tx.valid_before.map(|v| v.get() as i64),
+                tempo_tx.valid_after.map(|v| v.get() as i64),
                 Some(match aa_signed.signature().signature_type() {
                     SignatureType::Secp256k1 => 0,
                     SignatureType::P256 => 1,
