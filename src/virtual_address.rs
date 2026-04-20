@@ -58,6 +58,13 @@ type TxHash = Vec<u8>;
 type BucketKey = (Vec<u8>, [u8; 20], [u8; 32]);
 
 #[derive(Debug, Clone, Copy)]
+struct ParsedTransfer {
+    from: [u8; 20],
+    to: [u8; 20],
+    amount: [u8; 32],
+}
+
+#[derive(Debug, Clone, Copy)]
 struct TransferCandidate {
     idx_in_logs: usize,
     log_idx: i32,
@@ -92,7 +99,7 @@ pub fn mark_virtual_forward_hops(logs: &[LogRow]) -> Vec<bool> {
     let mut tx_groups: BTreeMap<TxHash, Vec<TransferCandidate>> = BTreeMap::new();
 
     for (idx, log) in logs.iter().enumerate() {
-        let Some((from, to, amount)) = parse_transfer_candidate(log) else {
+        let Some(parsed) = parse_transfer_candidate(log) else {
             continue;
         };
         if log.tx_hash.is_empty() {
@@ -105,11 +112,11 @@ pub fn mark_virtual_forward_hops(logs: &[LogRow]) -> Vec<bool> {
             .push(TransferCandidate {
                 idx_in_logs: idx,
                 log_idx: log.log_idx,
-                from,
-                to,
-                amount,
-                is_attribution: Address::from(to).is_virtual(),
-                is_forward: Address::from(from).is_virtual(),
+                from: parsed.from,
+                to: parsed.to,
+                amount: parsed.amount,
+                is_attribution: Address::from(parsed.to).is_virtual(),
+                is_forward: Address::from(parsed.from).is_virtual(),
             });
     }
 
@@ -184,24 +191,30 @@ pub fn mark_virtual_forward_hops(logs: &[LogRow]) -> Vec<bool> {
     marks
 }
 
-fn parse_transfer_candidate(log: &LogRow) -> Option<([u8; 20], [u8; 20], [u8; 32])> {
+fn parse_transfer_candidate(log: &LogRow) -> Option<ParsedTransfer> {
     let topic0 = B256::from(<[u8; 32]>::try_from(log.topic0.as_deref()?).ok()?);
-    let topic1_bytes = <[u8; 32]>::try_from(log.topic1.as_deref()?).ok()?;
-    let topic2_bytes = <[u8; 32]>::try_from(log.topic2.as_deref()?).ok()?;
-
-    if topic1_bytes[..12].iter().any(|b| *b != 0) || topic2_bytes[..12].iter().any(|b| *b != 0) {
+    if topic0 != Transfer::SIGNATURE_HASH {
         return None;
     }
 
-    let topics = vec![topic0, B256::from(topic1_bytes), B256::from(topic2_bytes)];
-    let log_data = LogData::new(topics, Bytes::copy_from_slice(&log.data))?;
+    let topic1 = <[u8; 32]>::try_from(log.topic1.as_deref()?).ok()?;
+    let topic2 = <[u8; 32]>::try_from(log.topic2.as_deref()?).ok()?;
+
+    if topic1[..12].iter().any(|b| *b != 0) || topic2[..12].iter().any(|b| *b != 0) {
+        return None;
+    }
+
+    let log_data = LogData::new(
+        vec![topic0, B256::from(topic1), B256::from(topic2)],
+        Bytes::copy_from_slice(&log.data),
+    )?;
     let transfer = Transfer::decode_log_data_validate(&log_data).ok()?;
 
-    Some((
-        transfer.from.into_array(),
-        transfer.to.into_array(),
-        transfer.amount.to_be_bytes::<32>(),
-    ))
+    Some(ParsedTransfer {
+        from: transfer.from.into_array(),
+        to: transfer.to.into_array(),
+        amount: transfer.amount.to_be_bytes::<32>(),
+    })
 }
 
 #[cfg(test)]
