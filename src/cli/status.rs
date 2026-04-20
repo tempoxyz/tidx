@@ -113,6 +113,7 @@ fn print_http_status(resp: &serde_json::Value) -> Result<()> {
         let name = chain["name"].as_str().unwrap_or("unknown");
         let chain_id = chain["chain_id"].as_i64().unwrap_or(0);
         let head_num = chain["head_num"].as_i64().unwrap_or(0);
+        let synced_num = chain["synced_num"].as_i64().unwrap_or(0);
         let lag = chain["lag"].as_i64().unwrap_or(0);
 
         println!("┌─ {} (chain_id: {}) ─────────────────────", name, chain_id);
