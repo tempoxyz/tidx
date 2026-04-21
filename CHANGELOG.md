@@ -1,5 +1,11 @@
 # Changelog
 
+## `tidx@0.5.2`
+
+### Patch Changes
+
+- Added support for virtual address detection (by @o-az, [#170](https://github.com/tempoxyz/tidx/pull/170))
+
 ## `tidx@0.5.1`
 
 ### Patch Changes
