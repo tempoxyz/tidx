@@ -22,26 +22,39 @@ pub async fn run_migrations(pool: &Pool) -> Result<()> {
         .await?;
 
     if !terminated.is_empty() {
-        warn!(count = terminated.len(), "Terminated stale connections before migrations");
+        warn!(
+            count = terminated.len(),
+            "Terminated stale connections before migrations"
+        );
     }
 
     info!("Running schema migrations");
-    conn.batch_execute(include_str!("../../db/blocks.sql")).await?;
+    conn.batch_execute(include_str!("../../db/blocks.sql"))
+        .await?;
     conn.batch_execute(include_str!("../../db/txs.sql")).await?;
-    conn.batch_execute(include_str!("../../db/logs.sql")).await?;
-    conn.batch_execute(include_str!("../../db/receipts.sql")).await?;
-    conn.batch_execute(include_str!("../../db/sync_state.sql")).await?;
-    conn.batch_execute(include_str!("../../db/functions.sql")).await?;
+    conn.batch_execute(include_str!("../../db/logs.sql"))
+        .await?;
+    conn.batch_execute(include_str!("../../db/receipts.sql"))
+        .await?;
+    conn.batch_execute(include_str!("../../db/sync_state.sql"))
+        .await?;
+    conn.batch_execute(include_str!("../../db/functions.sql"))
+        .await?;
 
     // Apply additive upgrades for existing deployments whose tables were
     // created before newer columns were introduced.
-    conn.batch_execute(include_str!("../../db/migrations/20260416_add_is_virtual_forward.sql"))
-        .await?;
+    conn.batch_execute(include_str!(
+        "../../db/migrations/20260416_add_is_virtual_forward.sql"
+    ))
+    .await?;
+    conn.batch_execute(include_str!(
+        "../../db/migrations/20260417_add_logs_virtual_forward_indexes.sql"
+    ))
+    .await?;
 
     // Load any optional extensions
-    conn.batch_execute(include_str!("../../db/extensions.sql")).await?;
+    conn.batch_execute(include_str!("../../db/extensions.sql"))
+        .await?;
 
     Ok(())
 }
-
-
