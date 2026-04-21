@@ -57,7 +57,7 @@ impl TestClickHouse {
 
     /// Drop and recreate the test database for clean state.
     pub async fn reset_database(&self) -> Result<()> {
-        self.query_raw(&format!("DROP DATABASE IF EXISTS {}", self.database))
+        self.query_raw(&format!("DROP DATABASE IF EXISTS {} SYNC", self.database))
             .await?;
         self.query_raw(&format!("CREATE DATABASE {}", self.database))
             .await?;
@@ -142,6 +142,7 @@ impl TestClickHouse {
                 topic2 Nullable(String),
                 topic3 Nullable(String),
                 data String,
+                is_virtual_forward UInt8 DEFAULT 0,
                 INDEX idx_selector selector TYPE bloom_filter GRANULARITY 1,
                 INDEX idx_address address TYPE bloom_filter GRANULARITY 1,
                 INDEX idx_topic1 topic1 TYPE bloom_filter GRANULARITY 1,

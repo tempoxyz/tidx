@@ -771,12 +771,8 @@ impl AbiParam {
                     (parts[0], false, Some(parts[1].to_string()))
                 }
             }
-            3 => {
-                if parts[1] == "indexed" {
-                    (parts[0], true, Some(parts[2].to_string()))
-                } else {
-                    return Err(anyhow!("Invalid parameter format: {s}"));
-                }
+            3 if parts[1] == "indexed" => {
+                (parts[0], true, Some(parts[2].to_string()))
             }
             _ => return Err(anyhow!("Invalid parameter format: {s}")),
         };

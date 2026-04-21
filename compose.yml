@@ -35,9 +35,10 @@ services:
     entrypoint: ["sh", "-ec"]
     command:
       - |
-        BLOCK_NUMBER=$$(cast block-number --rpc-url https://rpc.testnet.tempo.xyz)
+        BLOCK_NUMBER=$${FORK_BLOCK_NUMBER:-$$(cast block-number --rpc-url https://rpc.testnet.tempo.xyz)}
         echo "Forking Tempo testnet from block $$BLOCK_NUMBER"
         exec anvil \
+          --tempo \
           --host 0.0.0.0 \
           --port 8545 \
           --fork-url https://rpc.testnet.tempo.xyz \

@@ -112,7 +112,7 @@ impl SinkSet {
     /// Returns the number of blocks deleted from PostgreSQL.
     pub async fn delete_from(&self, block_num: u64) -> Result<u64> {
         if let Some(ch) = &self.ch {
-            let (deleted, _) = tokio::try_join!(
+            let (deleted, ()) = tokio::try_join!(
                 writer::delete_blocks_from(&self.pool, block_num),
                 ch.delete_from(block_num),
             )?;
@@ -228,8 +228,8 @@ impl SinkSet {
                 );
             }
 
-            if next_data.is_some() {
-                current = next_data.as_ref().unwrap().0 + 1;
+            if let Some(ref nd) = next_data {
+                current = nd.0 + 1;
             }
             pending = next_data;
         }
@@ -362,7 +362,7 @@ async fn fetch_logs(conn: &deadpool_postgres::Object, from: i64, to: i64) -> Res
     let rows = conn
         .query(
             "SELECT block_num, block_timestamp, log_idx, tx_idx, tx_hash, address, \
-             selector, topic0, topic1, topic2, topic3, data \
+             selector, topic0, topic1, topic2, topic3, data, is_virtual_forward \
              FROM logs WHERE block_num >= $1 AND block_num <= $2 ORDER BY block_num, log_idx",
             &[&from, &to],
         )
@@ -383,6 +383,7 @@ async fn fetch_logs(conn: &deadpool_postgres::Object, from: i64, to: i64) -> Res
             topic2: r.get(9),
             topic3: r.get(10),
             data: r.get(11),
+            is_virtual_forward: r.get(12),
         })
         .collect())
 }

@@ -16,6 +16,10 @@ use crate::types::{BlockRow, LogRow, ReceiptRow, TxRow};
 const BLOCKS_SCHEMA: &str = include_str!("../../db/clickhouse/blocks.sql");
 const TXS_SCHEMA: &str = include_str!("../../db/clickhouse/txs.sql");
 const LOGS_SCHEMA: &str = include_str!("../../db/clickhouse/logs.sql");
+const LOGS_MIGRATION_20260416: &str =
+    include_str!("../../db/clickhouse/migrations/20260416_add_is_virtual_forward.sql");
+const LOGS_MIGRATION_20260417: &str =
+    include_str!("../../db/clickhouse/migrations/20260417_add_logs_virtual_forward_index.sql");
 const RECEIPTS_SCHEMA: &str = include_str!("../../db/clickhouse/receipts.sql");
 
 /// Max rows per ClickHouse INSERT to avoid unbounded memory growth during backfills.
@@ -97,6 +101,18 @@ impl ClickHouseSink {
                 .map_err(|e| anyhow!("Failed to create ClickHouse table {name}: {e}"))?;
             debug!(table = name, database = %self.database, "ClickHouse table ready");
         }
+
+        self.client
+            .query(LOGS_MIGRATION_20260416)
+            .execute()
+            .await
+            .map_err(|e| anyhow!("Failed to run ClickHouse logs migration 20260416: {e}"))?;
+
+        self.client
+            .query(LOGS_MIGRATION_20260417)
+            .execute()
+            .await
+            .map_err(|e| anyhow!("Failed to run ClickHouse logs migration 20260417: {e}"))?;
 
         info!(database = %self.database, "ClickHouse schema ready");
         Ok(())
@@ -419,6 +435,7 @@ struct ChLogWire {
     topic2: Option<String>,
     topic3: Option<String>,
     data: String,
+    is_virtual_forward: u8,
 }
 
 impl ChLogWire {
@@ -440,6 +457,7 @@ impl ChLogWire {
             topic2: log.topic2.as_ref().map(|v| hex_encode(v)),
             topic3: log.topic3.as_ref().map(|v| hex_encode(v)),
             data: hex_encode(&log.data),
+            is_virtual_forward: log.is_virtual_forward as u8,
         }
     }
 }

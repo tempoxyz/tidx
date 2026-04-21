@@ -840,7 +840,7 @@ fn make_tx(block_num: i64, idx: i32) -> TxRow {
         idx,
         hash: {
             let mut h = vec![block_num as u8; 16];
-            h.extend_from_slice(&vec![idx as u8; 16]);
+            h.extend_from_slice(&[idx as u8; 16]);
             h
         },
         tx_type: 2,
@@ -881,6 +881,7 @@ fn make_log(block_num: i64, log_idx: i32) -> LogRow {
         topic2: Some(vec![0x22; 32]),
         topic3: None,
         data: vec![0x00; 32],
+        is_virtual_forward: false,
     }
 }
 
@@ -983,6 +984,27 @@ async fn test_sink_write_logs() {
 
     let count = ch.table_count("logs").await.expect("count failed");
     assert_eq!(count, 12);
+}
+
+#[tokio::test]
+#[serial(clickhouse)]
+async fn test_sink_write_logs_roundtrips_virtual_forward_flag() {
+    let Some((sink, ch)) = setup_sink().await else {
+        return;
+    };
+
+    let mut logs: Vec<LogRow> = (1..=2).map(|b| make_log(b, 0)).collect();
+    logs[1].is_virtual_forward = true;
+    sink.write_logs(&logs).await.expect("write_logs failed");
+
+    let result = ch
+        .query_json("SELECT block_num, is_virtual_forward FROM logs ORDER BY block_num")
+        .await
+        .unwrap();
+    let rows = result["data"].as_array().unwrap();
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0]["is_virtual_forward"].as_u64(), Some(0));
+    assert_eq!(rows[1]["is_virtual_forward"].as_u64(), Some(1));
 }
 
 #[tokio::test]
@@ -1279,6 +1301,7 @@ async fn test_cte_query_against_sink_data() {
         topic2: Some(to_addr),
         topic3: None,
         data: value_data,
+        is_virtual_forward: false,
     };
 
     sink.write_logs(&[log]).await.expect("write_logs failed");
@@ -1340,6 +1363,7 @@ async fn test_predicate_pushdown_against_sink_data() {
             topic2: Some(to_addr.clone()),
             topic3: None,
             data: value_data.clone(),
+            is_virtual_forward: false,
         });
     }
     // 3 logs from addr_b
@@ -1357,6 +1381,7 @@ async fn test_predicate_pushdown_against_sink_data() {
             topic2: Some(to_addr.clone()),
             topic3: None,
             data: value_data.clone(),
+            is_virtual_forward: false,
         });
     }
 
@@ -1529,6 +1554,36 @@ async fn test_backfill_pg_to_empty_clickhouse() {
     assert_eq!(ch.table_count("receipts").await.unwrap(), 20);
 }
 
+#[tokio::test]
+#[serial(clickhouse)]
+async fn test_backfill_pg_to_clickhouse_preserves_virtual_forward_flag() {
+    let Some((pool, sinks, ch)) = setup_backfill().await else {
+        return;
+    };
+
+    let blocks: Vec<BlockRow> = (1..=2).map(make_block).collect();
+    let txs: Vec<TxRow> = (1..=2).map(|b| make_tx(b, 0)).collect();
+    let mut logs: Vec<LogRow> = (1..=2).map(|b| make_log(b, 0)).collect();
+    logs[1].is_virtual_forward = true;
+    let receipts: Vec<ReceiptRow> = (1..=2).map(|b| make_receipt(b, 0)).collect();
+
+    writer::write_blocks(&pool, &blocks).await.unwrap();
+    writer::write_txs(&pool, &txs).await.unwrap();
+    writer::write_logs(&pool, &logs).await.unwrap();
+    writer::write_receipts(&pool, &receipts).await.unwrap();
+
+    sinks.backfill_clickhouse(TEST_CHAIN_ID).await.unwrap();
+
+    let result = ch
+        .query_json("SELECT block_num, is_virtual_forward FROM logs ORDER BY block_num")
+        .await
+        .unwrap();
+    let rows = result["data"].as_array().unwrap();
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0]["is_virtual_forward"].as_u64(), Some(0));
+    assert_eq!(rows[1]["is_virtual_forward"].as_u64(), Some(1));
+}
+
 /// Backfill should resume from the persisted PG cursor.
 #[tokio::test]
 #[serial(clickhouse)]
@@ -1568,8 +1623,8 @@ async fn test_backfill_resumes_from_highwater_mark() {
         .await
         .expect("backfill failed");
 
-    assert_eq!(ch.table_count("blocks").await.unwrap(), 20);
-    assert_eq!(ch.table_count("txs").await.unwrap(), 20);
+    assert_eq!(ch.table_count_final("blocks").await.unwrap(), 20);
+    assert_eq!(ch.table_count_final("txs").await.unwrap(), 20);
 }
 
 /// Backfill should be a no-op when the persisted cursor is already up to date.
@@ -1654,8 +1709,8 @@ async fn test_backfill_per_table_independent_highwater() {
     ch_sink.write_txs(&partial_txs).await.unwrap();
     // logs and receipts: nothing in CH
 
-    assert_eq!(ch.table_count("blocks").await.unwrap(), 10);
-    assert_eq!(ch.table_count("txs").await.unwrap(), 10); // only 5 blocks × 2 txs
+    assert_eq!(ch.table_count_final("blocks").await.unwrap(), 10);
+    assert_eq!(ch.table_count_final("txs").await.unwrap(), 10); // only 5 blocks × 2 txs
     assert_eq!(ch.table_count("logs").await.unwrap(), 0);
     assert_eq!(ch.table_count("receipts").await.unwrap(), 0);
 
@@ -1698,7 +1753,7 @@ async fn test_backfill_multi_batch_pagination() {
         .await
         .expect("backfill failed");
 
-    assert_eq!(ch.table_count("blocks").await.unwrap(), block_count as u64);
+    assert_eq!(ch.table_count_final("blocks").await.unwrap(), block_count as u64);
 
     // Verify first and last blocks roundtripped
     let result = ch

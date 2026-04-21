@@ -1,4 +1,5 @@
 use anyhow::Result;
+use std::collections::BTreeSet;
 use std::pin::Pin;
 use std::time::Instant;
 use tokio_postgres::binary_copy::BinaryCopyInWriter;
@@ -7,6 +8,26 @@ use tokio_postgres::types::Type;
 use crate::db::Pool;
 use crate::metrics;
 use crate::types::{BlockRow, LogRow, ReceiptRow, SyncState, TxRow};
+
+async fn delete_blocks_exact(
+    tx: &tokio_postgres::Transaction<'_>,
+    table: &str,
+    block_nums: &[i64],
+) -> Result<()> {
+    if block_nums.is_empty() {
+        return Ok(());
+    }
+    tx.execute(
+        &format!("DELETE FROM {table} WHERE block_num = ANY($1)"),
+        &[&block_nums],
+    )
+    .await?;
+    Ok(())
+}
+
+fn exact_block_nums(nums: impl Iterator<Item = i64>) -> Vec<i64> {
+    nums.collect::<BTreeSet<_>>().into_iter().collect()
+}
 
 pub async fn write_block(pool: &Pool, block: &BlockRow) -> Result<()> {
     write_blocks(pool, std::slice::from_ref(block)).await
@@ -98,6 +119,10 @@ pub async fn write_txs(pool: &Pool, txs: &[TxRow]) -> Result<()> {
     let start = Instant::now();
     let mut conn = pool.get().await?;
     let tx = conn.transaction().await?;
+
+    let block_nums = exact_block_nums(txs.iter().map(|tx| tx.block_num));
+    delete_blocks_exact(&tx, "txs", &block_nums).await?;
+
     tx.execute(
         "CREATE TEMP TABLE _staging_txs (
             block_num INT8, block_timestamp TIMESTAMPTZ, idx INT4, hash BYTEA,
@@ -202,11 +227,16 @@ pub async fn write_logs(pool: &Pool, logs: &[LogRow]) -> Result<()> {
     let start = Instant::now();
     let mut conn = pool.get().await?;
     let tx = conn.transaction().await?;
+
+    let block_nums = exact_block_nums(logs.iter().map(|log| log.block_num));
+    delete_blocks_exact(&tx, "logs", &block_nums).await?;
+
     tx.execute(
         "CREATE TEMP TABLE _staging_logs (
             block_num INT8, block_timestamp TIMESTAMPTZ, log_idx INT4, tx_idx INT4,
             tx_hash BYTEA, address BYTEA, selector BYTEA, topic0 BYTEA,
-            topic1 BYTEA, topic2 BYTEA, topic3 BYTEA, data BYTEA
+            topic1 BYTEA, topic2 BYTEA, topic3 BYTEA, data BYTEA,
+            is_virtual_forward BOOLEAN
         ) ON COMMIT DROP",
         &[],
     )
@@ -225,11 +255,12 @@ pub async fn write_logs(pool: &Pool, logs: &[LogRow]) -> Result<()> {
         Type::BYTEA,      // topic2
         Type::BYTEA,      // topic3
         Type::BYTEA,      // data
+        Type::BOOL,       // is_virtual_forward
     ];
 
     let sink = tx
         .copy_in(
-            "COPY _staging_logs (block_num, block_timestamp, log_idx, tx_idx, tx_hash, address, selector, topic0, topic1, topic2, topic3, data) FROM STDIN BINARY",
+            "COPY _staging_logs (block_num, block_timestamp, log_idx, tx_idx, tx_hash, address, selector, topic0, topic1, topic2, topic3, data, is_virtual_forward) FROM STDIN BINARY",
         )
         .await?;
 
@@ -252,6 +283,7 @@ pub async fn write_logs(pool: &Pool, logs: &[LogRow]) -> Result<()> {
                 &log.topic2,
                 &log.topic3,
                 &log.data,
+                &log.is_virtual_forward,
             ])
             .await?;
     }
@@ -280,6 +312,10 @@ pub async fn write_receipts(pool: &Pool, receipts: &[ReceiptRow]) -> Result<()> 
     let start = Instant::now();
     let mut conn = pool.get().await?;
     let tx = conn.transaction().await?;
+
+    let block_nums = exact_block_nums(receipts.iter().map(|receipt| receipt.block_num));
+    delete_blocks_exact(&tx, "receipts", &block_nums).await?;
+
     tx.execute(
         "CREATE TEMP TABLE _staging_receipts (
             block_num INT8, block_timestamp TIMESTAMPTZ, tx_idx INT4, tx_hash BYTEA,
@@ -428,6 +464,9 @@ pub async fn write_batch(
 
     // ── txs ───────────────────────────────────────────────────────────────
     if !txs.is_empty() {
+        let block_nums = exact_block_nums(txs.iter().map(|tx| tx.block_num));
+        delete_blocks_exact(&tx, "txs", &block_nums).await?;
+
         tx.execute(
             "CREATE TEMP TABLE _staging_txs (
                 block_num INT8, block_timestamp TIMESTAMPTZ, idx INT4, hash BYTEA,
@@ -515,11 +554,15 @@ pub async fn write_batch(
 
     // ── logs ──────────────────────────────────────────────────────────────
     if !logs.is_empty() {
+        let block_nums = exact_block_nums(logs.iter().map(|log| log.block_num));
+        delete_blocks_exact(&tx, "logs", &block_nums).await?;
+
         tx.execute(
             "CREATE TEMP TABLE _staging_logs (
                 block_num INT8, block_timestamp TIMESTAMPTZ, log_idx INT4, tx_idx INT4,
                 tx_hash BYTEA, address BYTEA, selector BYTEA, topic0 BYTEA,
-                topic1 BYTEA, topic2 BYTEA, topic3 BYTEA, data BYTEA
+                topic1 BYTEA, topic2 BYTEA, topic3 BYTEA, data BYTEA,
+                is_virtual_forward BOOLEAN
             ) ON COMMIT DROP",
             &[],
         )
@@ -538,11 +581,12 @@ pub async fn write_batch(
             Type::BYTEA,       // topic2
             Type::BYTEA,       // topic3
             Type::BYTEA,       // data
+            Type::BOOL,        // is_virtual_forward
         ];
 
         let sink = tx
             .copy_in(
-                "COPY _staging_logs (block_num, block_timestamp, log_idx, tx_idx, tx_hash, address, selector, topic0, topic1, topic2, topic3, data) FROM STDIN BINARY",
+                "COPY _staging_logs (block_num, block_timestamp, log_idx, tx_idx, tx_hash, address, selector, topic0, topic1, topic2, topic3, data, is_virtual_forward) FROM STDIN BINARY",
             )
             .await?;
 
@@ -565,6 +609,7 @@ pub async fn write_batch(
                     &log.topic2,
                     &log.topic3,
                     &log.data,
+                    &log.is_virtual_forward,
                 ])
                 .await?;
         }
@@ -576,6 +621,9 @@ pub async fn write_batch(
 
     // ── receipts ──────────────────────────────────────────────────────────
     if !receipts.is_empty() {
+        let block_nums = exact_block_nums(receipts.iter().map(|receipt| receipt.block_num));
+        delete_blocks_exact(&tx, "receipts", &block_nums).await?;
+
         tx.execute(
             "CREATE TEMP TABLE _staging_receipts (
                 block_num INT8, block_timestamp TIMESTAMPTZ, tx_idx INT4, tx_hash BYTEA,
@@ -853,6 +901,7 @@ pub async fn has_gaps(pool: &Pool, from: u64, to: u64) -> Result<bool> {
 /// `below` bounds the scan to `num <= below`, avoiding a full-table scan.
 pub async fn detect_gaps(pool: &Pool, below: u64) -> Result<Vec<(u64, u64)>> {
     let conn = pool.get().await?;
+    let below = below.min(i64::MAX as u64) as i64;
 
     let rows = conn
         .query(
@@ -866,7 +915,7 @@ pub async fn detect_gaps(pool: &Pool, below: u64) -> Result<Vec<(u64, u64)>> {
             FROM numbered
             WHERE num - prev_num > 1
             "#,
-            &[&(below as i64)],
+            &[&below],
         )
         .await?;
 
@@ -932,7 +981,7 @@ pub async fn detect_all_gaps(pool: &Pool, tip_num: u64) -> Result<Vec<(u64, u64)
     gaps.retain(|(_, end)| *end <= tip_num);
 
     // Sort by end block descending (most recent gaps first)
-    gaps.sort_by(|a, b| b.1.cmp(&a.1));
+    gaps.sort_by_key(|b| std::cmp::Reverse(b.1));
 
     Ok(gaps)
 }

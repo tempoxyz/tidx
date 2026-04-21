@@ -54,6 +54,9 @@ pub struct LogRow {
     pub topic2: Option<Vec<u8>>,
     pub topic3: Option<Vec<u8>>,
     pub data: Vec<u8>,
+    /// TIP-1022: true if this log is the forwarding hop of a virtual address
+    /// Transfer pair (the second Transfer from virtualAddr → master).
+    pub is_virtual_forward: bool,
 }
 
 #[derive(Debug, Clone, Default)]

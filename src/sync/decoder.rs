@@ -44,8 +44,8 @@ pub fn decode_transaction(tx: &Transaction, block: &Block, idx: u32) -> TxRow {
                 tempo_tx.fee_token.map(|a| a.as_slice().to_vec()),
                 serde_json::to_value(&tempo_tx.calls).ok(),
                 tempo_tx.calls.len() as i16,
-                tempo_tx.valid_before.map(|v| v as i64),
-                tempo_tx.valid_after.map(|v| v as i64),
+                tempo_tx.valid_before.map(|v| v.get() as i64),
+                tempo_tx.valid_after.map(|v| v.get() as i64),
                 Some(match aa_signed.signature().signature_type() {
                     SignatureType::Secp256k1 => 0,
                     SignatureType::P256 => 1,
@@ -102,6 +102,7 @@ pub fn decode_log(log: &Log, block_timestamp: DateTime<Utc>) -> LogRow {
         topic2: topics.get(2).map(|t| t.as_slice().to_vec()),
         topic3: topics.get(3).map(|t| t.as_slice().to_vec()),
         data: log.data().data.to_vec(),
+        is_virtual_forward: false,
     }
 }
 
@@ -116,8 +117,25 @@ pub fn enrich_txs_from_receipts(txs: &mut [TxRow], receipts: &[ReceiptRow]) {
     for tx in txs.iter_mut() {
         if let Some(r) = receipt_map.get(&(tx.block_num, tx.idx)) {
             tx.gas_used = Some(r.gas_used);
-            tx.fee_payer = r.fee_payer.clone();
+            tx.fee_payer.clone_from(&r.fee_payer);
         }
+    }
+}
+
+pub fn decode_receipt(receipt: &Receipt, block_timestamp: DateTime<Utc>) -> ReceiptRow {
+    ReceiptRow {
+        block_num: receipt.block_number().unwrap_or(0) as i64,
+        block_timestamp,
+        tx_idx: receipt.transaction_index().unwrap_or(0) as i32,
+        tx_hash: receipt.transaction_hash().as_slice().to_vec(),
+        from: receipt.from().as_slice().to_vec(),
+        to: receipt.to().map(|a| a.as_slice().to_vec()),
+        contract_address: receipt.contract_address().map(|a| a.as_slice().to_vec()),
+        gas_used: receipt.gas_used() as i64,
+        cumulative_gas_used: receipt.cumulative_gas_used() as i64,
+        effective_gas_price: Some(receipt.effective_gas_price().to_string()),
+        status: if receipt.status() { Some(1) } else { Some(0) },
+        fee_payer: Some(receipt.fee_payer.as_slice().to_vec()),
     }
 }
 
@@ -207,22 +225,5 @@ mod tests {
         assert_eq!(txs[1].fee_payer, None);
         assert_eq!(txs[2].gas_used, Some(63000));
         assert_eq!(txs[2].fee_payer, Some(vec![0x02; 20]));
-    }
-}
-
-pub fn decode_receipt(receipt: &Receipt, block_timestamp: DateTime<Utc>) -> ReceiptRow {
-    ReceiptRow {
-        block_num: receipt.block_number().unwrap_or(0) as i64,
-        block_timestamp,
-        tx_idx: receipt.transaction_index().unwrap_or(0) as i32,
-        tx_hash: receipt.transaction_hash().as_slice().to_vec(),
-        from: receipt.from().as_slice().to_vec(),
-        to: receipt.to().map(|a| a.as_slice().to_vec()),
-        contract_address: receipt.contract_address().map(|a| a.as_slice().to_vec()),
-        gas_used: receipt.gas_used() as i64,
-        cumulative_gas_used: receipt.cumulative_gas_used() as i64,
-        effective_gas_price: Some(receipt.effective_gas_price().to_string()),
-        status: if receipt.status() { Some(1) } else { Some(0) },
-        fee_payer: Some(receipt.fee_payer.as_slice().to_vec()),
     }
 }
