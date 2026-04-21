@@ -1,5 +1,11 @@
 # Changelog
 
+## `tidx@0.5.3`
+
+### Patch Changes
+
+- Fixed a migration ordering issue. (by @o-az, [#172](https://github.com/tempoxyz/tidx/pull/172))
+
 ## `tidx@0.5.2`
 
 ### Patch Changes
