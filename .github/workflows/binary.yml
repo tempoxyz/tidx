@@ -66,6 +66,7 @@ jobs:
         with:
           path: artifacts
           merge-multiple: true
+          pattern: tidx-*
       - uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ inputs.tag || github.ref_name }}
