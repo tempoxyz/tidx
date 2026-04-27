@@ -14,6 +14,7 @@ const RAW_PUSHDOWN_COLUMNS: &[&str] = &[
     "tx_hash",
     "log_idx",
     "tx_idx",
+    "is_virtual_forward",
 ];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -116,7 +117,7 @@ impl EventSignature {
 
         format!(
             r#"{name} AS (
-    SELECT block_num, block_timestamp, log_idx, tx_idx, tx_hash, address, selector, topic1, topic2, topic3, data{select_clause}
+    SELECT block_num, block_timestamp, log_idx, tx_idx, tx_hash, address, selector, topic1, topic2, topic3, data, is_virtual_forward{select_clause}
     FROM logs
     WHERE selector = '\x{topic0}'{extra_where}
 )"#,
@@ -172,7 +173,7 @@ impl EventSignature {
             r#"{name} AS (
     SELECT block_num, block_timestamp, log_idx, tx_idx, 
            {tx_hash_col},
-           {address_col}, selector, topic1, topic2, topic3, data{select_clause}
+           {address_col}, selector, topic1, topic2, topic3, data, is_virtual_forward{select_clause}
     FROM logs
     WHERE selector = '0x{topic0}'{extra_where}
 )"#,
@@ -694,6 +695,7 @@ fn expr_to_sql_literal(expr: &Expr) -> Option<String> {
         Expr::Value(v) => match &v.value {
             Value::SingleQuotedString(s) => Some(format!("'{s}'")),
             Value::Number(n, _) => Some(n.clone()),
+            Value::Boolean(b) => Some(b.to_string()),
             _ => None,
         },
         _ => None,
@@ -1451,6 +1453,15 @@ mod tests {
         );
         // "from" is not a raw column, should not be extracted
         assert!(!preds.iter().any(|p| p.contains("from")));
+        assert!(preds.contains(&"block_num > 50".to_string()));
+    }
+
+    #[test]
+    fn test_extract_raw_predicates_virtual_forward() {
+        let preds = extract_raw_column_predicates(
+            "SELECT * FROM Transfer WHERE is_virtual_forward = false AND block_num > 50",
+        );
+        assert!(preds.contains(&"is_virtual_forward = false".to_string()));
         assert!(preds.contains(&"block_num > 50".to_string()));
     }
 
