@@ -231,7 +231,7 @@ tidx query \
 
 ### Available decoded columns
 
-Each CTE always includes these raw columns: `block_num`, `block_timestamp`, `log_idx`, `tx_idx`, `tx_hash`, `address`, `selector`, `topic1`, `topic2`, `topic3`, `data`.
+Each CTE always includes these raw columns: `block_num`, `block_timestamp`, `log_idx`, `tx_idx`, `tx_hash`, `address`, `selector`, `topic1`, `topic2`, `topic3`, `data`, `is_virtual_forward`.
 
 Plus decoded columns from the signature params (e.g., `"from"`, `"to"`, `"value"` for Transfer).
 
