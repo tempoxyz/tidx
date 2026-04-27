@@ -1,0 +1,14 @@
+{
+  "operations": [
+    {
+      "add_column": {
+        "table": "logs",
+        "column": {
+          "name": "is_virtual_forward",
+          "type": "boolean",
+          "default": "false"
+        }
+      }
+    }
+  ]
+}

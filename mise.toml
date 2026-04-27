@@ -1,0 +1,21 @@
+[tools]
+usql = "latest"
+just = "latest"
+shfmt = "latest"
+tombi = "latest"
+hadolint = "latest"
+shellcheck = "latest"
+actionlint = "latest"
+"pipx:sqlfluff" = "latest"
+"github:foundry-rs/foundry" = "nightly"
+"github:tempoxyz/changelogs" = "latest"
+"github:xataio/pgroll" = { version = "latest", bin = "pgroll" }
+
+[shell_alias]
+psql = "usql"
+
+[env]
+FOUNDRY_DISABLE_NIGHTLY_WARNING = 1
+
+[settings]
+pipx.uvx = true

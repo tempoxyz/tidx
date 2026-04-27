@@ -17,9 +17,15 @@ pub async fn create_pool_with_size(database_url: &str, max_size: usize) -> Resul
     // prevent runaway queries. Sync/backfill writers SET statement_timeout = 0
     // per-connection for their large COPY/DELETE batches.
     let url_with_timeout = if database_url.contains('?') {
-        format!("{}&options=-c%20idle_in_transaction_session_timeout%3D60000", database_url)
+        format!(
+            "{}&options=-c%20idle_in_transaction_session_timeout%3D60000%20-c%20pgroll.no_inferred_migrations%3DTRUE",
+            database_url
+        )
     } else {
-        format!("{}?options=-c%20idle_in_transaction_session_timeout%3D60000", database_url)
+        format!(
+            "{}?options=-c%20idle_in_transaction_session_timeout%3D60000%20-c%20pgroll.no_inferred_migrations%3DTRUE",
+            database_url
+        )
     };
 
     let mut config = Config::new();

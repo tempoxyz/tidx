@@ -1,4 +1,5 @@
-.PHONY: help up down logs seed build check test bench bench-gen bench-open clean compose-up compose-down compose-logs
+.PHONY: help up down logs seed build check test bench bench-gen bench-open clean compose-up compose-down compose-logs \
+	pgroll-init pgroll-bootstrap pgroll-baseline pgroll-migrate pgroll-start pgroll-complete pgroll-rollback pgroll-status pgroll-validate
 
 .DEFAULT_GOAL := help
 
@@ -17,6 +18,12 @@ FORK_COMPOSE := docker compose -f compose.yml
 # Default seed parameters
 DURATION ?= 30
 TPS ?= 100
+
+# pgroll
+PGROLL_BIN ?= pgroll
+PGROLL_BASELINE_VERSION ?= 20260415_prod_baseline
+PGROLL_MIGRATIONS_DIR ?= db/pgroll
+PGROLL_BOOTSTRAP_OUT_DIR ?= /tmp/pgroll-baseline
 
 # ============================================================================
 # Environment
@@ -82,6 +89,50 @@ seed-heavy:
 		--tip20-weight 3 \
 		--erc20-weight 2 \
 		--swap-weight 2
+
+# ============================================================================
+# pgroll
+# ============================================================================
+
+pgroll-init:
+	@test -n "$(POSTGRES_URL)" || (echo "POSTGRES_URL is required" && exit 1)
+	@$(PGROLL_BIN) init --postgres-url '$(POSTGRES_URL)'
+
+pgroll-bootstrap:
+	@test -n "$(POSTGRES_URL)" || (echo "POSTGRES_URL is required" && exit 1)
+	@mkdir -p $(PGROLL_BOOTSTRAP_OUT_DIR)
+	@$(PGROLL_BIN) init --postgres-url '$(POSTGRES_URL)'
+	@$(PGROLL_BIN) baseline $(PGROLL_BASELINE_VERSION) $(PGROLL_BOOTSTRAP_OUT_DIR) --yes --json --postgres-url '$(POSTGRES_URL)'
+
+pgroll-baseline:
+	@test -n "$(POSTGRES_URL)" || (echo "POSTGRES_URL is required" && exit 1)
+	@mkdir -p $(PGROLL_MIGRATIONS_DIR)
+	@$(PGROLL_BIN) baseline $(PGROLL_BASELINE_VERSION) $(PGROLL_MIGRATIONS_DIR) --yes --json --postgres-url '$(POSTGRES_URL)'
+
+pgroll-migrate:
+	@test -n "$(POSTGRES_URL)" || (echo "POSTGRES_URL is required" && exit 1)
+	@$(PGROLL_BIN) migrate $(PGROLL_MIGRATIONS_DIR) --complete --postgres-url '$(POSTGRES_URL)'
+
+pgroll-start:
+	@test -n "$(POSTGRES_URL)" || (echo "POSTGRES_URL is required" && exit 1)
+	@test -n "$(MIGRATION)" || (echo "MIGRATION is required" && exit 1)
+	@$(PGROLL_BIN) --postgres-url '$(POSTGRES_URL)' start $(MIGRATION)
+
+pgroll-complete:
+	@test -n "$(POSTGRES_URL)" || (echo "POSTGRES_URL is required" && exit 1)
+	@$(PGROLL_BIN) --postgres-url '$(POSTGRES_URL)' complete
+
+pgroll-rollback:
+	@test -n "$(POSTGRES_URL)" || (echo "POSTGRES_URL is required" && exit 1)
+	@$(PGROLL_BIN) --postgres-url '$(POSTGRES_URL)' rollback
+
+pgroll-status:
+	@test -n "$(POSTGRES_URL)" || (echo "POSTGRES_URL is required" && exit 1)
+	@$(PGROLL_BIN) status --postgres-url '$(POSTGRES_URL)'
+
+pgroll-validate:
+	@test -n "$(MIGRATION)" || (echo "MIGRATION is required" && exit 1)
+	@$(PGROLL_BIN) validate $(MIGRATION)
 
 # ============================================================================
 # Build & Test

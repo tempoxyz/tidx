@@ -52,9 +52,55 @@ services:
       retries: 10
     restart: unless-stopped
 
+  pgroll-bootstrap:
+    profiles:
+      - migrations
+    platform: linux/amd64
+    image: ghcr.io/tempoxyz/tidx:${TIDX_IMAGE_TAG:-latest}
+    environment:
+      PGROLL_POSTGRES_URLS: ${PGROLL_POSTGRES_URLS:-postgres://tidx:${POSTGRES_PASSWORD:-tidx}@postgres:5432/tidx_moderato?sslmode=disable postgres://tidx:${POSTGRES_PASSWORD:-tidx}@postgres:5432/tidx_mainnet?sslmode=disable}
+      PGROLL_BASELINE_VERSION: ${PGROLL_BASELINE_VERSION:-20260415_prod_baseline}
+    entrypoint: ["sh", "-ec"]
+    command:
+      - |
+        for postgres_url in $${PGROLL_POSTGRES_URLS}; do
+          echo "Bootstrapping pgroll for $${postgres_url}"
+          tidx pgroll init --postgres-url "$${postgres_url}"
+          mkdir -p "/tmp/pgroll-baseline/$$(basename "$${postgres_url%%\?*}")"
+          tidx pgroll baseline "$${PGROLL_BASELINE_VERSION}" "/tmp/pgroll-baseline/$$(basename "$${postgres_url%%\?*}")" --yes --json --postgres-url "$${postgres_url}"
+        done
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  pgroll-migrate:
+    profiles:
+      - migrations
+    platform: linux/amd64
+    image: ghcr.io/tempoxyz/tidx:${TIDX_IMAGE_TAG:-latest}
+    environment:
+      PGROLL_POSTGRES_URLS: ${PGROLL_POSTGRES_URLS:-postgres://tidx:${POSTGRES_PASSWORD:-tidx}@postgres:5432/tidx_moderato?sslmode=disable postgres://tidx:${POSTGRES_PASSWORD:-tidx}@postgres:5432/tidx_mainnet?sslmode=disable}
+    entrypoint: ["sh", "-ec"]
+    command:
+      - |
+        for postgres_url in $${PGROLL_POSTGRES_URLS}; do
+          echo "Running pgroll migrations for $${postgres_url}"
+          tidx pgroll init --postgres-url "$${postgres_url}" || true
+          tidx pgroll migrate /db/pgroll --complete --postgres-url "$${postgres_url}"
+          status="$$(tidx pgroll status --postgres-url "$${postgres_url}")"
+          if ! echo "$${status}" | grep -q '"version": "20260417_add_logs_virtual_forward_indexes"'; then
+            echo "pgroll migration did not reach expected version for $${postgres_url}:" >&2
+            echo "$${status}" >&2
+            exit 1
+          fi
+        done
+    depends_on:
+      postgres:
+        condition: service_healthy
+
   tidx:
     platform: linux/amd64
-    image: ghcr.io/tempoxyz/tidx:latest
+    image: ghcr.io/tempoxyz/tidx:${TIDX_IMAGE_TAG:-latest}
     command:
       - up
       - --config

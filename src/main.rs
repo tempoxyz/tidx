@@ -29,6 +29,7 @@ async fn main() -> Result<()> {
         Commands::Up(args) => cli::up::run(args).await,
         Commands::Status(args) => cli::status::run(args).await,
         Commands::Query(args) => cli::query::run(args).await,
+        Commands::Pgroll(args) => cli::pgroll::run(args),
         Commands::Views(args) => cli::views::run(args).await,
         Commands::BackfillReceiptData(args) => cli::backfill_receipt_data::run(args).await,
         Commands::Upgrade => cli::upgrade::run(),
