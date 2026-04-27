@@ -1,5 +1,11 @@
 # Changelog
 
+## `tidx@0.5.4`
+
+### Patch Changes
+
+- Added pgroll support to the tidx binary and Docker image, including bundled (by @o-az, [#175](https://github.com/tempoxyz/tidx/pull/175))
+
 ## `tidx@0.5.3`
 
 ### Patch Changes
