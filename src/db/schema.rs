@@ -3,6 +3,12 @@ use tracing::{info, warn};
 
 use super::Pool;
 
+const VIRTUAL_FORWARD_INDEX_SQL: &str =
+    include_str!("../../db/migrations/20260417_add_logs_virtual_forward_indexes.sql");
+const VIRTUAL_FORWARD_TX_HASH_INDEX_SQL: &str = "CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_logs_tx_hash_virtual_forward \
+ON logs (tx_hash, log_idx) \
+WHERE is_virtual_forward = TRUE;";
+
 pub async fn run_migrations(pool: &Pool) -> Result<()> {
     let conn = pool.get().await?;
 
@@ -41,19 +47,29 @@ pub async fn run_migrations(pool: &Pool) -> Result<()> {
     conn.batch_execute(include_str!("../../db/functions.sql"))
         .await?;
 
-    // Apply additive upgrades for existing deployments whose tables were
-    // created before newer columns were introduced.
+    // Apply lightweight additive upgrades for existing deployments whose
+    // tables were created before newer columns were introduced.
     conn.batch_execute(include_str!(
         "../../db/migrations/20260416_add_is_virtual_forward.sql"
     ))
     .await?;
-    conn.batch_execute(include_str!(
-        "../../db/migrations/20260417_add_logs_virtual_forward_indexes.sql"
-    ))
-    .await?;
+
+    // Heavyweight upgrades such as concurrent index creation run in a
+    // best-effort post-startup task so normal boot isn't blocked. Production
+    // should still apply them in a pre-deploy migration flow.
 
     // Load any optional extensions
     conn.batch_execute(include_str!("../../db/extensions.sql"))
+        .await?;
+
+    Ok(())
+}
+
+pub async fn run_post_startup_migrations(pool: &Pool) -> Result<()> {
+    let conn = pool.get().await?;
+
+    conn.batch_execute(VIRTUAL_FORWARD_INDEX_SQL).await?;
+    conn.batch_execute(VIRTUAL_FORWARD_TX_HASH_INDEX_SQL)
         .await?;
 
     Ok(())

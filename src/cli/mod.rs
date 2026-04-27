@@ -1,5 +1,6 @@
 pub mod backfill_receipt_data;
 pub mod init;
+pub mod pgroll;
 pub mod query;
 pub mod status;
 pub mod up;
@@ -27,6 +28,8 @@ pub enum Commands {
     Status(status::Args),
     /// Run a SQL query (use --signature to decode event logs)
     Query(query::Args),
+    /// Run pgroll with arguments passed through
+    Pgroll(pgroll::Args),
     /// Manage ClickHouse materialized views
     Views(views::Args),
     /// Backfill txs.gas_used and txs.fee_payer from receipts

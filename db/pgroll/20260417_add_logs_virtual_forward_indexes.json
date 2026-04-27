@@ -1,0 +1,35 @@
+{
+  "operations": [
+    {
+      "create_index": {
+        "name": "idx_logs_virtual_forward",
+        "table": "logs",
+        "columns": [
+          {
+            "column": "block_num",
+            "sort": "DESC"
+          },
+          {
+            "column": "log_idx"
+          }
+        ],
+        "predicate": "is_virtual_forward = true"
+      }
+    },
+    {
+      "create_index": {
+        "name": "idx_logs_tx_hash_virtual_forward",
+        "table": "logs",
+        "columns": [
+          {
+            "column": "tx_hash"
+          },
+          {
+            "column": "log_idx"
+          }
+        ],
+        "predicate": "is_virtual_forward = true"
+      }
+    }
+  ]
+}

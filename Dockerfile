@@ -24,11 +24,24 @@ RUN cargo build --release
 
 FROM ubuntu:24.04
 
+ARG TARGETARCH
+ARG PGROLL_VERSION=v0.16.1
+
 RUN apt-get update --yes \
     && apt-get install --yes --no-install-recommends \
     ca-certificates \
+    curl \
     libssl3 \
     libstdc++6 \
+    && case "${TARGETARCH}" in \
+    amd64|arm64) pgroll_arch="${TARGETARCH}" ;; \
+    *) echo "unsupported pgroll architecture: ${TARGETARCH}" >&2; exit 1 ;; \
+    esac \
+    && curl --fail --location --show-error \
+    --output /usr/local/bin/pgroll \
+    "https://github.com/xataio/pgroll/releases/download/${PGROLL_VERSION}/pgroll.linux.${pgroll_arch}" \
+    && chmod +x /usr/local/bin/pgroll \
+    && apt-get purge --yes --auto-remove curl \
     && apt-get clean --yes \
     && rm -rf /var/lib/apt/lists/*
 

@@ -238,6 +238,36 @@ async fn initialize_chain(
     info!(chain = %chain.name, "Running migrations...");
     db::run_migrations(&throttled_pool.pool).await?;
 
+    {
+        let pool = throttled_pool.pool.clone();
+        let chain_name = chain.name.clone();
+        tokio::spawn(async move {
+            // Transitional compatibility fallback:
+            //
+            // PostgreSQL index creation for `logs.is_virtual_forward` is moving
+            // to a pre-deploy pgroll flow so migration failures block rollout
+            // without breaking the currently running indexer. However, the repo
+            // still has startup paths that only call `run_migrations()`.
+            // Without this fallback, those paths could upgrade successfully but
+            // silently miss the new indexes.
+            //
+            // This task keeps the app-side safety net by attempting the index
+            // migration after startup, in the background, so boot is not held
+            // hostage by concurrent index creation.
+            //
+            // Remove this once pgroll pre-deploy migrations are the universal
+            // and enforced path for all real startup/deploy flows.
+            match db::run_post_startup_migrations(&pool).await {
+                Ok(()) => info!(chain = %chain_name, "Post-startup migrations complete"),
+                Err(e) => warn!(
+                    error = %e,
+                    chain = %chain_name,
+                    "Post-startup migrations failed; pre-deploy pgroll migration is still recommended"
+                ),
+            }
+        });
+    }
+
     // Seed in-memory watermarks and row counts from existing DB data
     // so that status display is accurate immediately after restart.
     seed_metrics_from_db(&throttled_pool.pool).await;
