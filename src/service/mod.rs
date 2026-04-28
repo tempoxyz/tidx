@@ -65,11 +65,9 @@ pub async fn get_all_status(pool: &Pool) -> Result<Vec<SyncStatus>> {
         )
         .await?;
 
-    // Detect actual gaps in the blocks table (bounded by max tip_num)
-    let max_tip: u64 = rows.iter().map(|r| r.get::<_, i64>(3) as u64).max().unwrap_or(0);
-    let gaps = crate::sync::writer::detect_gaps(pool, max_tip).await.unwrap_or_default();
-    let gaps_i64: Vec<(i64, i64)> = gaps.iter().map(|(s, e)| (*s as i64, *e as i64)).collect();
-
+    // Keep /status cheap and reliable: do not run gap detection here.
+    // Exact gap discovery uses a window scan over blocks and belongs in the
+    // background gap-fill loop, not on the HTTP request path.
     Ok(rows
         .iter()
         .map(|row| {
@@ -108,7 +106,7 @@ pub async fn get_all_status(pool: &Pool) -> Result<Vec<SyncStatus>> {
                 tip_num,
                 lag: row.get::<_, i64>(1) - tip_num, // lag from head to tip (realtime)
                 gap_blocks,
-                gaps: gaps_i64.clone(),
+                gaps: Vec::new(),
                 backfill_num,
                 backfill_remaining,
                 sync_rate,
