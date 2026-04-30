@@ -16,6 +16,7 @@ fn generate_blocks(count: usize) -> Vec<BlockRow> {
             gas_used: 15_000_000,
             miner: vec![0u8; 20],
             extra_data: Some(vec![0u8; 32]),
+            consensus_proposer: None,
         })
         .collect()
 }
