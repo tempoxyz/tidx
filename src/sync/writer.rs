@@ -95,16 +95,8 @@ pub async fn write_blocks(pool: &Pool, blocks: &[BlockRow]) -> Result<()> {
 
     pinned_writer.as_mut().finish().await?;
 
-    // Use DO UPDATE for `consensus_proposer` so post-T4 blocks indexed by an
-    // older tidx version (which stored NULL) self-heal to the populated value
-    // on any later reinsert (reorg, refetch). All other columns stay
-    // immutable: the WHERE clause makes this a no-op once `consensus_proposer`
-    // is set, preserving existing reorg-idempotent semantics.
     tx.execute(
-        "INSERT INTO blocks SELECT * FROM _staging_blocks \
-         ON CONFLICT (timestamp, num) DO UPDATE \
-         SET consensus_proposer = EXCLUDED.consensus_proposer \
-         WHERE blocks.consensus_proposer IS NULL AND EXCLUDED.consensus_proposer IS NOT NULL",
+        "INSERT INTO blocks SELECT * FROM _staging_blocks ON CONFLICT (timestamp, num) DO NOTHING",
         &[],
     )
     .await?;
@@ -480,12 +472,8 @@ pub async fn write_batch(
 
         pinned_writer.as_mut().finish().await?;
 
-        // See `write_blocks` for rationale; keep both paths in lockstep.
         tx.execute(
-            "INSERT INTO blocks SELECT * FROM _staging_blocks \
-             ON CONFLICT (timestamp, num) DO UPDATE \
-             SET consensus_proposer = EXCLUDED.consensus_proposer \
-             WHERE blocks.consensus_proposer IS NULL AND EXCLUDED.consensus_proposer IS NOT NULL",
+            "INSERT INTO blocks SELECT * FROM _staging_blocks ON CONFLICT (timestamp, num) DO NOTHING",
             &[],
         )
         .await?;

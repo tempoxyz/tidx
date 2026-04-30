@@ -35,11 +35,6 @@ postgres-types = { version = "0.2", features = ["derive"] }
 # Ethereum/Tempo primitives
 alloy = { version = "2", features = ["full"] }
 tempo-alloy = { git = "https://github.com/tempoxyz/tempo", default-features = false }
-# `default-features = false` avoids tempo-primitives' default `reth`/`std`
-# features, which transitively pull `revm` -> `c-kzg 2.1.7` and conflict with
-# the `c-kzg 2.1.5` locked by `alloy-consensus 2.0`. We only need `serde` for
-# `TempoConsensusContext` deserialization; `std` is satisfied transitively
-# through tempo-alloy's dependency on tempo-primitives with `serde`+`rpc`.
 tempo-primitives = { git = "https://github.com/tempoxyz/tempo", package = "tempo-primitives", default-features = false, features = ["serde"] }
 
 # URL parsing
@@ -165,4 +160,3 @@ needless_range_loop = "allow"
 format_push_string = "allow"
 unnecessary_cast = "allow"
 cast_lossless = "allow"
-
