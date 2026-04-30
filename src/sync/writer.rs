@@ -46,7 +46,8 @@ pub async fn write_blocks(pool: &Pool, blocks: &[BlockRow]) -> Result<()> {
     tx.execute(
         "CREATE TEMP TABLE _staging_blocks (
             num INT8, hash BYTEA, parent_hash BYTEA, timestamp TIMESTAMPTZ,
-            timestamp_ms INT8, gas_limit INT8, gas_used INT8, miner BYTEA, extra_data BYTEA
+            timestamp_ms INT8, gas_limit INT8, gas_used INT8, miner BYTEA, extra_data BYTEA,
+            consensus_proposer BYTEA
         ) ON COMMIT DROP",
         &[],
     )
@@ -62,11 +63,12 @@ pub async fn write_blocks(pool: &Pool, blocks: &[BlockRow]) -> Result<()> {
         Type::INT8,        // gas_used
         Type::BYTEA,       // miner
         Type::BYTEA,       // extra_data
+        Type::BYTEA,       // consensus_proposer
     ];
 
     let sink = tx
         .copy_in(
-            "COPY _staging_blocks (num, hash, parent_hash, timestamp, timestamp_ms, gas_limit, gas_used, miner, extra_data) FROM STDIN BINARY",
+            "COPY _staging_blocks (num, hash, parent_hash, timestamp, timestamp_ms, gas_limit, gas_used, miner, extra_data, consensus_proposer) FROM STDIN BINARY",
         )
         .await?;
 
@@ -86,14 +88,23 @@ pub async fn write_blocks(pool: &Pool, blocks: &[BlockRow]) -> Result<()> {
                 &block.gas_used,
                 &block.miner,
                 &block.extra_data as &(dyn tokio_postgres::types::ToSql + Sync),
+                &block.consensus_proposer as &(dyn tokio_postgres::types::ToSql + Sync),
             ])
             .await?;
     }
 
     pinned_writer.as_mut().finish().await?;
 
+    // Use DO UPDATE for `consensus_proposer` so post-T4 blocks indexed by an
+    // older tidx version (which stored NULL) self-heal to the populated value
+    // on any later reinsert (reorg, refetch). All other columns stay
+    // immutable: the WHERE clause makes this a no-op once `consensus_proposer`
+    // is set, preserving existing reorg-idempotent semantics.
     tx.execute(
-        "INSERT INTO blocks SELECT * FROM _staging_blocks ON CONFLICT (timestamp, num) DO NOTHING",
+        "INSERT INTO blocks SELECT * FROM _staging_blocks \
+         ON CONFLICT (timestamp, num) DO UPDATE \
+         SET consensus_proposer = EXCLUDED.consensus_proposer \
+         WHERE blocks.consensus_proposer IS NULL AND EXCLUDED.consensus_proposer IS NOT NULL",
         &[],
     )
     .await?;
@@ -420,7 +431,8 @@ pub async fn write_batch(
         tx.execute(
             "CREATE TEMP TABLE _staging_blocks (
                 num INT8, hash BYTEA, parent_hash BYTEA, timestamp TIMESTAMPTZ,
-                timestamp_ms INT8, gas_limit INT8, gas_used INT8, miner BYTEA, extra_data BYTEA
+                timestamp_ms INT8, gas_limit INT8, gas_used INT8, miner BYTEA, extra_data BYTEA,
+                consensus_proposer BYTEA
             ) ON COMMIT DROP",
             &[],
         )
@@ -436,11 +448,12 @@ pub async fn write_batch(
             Type::INT8,        // gas_used
             Type::BYTEA,       // miner
             Type::BYTEA,       // extra_data
+            Type::BYTEA,       // consensus_proposer
         ];
 
         let sink = tx
             .copy_in(
-                "COPY _staging_blocks (num, hash, parent_hash, timestamp, timestamp_ms, gas_limit, gas_used, miner, extra_data) FROM STDIN BINARY",
+                "COPY _staging_blocks (num, hash, parent_hash, timestamp, timestamp_ms, gas_limit, gas_used, miner, extra_data, consensus_proposer) FROM STDIN BINARY",
             )
             .await?;
 
@@ -460,14 +473,19 @@ pub async fn write_batch(
                     &block.gas_used,
                     &block.miner,
                     &block.extra_data as &(dyn tokio_postgres::types::ToSql + Sync),
+                    &block.consensus_proposer as &(dyn tokio_postgres::types::ToSql + Sync),
                 ])
                 .await?;
         }
 
         pinned_writer.as_mut().finish().await?;
 
+        // See `write_blocks` for rationale; keep both paths in lockstep.
         tx.execute(
-            "INSERT INTO blocks SELECT * FROM _staging_blocks ON CONFLICT (timestamp, num) DO NOTHING",
+            "INSERT INTO blocks SELECT * FROM _staging_blocks \
+             ON CONFLICT (timestamp, num) DO UPDATE \
+             SET consensus_proposer = EXCLUDED.consensus_proposer \
+             WHERE blocks.consensus_proposer IS NULL AND EXCLUDED.consensus_proposer IS NOT NULL",
             &[],
         )
         .await?;

@@ -1,3 +1,4 @@
+use alloy::consensus::BlockHeader as _;
 use alloy::network::ReceiptResponse;
 use anyhow::Result;
 use std::collections::HashMap;
@@ -409,14 +410,14 @@ impl SyncEngine {
                 for block in &blocks {
                     broadcaster.send(BlockUpdate {
                         chain_id: self.chain_id,
-                        block_num: block.header.number,
+                        block_num: block.header.number(),
                         block_hash: format!("0x{}", hex::encode(block.header.hash)),
                         tx_count: block.transactions.len() as u64,
                         log_count: logs_per_block
-                            .get(&(block.header.number as i64))
+                            .get(&(block.header.number() as i64))
                             .copied()
                             .unwrap_or(0),
-                        timestamp: block.header.timestamp as i64,
+                        timestamp: block.header.timestamp() as i64,
                     });
                 }
             }
@@ -446,7 +447,7 @@ impl SyncEngine {
         }
 
         let first_block = &blocks[0];
-        let first_num = first_block.header.number;
+        let first_num = first_block.header.number();
 
         // Check parent hash against stored block (if not genesis)
         if first_num > 0
@@ -455,7 +456,7 @@ impl SyncEngine {
             let expected_parent: [u8; 32] = stored_hash
                 .try_into()
                 .map_err(|_| anyhow::anyhow!("Invalid stored hash length"))?;
-            if first_block.header.parent_hash.0 != expected_parent {
+            if first_block.header.parent_hash().0 != expected_parent {
                 // Reorg detected - handle it automatically
                 return self.handle_reorg(first_num).await;
             }
@@ -463,11 +464,11 @@ impl SyncEngine {
 
         // Validate internal chain continuity
         for window in blocks.windows(2) {
-            if window[1].header.parent_hash != window[0].header.hash {
+            if window[1].header.parent_hash() != window[0].header.hash {
                 return Err(anyhow::anyhow!(
                     "Internal chain break at block {}: parent_hash {:?} != prev hash {:?}",
-                    window[1].header.number,
-                    hex::encode(window[1].header.parent_hash.0),
+                    window[1].header.number(),
+                    hex::encode(window[1].header.parent_hash().0),
                     hex::encode(window[0].header.hash.0)
                 ));
             }
@@ -561,7 +562,7 @@ impl SyncEngine {
 
         let block_timestamps: HashMap<u64, _> = blocks
             .iter()
-            .map(|b| (b.header.number, timestamp_from_secs(b.header.timestamp)))
+            .map(|b| (b.header.number(), timestamp_from_secs(b.header.timestamp())))
             .collect();
 
         let block_rows: Vec<_> = blocks.iter().map(decode_block).collect();
@@ -636,7 +637,7 @@ impl SyncEngine {
         )?;
 
         let block_row = decode_block(&block);
-        let block_ts = timestamp_from_secs(block.header.timestamp);
+        let block_ts = timestamp_from_secs(block.header.timestamp());
         let mut txs: Vec<_> = block
             .transactions
             .txns()
@@ -1356,7 +1357,7 @@ async fn sync_range_standalone(sinks: &SinkSet, rpc: &RpcClient, from: u64, to: 
 
     let block_timestamps: HashMap<u64, _> = blocks
         .iter()
-        .map(|b| (b.header.number, timestamp_from_secs(b.header.timestamp)))
+        .map(|b| (b.header.number(), timestamp_from_secs(b.header.timestamp())))
         .collect();
 
     let block_rows: Vec<_> = blocks.iter().map(decode_block).collect();

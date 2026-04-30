@@ -1,11 +1,21 @@
 use alloy::consensus::transaction::Recovered;
-use alloy::consensus::{Transaction as TransactionTrait, Typed2718};
+use alloy::consensus::{BlockHeader as _, Transaction as TransactionTrait, Typed2718};
 use alloy::network::{ReceiptResponse, TransactionResponse};
+use alloy::primitives::B256;
 use chrono::{DateTime, TimeZone, Utc};
 use tempo_alloy::primitives::transaction::SignatureType;
 
 use crate::tempo::{Block, Log, Receipt, TempoTxEnvelope, Transaction};
 use crate::types::{BlockRow, LogRow, ReceiptRow, TxRow};
+
+use tempo_primitives::TempoConsensusContext;
+
+/// TIP-1031: extract the 32-byte ed25519 proposer pubkey from an optional
+/// consensus context. Returns `None` for pre-fork blocks where the header
+/// carries no consensus context.
+fn extract_consensus_proposer(ctx: Option<&TempoConsensusContext>) -> Option<Vec<u8>> {
+    ctx.map(|c| B256::from(&c.proposer).0.to_vec())
+}
 
 pub fn timestamp_from_secs(secs: u64) -> DateTime<Utc> {
     Utc.timestamp_opt(secs as i64, 0)
@@ -14,25 +24,30 @@ pub fn timestamp_from_secs(secs: u64) -> DateTime<Utc> {
 }
 
 pub fn decode_block(block: &Block) -> BlockRow {
-    let timestamp_secs = block.header.timestamp;
+    let header = &block.header;
+    let timestamp_secs = header.timestamp();
     let timestamp = timestamp_from_secs(timestamp_secs);
     let timestamp_ms = (timestamp_secs * 1000) as i64;
 
+    let consensus_proposer = extract_consensus_proposer(header.consensus_context.as_ref());
+    crate::metrics::record_block_consensus_context(consensus_proposer.is_some());
+
     BlockRow {
-        num: block.header.number as i64,
-        hash: block.header.hash.as_slice().to_vec(),
-        parent_hash: block.header.parent_hash.as_slice().to_vec(),
+        num: header.number() as i64,
+        hash: header.hash.as_slice().to_vec(),
+        parent_hash: header.parent_hash().as_slice().to_vec(),
         timestamp,
         timestamp_ms,
-        gas_limit: block.header.gas_limit as i64,
-        gas_used: block.header.gas_used as i64,
-        miner: block.header.beneficiary.as_slice().to_vec(),
-        extra_data: Some(block.header.extra_data.to_vec()),
+        gas_limit: header.gas_limit() as i64,
+        gas_used: header.gas_used() as i64,
+        miner: header.beneficiary().as_slice().to_vec(),
+        extra_data: Some(header.extra_data().to_vec()),
+        consensus_proposer,
     }
 }
 
 pub fn decode_transaction(tx: &Transaction, block: &Block, idx: u32) -> TxRow {
-    let block_timestamp = timestamp_from_secs(block.header.timestamp);
+    let block_timestamp = timestamp_from_secs(block.header.timestamp());
     let inner: &Recovered<TempoTxEnvelope> = &tx.inner;
 
     // Extract Tempo-specific fields if this is a 0x76 transaction
@@ -57,7 +72,7 @@ pub fn decode_transaction(tx: &Transaction, block: &Block, idx: u32) -> TxRow {
         };
 
     TxRow {
-        block_num: block.header.number as i64,
+        block_num: block.header.number() as i64,
         block_timestamp,
         idx: idx as i32,
         hash: tx.tx_hash().as_slice().to_vec(),
@@ -144,6 +159,38 @@ pub fn decode_receipt(receipt: &Receipt, block_timestamp: DateTime<Utc>) -> Rece
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tempo_primitives::ed25519::PublicKey;
+
+    /// RFC 8032 ed25519 test vector #1 — known-valid 32-byte verification key.
+    /// Hardcoded as bytes (rather than constructed via `PublicKey::from_seed`)
+    /// because that constructor is gated on the `arbitrary` feature in
+    /// tempo-primitives, which we don't enable from tidx.
+    const RFC8032_TEST_VECTOR_1_PUBKEY: [u8; 32] = [
+        0xd7, 0x5a, 0x98, 0x01, 0x82, 0xb1, 0x0a, 0xb7, 0xd5, 0x4b, 0xfe, 0xd3,
+        0xc9, 0x64, 0x07, 0x3a, 0x0e, 0xe1, 0x72, 0xf3, 0xda, 0xa6, 0x23, 0x25,
+        0xaf, 0x02, 0x1a, 0x68, 0xf7, 0x07, 0x51, 0x1a,
+    ];
+
+    #[test]
+    fn extract_consensus_proposer_none_when_pre_fork() {
+        assert_eq!(extract_consensus_proposer(None), None);
+    }
+
+    #[test]
+    fn extract_consensus_proposer_returns_raw_32_bytes_when_present() {
+        let proposer: PublicKey = B256::from(RFC8032_TEST_VECTOR_1_PUBKEY)
+            .try_into()
+            .expect("valid ed25519 pubkey from RFC 8032 test vector 1");
+        let ctx = TempoConsensusContext {
+            epoch: 7,
+            view: 42,
+            parent_view: 41,
+            proposer,
+        };
+        let out = extract_consensus_proposer(Some(&ctx)).expect("some");
+        assert_eq!(out.len(), 32);
+        assert_eq!(out.as_slice(), RFC8032_TEST_VECTOR_1_PUBKEY.as_slice());
+    }
 
     fn make_tx(block_num: i64, idx: i32) -> TxRow {
         TxRow {

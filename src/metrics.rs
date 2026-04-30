@@ -8,6 +8,15 @@ pub fn record_blocks_indexed(chain_id: u64, count: u64) {
     counter!("tidx_blocks_indexed_total", &labels).increment(count);
 }
 
+/// TIP-1031: count of decoded block headers broken down by whether they
+/// carried a consensus context. After T4 activation `present` should rise
+/// monotonically and `absent` should plateau. Operators can correlate
+/// against `tidx_blocks_indexed_total{chain_id=...}` for per-chain breakdown.
+pub fn record_block_consensus_context(present: bool) {
+    let labels = [("proposer", if present { "present" } else { "absent" })];
+    counter!("tidx_blocks_consensus_context_total", &labels).increment(1);
+}
+
 pub fn record_txs_indexed(chain_id: u64, count: u64) {
     let labels = [("chain_id", chain_id.to_string())];
     counter!("tidx_txs_indexed_total", &labels).increment(count);
