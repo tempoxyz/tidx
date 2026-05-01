@@ -40,7 +40,7 @@ jobs:
             target: aarch64-apple-darwin
             asset: tidx-darwin-arm64
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         with:
           ref: ${{ inputs.tag || github.ref }}
       - uses: dtolnay/rust-toolchain@stable
