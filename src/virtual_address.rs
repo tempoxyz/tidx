@@ -242,7 +242,7 @@ mod tests {
 
         let logs = vec![
             // Hop 1: sender → virtualAddress
-            make_transfer_log(f.tx_hash, token.clone(), f.sender, f.vaddr, f.amount, 0),
+            make_transfer_log(f.tx_hash, token, f.sender, f.vaddr, f.amount, 0),
             // Hop 2: virtualAddress → master
             make_transfer_log(f.tx_hash, token, f.vaddr, f.master, f.amount, 1),
         ];

@@ -4,7 +4,7 @@ use std::path::PathBuf;
 
 use tidx::config::Config;
 use tidx::db;
-use tidx::service::{self, execute_query_postgres, QueryOptions};
+use tidx::service::{self, QueryOptions, execute_query_postgres};
 
 #[derive(ClapArgs)]
 pub struct Args {
@@ -76,17 +76,13 @@ pub async fn run(args: Args) -> Result<()> {
     // CLI currently only supports PostgreSQL engine
     // For ClickHouse OLAP queries, use the HTTP API with engine=clickhouse
     if args.engine.as_deref() == Some("clickhouse") {
-        anyhow::bail!("ClickHouse engine not available in CLI. Use HTTP API with engine=clickhouse for OLAP queries.");
+        anyhow::bail!(
+            "ClickHouse engine not available in CLI. Use HTTP API with engine=clickhouse for OLAP queries."
+        );
     }
 
     let sig_strs: Vec<&str> = args.signature.iter().map(String::as_str).collect();
-    let result = execute_query_postgres(
-        &pool,
-        &args.sql,
-        &sig_strs,
-        &options,
-    )
-    .await?;
+    let result = execute_query_postgres(&pool, &args.sql, &sig_strs, &options).await?;
 
     if result.row_count == 0 {
         println!("No results");
@@ -164,6 +160,94 @@ fn json_to_string(v: &serde_json::Value) -> String {
         serde_json::Value::Bool(b) => b.to_string(),
         other => other.to_string(),
     }
+}
+
+async fn run_via_http(base_url: &str, args: &Args) -> Result<()> {
+    let chain_id = args
+        .chain_id
+        .ok_or_else(|| anyhow::anyhow!("--chain-id required when using --url"))?;
+
+    let client = reqwest::Client::new();
+    let mut url = reqwest::Url::parse(&format!("{}/query", base_url.trim_end_matches('/')))?;
+
+    // Extract basic auth credentials from URL before building the request
+    let username = if !url.username().is_empty() {
+        Some(url.username().to_string())
+    } else {
+        None
+    };
+    let password = url.password().map(String::from);
+    let _ = url.set_username("");
+    let _ = url.set_password(None);
+
+    url.query_pairs_mut()
+        .append_pair("sql", &args.sql)
+        .append_pair("chainId", &chain_id.to_string())
+        .append_pair("timeout_ms", &args.timeout.to_string())
+        .append_pair("limit", &args.limit.to_string());
+
+    for sig in &args.signature {
+        url.query_pairs_mut().append_pair("signature", sig);
+    }
+    if let Some(engine) = &args.engine {
+        url.query_pairs_mut().append_pair("engine", engine);
+    }
+
+    let mut req = client.get(url);
+    if let Some(user) = &username {
+        req = req.basic_auth(user, password.as_deref());
+    }
+
+    let resp = req.send().await?;
+    let status = resp.status();
+    let body = resp.text().await?;
+
+    if !status.is_success() {
+        anyhow::bail!("HTTP {}: {}", status, body);
+    }
+
+    let parsed: serde_json::Value = serde_json::from_str(&body)?;
+
+    if !parsed["ok"].as_bool().unwrap_or(false) {
+        let err = parsed["error"].as_str().unwrap_or("Unknown error");
+        anyhow::bail!("{}", err);
+    }
+
+    let result = service::QueryResult {
+        columns: parsed["columns"]
+            .as_array()
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str().map(String::from))
+                    .collect()
+            })
+            .unwrap_or_default(),
+        rows: parsed["rows"]
+            .as_array()
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|row| row.as_array().cloned())
+                    .collect()
+            })
+            .unwrap_or_default(),
+        row_count: parsed["row_count"].as_i64().unwrap_or(0) as usize,
+        engine: parsed["engine"].as_str().map(String::from),
+        query_time_ms: parsed["query_time_ms"].as_f64(),
+    };
+
+    if result.row_count == 0 {
+        println!("No results");
+        return Ok(());
+    }
+
+    match args.format.as_str() {
+        "json" => print_json(&result)?,
+        "csv" => print_csv(&result)?,
+        "toon" => print_toon(&result)?,
+        _ => print_table(&result)?,
+    }
+
+    Ok(())
 }
 
 #[cfg(test)]
@@ -255,88 +339,4 @@ mod tests {
     fn test_print_table_does_not_panic() {
         print_table(&sample_result()).unwrap();
     }
-}
-
-async fn run_via_http(base_url: &str, args: &Args) -> Result<()> {
-    let chain_id = args
-        .chain_id
-        .ok_or_else(|| anyhow::anyhow!("--chain-id required when using --url"))?;
-
-    let client = reqwest::Client::new();
-    let mut url = reqwest::Url::parse(&format!("{}/query", base_url.trim_end_matches('/')))?;
-
-    // Extract basic auth credentials from URL before building the request
-    let username = if !url.username().is_empty() {
-        Some(url.username().to_string())
-    } else {
-        None
-    };
-    let password = url.password().map(String::from);
-    let _ = url.set_username("");
-    let _ = url.set_password(None);
-
-    url.query_pairs_mut()
-        .append_pair("sql", &args.sql)
-        .append_pair("chainId", &chain_id.to_string())
-        .append_pair("timeout_ms", &args.timeout.to_string())
-        .append_pair("limit", &args.limit.to_string());
-
-    for sig in &args.signature {
-        url.query_pairs_mut().append_pair("signature", sig);
-    }
-    if let Some(engine) = &args.engine {
-        url.query_pairs_mut().append_pair("engine", engine);
-    }
-
-    let mut req = client.get(url);
-    if let Some(user) = &username {
-        req = req.basic_auth(user, password.as_deref());
-    }
-
-    let resp = req.send().await?;
-    let status = resp.status();
-    let body = resp.text().await?;
-
-    if !status.is_success() {
-        anyhow::bail!("HTTP {}: {}", status, body);
-    }
-
-    let parsed: serde_json::Value = serde_json::from_str(&body)?;
-
-    if !parsed["ok"].as_bool().unwrap_or(false) {
-        let err = parsed["error"].as_str().unwrap_or("Unknown error");
-        anyhow::bail!("{}", err);
-    }
-
-    let result = service::QueryResult {
-        columns: parsed["columns"]
-            .as_array()
-            .map(|arr| arr.iter().filter_map(|v| v.as_str().map(String::from)).collect())
-            .unwrap_or_default(),
-        rows: parsed["rows"]
-            .as_array()
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(|row| row.as_array().cloned())
-                    .collect()
-            })
-            .unwrap_or_default(),
-        row_count: parsed["row_count"].as_i64().unwrap_or(0) as usize,
-        engine: parsed["engine"].as_str().map(String::from),
-        query_time_ms: parsed["query_time_ms"].as_f64(),
-    };
-
-    if result.row_count == 0 {
-        println!("No results");
-        return Ok(());
-    }
-
-    match args.format.as_str() {
-        "json" => print_json(&result)?,
-        "csv" => print_csv(&result)?,
-        "toon" => print_toon(&result)?,
-        _ => print_table(&result)?,
-    }
-
-    Ok(())
 }

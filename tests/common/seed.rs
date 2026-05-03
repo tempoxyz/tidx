@@ -65,8 +65,8 @@ pub async fn seed(pool: &Pool, config: &SeedConfig) -> Result<(u64, i64, u64)> {
                 break;
             }
 
-            let timestamp = chrono::Utc::now()
-                - chrono::Duration::seconds((config.txs - txs_written) as i64);
+            let timestamp =
+                chrono::Utc::now() - chrono::Duration::seconds((config.txs - txs_written) as i64);
             let block_hash = generate_hash(block_num as u64, 0xB10C);
 
             blocks.push(BlockRow {

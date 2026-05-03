@@ -1,13 +1,13 @@
 //! Views API for managing ClickHouse materialized views
 
 use axum::{
-    extract::{ConnectInfo, Path, Query, State},
     Json,
+    extract::{ConnectInfo, Path, Query, State},
 };
 use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
 
-use super::{AppState, ApiError};
+use super::{ApiError, AppState};
 use crate::query::EventSignature;
 
 /// Validate view name (alphanumeric + underscore only)
@@ -68,42 +68,66 @@ pub async fn list_views(
     let clickhouse = state
         .get_clickhouse(Some(params.chain_id))
         .await
-        .ok_or_else(|| ApiError::BadRequest(format!(
-            "ClickHouse not configured for chain_id: {}",
-            params.chain_id
-        )))?;
+        .ok_or_else(|| {
+            ApiError::BadRequest(format!(
+                "ClickHouse not configured for chain_id: {}",
+                params.chain_id
+            ))
+        })?;
 
     let database = format!("analytics_{}", params.chain_id);
-    
+
     // Query system.tables for views in analytics database
     let sql = format!(
         "SELECT name, engine FROM system.tables WHERE database = '{}' AND engine IN ('View', 'MaterializedView') ORDER BY name",
         database
     );
 
-    let result = clickhouse.query(&sql, &[]).await
+    let result = clickhouse
+        .query(&sql, &[])
+        .await
         .map_err(|e| ApiError::QueryError(e.to_string()))?;
 
     let mut views = Vec::new();
     for row in &result.rows {
-        let name = row.first().and_then(|v| v.as_str()).unwrap_or("").to_string();
-        let engine = row.get(1).and_then(|v| v.as_str()).unwrap_or("").to_string();
-        
+        let name = row
+            .first()
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let engine = row
+            .get(1)
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+
         // Get columns for this view
         let columns_sql = format!(
             "SELECT name, type FROM system.columns WHERE database = '{}' AND table = '{}' ORDER BY position",
             database, name
         );
-        let columns_result = clickhouse.query(&columns_sql, &[]).await
+        let columns_result = clickhouse
+            .query(&columns_sql, &[])
+            .await
             .map_err(|e| ApiError::QueryError(e.to_string()))?;
-        
-        let columns: Vec<ColumnInfo> = columns_result.rows.iter().map(|col_row| {
-            ColumnInfo {
-                name: col_row.first().and_then(|v| v.as_str()).unwrap_or("").to_string(),
-                col_type: col_row.get(1).and_then(|v| v.as_str()).unwrap_or("").to_string(),
-            }
-        }).collect();
-        
+
+        let columns: Vec<ColumnInfo> = columns_result
+            .rows
+            .iter()
+            .map(|col_row| ColumnInfo {
+                name: col_row
+                    .first()
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string(),
+                col_type: col_row
+                    .get(1)
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string(),
+            })
+            .collect();
+
         views.push(ViewInfo {
             name,
             engine,
@@ -150,12 +174,16 @@ pub async fn create_view(
 ) -> Result<Json<CreateViewResponse>, ApiError> {
     // Check trusted IP access
     if !state.is_trusted_ip(&addr) {
-        return Err(ApiError::Forbidden("Mutations only allowed from trusted IPs".to_string()));
+        return Err(ApiError::Forbidden(
+            "Mutations only allowed from trusted IPs".to_string(),
+        ));
     }
 
     // Validate view name
     if !is_valid_view_name(&req.name) {
-        return Err(ApiError::BadRequest("Invalid view name: must be alphanumeric with underscores".to_string()));
+        return Err(ApiError::BadRequest(
+            "Invalid view name: must be alphanumeric with underscores".to_string(),
+        ));
     }
 
     // Validate order_by columns are safe identifiers
@@ -181,13 +209,17 @@ pub async fn create_view(
     // Validate SQL is SELECT only
     let sql_upper = req.sql.trim().to_uppercase();
     if !sql_upper.starts_with("SELECT") {
-        return Err(ApiError::BadRequest("SQL must be a SELECT statement".to_string()));
+        return Err(ApiError::BadRequest(
+            "SQL must be a SELECT statement".to_string(),
+        ));
     }
 
     // Parse signature if provided
     let signature = if let Some(ref sig_str) = req.signature {
-        Some(EventSignature::parse(sig_str)
-            .map_err(|e| ApiError::BadRequest(format!("Invalid signature: {}", e)))?)
+        Some(
+            EventSignature::parse(sig_str)
+                .map_err(|e| ApiError::BadRequest(format!("Invalid signature: {}", e)))?,
+        )
     } else {
         None
     };
@@ -195,10 +227,12 @@ pub async fn create_view(
     let clickhouse = state
         .get_clickhouse(Some(req.chain_id))
         .await
-        .ok_or_else(|| ApiError::BadRequest(format!(
-            "ClickHouse not configured for chain_id: {}",
-            req.chain_id
-        )))?;
+        .ok_or_else(|| {
+            ApiError::BadRequest(format!(
+                "ClickHouse not configured for chain_id: {}",
+                req.chain_id
+            ))
+        })?;
 
     let database = format!("analytics_{}", req.chain_id);
     let table_name = &req.name;
@@ -214,10 +248,12 @@ pub async fn create_view(
     } else {
         req.sql.clone()
     };
-    
+
     // 1. Ensure database exists
     let create_db = format!("CREATE DATABASE IF NOT EXISTS {}", database);
-    clickhouse.query(&create_db, &[]).await
+    clickhouse
+        .query(&create_db, &[])
+        .await
         .map_err(|e| ApiError::QueryError(format!("Failed to create database: {}", e)))?;
 
     // 2. Create target table (infer schema from SELECT ... LIMIT 0)
@@ -225,7 +261,9 @@ pub async fn create_view(
         "CREATE TABLE IF NOT EXISTS {}.{} ENGINE = {} ORDER BY ({}) AS {} LIMIT 0",
         database, table_name, req.engine, order_by, sql
     );
-    clickhouse.query(&create_table, &[]).await
+    clickhouse
+        .query(&create_table, &[])
+        .await
         .map_err(|e| ApiError::QueryError(format!("Failed to create table: {}", e)))?;
 
     // 3. Create materialized view
@@ -233,23 +271,27 @@ pub async fn create_view(
         "CREATE MATERIALIZED VIEW IF NOT EXISTS {}.{} TO {}.{} AS {}",
         database, mv_name, database, table_name, sql
     );
-    clickhouse.query(&create_mv, &[]).await
+    clickhouse
+        .query(&create_mv, &[])
+        .await
         .map_err(|e| ApiError::QueryError(format!("Failed to create materialized view: {}", e)))?;
 
     // 4. Backfill existing data
-    let backfill = format!(
-        "INSERT INTO {}.{} {}",
-        database, table_name, sql
-    );
-    clickhouse.query(&backfill, &[]).await
+    let backfill = format!("INSERT INTO {}.{} {}", database, table_name, sql);
+    clickhouse
+        .query(&backfill, &[])
+        .await
         .map_err(|e| ApiError::QueryError(format!("Failed to backfill: {}", e)))?;
 
     // 5. Get row count
     let count_sql = format!("SELECT count() FROM {}.{}", database, table_name);
-    let count_result = clickhouse.query(&count_sql, &[]).await
+    let count_result = clickhouse
+        .query(&count_sql, &[])
+        .await
         .map_err(|e| ApiError::QueryError(format!("Failed to get count: {}", e)))?;
-    
-    let backfill_rows = count_result.rows
+
+    let backfill_rows = count_result
+        .rows
         .first()
         .and_then(|r| r.first())
         .and_then(|v| v.as_str())
@@ -283,7 +325,9 @@ pub async fn delete_view(
 ) -> Result<Json<DeleteViewResponse>, ApiError> {
     // Check trusted IP access
     if !state.is_trusted_ip(&addr) {
-        return Err(ApiError::Forbidden("Mutations only allowed from trusted IPs".to_string()));
+        return Err(ApiError::Forbidden(
+            "Mutations only allowed from trusted IPs".to_string(),
+        ));
     }
 
     // Validate view name
@@ -294,10 +338,12 @@ pub async fn delete_view(
     let clickhouse = state
         .get_clickhouse(Some(params.chain_id))
         .await
-        .ok_or_else(|| ApiError::BadRequest(format!(
-            "ClickHouse not configured for chain_id: {}",
-            params.chain_id
-        )))?;
+        .ok_or_else(|| {
+            ApiError::BadRequest(format!(
+                "ClickHouse not configured for chain_id: {}",
+                params.chain_id
+            ))
+        })?;
 
     let database = format!("analytics_{}", params.chain_id);
     let mv_name = format!("{}_mv", name);
@@ -339,10 +385,12 @@ pub async fn get_view(
     let clickhouse = state
         .get_clickhouse(Some(params.chain_id))
         .await
-        .ok_or_else(|| ApiError::BadRequest(format!(
-            "ClickHouse not configured for chain_id: {}",
-            params.chain_id
-        )))?;
+        .ok_or_else(|| {
+            ApiError::BadRequest(format!(
+                "ClickHouse not configured for chain_id: {}",
+                params.chain_id
+            ))
+        })?;
 
     let database = format!("analytics_{}", params.chain_id);
 
@@ -351,7 +399,9 @@ pub async fn get_view(
         "SELECT engine, create_table_query FROM system.tables WHERE database = '{}' AND name = '{}'",
         database, name
     );
-    let result = clickhouse.query(&sql, &[]).await
+    let result = clickhouse
+        .query(&sql, &[])
+        .await
         .map_err(|e| ApiError::QueryError(e.to_string()))?;
 
     if result.rows.is_empty() {
@@ -359,8 +409,16 @@ pub async fn get_view(
     }
 
     let row = &result.rows[0];
-    let engine = row.first().and_then(|v| v.as_str()).unwrap_or("").to_string();
-    let definition = row.get(1).and_then(|v| v.as_str()).unwrap_or("").to_string();
+    let engine = row
+        .first()
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let definition = row
+        .get(1)
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
 
     // Get row count
     let count_sql = format!("SELECT count() FROM {}.{}", database, name);
@@ -395,7 +453,7 @@ mod tests {
         assert!(is_valid_view_name("token_holders"));
         assert!(is_valid_view_name("my_view_123"));
         assert!(is_valid_view_name("View1"));
-        
+
         assert!(!is_valid_view_name(""));
         assert!(!is_valid_view_name("123view")); // Starts with number
         assert!(!is_valid_view_name("my-view")); // Has hyphen
@@ -405,14 +463,14 @@ mod tests {
     // ========================================================================
     // Helper to generate full SQL from signature + user query
     // ========================================================================
-    
+
     fn generate_view_sql(signature: &str, user_sql: &str) -> String {
         let sig = EventSignature::parse(signature).unwrap();
         let sql = sig.rewrite_filters_for_pushdown(user_sql);
         let cte = sig.to_cte_sql_clickhouse();
         format!("WITH {} {}", cte, sql)
     }
-    
+
     /// Generate runtime SQL (what actually gets executed against ClickHouse)
     fn generate_runtime_sql(signature: &str, user_sql: &str) -> String {
         generate_view_sql(signature, user_sql)
@@ -453,8 +511,9 @@ mod tests {
     #[test]
     fn test_cte_bytes32_indexed() {
         let sig = EventSignature::parse(
-            "RoleGranted(bytes32 indexed role, address indexed account, address indexed sender)"
-        ).unwrap();
+            "RoleGranted(bytes32 indexed role, address indexed account, address indexed sender)",
+        )
+        .unwrap();
         assert_snapshot!(sig.to_cte_sql_clickhouse());
     }
 
@@ -467,24 +526,22 @@ mod tests {
     #[test]
     fn test_cte_approval() {
         let sig = EventSignature::parse(
-            "Approval(address indexed owner, address indexed spender, uint256 value)"
-        ).unwrap();
+            "Approval(address indexed owner, address indexed spender, uint256 value)",
+        )
+        .unwrap();
         assert_snapshot!(sig.to_cte_sql_clickhouse());
     }
 
     #[test]
     fn test_cte_unnamed_params() {
-        let sig = EventSignature::parse(
-            "Transfer(address indexed, address indexed, uint256)"
-        ).unwrap();
+        let sig =
+            EventSignature::parse("Transfer(address indexed, address indexed, uint256)").unwrap();
         assert_snapshot!(sig.to_cte_sql_clickhouse());
     }
 
     #[test]
     fn test_cte_deposit() {
-        let sig = EventSignature::parse(
-            "Deposit(address indexed dst, uint256 wad)"
-        ).unwrap();
+        let sig = EventSignature::parse("Deposit(address indexed dst, uint256 wad)").unwrap();
         assert_snapshot!(sig.to_cte_sql_clickhouse());
     }
 
@@ -513,8 +570,9 @@ mod tests {
     #[test]
     fn test_pushdown_non_indexed_unchanged() {
         let sig = EventSignature::parse(
-            "Transfer(address indexed from, address indexed to, uint256 value)"
-        ).unwrap();
+            "Transfer(address indexed from, address indexed to, uint256 value)",
+        )
+        .unwrap();
         let user_sql = r#"SELECT * FROM Transfer WHERE "value" > 1000000"#;
         let rewritten = sig.rewrite_filters_for_pushdown(user_sql);
         assert_eq!(user_sql, rewritten); // Should be unchanged
@@ -523,8 +581,9 @@ mod tests {
     #[test]
     fn test_pushdown_invalid_address_unchanged() {
         let sig = EventSignature::parse(
-            "Transfer(address indexed from, address indexed to, uint256 value)"
-        ).unwrap();
+            "Transfer(address indexed from, address indexed to, uint256 value)",
+        )
+        .unwrap();
         let user_sql = r#"SELECT * FROM Transfer WHERE "from" = '0xabc'"#;
         let rewritten = sig.rewrite_filters_for_pushdown(user_sql);
         assert_eq!(user_sql, rewritten); // Should be unchanged

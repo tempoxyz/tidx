@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 
-use anyhow::{bail, Result};
+use anyhow::{Result, bail};
 use clap::Args as ClapArgs;
 use dialoguer::{Input, Select};
 
@@ -33,22 +33,21 @@ pub fn run(args: Args) -> Result<()> {
 
     let network_idx = Select::new()
         .with_prompt("Select network")
-        .items(&TEMPO_NETWORKS.iter().map(|(name, _, _)| *name).collect::<Vec<_>>())
+        .items(
+            &TEMPO_NETWORKS
+                .iter()
+                .map(|(name, _, _)| *name)
+                .collect::<Vec<_>>(),
+        )
         .default(0)
         .interact()?;
 
     let (name, chain_id, rpc_url) = if network_idx == TEMPO_NETWORKS.len() - 1 {
-        let name: String = Input::new()
-            .with_prompt("Chain name")
-            .interact_text()?;
+        let name: String = Input::new().with_prompt("Chain name").interact_text()?;
 
-        let chain_id: u64 = Input::new()
-            .with_prompt("Chain ID")
-            .interact_text()?;
+        let chain_id: u64 = Input::new().with_prompt("Chain ID").interact_text()?;
 
-        let rpc_url: String = Input::new()
-            .with_prompt("RPC URL")
-            .interact_text()?;
+        let rpc_url: String = Input::new().with_prompt("RPC URL").interact_text()?;
 
         (name, chain_id, rpc_url)
     } else {
@@ -74,7 +73,9 @@ pub fn run(args: Args) -> Result<()> {
     println!("\nNext steps:");
     println!("  1. Start PostgreSQL");
     println!("  2. Run: tidx up");
-    println!("  3. Query: curl \"http://localhost:{http_port}/query?chainId={chain_id}&sql=SELECT * FROM blocks LIMIT 5\"");
+    println!(
+        "  3. Query: curl \"http://localhost:{http_port}/query?chainId={chain_id}&sql=SELECT * FROM blocks LIMIT 5\""
+    );
 
     Ok(())
 }

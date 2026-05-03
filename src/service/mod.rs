@@ -1,4 +1,4 @@
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use chrono::{DateTime, Utc};
 use serde::Serialize;
 use std::time::Instant;
@@ -6,8 +6,8 @@ use std::time::Instant;
 use crate::db::Pool;
 use crate::metrics;
 use crate::query::{
-    extract_column_references, extract_raw_column_predicates, validate_query, EventSignature,
-    HARD_LIMIT_MAX,
+    EventSignature, HARD_LIMIT_MAX, extract_column_references, extract_raw_column_predicates,
+    validate_query,
 };
 
 #[derive(Debug, Clone, Serialize)]
@@ -66,8 +66,14 @@ pub async fn get_all_status(pool: &Pool) -> Result<Vec<SyncStatus>> {
         .await?;
 
     // Detect actual gaps in the blocks table (bounded by max tip_num)
-    let max_tip: u64 = rows.iter().map(|r| r.get::<_, i64>(3) as u64).max().unwrap_or(0);
-    let gaps = crate::sync::writer::detect_gaps(pool, max_tip).await.unwrap_or_default();
+    let max_tip: u64 = rows
+        .iter()
+        .map(|r| r.get::<_, i64>(3) as u64)
+        .max()
+        .unwrap_or(0);
+    let gaps = crate::sync::writer::detect_gaps(pool, max_tip)
+        .await
+        .unwrap_or_default();
     let gaps_i64: Vec<(i64, i64)> = gaps.iter().map(|(s, e)| (*s as i64, *e as i64)).collect();
 
     Ok(rows
@@ -91,11 +97,19 @@ pub async fn get_all_status(pool: &Pool) -> Result<Vec<SyncStatus>> {
                     Some(n) => synced_num - n + 1,
                     None => 1,
                 };
-                if secs > 0.0 { Some(total_indexed as f64 / secs) } else { None }
+                if secs > 0.0 {
+                    Some(total_indexed as f64 / secs)
+                } else {
+                    None
+                }
             });
 
             let eta_secs = sync_rate.and_then(|rate| {
-                if rate > 0.0 { Some(backfill_remaining as f64 / rate) } else { None }
+                if rate > 0.0 {
+                    Some(backfill_remaining as f64 / rate)
+                } else {
+                    None
+                }
             });
 
             // Gap = blocks between synced_num and tip_num that may be missing
@@ -215,7 +229,12 @@ pub async fn execute_query_postgres(
             metrics::record_query_duration(start.elapsed());
             rows
         }
-        Ok(Err(e)) => return Err(anyhow!("Query error: {}", sanitize_db_error(&e.to_string()))),
+        Ok(Err(e)) => {
+            return Err(anyhow!(
+                "Query error: {}",
+                sanitize_db_error(&e.to_string())
+            ));
+        }
         Err(_) => return Err(anyhow!("Query timeout")),
     };
 
@@ -228,7 +247,11 @@ pub async fn execute_query_postgres(
             .map(|s| s.columns().iter().map(|c| c.name().to_string()).collect())
             .unwrap_or_default()
     } else {
-        rows[0].columns().iter().map(|c| c.name().to_string()).collect()
+        rows[0]
+            .columns()
+            .iter()
+            .map(|c| c.name().to_string())
+            .collect()
     };
 
     let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
@@ -285,15 +308,21 @@ pub fn format_column_json(row: &tokio_postgres::Row, idx: usize) -> serde_json::
         "int2" => row
             .try_get::<_, i16>(idx)
             .ok()
-            .map_or(serde_json::Value::Null, |v| serde_json::Value::Number(v.into())),
+            .map_or(serde_json::Value::Null, |v| {
+                serde_json::Value::Number(v.into())
+            }),
         "int4" => row
             .try_get::<_, i32>(idx)
             .ok()
-            .map_or(serde_json::Value::Null, |v| serde_json::Value::Number(v.into())),
+            .map_or(serde_json::Value::Null, |v| {
+                serde_json::Value::Number(v.into())
+            }),
         "int8" => row
             .try_get::<_, i64>(idx)
             .ok()
-            .map_or(serde_json::Value::Null, |v| serde_json::Value::Number(v.into())),
+            .map_or(serde_json::Value::Null, |v| {
+                serde_json::Value::Number(v.into())
+            }),
         "numeric" => {
             // rust_decimal::Decimal panics (not errors) for values exceeding its
             // 96-bit mantissa (~28 digits). Postgres NUMERIC is arbitrary precision
@@ -313,7 +342,9 @@ pub fn format_column_json(row: &tokio_postgres::Row, idx: usize) -> serde_json::
         "bytea" => row
             .try_get::<_, Vec<u8>>(idx)
             .ok()
-            .map_or(serde_json::Value::Null, |v| serde_json::Value::String(format!("0x{}", hex::encode(v)))),
+            .map_or(serde_json::Value::Null, |v| {
+                serde_json::Value::String(format!("0x{}", hex::encode(v)))
+            }),
         "text" | "varchar" | "name" => row
             .try_get::<_, String>(idx)
             .ok()
@@ -321,7 +352,9 @@ pub fn format_column_json(row: &tokio_postgres::Row, idx: usize) -> serde_json::
         "timestamptz" | "timestamp" => row
             .try_get::<_, DateTime<Utc>>(idx)
             .ok()
-            .map_or(serde_json::Value::Null, |v| serde_json::Value::String(v.to_rfc3339())),
+            .map_or(serde_json::Value::Null, |v| {
+                serde_json::Value::String(v.to_rfc3339())
+            }),
         "bool" => row
             .try_get::<_, bool>(idx)
             .ok()
@@ -382,25 +415,37 @@ mod tests {
 
     #[test]
     fn test_transfer_cte_postgres() {
-        let sig = EventSignature::parse("Transfer(address indexed from, address indexed to, uint256 value)").unwrap();
+        let sig = EventSignature::parse(
+            "Transfer(address indexed from, address indexed to, uint256 value)",
+        )
+        .unwrap();
         assert_snapshot!(sig.to_cte_sql_postgres());
     }
 
     #[test]
     fn test_transfer_cte_clickhouse() {
-        let sig = EventSignature::parse("Transfer(address indexed from, address indexed to, uint256 value)").unwrap();
+        let sig = EventSignature::parse(
+            "Transfer(address indexed from, address indexed to, uint256 value)",
+        )
+        .unwrap();
         assert_snapshot!(sig.to_cte_sql_clickhouse());
     }
 
     #[test]
     fn test_approval_cte_postgres() {
-        let sig = EventSignature::parse("Approval(address indexed owner, address indexed spender, uint256 value)").unwrap();
+        let sig = EventSignature::parse(
+            "Approval(address indexed owner, address indexed spender, uint256 value)",
+        )
+        .unwrap();
         assert_snapshot!(sig.to_cte_sql_postgres());
     }
 
     #[test]
     fn test_approval_cte_clickhouse() {
-        let sig = EventSignature::parse("Approval(address indexed owner, address indexed spender, uint256 value)").unwrap();
+        let sig = EventSignature::parse(
+            "Approval(address indexed owner, address indexed spender, uint256 value)",
+        )
+        .unwrap();
         assert_snapshot!(sig.to_cte_sql_clickhouse());
     }
 
@@ -434,19 +479,28 @@ mod tests {
 
     #[test]
     fn test_role_granted_cte_postgres() {
-        let sig = EventSignature::parse("RoleGranted(bytes32 indexed role, address indexed account, address indexed sender)").unwrap();
+        let sig = EventSignature::parse(
+            "RoleGranted(bytes32 indexed role, address indexed account, address indexed sender)",
+        )
+        .unwrap();
         assert_snapshot!(sig.to_cte_sql_postgres());
     }
 
     #[test]
     fn test_role_granted_cte_clickhouse() {
-        let sig = EventSignature::parse("RoleGranted(bytes32 indexed role, address indexed account, address indexed sender)").unwrap();
+        let sig = EventSignature::parse(
+            "RoleGranted(bytes32 indexed role, address indexed account, address indexed sender)",
+        )
+        .unwrap();
         assert_snapshot!(sig.to_cte_sql_clickhouse());
     }
 
     #[test]
     fn test_filtered_cte_postgres() {
-        let sig = EventSignature::parse("Transfer(address indexed from, address indexed to, uint256 value)").unwrap();
+        let sig = EventSignature::parse(
+            "Transfer(address indexed from, address indexed to, uint256 value)",
+        )
+        .unwrap();
         let mut used_columns = std::collections::HashSet::new();
         used_columns.insert("to".to_string());
         used_columns.insert("value".to_string());
@@ -455,7 +509,10 @@ mod tests {
 
     #[test]
     fn test_filtered_cte_clickhouse() {
-        let sig = EventSignature::parse("Transfer(address indexed from, address indexed to, uint256 value)").unwrap();
+        let sig = EventSignature::parse(
+            "Transfer(address indexed from, address indexed to, uint256 value)",
+        )
+        .unwrap();
         let mut used_columns = std::collections::HashSet::new();
         used_columns.insert("to".to_string());
         used_columns.insert("value".to_string());
@@ -512,6 +569,4 @@ mod tests {
         assert!(sanitized.len() < 510); // 500 + "..."
         assert!(sanitized.ends_with("..."));
     }
-
 }
-

@@ -6,14 +6,14 @@ pub struct TempoNode {
 
 impl TempoNode {
     pub fn from_env() -> Self {
-        let rpc_url = std::env::var("TEMPO_RPC_URL")
-            .unwrap_or_else(|_| "http://localhost:8545".to_string());
+        let rpc_url =
+            std::env::var("TEMPO_RPC_URL").unwrap_or_else(|_| "http://localhost:8545".to_string());
         Self { rpc_url }
     }
 
     pub async fn wait_for_ready(&self) -> anyhow::Result<()> {
         let client = reqwest::Client::new();
-        
+
         for _ in 0..30 {
             let resp = client
                 .post(&self.rpc_url)
@@ -29,7 +29,7 @@ impl TempoNode {
             if resp.is_ok() {
                 return Ok(());
             }
-            
+
             tokio::time::sleep(Duration::from_secs(1)).await;
         }
 

@@ -4,7 +4,7 @@ use alloy::network::{ReceiptResponse, TransactionResponse};
 use chrono::{DateTime, TimeZone, Utc};
 use tempo_alloy::primitives::transaction::SignatureType;
 
-use crate::tempo::{Block, Log, Receipt, Transaction, TempoTxEnvelope};
+use crate::tempo::{Block, Log, Receipt, TempoTxEnvelope, Transaction};
 use crate::types::{BlockRow, LogRow, ReceiptRow, TxRow};
 
 pub fn timestamp_from_secs(secs: u64) -> DateTime<Utc> {
@@ -68,7 +68,9 @@ pub fn decode_transaction(tx: &Transaction, block: &Block, idx: u32) -> TxRow {
         input: inner.input().to_vec(),
         gas_limit: inner.gas_limit() as i64,
         max_fee_per_gas: inner.max_fee_per_gas().to_string(),
-        max_priority_fee_per_gas: inner.max_priority_fee_per_gas().map_or("0".into(), |v| v.to_string()),
+        max_priority_fee_per_gas: inner
+            .max_priority_fee_per_gas()
+            .map_or("0".into(), |v| v.to_string()),
         gas_used: None,
         nonce_key,
         nonce: inner.nonce() as i64,
@@ -151,7 +153,12 @@ mod tests {
         }
     }
 
-    fn make_receipt(block_num: i64, tx_idx: i32, gas_used: i64, fee_payer: Option<Vec<u8>>) -> ReceiptRow {
+    fn make_receipt(
+        block_num: i64,
+        tx_idx: i32,
+        gas_used: i64,
+        fee_payer: Option<Vec<u8>>,
+    ) -> ReceiptRow {
         ReceiptRow {
             block_num,
             tx_idx,
@@ -206,11 +213,7 @@ mod tests {
 
     #[test]
     fn enrich_multi_block_batch() {
-        let mut txs = vec![
-            make_tx(10, 0),
-            make_tx(10, 1),
-            make_tx(11, 0),
-        ];
+        let mut txs = vec![make_tx(10, 0), make_tx(10, 1), make_tx(11, 0)];
         let receipts = vec![
             make_receipt(10, 0, 21000, Some(vec![0x01; 20])),
             make_receipt(10, 1, 42000, None),

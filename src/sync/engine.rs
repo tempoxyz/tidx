@@ -15,13 +15,13 @@ use super::decoder::{
     decode_block, decode_log, decode_receipt, decode_transaction, enrich_txs_from_receipts,
     timestamp_from_secs,
 };
-use crate::virtual_address::mark_virtual_forward_hops;
 use super::fetcher::RpcClient;
 use super::sink::SinkSet;
 use super::writer::{
     detect_all_gaps, detect_blocks_missing_receipts, find_fork_point, get_block_hash, has_gaps,
     load_sync_state, save_sync_state, update_sync_rate, update_synced_num, update_tip_num,
 };
+use crate::virtual_address::mark_virtual_forward_hops;
 
 /// RPC concurrency limits
 const REALTIME_RPC_CONCURRENCY: usize = 4;

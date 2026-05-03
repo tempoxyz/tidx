@@ -1,4 +1,4 @@
-.PHONY: help up down logs seed build check test bench bench-gen bench-open clean compose-up compose-down compose-logs \
+.PHONY: help up down logs seed build check fmt-check cargo-check clippy unit-test test bench bench-gen bench-open clean compose-up compose-down compose-logs \
 	pgroll-init pgroll-bootstrap pgroll-baseline pgroll-migrate pgroll-start pgroll-complete pgroll-rollback pgroll-status pgroll-validate
 
 .DEFAULT_GOAL := help
@@ -142,9 +142,20 @@ pgroll-validate:
 build:
 	@$(COMPOSE) build tidx
 
-# Run clippy lints
-check:
-	@cargo clippy --all-targets
+# Run CI-safe checks
+check: fmt-check cargo-check clippy unit-test
+
+fmt-check:
+	@cargo fmt --all -- --check
+
+cargo-check:
+	@cargo check --all-targets --locked
+
+clippy:
+	@cargo clippy --all-targets --locked -- -D warnings
+
+unit-test:
+	@cargo test --lib --bins --locked
 
 # Localnet compose for tests
 LOCALNET_COMPOSE := docker compose -f docker/local/docker-compose.yml

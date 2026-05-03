@@ -1,6 +1,6 @@
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use sha3::{Digest, Keccak256};
-use sqlparser::ast::{visit_expressions, BinaryOperator, Expr, Value};
+use sqlparser::ast::{BinaryOperator, Expr, Value, visit_expressions};
 use sqlparser::dialect::GenericDialect;
 use sqlparser::parser::Parser;
 use std::collections::{HashMap, HashSet};
@@ -26,7 +26,9 @@ pub struct EventSignature {
 fn is_valid_identifier(s: &str) -> bool {
     !s.is_empty()
         && s.len() <= 64
-        && s.chars().next().is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+        && s.chars()
+            .next()
+            .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
         && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
@@ -49,9 +51,11 @@ impl EventSignature {
         if name.is_empty() {
             return Err(anyhow!("Invalid signature: empty event name"));
         }
-        
+
         if !is_valid_identifier(&name) {
-            return Err(anyhow!("Invalid signature: event name must be alphanumeric"));
+            return Err(anyhow!(
+                "Invalid signature: event name must be alphanumeric"
+            ));
         }
 
         let params_str = &sig[open_paren + 1..close_paren];
@@ -133,10 +137,10 @@ impl EventSignature {
     }
 
     /// Generate ClickHouse-compatible CTE SQL, only including columns used in the query.
-    /// 
+    ///
     /// Data is stored as '0x'-prefixed hex strings via ClickHouseSink direct-write.
     /// We use substring(..., 3) to strip the '0x' prefix before unhex().
-    /// 
+    ///
     /// For output columns, we convert to '0x...' format for standard Ethereum hex representation.
     pub fn to_cte_sql_clickhouse_filtered(&self, used_columns: Option<&HashSet<String>>) -> String {
         self.to_cte_sql_clickhouse_with_pushdown(used_columns, &[])
@@ -338,9 +342,17 @@ impl EventSignature {
                     // Match: "col" = 'value' or "col" = '0xvalue'
                     let patterns = [
                         format!(r#""{}" = '{}'"#, col, value),
-                        format!(r#""{}" = '0x{}'"#, col, value.strip_prefix("0x").unwrap_or(&value)),
+                        format!(
+                            r#""{}" = '0x{}'"#,
+                            col,
+                            value.strip_prefix("0x").unwrap_or(&value)
+                        ),
                         format!(r#""{}"='{}'"#, col, value),
-                        format!(r#""{}"='0x{}'"#, col, value.strip_prefix("0x").unwrap_or(&value)),
+                        format!(
+                            r#""{}"='0x{}'"#,
+                            col,
+                            value.strip_prefix("0x").unwrap_or(&value)
+                        ),
                     ];
 
                     let replacement = format!("{} = '0x{}'", raw_col, encoded);
@@ -366,9 +378,15 @@ impl EventSignature {
             AbiType::Bool => {
                 let b = value.to_lowercase();
                 if b == "true" || b == "1" {
-                    Some("0000000000000000000000000000000000000000000000000000000000000001".to_string())
+                    Some(
+                        "0000000000000000000000000000000000000000000000000000000000000001"
+                            .to_string(),
+                    )
                 } else if b == "false" || b == "0" {
-                    Some("0000000000000000000000000000000000000000000000000000000000000000".to_string())
+                    Some(
+                        "0000000000000000000000000000000000000000000000000000000000000000"
+                            .to_string(),
+                    )
                 } else {
                     None
                 }
@@ -449,7 +467,12 @@ pub fn extract_equality_filters(sql: &str) -> HashMap<String, String> {
 
 /// Extract equality comparisons from an expression.
 fn extract_eq_from_expr(expr: &Expr, filters: &mut HashMap<String, String>) {
-    if let Expr::BinaryOp { left, op: BinaryOperator::Eq, right } = expr {
+    if let Expr::BinaryOp {
+        left,
+        op: BinaryOperator::Eq,
+        right,
+    } = expr
+    {
         // Check for column = literal patterns
         if let Some((col, val)) = extract_col_eq_literal(left, right) {
             filters.insert(col.to_lowercase(), val);
@@ -771,9 +794,7 @@ impl AbiParam {
                     (parts[0], false, Some(parts[1].to_string()))
                 }
             }
-            3 if parts[1] == "indexed" => {
-                (parts[0], true, Some(parts[2].to_string()))
-            }
+            3 if parts[1] == "indexed" => (parts[0], true, Some(parts[2].to_string())),
             _ => return Err(anyhow!("Invalid parameter format: {s}")),
         };
 
@@ -919,7 +940,7 @@ impl AbiType {
     }
 
     // ClickHouse decode functions for 0x-prefixed hex data (direct-write)
-    // 
+    //
     // Columns are stored as '0x'-prefixed hex strings via ClickHouseSink.
     // e.g., topic1 = '0x000000000000000000000000a975ba910c2ee169956f3df99ee2ece79d3887cf'
     // We need to:
@@ -954,7 +975,10 @@ impl AbiType {
         match self {
             // Address: skip first 12 bytes (24 hex chars) of 32-byte word, take 20 bytes (40 hex chars)
             AbiType::Address => {
-                format!("concat('0x', lower(substring(data, {}, 40)))", hex_start + 24)
+                format!(
+                    "concat('0x', lower(substring(data, {}, 40)))",
+                    hex_start + 24
+                )
             }
             // Uint: unhex 32 bytes (64 hex chars), reverse, reinterpret
             AbiType::Uint(_) => {
@@ -965,7 +989,10 @@ impl AbiType {
             }
             // Bool: check last byte of 32-byte word (last 2 hex chars of 64)
             AbiType::Bool => {
-                format!("unhex(substring(data, {}, 2)) != unhex('00')", hex_start + 62)
+                format!(
+                    "unhex(substring(data, {}, 2)) != unhex('00')",
+                    hex_start + 62
+                )
             }
             // Bytes32: take 64 hex chars, format with 0x prefix
             AbiType::Bytes(Some(_) | None) => {
@@ -1060,9 +1087,15 @@ mod tests {
         .unwrap();
         assert_eq!(sig.name, "TransferBatch");
         assert_eq!(sig.params.len(), 5);
-        assert_eq!(sig.params[3].ty, AbiType::DynamicArray(Box::new(AbiType::Uint(256))));
+        assert_eq!(
+            sig.params[3].ty,
+            AbiType::DynamicArray(Box::new(AbiType::Uint(256)))
+        );
         assert_eq!(sig.params[3].name.as_deref(), Some("ids"));
-        assert_eq!(sig.params[4].ty, AbiType::DynamicArray(Box::new(AbiType::Uint(256))));
+        assert_eq!(
+            sig.params[4].ty,
+            AbiType::DynamicArray(Box::new(AbiType::Uint(256)))
+        );
         // ERC-1155 TransferBatch topic0
         assert!(sig.topic0_hex().starts_with("4a39dc06"));
     }
@@ -1070,7 +1103,10 @@ mod tests {
     #[test]
     fn test_parse_fixed_array_type() {
         let sig = EventSignature::parse("SomeEvent(uint256[3])").unwrap();
-        assert_eq!(sig.params[0].ty, AbiType::FixedArray(Box::new(AbiType::Uint(256)), 3));
+        assert_eq!(
+            sig.params[0].ty,
+            AbiType::FixedArray(Box::new(AbiType::Uint(256)), 3)
+        );
     }
 
     #[test]
@@ -1094,7 +1130,8 @@ mod tests {
 
     #[test]
     fn test_extract_column_references() {
-        let cols = extract_column_references("SELECT \"to\", COUNT(*) FROM transfer GROUP BY \"to\"");
+        let cols =
+            extract_column_references("SELECT \"to\", COUNT(*) FROM transfer GROUP BY \"to\"");
         assert!(cols.contains("to"));
 
         let cols = extract_column_references("SELECT value, SUM(amount) FROM t WHERE x > 5");
@@ -1112,32 +1149,35 @@ mod tests {
 
     #[test]
     fn test_normalize_table_references() {
-        let sig = EventSignature::parse("Transfer(address indexed from, address indexed to, uint256 value)").unwrap();
-        
+        let sig = EventSignature::parse(
+            "Transfer(address indexed from, address indexed to, uint256 value)",
+        )
+        .unwrap();
+
         // lowercase -> original case
         assert_eq!(
             sig.normalize_table_references("SELECT * FROM transfer"),
             "SELECT * FROM Transfer"
         );
-        
+
         // uppercase -> original case
         assert_eq!(
             sig.normalize_table_references("SELECT * FROM TRANSFER"),
             "SELECT * FROM Transfer"
         );
-        
+
         // mixed case -> original case
         assert_eq!(
             sig.normalize_table_references("SELECT * FROM TrAnSfEr"),
             "SELECT * FROM Transfer"
         );
-        
+
         // multiple occurrences
         assert_eq!(
             sig.normalize_table_references("SELECT * FROM transfer UNION SELECT * FROM TRANSFER"),
             "SELECT * FROM Transfer UNION SELECT * FROM Transfer"
         );
-        
+
         // shouldn't match partial words
         assert_eq!(
             sig.normalize_table_references("SELECT transfers FROM transfer"),
@@ -1147,74 +1187,83 @@ mod tests {
 
     #[test]
     fn test_normalize_table_references_query_patterns() {
-        let sig = EventSignature::parse("Transfer(address indexed from, address indexed to, uint256 value)").unwrap();
-        
+        let sig = EventSignature::parse(
+            "Transfer(address indexed from, address indexed to, uint256 value)",
+        )
+        .unwrap();
+
         // Simple SELECT
         assert_eq!(
-            sig.normalize_table_references("SELECT \"to\", \"value\" FROM transfer WHERE \"from\" = '0x123'"),
+            sig.normalize_table_references(
+                "SELECT \"to\", \"value\" FROM transfer WHERE \"from\" = '0x123'"
+            ),
             "SELECT \"to\", \"value\" FROM Transfer WHERE \"from\" = '0x123'"
         );
-        
+
         // SELECT with alias
         assert_eq!(
             sig.normalize_table_references("SELECT t.\"to\" FROM transfer t"),
             "SELECT t.\"to\" FROM Transfer t"
         );
-        
+
         // SELECT with AS alias
         assert_eq!(
             sig.normalize_table_references("SELECT t.\"to\" FROM transfer AS t"),
             "SELECT t.\"to\" FROM Transfer AS t"
         );
-        
+
         // JOIN (self-join pattern)
         assert_eq!(
             sig.normalize_table_references("SELECT a.\"to\", b.\"from\" FROM transfer a JOIN transfer b ON a.\"to\" = b.\"from\""),
             "SELECT a.\"to\", b.\"from\" FROM Transfer a JOIN Transfer b ON a.\"to\" = b.\"from\""
         );
-        
+
         // Subquery
         assert_eq!(
-            sig.normalize_table_references("SELECT * FROM (SELECT \"to\", SUM(\"value\") FROM transfer GROUP BY \"to\") sub"),
+            sig.normalize_table_references(
+                "SELECT * FROM (SELECT \"to\", SUM(\"value\") FROM transfer GROUP BY \"to\") sub"
+            ),
             "SELECT * FROM (SELECT \"to\", SUM(\"value\") FROM Transfer GROUP BY \"to\") sub"
         );
-        
+
         // UNION ALL
         assert_eq!(
             sig.normalize_table_references("SELECT \"to\" as addr, \"value\" FROM transfer UNION ALL SELECT \"from\" as addr, -\"value\" FROM transfer"),
             "SELECT \"to\" as addr, \"value\" FROM Transfer UNION ALL SELECT \"from\" as addr, -\"value\" FROM Transfer"
         );
-        
+
         // CTE (WITH clause) - user might write their own CTE referencing the event table
         assert_eq!(
             sig.normalize_table_references("WITH filtered AS (SELECT * FROM transfer WHERE \"value\" > 1000) SELECT * FROM filtered"),
             "WITH filtered AS (SELECT * FROM Transfer WHERE \"value\" > 1000) SELECT * FROM filtered"
         );
-        
+
         // GROUP BY with aggregates
         assert_eq!(
             sig.normalize_table_references("SELECT \"to\", COUNT(*), SUM(\"value\") FROM transfer GROUP BY \"to\" HAVING COUNT(*) > 10"),
             "SELECT \"to\", COUNT(*), SUM(\"value\") FROM Transfer GROUP BY \"to\" HAVING COUNT(*) > 10"
         );
-        
+
         // ORDER BY and LIMIT
         assert_eq!(
-            sig.normalize_table_references("SELECT * FROM transfer ORDER BY block_num DESC LIMIT 100"),
+            sig.normalize_table_references(
+                "SELECT * FROM transfer ORDER BY block_num DESC LIMIT 100"
+            ),
             "SELECT * FROM Transfer ORDER BY block_num DESC LIMIT 100"
         );
-        
+
         // Window functions
         assert_eq!(
             sig.normalize_table_references("SELECT \"to\", \"value\", ROW_NUMBER() OVER (PARTITION BY \"to\" ORDER BY block_num) FROM transfer"),
             "SELECT \"to\", \"value\", ROW_NUMBER() OVER (PARTITION BY \"to\" ORDER BY block_num) FROM Transfer"
         );
-        
+
         // IN subquery
         assert_eq!(
             sig.normalize_table_references("SELECT * FROM transfer WHERE \"to\" IN (SELECT \"from\" FROM transfer WHERE \"value\" > 1000000)"),
             "SELECT * FROM Transfer WHERE \"to\" IN (SELECT \"from\" FROM Transfer WHERE \"value\" > 1000000)"
         );
-        
+
         // EXISTS subquery
         assert_eq!(
             sig.normalize_table_references("SELECT * FROM transfer t1 WHERE EXISTS (SELECT 1 FROM transfer t2 WHERE t2.\"to\" = t1.\"from\")"),
@@ -1225,7 +1274,10 @@ mod tests {
     #[test]
     fn test_normalize_different_event_names() {
         // Test with Approval event
-        let sig = EventSignature::parse("Approval(address indexed owner, address indexed spender, uint256 value)").unwrap();
+        let sig = EventSignature::parse(
+            "Approval(address indexed owner, address indexed spender, uint256 value)",
+        )
+        .unwrap();
         assert_eq!(
             sig.normalize_table_references("SELECT * FROM approval WHERE \"owner\" = '0x123'"),
             "SELECT * FROM Approval WHERE \"owner\" = '0x123'"
@@ -1234,14 +1286,16 @@ mod tests {
             sig.normalize_table_references("SELECT * FROM APPROVAL"),
             "SELECT * FROM Approval"
         );
-        
+
         // Test with Swap event (common in DEX)
         let sig = EventSignature::parse("Swap(address indexed sender, uint256 amount0In, uint256 amount1In, uint256 amount0Out, uint256 amount1Out, address indexed to)").unwrap();
         assert_eq!(
-            sig.normalize_table_references("SELECT address, SUM(\"amount0In\") FROM swap GROUP BY address"),
+            sig.normalize_table_references(
+                "SELECT address, SUM(\"amount0In\") FROM swap GROUP BY address"
+            ),
             "SELECT address, SUM(\"amount0In\") FROM Swap GROUP BY address"
         );
-        
+
         // Test with lowercase event name in signature
         let sig = EventSignature::parse("mint(address indexed to, uint256 amount)").unwrap();
         assert_eq!(
@@ -1260,7 +1314,7 @@ mod tests {
             "Transfer(address indexed from, address indexed to, uint256 value)",
         )
         .unwrap();
-        
+
         let used_cols: HashSet<String> = ["to"].iter().map(|s| s.to_string()).collect();
         assert_snapshot!(sig.to_cte_sql_clickhouse_filtered(Some(&used_cols)));
     }
@@ -1271,7 +1325,7 @@ mod tests {
             "Transfer(address indexed from, address indexed to, uint256 value)",
         )
         .unwrap();
-        
+
         let used_cols: HashSet<String> = ["from", "value"].iter().map(|s| s.to_string()).collect();
         assert_snapshot!(sig.to_cte_sql_clickhouse_filtered(Some(&used_cols)));
     }
@@ -1282,7 +1336,7 @@ mod tests {
             "Transfer(address indexed from, address indexed to, uint256 value)",
         )
         .unwrap();
-        
+
         let used_cols: HashSet<String> = ["value"].iter().map(|s| s.to_string()).collect();
         assert_snapshot!(sig.to_cte_sql_postgres_filtered(Some(&used_cols)));
     }
@@ -1302,7 +1356,7 @@ mod tests {
             "Transfer(address indexed from, address indexed to, uint256 value)",
         )
         .unwrap();
-        
+
         let used_cols: HashSet<String> = ["to", "value"].iter().map(|s| s.to_string()).collect();
         assert_snapshot!(sig.to_cte_sql_clickhouse_filtered(Some(&used_cols)));
     }
@@ -1314,7 +1368,7 @@ mod tests {
     #[test]
     fn test_extract_equality_filters() {
         let filters = extract_equality_filters(
-            "SELECT * FROM transfer WHERE \"from\" = '0xABC123' AND value > 100"
+            "SELECT * FROM transfer WHERE \"from\" = '0xABC123' AND value > 100",
         );
         assert_eq!(filters.get("from"), Some(&"0xABC123".to_string()));
         // value > 100 is not an equality filter
@@ -1324,7 +1378,7 @@ mod tests {
     #[test]
     fn test_extract_equality_filters_multiple() {
         let filters = extract_equality_filters(
-            "SELECT * FROM transfer WHERE \"from\" = '0xABC' AND \"to\" = '0xDEF'"
+            "SELECT * FROM transfer WHERE \"from\" = '0xABC' AND \"to\" = '0xDEF'",
         );
         assert_eq!(filters.get("from"), Some(&"0xABC".to_string()));
         assert_eq!(filters.get("to"), Some(&"0xDEF".to_string()));
@@ -1354,7 +1408,8 @@ mod tests {
 
     #[test]
     fn test_extract_group_by_columns() {
-        let cols = extract_group_by_columns("SELECT \"to\", COUNT(*) FROM transfer GROUP BY \"to\"");
+        let cols =
+            extract_group_by_columns("SELECT \"to\", COUNT(*) FROM transfer GROUP BY \"to\"");
         assert!(cols.contains("to"));
     }
 
@@ -1376,19 +1431,19 @@ mod tests {
         .unwrap();
 
         let mapping = sig.column_mapping();
-        
+
         // "from" is first indexed param -> topic1
         let (col, ty, indexed) = mapping.get("from").unwrap();
         assert_eq!(col, "topic1");
         assert!(matches!(ty, AbiType::Address));
         assert!(indexed);
-        
+
         // "to" is second indexed param -> topic2
         let (col, ty, indexed) = mapping.get("to").unwrap();
         assert_eq!(col, "topic2");
         assert!(matches!(ty, AbiType::Address));
         assert!(indexed);
-        
+
         // "value" is not indexed -> data
         let (col, _, indexed) = mapping.get("value").unwrap();
         assert_eq!(col, "data");
@@ -1402,7 +1457,8 @@ mod tests {
         )
         .unwrap();
 
-        let sql = r#"SELECT * FROM Transfer WHERE "from" = '0xdAC17F958D2ee523a2206206994597C13D831ec7'"#;
+        let sql =
+            r#"SELECT * FROM Transfer WHERE "from" = '0xdAC17F958D2ee523a2206206994597C13D831ec7'"#;
         assert_snapshot!(sig.rewrite_filters_for_pushdown(sql));
     }
 
@@ -1436,7 +1492,7 @@ mod tests {
     #[test]
     fn test_extract_raw_predicates_block_num_range() {
         let preds = extract_raw_column_predicates(
-            "SELECT * FROM OrderFilled WHERE address = '0xABC' AND block_num >= 100 AND block_num <= 200"
+            "SELECT * FROM OrderFilled WHERE address = '0xABC' AND block_num >= 100 AND block_num <= 200",
         );
         assert!(preds.contains(&"address = '0xABC'".to_string()));
         assert!(preds.contains(&"block_num >= 100".to_string()));
@@ -1447,7 +1503,7 @@ mod tests {
     #[test]
     fn test_extract_raw_predicates_ignores_decoded_columns() {
         let preds = extract_raw_column_predicates(
-            r#"SELECT * FROM Transfer WHERE "from" = '0xABC' AND block_num > 50"#
+            r#"SELECT * FROM Transfer WHERE "from" = '0xABC' AND block_num > 50"#,
         );
         // "from" is not a raw column, should not be extracted
         assert!(!preds.iter().any(|p| p.contains("from")));
@@ -1456,25 +1512,23 @@ mod tests {
 
     #[test]
     fn test_extract_raw_predicates_in_list() {
-        let preds = extract_raw_column_predicates(
-            "SELECT * FROM txs WHERE tx_hash IN ('0xabc', '0xdef')"
-        );
+        let preds =
+            extract_raw_column_predicates("SELECT * FROM txs WHERE tx_hash IN ('0xabc', '0xdef')");
         assert_eq!(preds.len(), 1);
         assert!(preds[0].contains("tx_hash IN"));
     }
 
     #[test]
     fn test_extract_raw_predicates_reversed_comparison() {
-        let preds = extract_raw_column_predicates(
-            "SELECT * FROM OrderFilled WHERE 100 <= block_num"
-        );
+        let preds =
+            extract_raw_column_predicates("SELECT * FROM OrderFilled WHERE 100 <= block_num");
         assert!(preds.contains(&"block_num >= 100".to_string()));
     }
 
     #[test]
     fn test_extract_raw_predicates_empty_for_no_raw_columns() {
         let preds = extract_raw_column_predicates(
-            r#"SELECT * FROM Transfer WHERE "to" = '0xABC' AND "value" > 1000"#
+            r#"SELECT * FROM Transfer WHERE "to" = '0xABC' AND "value" > 1000"#,
         );
         assert!(preds.is_empty());
     }
@@ -1511,7 +1565,8 @@ mod tests {
     fn test_cte_postgres_no_pushdown() {
         let sig = EventSignature::parse(
             "Transfer(address indexed from, address indexed to, uint256 value)",
-        ).unwrap();
+        )
+        .unwrap();
         // Empty pushdown should produce identical output to _filtered
         let without = sig.to_cte_sql_postgres_filtered(None);
         let with = sig.to_cte_sql_postgres_with_pushdown(None, &[]);
@@ -1522,10 +1577,10 @@ mod tests {
     fn test_cte_clickhouse_no_pushdown() {
         let sig = EventSignature::parse(
             "Transfer(address indexed from, address indexed to, uint256 value)",
-        ).unwrap();
+        )
+        .unwrap();
         let without = sig.to_cte_sql_clickhouse_filtered(None);
         let with = sig.to_cte_sql_clickhouse_with_pushdown(None, &[]);
         assert_eq!(without, with);
     }
-
 }

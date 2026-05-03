@@ -8,20 +8,20 @@ use std::sync::Arc;
 use tokio::sync::RwLock;
 
 use axum::{
+    Json, Router,
     extract::{Query, State},
-    http::{header, Method, StatusCode},
+    http::{Method, StatusCode, header},
     response::{
-        sse::{Event as SseEvent, KeepAlive, KeepAliveStream},
         IntoResponse, Response, Sse,
+        sse::{Event as SseEvent, KeepAlive, KeepAliveStream},
     },
     routing::get,
-    Json, Router,
 };
+use chrono::Utc;
 use futures::Stream;
 use serde::{Deserialize, Serialize};
 use tower_http::cors::CorsLayer;
 use tower_http::trace::TraceLayer;
-use chrono::Utc;
 
 use crate::broadcast::Broadcaster;
 use crate::clickhouse::ClickHouseEngine;
@@ -62,7 +62,7 @@ impl AppState {
         let id = chain_id.unwrap_or(self.default_chain_id);
         self.pools.read().await.get(&id).cloned()
     }
-    
+
     async fn get_clickhouse(&self, chain_id: Option<u64>) -> Option<Arc<ClickHouseEngine>> {
         let id = chain_id.unwrap_or(self.default_chain_id);
         self.clickhouse_engines.read().await.get(&id).cloned()
@@ -74,7 +74,9 @@ impl AppState {
             return true;
         }
         let ip = addr.ip();
-        self.trusted_cidrs.iter().any(|(network, prefix)| ip_in_cidr(&ip, network, *prefix))
+        self.trusted_cidrs
+            .iter()
+            .any(|(network, prefix)| ip_in_cidr(&ip, network, *prefix))
     }
 }
 
@@ -101,7 +103,11 @@ fn ip_in_cidr(ip: &IpAddr, network: &IpAddr, prefix_len: u8) -> bool {
             if prefix_len > 32 {
                 return false;
             }
-            let mask = if prefix_len == 0 { 0 } else { u32::MAX << (32 - prefix_len) };
+            let mask = if prefix_len == 0 {
+                0
+            } else {
+                u32::MAX << (32 - prefix_len)
+            };
             (u32::from(*ip) & mask) == (u32::from(*net) & mask)
         }
         (IpAddr::V6(ip), IpAddr::V6(net)) => {
@@ -110,15 +116,29 @@ fn ip_in_cidr(ip: &IpAddr, network: &IpAddr, prefix_len: u8) -> bool {
             }
             let ip_bits = u128::from(*ip);
             let net_bits = u128::from(*net);
-            let mask = if prefix_len == 0 { 0 } else { u128::MAX << (128 - prefix_len) };
+            let mask = if prefix_len == 0 {
+                0
+            } else {
+                u128::MAX << (128 - prefix_len)
+            };
             (ip_bits & mask) == (net_bits & mask)
         }
         _ => false,
     }
 }
 
-pub fn router(pools: HashMap<u64, Pool>, default_chain_id: u64, broadcaster: Arc<Broadcaster>) -> Router<()> {
-    router_with_options(pools, default_chain_id, broadcaster, HashMap::new(), &HttpConfig::default())
+pub fn router(
+    pools: HashMap<u64, Pool>,
+    default_chain_id: u64,
+    broadcaster: Arc<Broadcaster>,
+) -> Router<()> {
+    router_with_options(
+        pools,
+        default_chain_id,
+        broadcaster,
+        HashMap::new(),
+        &HttpConfig::default(),
+    )
 }
 
 pub fn router_with_options(
@@ -175,7 +195,10 @@ fn build_router(state: AppState) -> Router<()> {
         .route("/status", get(handle_status))
         .route("/query", get(handle_query))
         .route("/views", get(views::list_views).post(views::create_view))
-        .route("/views/{name}", get(views::get_view).delete(views::delete_view))
+        .route(
+            "/views/{name}",
+            get(views::get_view).delete(views::delete_view),
+        )
         .layer(cors)
         .layer(TraceLayer::new_for_http())
         .with_state(state)
@@ -194,15 +217,19 @@ struct StatusResponse {
 }
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
-const GIT_REV: &str = if let Some(rev) = option_env!("GIT_REV") { rev } else { "dev" };
+const GIT_REV: &str = if let Some(rev) = option_env!("GIT_REV") {
+    rev
+} else {
+    "dev"
+};
 
 async fn handle_status(State(state): State<AppState>) -> Result<Json<StatusResponse>, ApiError> {
     let mut all_chains = Vec::new();
     let pools = state.pools.read().await;
     for (chain_id, pool) in pools.iter() {
-        let chains = crate::service::get_all_status(pool)
-            .await
-            .map_err(|e| ApiError::QueryError(format!("Failed to load status for chain {chain_id}: {e}")))?;
+        let chains = crate::service::get_all_status(pool).await.map_err(|e| {
+            ApiError::QueryError(format!("Failed to load status for chain {chain_id}: {e}"))
+        })?;
         if chains.is_empty() {
             all_chains.push(empty_status(*chain_id));
         } else {
@@ -217,27 +244,40 @@ async fn handle_status(State(state): State<AppState>) -> Result<Json<StatusRespo
         let chain_id = chain.chain_id as u64;
 
         // PostgreSQL per-table watermarks (from in-memory atomics, no table scans)
-        let (pg_blocks, pg_txs, pg_logs, pg_receipts) = crate::metrics::get_sink_watermarks("postgres");
+        let (pg_blocks, pg_txs, pg_logs, pg_receipts) =
+            crate::metrics::get_sink_watermarks("postgres");
         let (pg_bc, pg_tc, pg_lc, pg_rc) = crate::metrics::get_sink_row_counts("postgres");
         if pg_blocks.is_some() || pg_txs.is_some() || pg_logs.is_some() || pg_receipts.is_some() {
             chain.postgres = Some(crate::service::StoreStatus {
-                blocks: pg_blocks, txs: pg_txs, logs: pg_logs, receipts: pg_receipts,
+                blocks: pg_blocks,
+                txs: pg_txs,
+                logs: pg_logs,
+                receipts: pg_receipts,
                 rate: crate::metrics::get_sink_block_rate("postgres"),
-                blocks_count: Some(pg_bc), txs_count: Some(pg_tc),
-                logs_count: Some(pg_lc), receipts_count: Some(pg_rc),
+                blocks_count: Some(pg_bc),
+                txs_count: Some(pg_tc),
+                logs_count: Some(pg_lc),
+                receipts_count: Some(pg_rc),
             });
         }
 
         // ClickHouse per-table watermarks (from in-memory atomics, no table scans)
         if ch_configs.get(&chain_id).is_some_and(|c| c.enabled) {
-            let (ch_blocks, ch_txs, ch_logs, ch_receipts) = crate::metrics::get_sink_watermarks("clickhouse");
+            let (ch_blocks, ch_txs, ch_logs, ch_receipts) =
+                crate::metrics::get_sink_watermarks("clickhouse");
             let (ch_bc, ch_tc, ch_lc, ch_rc) = crate::metrics::get_sink_row_counts("clickhouse");
-            if ch_blocks.is_some() || ch_txs.is_some() || ch_logs.is_some() || ch_receipts.is_some() {
+            if ch_blocks.is_some() || ch_txs.is_some() || ch_logs.is_some() || ch_receipts.is_some()
+            {
                 chain.clickhouse = Some(crate::service::StoreStatus {
-                    blocks: ch_blocks, txs: ch_txs, logs: ch_logs, receipts: ch_receipts,
+                    blocks: ch_blocks,
+                    txs: ch_txs,
+                    logs: ch_logs,
+                    receipts: ch_receipts,
                     rate: crate::metrics::get_sink_block_rate("clickhouse"),
-                    blocks_count: Some(ch_bc), txs_count: Some(ch_tc),
-                    logs_count: Some(ch_lc), receipts_count: Some(ch_rc),
+                    blocks_count: Some(ch_bc),
+                    txs_count: Some(ch_tc),
+                    logs_count: Some(ch_lc),
+                    receipts_count: Some(ch_rc),
                 });
             }
         }
@@ -329,9 +369,13 @@ async fn handle_query(
                 "engine=clickhouse is not supported with live=true (use PostgreSQL for real-time streaming)".to_string()
             ).into_response();
         }
-        handle_query_live(state, params, signatures).await.into_response()
+        handle_query_live(state, params, signatures)
+            .await
+            .into_response()
     } else {
-        handle_query_once(state, params, signatures).await.into_response()
+        handle_query_once(state, params, signatures)
+            .await
+            .into_response()
     }
 }
 
@@ -343,10 +387,7 @@ async fn handle_query_once(
     let pool = state
         .get_pool(Some(params.chain_id))
         .await
-        .ok_or_else(|| ApiError::BadRequest(format!(
-            "Unknown chain_id: {}",
-            params.chain_id,
-        )))?;
+        .ok_or_else(|| ApiError::BadRequest(format!("Unknown chain_id: {}", params.chain_id)))?;
 
     let options = QueryOptions {
         timeout_ms: params.timeout_ms.clamp(100, 30000),
@@ -354,22 +395,24 @@ async fn handle_query_once(
     };
 
     // Route to appropriate engine
-    let use_clickhouse = matches!(
-        params.engine.as_deref(),
-        Some("clickhouse")
-    );
+    let use_clickhouse = matches!(params.engine.as_deref(), Some("clickhouse"));
 
     let sigs: Vec<&str> = signatures.iter().map(String::as_str).collect();
 
     let result = if use_clickhouse {
         // Use ClickHouse engine for OLAP queries
-        let clickhouse = state.get_clickhouse(Some(params.chain_id)).await
-            .ok_or_else(|| ApiError::BadRequest(format!(
-                "ClickHouse not configured for chain_id: {}",
-                params.chain_id
-            )))?;
+        let clickhouse = state
+            .get_clickhouse(Some(params.chain_id))
+            .await
+            .ok_or_else(|| {
+                ApiError::BadRequest(format!(
+                    "ClickHouse not configured for chain_id: {}",
+                    params.chain_id
+                ))
+            })?;
 
-        clickhouse.query(&params.sql, &sigs)
+        clickhouse
+            .query(&params.sql, &sigs)
             .await
             .map(|r| QueryResult {
                 columns: r.columns,
@@ -532,9 +575,7 @@ async fn handle_query_live(
 /// avoiding SQL injection risks from string-based splicing.
 #[doc(hidden)]
 pub fn inject_block_filter(sql: &str, block_num: u64) -> Result<String, ApiError> {
-    use sqlparser::ast::{
-        BinaryOperator, Expr, Ident, SetExpr, Statement, Value,
-    };
+    use sqlparser::ast::{BinaryOperator, Expr, Ident, SetExpr, Statement, Value};
     use sqlparser::dialect::GenericDialect;
     use sqlparser::parser::Parser;
 
@@ -554,7 +595,7 @@ pub fn inject_block_filter(sql: &str, block_num: u64) -> Result<String, ApiError
         _ => {
             return Err(ApiError::BadRequest(
                 "Live mode requires a SELECT query".to_string(),
-            ))
+            ));
         }
     };
 
@@ -564,7 +605,7 @@ pub fn inject_block_filter(sql: &str, block_num: u64) -> Result<String, ApiError
             return Err(ApiError::BadRequest(
                 "Live mode requires a simple SELECT query (UNION/INTERSECT not supported)"
                     .to_string(),
-            ))
+            ));
         }
     };
 
@@ -572,28 +613,31 @@ pub fn inject_block_filter(sql: &str, block_num: u64) -> Result<String, ApiError
         .from
         .first()
         .and_then(|twj| match &twj.relation {
-            sqlparser::ast::TableFactor::Table { name, .. } => {
-                name.0.last().and_then(|part| part.as_ident()).map(|ident| ident.value.to_lowercase())
-            }
+            sqlparser::ast::TableFactor::Table { name, .. } => name
+                .0
+                .last()
+                .and_then(|part| part.as_ident())
+                .map(|ident| ident.value.to_lowercase()),
             _ => None,
         })
         .ok_or_else(|| {
-            ApiError::BadRequest(
-                "Live mode requires a query with a FROM table clause".to_string(),
-            )
+            ApiError::BadRequest("Live mode requires a query with a FROM table clause".to_string())
         })?;
 
-    let col_name = if table_name == "blocks" { "num" } else { "block_num" };
+    let col_name = if table_name == "blocks" {
+        "num"
+    } else {
+        "block_num"
+    };
 
-    let col_expr = Expr::CompoundIdentifier(vec![
-        Ident::new(&table_name),
-        Ident::new(col_name),
-    ]);
+    let col_expr = Expr::CompoundIdentifier(vec![Ident::new(&table_name), Ident::new(col_name)]);
 
     let block_filter = Expr::BinaryOp {
         left: Box::new(col_expr),
         op: BinaryOperator::Eq,
-        right: Box::new(Expr::Value(Value::Number(block_num.to_string(), false).into())),
+        right: Box::new(Expr::Value(
+            Value::Number(block_num.to_string(), false).into(),
+        )),
     };
 
     select.selection = Some(match select.selection.take() {
@@ -674,8 +718,8 @@ mod tests {
     fn test_parse_cidrs_invalid() {
         let cidrs = vec![
             "invalid".to_string(),
-            "100.64.0.0".to_string(),  // Missing prefix
-            "100.64.0.0/abc".to_string(),  // Invalid prefix
+            "100.64.0.0".to_string(),     // Missing prefix
+            "100.64.0.0/abc".to_string(), // Invalid prefix
         ];
         let parsed = parse_cidrs(&cidrs);
         assert_eq!(parsed.len(), 0);
@@ -684,12 +728,16 @@ mod tests {
     #[test]
     fn test_ip_in_cidr_v4() {
         let network: IpAddr = "100.64.0.0".parse().unwrap();
-        
+
         // Inside 100.64.0.0/10
         assert!(ip_in_cidr(&"100.64.0.1".parse().unwrap(), &network, 10));
         assert!(ip_in_cidr(&"100.100.50.25".parse().unwrap(), &network, 10));
-        assert!(ip_in_cidr(&"100.127.255.255".parse().unwrap(), &network, 10));
-        
+        assert!(ip_in_cidr(
+            &"100.127.255.255".parse().unwrap(),
+            &network,
+            10
+        ));
+
         // Outside 100.64.0.0/10
         assert!(!ip_in_cidr(&"100.0.0.1".parse().unwrap(), &network, 10));
         assert!(!ip_in_cidr(&"100.128.0.0".parse().unwrap(), &network, 10));
@@ -699,13 +747,25 @@ mod tests {
     #[test]
     fn test_ip_in_cidr_v6() {
         let network: IpAddr = "fd7a:115c:a1e0::".parse().unwrap();
-        
+
         // Inside fd7a:115c:a1e0::/48
-        assert!(ip_in_cidr(&"fd7a:115c:a1e0::1".parse().unwrap(), &network, 48));
-        assert!(ip_in_cidr(&"fd7a:115c:a1e0:ffff::1".parse().unwrap(), &network, 48));
-        
+        assert!(ip_in_cidr(
+            &"fd7a:115c:a1e0::1".parse().unwrap(),
+            &network,
+            48
+        ));
+        assert!(ip_in_cidr(
+            &"fd7a:115c:a1e0:ffff::1".parse().unwrap(),
+            &network,
+            48
+        ));
+
         // Outside fd7a:115c:a1e0::/48
-        assert!(!ip_in_cidr(&"fd7a:115c:a1e1::1".parse().unwrap(), &network, 48));
+        assert!(!ip_in_cidr(
+            &"fd7a:115c:a1e1::1".parse().unwrap(),
+            &network,
+            48
+        ));
         assert!(!ip_in_cidr(&"2001:db8::1".parse().unwrap(), &network, 48));
     }
 }

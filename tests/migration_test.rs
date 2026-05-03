@@ -114,7 +114,10 @@ async fn test_pg_upgrade_adds_virtual_forward_column_before_indexes() {
     .await;
 
     drop(pool);
-    temp_db.cleanup().await.expect("Failed to clean up temporary database");
+    temp_db
+        .cleanup()
+        .await
+        .expect("Failed to clean up temporary database");
 
     if let Err(panic) = result {
         std::panic::resume_unwind(panic);
@@ -145,7 +148,10 @@ impl TempDb {
         });
 
         admin_client
-            .execute(&format!("DROP DATABASE IF EXISTS \"{database_name}\";"), &[])
+            .execute(
+                &format!("DROP DATABASE IF EXISTS \"{database_name}\";"),
+                &[],
+            )
             .await?;
         admin_client
             .execute(&format!("CREATE DATABASE \"{database_name}\";"), &[])
@@ -174,7 +180,10 @@ impl TempDb {
             .await?;
 
         admin_client
-            .execute(&format!("DROP DATABASE IF EXISTS \"{}\";", self.database_name), &[])
+            .execute(
+                &format!("DROP DATABASE IF EXISTS \"{}\";", self.database_name),
+                &[],
+            )
             .await?;
 
         Ok(())

@@ -1753,7 +1753,10 @@ async fn test_backfill_multi_batch_pagination() {
         .await
         .expect("backfill failed");
 
-    assert_eq!(ch.table_count_final("blocks").await.unwrap(), block_count as u64);
+    assert_eq!(
+        ch.table_count_final("blocks").await.unwrap(),
+        block_count as u64
+    );
 
     // Verify first and last blocks roundtripped
     let result = ch

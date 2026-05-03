@@ -4,19 +4,19 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
+use axum::Router;
 use axum::body::Body;
 use axum::extract::connect_info::IntoMakeServiceWithConnectInfo;
 use axum::http::{Request, StatusCode};
-use axum::Router;
 use deadpool_postgres::{Config as PgConfig, Runtime};
 use tokio_postgres::NoTls;
 use tower::Service;
 
+use common::testdb::TestDb;
+use serial_test::serial;
 use tidx::api;
 use tidx::broadcast::Broadcaster;
 use tidx::metrics;
-use common::testdb::TestDb;
-use serial_test::serial;
 
 fn make_pools(pool: tidx::db::Pool) -> (HashMap<u64, tidx::db::Pool>, u64) {
     let mut pools = HashMap::new();
@@ -203,9 +203,7 @@ async fn test_cli_proxy_via_http_server() {
 
     // Spawn server in background
     let server = tokio::spawn(async move {
-        axum::serve(listener, router)
-            .await
-            .expect("Server failed");
+        axum::serve(listener, router).await.expect("Server failed");
     });
 
     // Wait for server to be ready

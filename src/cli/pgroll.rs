@@ -15,7 +15,11 @@ pub struct Args {
     ///
     /// The pgroll executable is resolved from TIDX_PGROLL_BIN, then PGROLL_BIN,
     /// then PATH as `pgroll`.
-    #[arg(value_name = "PGROLL_ARGS", trailing_var_arg = true, allow_hyphen_values = true)]
+    #[arg(
+        value_name = "PGROLL_ARGS",
+        trailing_var_arg = true,
+        allow_hyphen_values = true
+    )]
     pub args: Vec<OsString>,
 }
 

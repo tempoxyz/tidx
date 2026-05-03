@@ -87,7 +87,7 @@ async fn test_broadcaster_lagged_receiver() {
 #[tokio::test]
 async fn test_broadcaster_no_receivers() {
     let broadcaster = Broadcaster::new();
-    
+
     // Sending without receivers should not panic
     broadcaster.send(BlockUpdate {
         chain_id: 4217,

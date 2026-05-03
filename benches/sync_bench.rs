@@ -1,4 +1,4 @@
-use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
+use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use tokio::runtime::Runtime;
 
 use tidx::db::{create_pool, run_migrations};
@@ -80,7 +80,9 @@ fn bench_batch_writes(c: &mut Criterion) {
 
     let pool = rt.block_on(async {
         let pool = create_pool(&db_url).await.expect("Failed to create pool");
-        run_migrations(&pool).await.expect("Failed to run migrations");
+        run_migrations(&pool)
+            .await
+            .expect("Failed to run migrations");
         pool
     });
 
@@ -157,7 +159,9 @@ fn bench_mixed_workload(c: &mut Criterion) {
 
     let pool = rt.block_on(async {
         let pool = create_pool(&db_url).await.expect("Failed to create pool");
-        run_migrations(&pool).await.expect("Failed to run migrations");
+        run_migrations(&pool)
+            .await
+            .expect("Failed to run migrations");
         pool
     });
 
@@ -221,7 +225,9 @@ fn bench_copy_throughput(c: &mut Criterion) {
 
     let pool = rt.block_on(async {
         let pool = create_pool(&db_url).await.expect("Failed to create pool");
-        run_migrations(&pool).await.expect("Failed to run migrations");
+        run_migrations(&pool)
+            .await
+            .expect("Failed to run migrations");
         pool
     });
 
@@ -275,5 +281,10 @@ fn bench_copy_throughput(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, bench_batch_writes, bench_mixed_workload, bench_copy_throughput);
+criterion_group!(
+    benches,
+    bench_batch_writes,
+    bench_mixed_workload,
+    bench_copy_throughput
+);
 criterion_main!(benches);
