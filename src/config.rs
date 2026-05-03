@@ -35,7 +35,7 @@ pub struct HttpConfig {
     pub bind: String,
 
     /// Trusted CIDRs for admin operations (e.g., `100.64.0.0/10` for Tailscale)
-    #[serde(default)]
+    #[serde(default = "default_trusted_cidrs")]
     pub trusted_cidrs: Vec<String>,
 }
 
@@ -45,7 +45,7 @@ impl Default for HttpConfig {
             enabled: true,
             port: 8080,
             bind: "0.0.0.0".to_string(),
-            trusted_cidrs: Vec::new(),
+            trusted_cidrs: default_trusted_cidrs(),
         }
     }
 }
@@ -80,6 +80,10 @@ fn default_http_port() -> u16 {
 
 fn default_bind() -> String {
     "0.0.0.0".to_string()
+}
+
+fn default_trusted_cidrs() -> Vec<String> {
+    vec!["127.0.0.1/32".to_string(), "::1/128".to_string()]
 }
 
 fn default_metrics_port() -> u16 {

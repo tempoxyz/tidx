@@ -1,6 +1,8 @@
 //! Views API for managing ClickHouse materialized views
 
 use axum::{
+    extract::{ConnectInfo, Path, Query, State},
+    http::HeaderMap,
     Json,
     extract::{ConnectInfo, Path, Query, State},
 };
@@ -9,6 +11,24 @@ use std::net::SocketAddr;
 
 use super::{ApiError, AppState};
 use crate::query::EventSignature;
+
+const ADMIN_MUTATION_HEADER: &str = "x-tidx-admin";
+
+fn require_admin_mutation(headers: &HeaderMap, state: &AppState, addr: &SocketAddr) -> Result<(), ApiError> {
+    if !state.is_trusted_ip(addr) {
+        return Err(ApiError::Forbidden("Mutations only allowed from trusted IPs".to_string()));
+    }
+
+    if headers
+        .get(ADMIN_MUTATION_HEADER)
+        .and_then(|value| value.to_str().ok())
+        != Some("1")
+    {
+        return Err(ApiError::Forbidden("Missing admin mutation header".to_string()));
+    }
+
+    Ok(())
+}
 
 /// Validate view name (alphanumeric + underscore only)
 fn is_valid_view_name(name: &str) -> bool {
@@ -170,14 +190,10 @@ pub struct CreateViewResponse {
 pub async fn create_view(
     State(state): State<AppState>,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
     Json(req): Json<CreateViewRequest>,
 ) -> Result<Json<CreateViewResponse>, ApiError> {
-    // Check trusted IP access
-    if !state.is_trusted_ip(&addr) {
-        return Err(ApiError::Forbidden(
-            "Mutations only allowed from trusted IPs".to_string(),
-        ));
-    }
+    require_admin_mutation(&headers, &state, &addr)?;
 
     // Validate view name
     if !is_valid_view_name(&req.name) {
@@ -320,15 +336,11 @@ pub struct DeleteViewResponse {
 pub async fn delete_view(
     State(state): State<AppState>,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
     Path(name): Path<String>,
     Query(params): Query<ChainQuery>,
 ) -> Result<Json<DeleteViewResponse>, ApiError> {
-    // Check trusted IP access
-    if !state.is_trusted_ip(&addr) {
-        return Err(ApiError::Forbidden(
-            "Mutations only allowed from trusted IPs".to_string(),
-        ));
-    }
+    require_admin_mutation(&headers, &state, &addr)?;
 
     // Validate view name
     if !is_valid_view_name(&name) {
@@ -446,7 +458,12 @@ pub async fn get_view(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::broadcast::Broadcaster;
     use insta::assert_snapshot;
+    use std::collections::HashMap;
+    use std::net::IpAddr;
+    use std::sync::{Arc, RwLock as StdRwLock};
+    use tokio::sync::RwLock;
 
     #[test]
     fn test_valid_view_name() {
@@ -458,6 +475,35 @@ mod tests {
         assert!(!is_valid_view_name("123view")); // Starts with number
         assert!(!is_valid_view_name("my-view")); // Has hyphen
         assert!(!is_valid_view_name("my view")); // Has space
+    }
+
+    fn test_state_with_trusted_localhost() -> AppState {
+        let trusted_cidrs = vec![("127.0.0.1".parse::<IpAddr>().unwrap(), 32)];
+        AppState {
+            pools: Arc::new(RwLock::new(HashMap::new())),
+            default_chain_id: 0,
+            broadcaster: Arc::new(Broadcaster::new()),
+            clickhouse_configs: Arc::new(RwLock::new(HashMap::new())),
+            clickhouse_engines: Arc::new(RwLock::new(HashMap::new())),
+            trusted_cidrs: Arc::new(StdRwLock::new(trusted_cidrs)),
+        }
+    }
+
+    #[test]
+    fn test_requires_admin_mutation_header() {
+        let state = test_state_with_trusted_localhost();
+        let addr: SocketAddr = "127.0.0.1:8080".parse().unwrap();
+        let headers = HeaderMap::new();
+        assert!(require_admin_mutation(&headers, &state, &addr).is_err());
+    }
+
+    #[test]
+    fn test_accepts_admin_mutation_header_from_trusted_ip() {
+        let state = test_state_with_trusted_localhost();
+        let addr: SocketAddr = "127.0.0.1:8080".parse().unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert(ADMIN_MUTATION_HEADER, "1".parse().unwrap());
+        assert!(require_admin_mutation(&headers, &state, &addr).is_ok());
     }
 
     // ========================================================================

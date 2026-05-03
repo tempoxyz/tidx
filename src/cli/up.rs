@@ -125,6 +125,7 @@ pub async fn run(args: Args) -> Result<()> {
 
     if !args.no_watch {
         let watcher = ConfigWatcher::new(args.config.clone(), &config, chain_tx);
+        let trusted_cidrs = watcher.trusted_cidrs();
         watcher.start()?;
 
         if config.http.enabled && default_chain_id != 0 {
@@ -136,7 +137,7 @@ pub async fn run(args: Args) -> Result<()> {
                 broadcaster.clone(),
                 Arc::clone(&clickhouse_configs),
                 Arc::clone(&clickhouse_engines),
-                config.http.trusted_cidrs.clone(),
+                trusted_cidrs,
             );
 
             info!(addr = %addr, "Starting HTTP API server (hot-reload enabled)");
