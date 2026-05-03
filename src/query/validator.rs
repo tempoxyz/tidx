@@ -56,6 +56,50 @@ pub fn validate_query(sql: &str) -> Result<()> {
     }
 }
 
+/// Validates that a ClickHouse user query is safe to execute.
+///
+/// This path is deny-list oriented because ClickHouse analytics commonly use
+/// engine-specific scalar functions, but table functions, system catalogs, and
+/// multi-statement/non-SELECT queries are never needed for public queries.
+pub fn validate_clickhouse_query(sql: &str) -> Result<()> {
+    if sql.len() > MAX_QUERY_LENGTH {
+        return Err(anyhow!(
+            "Query too large ({} bytes, max {})",
+            sql.len(),
+            MAX_QUERY_LENGTH
+        ));
+    }
+
+    let dialect = sqlparser::dialect::ClickHouseDialect {};
+    let statements =
+        Parser::parse_sql(&dialect, sql).map_err(|e| anyhow!("SQL parse error: {e}"))?;
+
+    if statements.is_empty() {
+        return Err(anyhow!("Empty query"));
+    }
+    if statements.len() > 1 {
+        return Err(anyhow!("Multiple statements not allowed"));
+    }
+
+    match &statements[0] {
+        Statement::Query(query) => {
+            let cte_names = HashSet::new();
+            validate_clickhouse_query_ast(query, &cte_names, 0)
+        }
+        _ => Err(anyhow!("Only SELECT queries are allowed")),
+    }
+}
+
+fn extract_cte_names(query: &Query) -> HashSet<String> {
+    let mut names = HashSet::new();
+    if let Some(with) = &query.with {
+        for cte in &with.cte_tables {
+            names.insert(cte.alias.name.value.to_lowercase());
+        }
+    }
+    names
+}
+
 fn validate_query_ast(query: &Query, cte_names: &HashSet<String>, depth: usize) -> Result<()> {
     if depth > MAX_SUBQUERY_DEPTH {
         return Err(anyhow!(
@@ -161,6 +205,368 @@ fn validate_limit_expr(expr: &Expr, context: &str) -> Result<()> {
         }
         _ => Err(anyhow!("{context} must be a numeric literal")),
     }
+}
+
+const CLICKHOUSE_BLOCKED_SCHEMAS: &[&str] = &["system", "information_schema"];
+const CLICKHOUSE_DANGEROUS_FUNCTIONS: &[&str] = &[
+    "url",
+    "file",
+    "s3",
+    "remote",
+    "remotesecure",
+    "mysql",
+    "postgresql",
+    "jdbc",
+    "odbc",
+    "hdfs",
+    "mongodb",
+    "redis",
+];
+
+fn validate_clickhouse_query_ast(
+    query: &Query,
+    cte_names: &HashSet<String>,
+    depth: usize,
+) -> Result<()> {
+    if depth > MAX_SUBQUERY_DEPTH {
+        return Err(anyhow!(
+            "Subquery nesting too deep (max {} levels)",
+            MAX_SUBQUERY_DEPTH
+        ));
+    }
+
+    if query.fetch.is_some() || !query.locks.is_empty() {
+        return Err(anyhow!("Unsupported query clause"));
+    }
+
+    let mut all_cte_names = cte_names.clone();
+    if let Some(with) = &query.with {
+        if with.recursive {
+            return Err(anyhow!("Recursive CTEs are not allowed"));
+        }
+        for cte in &with.cte_tables {
+            validate_clickhouse_query_ast(&cte.query, &all_cte_names, depth + 1)?;
+            all_cte_names.insert(cte.alias.name.value.to_lowercase());
+        }
+    }
+
+    validate_clickhouse_set_expr(&query.body, &all_cte_names, depth)?;
+
+    if let Some(order_by) = &query.order_by {
+        if let sqlparser::ast::OrderByKind::Expressions(exprs) = &order_by.kind {
+            for order_expr in exprs {
+                validate_clickhouse_expr(&order_expr.expr, &all_cte_names, depth)?;
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn validate_clickhouse_set_expr(
+    set_expr: &SetExpr,
+    cte_names: &HashSet<String>,
+    depth: usize,
+) -> Result<()> {
+    match set_expr {
+        SetExpr::Select(select) => {
+            if select.into.is_some() {
+                return Err(anyhow!("SELECT INTO is not allowed"));
+            }
+            for table in &select.from {
+                validate_clickhouse_table_with_joins(table, cte_names, depth)?;
+            }
+            for item in &select.projection {
+                if let sqlparser::ast::SelectItem::UnnamedExpr(expr)
+                | sqlparser::ast::SelectItem::ExprWithAlias { expr, .. } = item
+                {
+                    validate_clickhouse_expr(expr, cte_names, depth)?;
+                }
+            }
+            if let Some(selection) = &select.selection {
+                validate_clickhouse_expr(selection, cte_names, depth)?;
+            }
+            if let sqlparser::ast::GroupByExpr::Expressions(exprs, _) = &select.group_by {
+                for expr in exprs {
+                    validate_clickhouse_expr(expr, cte_names, depth)?;
+                }
+            }
+            if let Some(having) = &select.having {
+                validate_clickhouse_expr(having, cte_names, depth)?;
+            }
+            Ok(())
+        }
+        SetExpr::Query(query) => validate_clickhouse_query_ast(query, cte_names, depth + 1),
+        SetExpr::SetOperation { left, right, .. } => {
+            validate_clickhouse_set_expr(left, cte_names, depth + 1)?;
+            validate_clickhouse_set_expr(right, cte_names, depth + 1)
+        }
+        SetExpr::Values(values) => {
+            for row in &values.rows {
+                for expr in row {
+                    validate_clickhouse_expr(expr, cte_names, depth)?;
+                }
+            }
+            Ok(())
+        }
+        _ => Err(anyhow!("Only SELECT queries are allowed")),
+    }
+}
+
+fn validate_clickhouse_table_with_joins(
+    table: &TableWithJoins,
+    cte_names: &HashSet<String>,
+    depth: usize,
+) -> Result<()> {
+    validate_clickhouse_table_factor(&table.relation, cte_names, depth)?;
+    for join in &table.joins {
+        validate_clickhouse_table_factor(&join.relation, cte_names, depth)?;
+        match &join.join_operator {
+            sqlparser::ast::JoinOperator::Join(sqlparser::ast::JoinConstraint::On(expr))
+            | sqlparser::ast::JoinOperator::Inner(sqlparser::ast::JoinConstraint::On(expr))
+            | sqlparser::ast::JoinOperator::Left(sqlparser::ast::JoinConstraint::On(expr))
+            | sqlparser::ast::JoinOperator::LeftOuter(sqlparser::ast::JoinConstraint::On(expr))
+            | sqlparser::ast::JoinOperator::Right(sqlparser::ast::JoinConstraint::On(expr))
+            | sqlparser::ast::JoinOperator::RightOuter(sqlparser::ast::JoinConstraint::On(expr))
+            | sqlparser::ast::JoinOperator::FullOuter(sqlparser::ast::JoinConstraint::On(expr))
+            | sqlparser::ast::JoinOperator::CrossJoin(sqlparser::ast::JoinConstraint::On(expr)) => {
+                validate_clickhouse_expr(expr, cte_names, depth)?;
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+fn validate_clickhouse_table_factor(
+    factor: &TableFactor,
+    cte_names: &HashSet<String>,
+    depth: usize,
+) -> Result<()> {
+    match factor {
+        TableFactor::Table {
+            name,
+            args,
+            sample,
+            with_ordinality,
+            ..
+        } => {
+            if args.is_some() || sample.is_some() || *with_ordinality {
+                return Err(anyhow!("Table functions are not allowed"));
+            }
+            validate_clickhouse_table_name(name, cte_names)
+        }
+        TableFactor::Derived { subquery, .. } => {
+            validate_clickhouse_query_ast(subquery, cte_names, depth + 1)
+        }
+        TableFactor::NestedJoin {
+            table_with_joins, ..
+        } => validate_clickhouse_table_with_joins(table_with_joins, cte_names, depth),
+        TableFactor::TableFunction { .. } | TableFactor::Function { .. } => {
+            Err(anyhow!("Table functions are not allowed"))
+        }
+        _ => Err(anyhow!("Unsupported FROM clause type")),
+    }
+}
+
+fn validate_clickhouse_table_name(name: &ObjectName, cte_names: &HashSet<String>) -> Result<()> {
+    let parts: Vec<String> = name
+        .0
+        .iter()
+        .map(|part| {
+            part.as_ident()
+                .map(|ident| ident.value.to_lowercase())
+                .ok_or_else(|| anyhow!("Unsupported table identifier"))
+        })
+        .collect::<Result<_>>()?;
+
+    if parts.len() > 1 && CLICKHOUSE_BLOCKED_SCHEMAS.contains(&parts[0].as_str()) {
+        return Err(anyhow!(
+            "Access to ClickHouse system schema '{}' is not allowed",
+            parts[0]
+        ));
+    }
+
+    let bare_name = parts.last().cloned().unwrap_or_default();
+    if ALLOWED_TABLES.contains(&bare_name.as_str()) {
+        return Ok(());
+    }
+    if parts.len() == 1 && cte_names.contains(&bare_name) {
+        return Ok(());
+    }
+
+    Err(anyhow!("Access to table '{bare_name}' is not allowed"))
+}
+
+fn validate_clickhouse_expr(expr: &Expr, cte_names: &HashSet<String>, depth: usize) -> Result<()> {
+    match expr {
+        Expr::Identifier(_)
+        | Expr::CompoundIdentifier(_)
+        | Expr::Value(_)
+        | Expr::TypedString(_)
+        | Expr::Wildcard(_)
+        | Expr::QualifiedWildcard(_, _) => Ok(()),
+        Expr::Function(func) => validate_clickhouse_function(func, cte_names, depth),
+        Expr::Subquery(query) => validate_clickhouse_query_ast(query, cte_names, depth + 1),
+        Expr::InSubquery { expr, subquery, .. } => {
+            validate_clickhouse_expr(expr, cte_names, depth)?;
+            validate_clickhouse_query_ast(subquery, cte_names, depth + 1)
+        }
+        Expr::Exists { subquery, .. } => {
+            validate_clickhouse_query_ast(subquery, cte_names, depth + 1)
+        }
+        Expr::BinaryOp { left, right, .. } => {
+            validate_clickhouse_expr(left, cte_names, depth)?;
+            validate_clickhouse_expr(right, cte_names, depth)
+        }
+        Expr::UnaryOp { expr, .. } | Expr::Nested(expr) | Expr::Cast { expr, .. } => {
+            validate_clickhouse_expr(expr, cte_names, depth)
+        }
+        Expr::Between {
+            expr, low, high, ..
+        } => {
+            validate_clickhouse_expr(expr, cte_names, depth)?;
+            validate_clickhouse_expr(low, cte_names, depth)?;
+            validate_clickhouse_expr(high, cte_names, depth)
+        }
+        Expr::InList { expr, list, .. } => {
+            validate_clickhouse_expr(expr, cte_names, depth)?;
+            for item in list {
+                validate_clickhouse_expr(item, cte_names, depth)?;
+            }
+            Ok(())
+        }
+        Expr::Case {
+            operand,
+            conditions,
+            else_result,
+            ..
+        } => {
+            if let Some(operand) = operand {
+                validate_clickhouse_expr(operand, cte_names, depth)?;
+            }
+            for case_when in conditions {
+                validate_clickhouse_expr(&case_when.condition, cte_names, depth)?;
+                validate_clickhouse_expr(&case_when.result, cte_names, depth)?;
+            }
+            if let Some(else_result) = else_result {
+                validate_clickhouse_expr(else_result, cte_names, depth)?;
+            }
+            Ok(())
+        }
+        Expr::Like { expr, pattern, .. } | Expr::ILike { expr, pattern, .. } => {
+            validate_clickhouse_expr(expr, cte_names, depth)?;
+            validate_clickhouse_expr(pattern, cte_names, depth)
+        }
+        Expr::Substring {
+            expr,
+            substring_from,
+            substring_for,
+            ..
+        } => {
+            validate_clickhouse_expr(expr, cte_names, depth)?;
+            if let Some(from) = substring_from {
+                validate_clickhouse_expr(from, cte_names, depth)?;
+            }
+            if let Some(for_expr) = substring_for {
+                validate_clickhouse_expr(for_expr, cte_names, depth)?;
+            }
+            Ok(())
+        }
+        Expr::Trim {
+            expr, trim_what, ..
+        } => {
+            validate_clickhouse_expr(expr, cte_names, depth)?;
+            if let Some(trim_what) = trim_what {
+                validate_clickhouse_expr(trim_what, cte_names, depth)?;
+            }
+            Ok(())
+        }
+        Expr::Extract { expr, .. }
+        | Expr::Ceil { expr, .. }
+        | Expr::Floor { expr, .. }
+        | Expr::Collate { expr, .. } => validate_clickhouse_expr(expr, cte_names, depth),
+        Expr::IsNull(expr)
+        | Expr::IsNotNull(expr)
+        | Expr::IsTrue(expr)
+        | Expr::IsFalse(expr)
+        | Expr::IsNotTrue(expr)
+        | Expr::IsNotFalse(expr)
+        | Expr::IsUnknown(expr)
+        | Expr::IsNotUnknown(expr) => validate_clickhouse_expr(expr, cte_names, depth),
+        Expr::Tuple(exprs) => {
+            for expr in exprs {
+                validate_clickhouse_expr(expr, cte_names, depth)?;
+            }
+            Ok(())
+        }
+        Expr::Array(arr) => {
+            for expr in &arr.elem {
+                validate_clickhouse_expr(expr, cte_names, depth)?;
+            }
+            Ok(())
+        }
+        _ => Err(anyhow!("Unsupported expression type")),
+    }
+}
+
+fn validate_clickhouse_function(
+    func: &Function,
+    cte_names: &HashSet<String>,
+    depth: usize,
+) -> Result<()> {
+    let func_name = func.name.to_string().to_lowercase();
+    let bare_name = func_name.rsplit('.').next().unwrap_or(&func_name);
+    if CLICKHOUSE_DANGEROUS_FUNCTIONS.contains(&bare_name) {
+        return Err(anyhow!("Function '{}' is not allowed", func_name));
+    }
+
+    if let FunctionArguments::List(arg_list) = &func.args {
+        for arg in &arg_list.args {
+            if let FunctionArg::Unnamed(FunctionArgExpr::Expr(expr))
+            | FunctionArg::Named {
+                arg: FunctionArgExpr::Expr(expr),
+                ..
+            } = arg
+            {
+                validate_clickhouse_expr(expr, cte_names, depth)?;
+            }
+        }
+        for clause in &arg_list.clauses {
+            match clause {
+                sqlparser::ast::FunctionArgumentClause::OrderBy(order_by) => {
+                    for order_expr in order_by {
+                        validate_clickhouse_expr(&order_expr.expr, cte_names, depth)?;
+                    }
+                }
+                sqlparser::ast::FunctionArgumentClause::Limit(expr) => {
+                    validate_limit_expr(expr, "FUNCTION LIMIT")?;
+                }
+                sqlparser::ast::FunctionArgumentClause::Having(bound) => {
+                    validate_clickhouse_expr(&bound.1, cte_names, depth)?;
+                }
+                sqlparser::ast::FunctionArgumentClause::IgnoreOrRespectNulls(_) => {}
+                _ => return Err(anyhow!("Unsupported function clause")),
+            }
+        }
+    }
+
+    if let Some(filter) = &func.filter {
+        validate_clickhouse_expr(filter, cte_names, depth)?;
+    }
+    for order_expr in &func.within_group {
+        validate_clickhouse_expr(&order_expr.expr, cte_names, depth)?;
+    }
+    if let Some(sqlparser::ast::WindowType::WindowSpec(spec)) = &func.over {
+        for expr in &spec.partition_by {
+            validate_clickhouse_expr(expr, cte_names, depth)?;
+        }
+        for order_expr in &spec.order_by {
+            validate_clickhouse_expr(&order_expr.expr, cte_names, depth)?;
+        }
+    }
+
+    Ok(())
 }
 
 fn validate_set_expr(set_expr: &SetExpr, cte_names: &HashSet<String>, depth: usize) -> Result<()> {
@@ -1183,5 +1589,52 @@ mod tests {
         }
         let sql = format!("SELECT * FROM {sql} nested");
         assert!(validate_query(&sql).is_err());
+    }
+
+    #[test]
+    fn test_clickhouse_allows_expected_analytics_query() {
+        assert!(
+            validate_clickhouse_query(
+                "SELECT lower(substring(tx_hash, 3)), count() FROM logs GROUP BY tx_hash LIMIT 10"
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn test_clickhouse_rejects_non_select_and_multiple_statements() {
+        assert!(validate_clickhouse_query("DROP TABLE logs").is_err());
+        assert!(validate_clickhouse_query("SELECT * FROM logs; SELECT * FROM txs").is_err());
+    }
+
+    #[test]
+    fn test_clickhouse_rejects_system_tables() {
+        assert!(validate_clickhouse_query("SELECT * FROM system.tables").is_err());
+        assert!(validate_clickhouse_query(r#"SELECT * FROM "system".tables"#).is_err());
+    }
+
+    #[test]
+    fn test_clickhouse_rejects_table_functions() {
+        assert!(validate_clickhouse_query("SELECT * FROM url('http://169.254.169.254/')").is_err());
+        assert!(validate_clickhouse_query("SELECT * FROM file('/etc/passwd')").is_err());
+        assert!(validate_clickhouse_query("SELECT * FROM s3('s3://bucket/key')").is_err());
+    }
+
+    #[test]
+    fn test_clickhouse_rejects_dangerous_scalar_functions() {
+        assert!(validate_clickhouse_query("SELECT url('http://example.com') FROM logs").is_err());
+        assert!(
+            validate_clickhouse_query("SELECT remote('host', 'db', 'table') FROM logs").is_err()
+        );
+    }
+
+    #[test]
+    fn test_clickhouse_rejects_schema_qualified_cte_shadowing() {
+        assert!(
+            validate_clickhouse_query(
+                "WITH system AS (SELECT * FROM logs) SELECT * FROM system.tables"
+            )
+            .is_err()
+        );
     }
 }

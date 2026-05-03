@@ -12,7 +12,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use tracing::{error, warn};
 
 use crate::config::ClickHouseConfig;
-use crate::query::{EventSignature, extract_raw_column_predicates};
+use crate::query::{EventSignature, extract_raw_column_predicates, validate_clickhouse_query};
 
 /// A single ClickHouse instance (connection + URL).
 struct Instance {
@@ -69,6 +69,7 @@ impl ClickHouseEngine {
     ) -> Result<Instance> {
         let http_client = reqwest::Client::builder()
             .pool_max_idle_per_host(4)
+            .timeout(std::time::Duration::from_secs(35))
             .build()
             .map_err(|e| anyhow!("Failed to create HTTP client: {e}"))?;
         Ok(Instance {
@@ -90,6 +91,33 @@ impl ClickHouseEngine {
     /// ClickHouse query errors (syntax, missing table, etc.) are returned
     /// immediately.
     pub async fn query(&self, sql: &str, signatures: &[&str]) -> Result<QueryResult> {
+        self.query_with_timeout(sql, signatures, 30_000).await
+    }
+
+    /// Execute a public user query after applying signature rewrites, SQL
+    /// validation, and caller-provided timeout limits.
+    pub async fn query_user(
+        &self,
+        sql: &str,
+        signatures: &[&str],
+        timeout_ms: u64,
+    ) -> Result<QueryResult> {
+        let sql = self.prepare_query(sql, signatures)?;
+        validate_clickhouse_query(&sql)?;
+        self.execute_prepared_query(&sql, timeout_ms).await
+    }
+
+    pub async fn query_with_timeout(
+        &self,
+        sql: &str,
+        signatures: &[&str],
+        timeout_ms: u64,
+    ) -> Result<QueryResult> {
+        let sql = self.prepare_query(sql, signatures)?;
+        self.execute_prepared_query(&sql, timeout_ms).await
+    }
+
+    fn prepare_query(&self, sql: &str, signatures: &[&str]) -> Result<String> {
         let sql = if !signatures.is_empty() {
             let sigs: Vec<EventSignature> = signatures
                 .iter()
@@ -112,6 +140,10 @@ impl ClickHouseEngine {
             sql.to_string()
         };
 
+        Ok(sql)
+    }
+
+    async fn execute_prepared_query(&self, sql: &str, timeout_ms: u64) -> Result<QueryResult> {
         let start = std::time::Instant::now();
         let n = self.instances.len();
         let starting = self.active.load(Ordering::Relaxed);
@@ -120,7 +152,7 @@ impl ClickHouseEngine {
             let idx = (starting + attempt) % n;
             let inst = &self.instances[idx];
 
-            match self.try_query(inst, &sql, start).await {
+            match self.try_query(inst, sql, start, timeout_ms).await {
                 Ok(result) => {
                     if attempt > 0 {
                         self.active.store(idx, Ordering::Relaxed);
@@ -153,23 +185,31 @@ impl ClickHouseEngine {
         inst: &Instance,
         sql: &str,
         start: std::time::Instant,
+        timeout_ms: u64,
     ) -> Result<QueryResult> {
+        let max_execution_time = ((timeout_ms + 999) / 1000).max(1);
         let url = format!(
-            "{}/?database={}&default_format=JSON",
+            "{}/?database={}&default_format=JSON&max_execution_time={}",
             inst.url.trim_end_matches('/'),
-            self.database
+            self.database,
+            max_execution_time
         );
 
-        let mut req = inst.http_client.post(&url).body(sql.to_string());
+        let request_timeout = std::time::Duration::from_millis(timeout_ms + 100);
+        let mut req = inst
+            .http_client
+            .post(&url)
+            .timeout(request_timeout)
+            .body(sql.to_string());
         if let Some(ref user) = inst.user {
             req = req.header("X-ClickHouse-User", user);
         }
         if let Some(ref password) = inst.password {
             req = req.header("X-ClickHouse-Key", password);
         }
-        let resp = req
-            .send()
+        let resp = tokio::time::timeout(request_timeout, req.send())
             .await
+            .map_err(|_| anyhow!("ClickHouse query timed out"))?
             .map_err(|e| anyhow!("ClickHouse HTTP request failed: {e}"))?;
 
         if !resp.status().is_success() {

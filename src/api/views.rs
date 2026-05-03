@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
 
 use super::{ApiError, AppState};
-use crate::query::EventSignature;
+use crate::query::{EventSignature, validate_clickhouse_query};
 
 /// Validate view name (alphanumeric + underscore only)
 fn is_valid_view_name(name: &str) -> bool {
@@ -248,6 +248,8 @@ pub async fn create_view(
     } else {
         req.sql.clone()
     };
+    validate_clickhouse_query(&sql)
+        .map_err(|e| ApiError::BadRequest(format!("Unsafe view SQL: {e}")))?;
 
     // 1. Ensure database exists
     let create_db = format!("CREATE DATABASE IF NOT EXISTS {}", database);
