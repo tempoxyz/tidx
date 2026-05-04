@@ -90,16 +90,6 @@ pub fn validate_clickhouse_query(sql: &str) -> Result<()> {
     }
 }
 
-fn extract_cte_names(query: &Query) -> HashSet<String> {
-    let mut names = HashSet::new();
-    if let Some(with) = &query.with {
-        for cte in &with.cte_tables {
-            names.insert(cte.alias.name.value.to_lowercase());
-        }
-    }
-    names
-}
-
 fn validate_query_ast(query: &Query, cte_names: &HashSet<String>, depth: usize) -> Result<()> {
     if depth > MAX_SUBQUERY_DEPTH {
         return Err(anyhow!(
