@@ -8,6 +8,7 @@ use tokio::sync::{RwLock, mpsc};
 use tracing::{error, info, warn};
 
 use super::{ChainConfig, Config, HttpConfig};
+use crate::api::{SharedTrustedCidrs, parse_cidrs};
 
 pub type SharedHttpConfig = Arc<RwLock<HttpConfig>>;
 
@@ -19,6 +20,7 @@ pub struct NewChainEvent {
 pub struct ConfigWatcher {
     config_path: PathBuf,
     http_config: SharedHttpConfig,
+    trusted_cidrs: SharedTrustedCidrs,
     chain_tx: mpsc::Sender<NewChainEvent>,
     known_chain_ids: Arc<RwLock<HashSet<u64>>>,
 }
@@ -28,25 +30,32 @@ impl ConfigWatcher {
         config_path: PathBuf,
         initial_config: &Config,
         chain_tx: mpsc::Sender<NewChainEvent>,
-    ) -> Self {
+    ) -> Result<Self> {
         let known_chain_ids: HashSet<u64> =
             initial_config.chains.iter().map(|c| c.chain_id).collect();
+        let trusted_cidrs = parse_cidrs(&initial_config.http.trusted_cidrs)?;
 
-        Self {
+        Ok(Self {
             config_path,
             http_config: Arc::new(RwLock::new(initial_config.http.clone())),
+            trusted_cidrs: Arc::new(std::sync::RwLock::new(trusted_cidrs)),
             chain_tx,
             known_chain_ids: Arc::new(RwLock::new(known_chain_ids)),
-        }
+        })
     }
 
     pub fn http_config(&self) -> SharedHttpConfig {
         Arc::clone(&self.http_config)
     }
 
+    pub fn trusted_cidrs(&self) -> SharedTrustedCidrs {
+        Arc::clone(&self.trusted_cidrs)
+    }
+
     pub fn start(self) -> Result<()> {
         let config_path = self.config_path.clone();
         let http_config = self.http_config.clone();
+        let trusted_cidrs = self.trusted_cidrs.clone();
         let chain_tx = self.chain_tx.clone();
         let known_chain_ids = self.known_chain_ids.clone();
 
@@ -87,6 +96,7 @@ impl ConfigWatcher {
                             if let Err(e) = reload_config(
                                 &config_path,
                                 &http_config,
+                                &trusted_cidrs,
                                 &chain_tx,
                                 &known_chain_ids,
                             ).await {
@@ -105,14 +115,23 @@ impl ConfigWatcher {
 async fn reload_config(
     config_path: &PathBuf,
     http_config: &SharedHttpConfig,
+    trusted_cidrs: &SharedTrustedCidrs,
     chain_tx: &mpsc::Sender<NewChainEvent>,
     known_chain_ids: &Arc<RwLock<HashSet<u64>>>,
 ) -> Result<()> {
     let new_config = Config::load(config_path)?;
+    let new_trusted_cidrs = parse_cidrs(&new_config.http.trusted_cidrs)?;
 
     {
         let mut http = http_config.write().await;
         *http = new_config.http.clone();
+    }
+
+    {
+        let mut cidrs = trusted_cidrs
+            .write()
+            .map_err(|_| anyhow::anyhow!("trusted CIDR lock poisoned"))?;
+        *cidrs = new_trusted_cidrs;
     }
 
     let mut known = known_chain_ids.write().await;
@@ -134,4 +153,27 @@ async fn reload_config(
 
     info!("Config reloaded");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::PrometheusConfig;
+
+    #[test]
+    fn test_new_rejects_invalid_trusted_cidr() {
+        let config = Config {
+            http: HttpConfig {
+                trusted_cidrs: vec!["100.64.0.0/33".to_string()],
+                ..Default::default()
+            },
+            prometheus: PrometheusConfig::default(),
+            chains: vec![],
+        };
+        let (chain_tx, _chain_rx) = mpsc::channel(1);
+
+        let result = ConfigWatcher::new(PathBuf::from("config.toml"), &config, chain_tx);
+
+        assert!(result.is_err());
+    }
 }

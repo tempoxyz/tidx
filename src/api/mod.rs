@@ -3,10 +3,11 @@ mod views;
 use std::collections::HashMap;
 use std::convert::Infallible;
 use std::net::{IpAddr, SocketAddr};
-use std::sync::Arc;
+use std::sync::{Arc, RwLock as StdRwLock};
 
 use tokio::sync::RwLock;
 
+use anyhow::{Result as AnyhowResult, anyhow};
 use axum::{
     Json, Router,
     extract::{Query, State},
@@ -41,6 +42,7 @@ pub struct ChainClickHouseConfig {
 }
 
 pub type SharedClickHouseConfigs = Arc<RwLock<HashMap<u64, ChainClickHouseConfig>>>;
+pub type SharedTrustedCidrs = Arc<StdRwLock<Vec<(IpAddr, u8)>>>;
 
 #[derive(Clone)]
 pub struct AppState {
@@ -54,7 +56,7 @@ pub struct AppState {
     /// ClickHouse engines for OLAP queries (per chain)
     pub clickhouse_engines: SharedClickHouseEngines,
     /// Parsed trusted CIDRs for admin operations
-    pub trusted_cidrs: Arc<Vec<(IpAddr, u8)>>,
+    pub trusted_cidrs: SharedTrustedCidrs,
 }
 
 impl AppState {
@@ -70,28 +72,41 @@ impl AppState {
 
     /// Check if an IP address is in the trusted CIDRs
     pub fn is_trusted_ip(&self, addr: &SocketAddr) -> bool {
-        if self.trusted_cidrs.is_empty() {
-            return true;
-        }
         let ip = addr.ip();
         self.trusted_cidrs
-            .iter()
-            .any(|(network, prefix)| ip_in_cidr(&ip, network, *prefix))
+            .read()
+            .map(|cidrs| {
+                cidrs
+                    .iter()
+                    .any(|(network, prefix)| ip_in_cidr(&ip, network, *prefix))
+            })
+            .unwrap_or(false)
     }
 }
 
 /// Parse CIDR strings into (network, prefix_len) tuples
-pub fn parse_cidrs(cidrs: &[String]) -> Vec<(IpAddr, u8)> {
+pub fn parse_cidrs(cidrs: &[String]) -> AnyhowResult<Vec<(IpAddr, u8)>> {
     cidrs
         .iter()
-        .filter_map(|cidr| {
-            let parts: Vec<&str> = cidr.split('/').collect();
-            if parts.len() != 2 {
-                return None;
+        .map(|cidr| {
+            let (ip, prefix) = cidr
+                .split_once('/')
+                .ok_or_else(|| anyhow!("Invalid CIDR '{cidr}': missing prefix"))?;
+            let ip: IpAddr = ip
+                .parse()
+                .map_err(|e| anyhow!("Invalid CIDR '{cidr}': invalid IP address: {e}"))?;
+            let prefix: u8 = prefix
+                .parse()
+                .map_err(|e| anyhow!("Invalid CIDR '{cidr}': invalid prefix: {e}"))?;
+            match ip {
+                IpAddr::V4(_) if prefix > 32 => {
+                    Err(anyhow!("Invalid CIDR '{cidr}': IPv4 prefix exceeds 32"))
+                }
+                IpAddr::V6(_) if prefix > 128 => {
+                    Err(anyhow!("Invalid CIDR '{cidr}': IPv6 prefix exceeds 128"))
+                }
+                _ => Ok((ip, prefix)),
             }
-            let ip: IpAddr = parts[0].parse().ok()?;
-            let prefix: u8 = parts[1].parse().ok()?;
-            Some((ip, prefix))
         })
         .collect()
 }
@@ -131,7 +146,7 @@ pub fn router(
     pools: HashMap<u64, Pool>,
     default_chain_id: u64,
     broadcaster: Arc<Broadcaster>,
-) -> Router<()> {
+) -> AnyhowResult<Router<()>> {
     router_with_options(
         pools,
         default_chain_id,
@@ -147,8 +162,8 @@ pub fn router_with_options(
     broadcaster: Arc<Broadcaster>,
     clickhouse_configs: HashMap<u64, ChainClickHouseConfig>,
     http_config: &HttpConfig,
-) -> Router<()> {
-    let trusted_cidrs = Arc::new(parse_cidrs(&http_config.trusted_cidrs));
+) -> AnyhowResult<Router<()>> {
+    let trusted_cidrs = Arc::new(StdRwLock::new(parse_cidrs(&http_config.trusted_cidrs)?));
 
     let state = AppState {
         pools: Arc::new(RwLock::new(pools)),
@@ -159,7 +174,7 @@ pub fn router_with_options(
         trusted_cidrs,
     };
 
-    build_router(state)
+    Ok(build_router(state))
 }
 
 pub fn router_shared(
@@ -168,10 +183,8 @@ pub fn router_shared(
     broadcaster: Arc<Broadcaster>,
     clickhouse_configs: SharedClickHouseConfigs,
     clickhouse_engines: SharedClickHouseEngines,
-    trusted_cidrs: Vec<String>,
+    trusted_cidrs: SharedTrustedCidrs,
 ) -> Router<()> {
-    let trusted_cidrs = Arc::new(parse_cidrs(&trusted_cidrs));
-
     let state = AppState {
         pools,
         default_chain_id,
@@ -186,7 +199,7 @@ pub fn router_shared(
 
 fn build_router(state: AppState) -> Router<()> {
     let cors = CorsLayer::new()
-        .allow_methods([Method::GET, Method::POST, Method::DELETE, Method::OPTIONS])
+        .allow_methods([Method::GET, Method::OPTIONS])
         .allow_headers([header::CONTENT_TYPE, header::AUTHORIZATION])
         .allow_origin(tower_http::cors::Any);
 
@@ -707,7 +720,7 @@ mod tests {
             "10.0.0.0/8".to_string(),
             "192.168.1.0/24".to_string(),
         ];
-        let parsed = parse_cidrs(&cidrs);
+        let parsed = parse_cidrs(&cidrs).unwrap();
         assert_eq!(parsed.len(), 3);
         assert_eq!(parsed[0], ("100.64.0.0".parse().unwrap(), 10));
         assert_eq!(parsed[1], ("10.0.0.0".parse().unwrap(), 8));
@@ -721,8 +734,48 @@ mod tests {
             "100.64.0.0".to_string(),     // Missing prefix
             "100.64.0.0/abc".to_string(), // Invalid prefix
         ];
-        let parsed = parse_cidrs(&cidrs);
-        assert_eq!(parsed.len(), 0);
+        assert!(parse_cidrs(&cidrs).is_err());
+        assert!(parse_cidrs(&["100.64.0.0/33".to_string()]).is_err());
+        assert!(parse_cidrs(&["fd7a:115c:a1e0::/129".to_string()]).is_err());
+    }
+
+    #[test]
+    fn test_router_with_options_rejects_invalid_trusted_cidr() {
+        let http_config = HttpConfig {
+            trusted_cidrs: vec!["100.64.0.0/33".to_string()],
+            ..Default::default()
+        };
+
+        let result = router_with_options(
+            HashMap::new(),
+            0,
+            Arc::new(Broadcaster::new()),
+            HashMap::new(),
+            &http_config,
+        );
+
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_trusted_ip_fails_closed_when_empty() {
+        let state = AppState {
+            pools: Arc::new(RwLock::new(HashMap::new())),
+            default_chain_id: 0,
+            broadcaster: Arc::new(Broadcaster::new()),
+            clickhouse_configs: Arc::new(RwLock::new(HashMap::new())),
+            clickhouse_engines: Arc::new(RwLock::new(HashMap::new())),
+            trusted_cidrs: Arc::new(std::sync::RwLock::new(Vec::new())),
+        };
+        let addr: SocketAddr = "127.0.0.1:8080".parse().unwrap();
+        assert!(!state.is_trusted_ip(&addr));
+    }
+
+    #[test]
+    fn test_http_config_default_trusts_only_loopback() {
+        let parsed = parse_cidrs(&HttpConfig::default().trusted_cidrs).unwrap();
+        assert!(parsed.contains(&("127.0.0.1".parse().unwrap(), 32)));
+        assert!(parsed.contains(&("::1".parse().unwrap(), 128)));
     }
 
     #[test]

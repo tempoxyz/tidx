@@ -33,6 +33,7 @@ async fn make_test_service(
 {
     let mut svc: IntoMakeServiceWithConnectInfo<Router, SocketAddr> =
         api::router(pools, chain_id, broadcaster)
+            .unwrap()
             .into_make_service_with_connect_info::<SocketAddr>();
     svc.call(SocketAddr::from(([127, 0, 0, 1], 0)))
         .await
@@ -193,6 +194,7 @@ async fn test_cli_proxy_via_http_server() {
     metrics::update_sink_watermark("postgres", "txs", 1_000_000);
 
     let router = api::router(pools, chain_id, broadcaster)
+        .unwrap()
         .into_make_service_with_connect_info::<SocketAddr>();
 
     // Bind to a random available port
