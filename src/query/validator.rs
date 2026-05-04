@@ -1,6 +1,6 @@
 use std::collections::HashSet;
 
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use sqlparser::ast::{
     Expr, Function, FunctionArg, FunctionArgExpr, FunctionArguments, ObjectName, Query, SetExpr,
     Statement, TableFactor, TableWithJoins,
@@ -8,12 +8,7 @@ use sqlparser::ast::{
 use sqlparser::dialect::GenericDialect;
 use sqlparser::parser::Parser;
 
-const ALLOWED_TABLES: &[&str] = &[
-    "blocks",
-    "txs",
-    "logs",
-    "receipts",
-];
+const ALLOWED_TABLES: &[&str] = &["blocks", "txs", "logs", "receipts"];
 
 const MAX_QUERY_LENGTH: usize = 65_536;
 const MAX_SUBQUERY_DEPTH: usize = 4;
@@ -99,11 +94,7 @@ fn validate_query_ast(query: &Query, cte_names: &HashSet<String>, depth: usize) 
         }
     }
 
-    for cte in &query
-        .with
-        .as_ref()
-        .map_or(vec![], |w| w.cte_tables.clone())
-    {
+    for cte in &query.with.as_ref().map_or(vec![], |w| w.cte_tables.clone()) {
         validate_query_ast(&cte.query, &all_cte_names, depth + 1)?;
     }
 
@@ -169,9 +160,7 @@ fn validate_limit_expr(expr: &Expr, context: &str) -> Result<()> {
                         Err(anyhow!("{context} must be a valid integer"))
                     }
                 }
-                sqlparser::ast::Value::Null => {
-                    Err(anyhow!("{context} NULL is not allowed"))
-                }
+                sqlparser::ast::Value::Null => Err(anyhow!("{context} NULL is not allowed")),
                 _ => Err(anyhow!("{context} must be a numeric literal")),
             }
         }
@@ -179,11 +168,7 @@ fn validate_limit_expr(expr: &Expr, context: &str) -> Result<()> {
     }
 }
 
-fn validate_set_expr(
-    set_expr: &SetExpr,
-    cte_names: &HashSet<String>,
-    depth: usize,
-) -> Result<()> {
+fn validate_set_expr(set_expr: &SetExpr, cte_names: &HashSet<String>, depth: usize) -> Result<()> {
     match set_expr {
         SetExpr::Select(select) => {
             // Reject SELECT INTO (creates objects)
@@ -286,9 +271,7 @@ fn validate_table_factor(
             }
             validate_table_name(name, cte_names)
         }
-        TableFactor::Derived { subquery, .. } => {
-            validate_query_ast(subquery, cte_names, depth + 1)
-        }
+        TableFactor::Derived { subquery, .. } => validate_query_ast(subquery, cte_names, depth + 1),
         TableFactor::TableFunction { .. } => Err(anyhow!("Table functions are not allowed")),
         TableFactor::Function { .. } => Err(anyhow!("Table functions are not allowed")),
         TableFactor::NestedJoin {
@@ -301,12 +284,7 @@ fn validate_table_factor(
 fn validate_table_name(name: &ObjectName, cte_names: &HashSet<String>) -> Result<()> {
     let full_name = name.to_string().to_lowercase();
 
-    const BLOCKED_SCHEMAS: &[&str] = &[
-        "pg_catalog",
-        "information_schema",
-        "pg_temp",
-        "pg_toast",
-    ];
+    const BLOCKED_SCHEMAS: &[&str] = &["pg_catalog", "information_schema", "pg_temp", "pg_toast"];
 
     for schema in BLOCKED_SCHEMAS {
         if full_name.starts_with(schema) {
@@ -364,9 +342,7 @@ fn validate_expr(expr: &Expr, cte_names: &HashSet<String>, depth: usize) -> Resu
 
         // Subqueries (increment depth)
         Expr::Subquery(q) => validate_query_ast(q, cte_names, depth + 1),
-        Expr::InSubquery {
-            expr, subquery, ..
-        } => {
+        Expr::InSubquery { expr, subquery, .. } => {
             validate_expr(expr, cte_names, depth)?;
             validate_query_ast(subquery, cte_names, depth + 1)
         }
@@ -454,7 +430,12 @@ fn validate_expr(expr: &Expr, cte_names: &HashSet<String>, depth: usize) -> Resu
 
         // SQL builtins parsed as dedicated Expr variants (not Function)
         Expr::Extract { expr, .. } => validate_expr(expr, cte_names, depth),
-        Expr::Substring { expr, substring_from, substring_for, .. } => {
+        Expr::Substring {
+            expr,
+            substring_from,
+            substring_for,
+            ..
+        } => {
             validate_expr(expr, cte_names, depth)?;
             if let Some(from) = substring_from {
                 validate_expr(from, cte_names, depth)?;
@@ -464,21 +445,27 @@ fn validate_expr(expr: &Expr, cte_names: &HashSet<String>, depth: usize) -> Resu
             }
             Ok(())
         }
-        Expr::Trim { expr, trim_what, .. } => {
+        Expr::Trim {
+            expr, trim_what, ..
+        } => {
             validate_expr(expr, cte_names, depth)?;
             if let Some(what) = trim_what {
                 validate_expr(what, cte_names, depth)?;
             }
             Ok(())
         }
-        Expr::Ceil { expr, .. } | Expr::Floor { expr, .. } => {
-            validate_expr(expr, cte_names, depth)
-        }
+        Expr::Ceil { expr, .. } | Expr::Floor { expr, .. } => validate_expr(expr, cte_names, depth),
         Expr::Position { expr, r#in, .. } => {
             validate_expr(expr, cte_names, depth)?;
             validate_expr(r#in, cte_names, depth)
         }
-        Expr::Overlay { expr, overlay_what, overlay_from, overlay_for, .. } => {
+        Expr::Overlay {
+            expr,
+            overlay_what,
+            overlay_from,
+            overlay_for,
+            ..
+        } => {
             validate_expr(expr, cte_names, depth)?;
             validate_expr(overlay_what, cte_names, depth)?;
             validate_expr(overlay_from, cte_names, depth)?;
@@ -488,7 +475,11 @@ fn validate_expr(expr: &Expr, cte_names: &HashSet<String>, depth: usize) -> Resu
             Ok(())
         }
         Expr::Collate { expr, .. } => validate_expr(expr, cte_names, depth),
-        Expr::AtTimeZone { timestamp, time_zone, .. } => {
+        Expr::AtTimeZone {
+            timestamp,
+            time_zone,
+            ..
+        } => {
             validate_expr(timestamp, cte_names, depth)?;
             validate_expr(time_zone, cte_names, depth)
         }
@@ -742,9 +733,7 @@ mod tests {
 
     #[test]
     fn test_allows_window_functions() {
-        assert!(
-            validate_query("SELECT num, ROW_NUMBER() OVER (ORDER BY num) FROM blocks").is_ok()
-        );
+        assert!(validate_query("SELECT num, ROW_NUMBER() OVER (ORDER BY num) FROM blocks").is_ok());
     }
 
     #[test]
@@ -783,10 +772,12 @@ mod tests {
 
     #[test]
     fn test_rejects_dblink() {
-        assert!(validate_query(
-            "SELECT * FROM dblink('host=evil dbname=secrets', 'SELECT * FROM passwords')"
-        )
-        .is_err());
+        assert!(
+            validate_query(
+                "SELECT * FROM dblink('host=evil dbname=secrets', 'SELECT * FROM passwords')"
+            )
+            .is_err()
+        );
         assert!(validate_query("SELECT dblink_connect('myconn', 'host=evil')").is_err());
         assert!(validate_query("SELECT dblink_exec('myconn', 'DROP TABLE blocks')").is_err());
     }
@@ -798,19 +789,23 @@ mod tests {
 
     #[test]
     fn test_rejects_recursive_cte() {
-        assert!(validate_query(
-            "WITH RECURSIVE r AS (SELECT 1 AS n UNION ALL SELECT n+1 FROM r) SELECT * FROM r"
-        )
-        .is_err());
+        assert!(
+            validate_query(
+                "WITH RECURSIVE r AS (SELECT 1 AS n UNION ALL SELECT n+1 FROM r) SELECT * FROM r"
+            )
+            .is_err()
+        );
     }
 
     #[test]
     fn test_rejects_generate_series() {
         assert!(validate_query("SELECT generate_series(1, 1000000000)").is_err());
-        assert!(validate_query(
-            "SELECT * FROM blocks WHERE num IN (SELECT generate_series(1, 1000000))"
-        )
-        .is_err());
+        assert!(
+            validate_query(
+                "SELECT * FROM blocks WHERE num IN (SELECT generate_series(1, 1000000))"
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -844,10 +839,12 @@ mod tests {
 
     #[test]
     fn test_rejects_dangerous_function_in_having() {
-        assert!(validate_query(
-            "SELECT COUNT(*) FROM blocks GROUP BY num HAVING pg_sleep(1) IS NOT NULL"
-        )
-        .is_err());
+        assert!(
+            validate_query(
+                "SELECT COUNT(*) FROM blocks GROUP BY num HAVING pg_sleep(1) IS NOT NULL"
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -880,9 +877,7 @@ mod tests {
         assert!(validate_query("SELECT COALESCE(gas_used, 0) FROM blocks").is_ok());
         assert!(validate_query("SELECT ABS(gas_used) FROM blocks").is_ok());
         assert!(validate_query("SELECT LOWER('test') FROM blocks").is_ok());
-        assert!(
-            validate_query("SELECT date_trunc('hour', to_timestamp(ts)) FROM blocks").is_ok()
-        );
+        assert!(validate_query("SELECT date_trunc('hour', to_timestamp(ts)) FROM blocks").is_ok());
     }
 
     #[test]
@@ -906,9 +901,7 @@ mod tests {
 
     #[test]
     fn test_rejects_dangerous_function_in_order_by() {
-        assert!(
-            validate_query("SELECT * FROM blocks ORDER BY pg_sleep(1)").is_err()
-        );
+        assert!(validate_query("SELECT * FROM blocks ORDER BY pg_sleep(1)").is_err());
     }
 
     #[test]
@@ -945,16 +938,17 @@ mod tests {
 
     #[test]
     fn test_rejects_query_too_large() {
-        let huge = format!("SELECT * FROM blocks WHERE num IN ({})", "1,".repeat(70_000));
+        let huge = format!(
+            "SELECT * FROM blocks WHERE num IN ({})",
+            "1,".repeat(70_000)
+        );
         assert!(validate_query(&huge).is_err());
     }
 
     #[test]
     fn test_allows_order_by_column() {
         assert!(validate_query("SELECT * FROM blocks ORDER BY num DESC").is_ok());
-        assert!(
-            validate_query("SELECT * FROM blocks ORDER BY num DESC, hash ASC").is_ok()
-        );
+        assert!(validate_query("SELECT * FROM blocks ORDER BY num DESC, hash ASC").is_ok());
     }
 
     #[test]
@@ -979,10 +973,10 @@ mod tests {
 
     #[test]
     fn test_allows_case_when() {
-        assert!(validate_query(
-            "SELECT CASE WHEN num > 100 THEN 'big' ELSE 'small' END FROM blocks"
-        )
-        .is_ok());
+        assert!(
+            validate_query("SELECT CASE WHEN num > 100 THEN 'big' ELSE 'small' END FROM blocks")
+                .is_ok()
+        );
     }
 
     #[test]
@@ -992,10 +986,10 @@ mod tests {
 
     #[test]
     fn test_rejects_filter_clause_bypass() {
-        assert!(validate_query(
-            "SELECT COUNT(*) FILTER (WHERE pg_sleep(1) IS NOT NULL) FROM blocks"
-        )
-        .is_err());
+        assert!(
+            validate_query("SELECT COUNT(*) FILTER (WHERE pg_sleep(1) IS NOT NULL) FROM blocks")
+                .is_err()
+        );
     }
 
     #[test]
@@ -1010,8 +1004,6 @@ mod tests {
 
     #[test]
     fn test_rejects_fetch_clause() {
-        assert!(
-            validate_query("SELECT * FROM blocks FETCH FIRST 10 ROWS ONLY").is_err()
-        );
+        assert!(validate_query("SELECT * FROM blocks FETCH FIRST 10 ROWS ONLY").is_err());
     }
 }

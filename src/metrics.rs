@@ -34,12 +34,18 @@ pub fn set_sync_lag(chain_id: u64, lag: u64) {
 }
 
 pub fn set_backfill_block(chain_id: u64, sink: &str, block_num: u64) {
-    let labels = [("chain_id", chain_id.to_string()), ("sink", sink.to_string())];
+    let labels = [
+        ("chain_id", chain_id.to_string()),
+        ("sink", sink.to_string()),
+    ];
     gauge!("tidx_backfill_block", &labels).set(block_num as f64);
 }
 
 pub fn set_backfill_remaining(chain_id: u64, sink: &str, remaining: u64) {
-    let labels = [("chain_id", chain_id.to_string()), ("sink", sink.to_string())];
+    let labels = [
+        ("chain_id", chain_id.to_string()),
+        ("sink", sink.to_string()),
+    ];
     gauge!("tidx_backfill_remaining_blocks", &labels).set(remaining as f64);
 }
 
@@ -54,12 +60,18 @@ pub fn set_synced(chain_id: u64, synced: bool) {
 }
 
 pub fn set_gap_blocks(chain_id: u64, sink: &str, blocks: u64) {
-    let labels = [("chain_id", chain_id.to_string()), ("sink", sink.to_string())];
+    let labels = [
+        ("chain_id", chain_id.to_string()),
+        ("sink", sink.to_string()),
+    ];
     gauge!("tidx_gap_blocks", &labels).set(blocks as f64);
 }
 
 pub fn set_gap_count(chain_id: u64, sink: &str, count: u64) {
-    let labels = [("chain_id", chain_id.to_string()), ("sink", sink.to_string())];
+    let labels = [
+        ("chain_id", chain_id.to_string()),
+        ("sink", sink.to_string()),
+    ];
     gauge!("tidx_gap_count", &labels).set(count as f64);
 }
 
@@ -115,7 +127,11 @@ impl SyncProgress {
     pub fn report_backfill(&mut self, current_block: u64, target_block: u64, blocks_synced: u64) {
         self.blocks_since_report += blocks_synced;
         set_backfill_block(self.chain_id, "postgres", current_block);
-        set_backfill_remaining(self.chain_id, "postgres", current_block.saturating_sub(target_block));
+        set_backfill_remaining(
+            self.chain_id,
+            "postgres",
+            current_block.saturating_sub(target_block),
+        );
 
         let elapsed = self.last_report.elapsed();
         if elapsed.as_secs() >= 5 {
@@ -176,18 +192,12 @@ impl SyncProgress {
 // Sink metrics (dual-sink write path)
 
 pub fn record_sink_write_duration(sink: &str, table: &str, duration: std::time::Duration) {
-    let labels = [
-        ("sink", sink.to_string()),
-        ("table", table.to_string()),
-    ];
+    let labels = [("sink", sink.to_string()), ("table", table.to_string())];
     histogram!("tidx_sink_write_duration_seconds", &labels).record(duration.as_secs_f64());
 }
 
 pub fn record_sink_write_rows(sink: &str, table: &str, count: u64) {
-    let labels = [
-        ("sink", sink.to_string()),
-        ("table", table.to_string()),
-    ];
+    let labels = [("sink", sink.to_string()), ("table", table.to_string())];
     counter!("tidx_sink_write_rows_total", &labels).increment(count);
 }
 
@@ -305,7 +315,8 @@ pub fn get_sink_watermarks(sink: &str) -> (Option<i64>, Option<i64>, Option<i64>
 /// Increment the cumulative row count for a table in a sink.
 pub fn increment_sink_row_count(sink: &str, table: &str, count: u64) {
     let wm = watermarks_for(sink);
-    wm.get_row_counter(table).fetch_add(count, Ordering::Relaxed);
+    wm.get_row_counter(table)
+        .fetch_add(count, Ordering::Relaxed);
 }
 
 /// Get cumulative row counts for a sink as (blocks, txs, logs, receipts).
@@ -334,13 +345,11 @@ static SINK_RATES: OnceLock<std::sync::Mutex<std::collections::HashMap<String, R
 pub fn update_sink_block_rate(sink: &str, count: u64) {
     let rates = SINK_RATES.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
     let mut map = rates.lock().unwrap();
-    let entry = map
-        .entry(sink.to_string())
-        .or_insert_with(|| RateWindow {
-            last_reset: Instant::now(),
-            rows_since_reset: 0,
-            current_rate: 0.0,
-        });
+    let entry = map.entry(sink.to_string()).or_insert_with(|| RateWindow {
+        last_reset: Instant::now(),
+        rows_since_reset: 0,
+        current_rate: 0.0,
+    });
     entry.rows_since_reset += count;
     let elapsed = entry.last_reset.elapsed();
     if elapsed.as_secs() >= 3 {
@@ -354,9 +363,7 @@ pub fn update_sink_block_rate(sink: &str, count: u64) {
 pub fn get_sink_block_rate(sink: &str) -> Option<f64> {
     let rates = SINK_RATES.get()?;
     let map = rates.lock().unwrap();
-    map.get(sink)
-        .map(|w| w.current_rate)
-        .filter(|r| *r > 0.0)
+    map.get(sink).map(|w| w.current_rate).filter(|r| *r > 0.0)
 }
 
 fn format_eta(secs: f64) -> String {

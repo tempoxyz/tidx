@@ -137,28 +137,28 @@ pub async fn write_txs(pool: &Pool, txs: &[TxRow]) -> Result<()> {
     .await?;
 
     let types = &[
-        Type::INT8,       // block_num
+        Type::INT8,        // block_num
         Type::TIMESTAMPTZ, // block_timestamp
-        Type::INT4,       // idx
-        Type::BYTEA,      // hash
-        Type::INT2,       // type
-        Type::BYTEA,      // from
-        Type::BYTEA,      // to
-        Type::TEXT,       // value
-        Type::BYTEA,      // input
-        Type::INT8,       // gas_limit
-        Type::TEXT,       // max_fee_per_gas
-        Type::TEXT,       // max_priority_fee_per_gas
-        Type::INT8,       // gas_used
-        Type::BYTEA,      // nonce_key
-        Type::INT8,       // nonce
-        Type::BYTEA,      // fee_token
-        Type::BYTEA,      // fee_payer
-        Type::JSONB,      // calls
-        Type::INT2,       // call_count
-        Type::INT8,       // valid_before
-        Type::INT8,       // valid_after
-        Type::INT2,       // signature_type
+        Type::INT4,        // idx
+        Type::BYTEA,       // hash
+        Type::INT2,        // type
+        Type::BYTEA,       // from
+        Type::BYTEA,       // to
+        Type::TEXT,        // value
+        Type::BYTEA,       // input
+        Type::INT8,        // gas_limit
+        Type::TEXT,        // max_fee_per_gas
+        Type::TEXT,        // max_priority_fee_per_gas
+        Type::INT8,        // gas_used
+        Type::BYTEA,       // nonce_key
+        Type::INT8,        // nonce
+        Type::BYTEA,       // fee_token
+        Type::BYTEA,       // fee_payer
+        Type::JSONB,       // calls
+        Type::INT2,        // call_count
+        Type::INT8,        // valid_before
+        Type::INT8,        // valid_after
+        Type::INT2,        // signature_type
     ];
 
     let sink = tx
@@ -205,7 +205,11 @@ pub async fn write_txs(pool: &Pool, txs: &[TxRow]) -> Result<()> {
 
     pinned_writer.as_mut().finish().await?;
 
-    tx.execute("INSERT INTO txs SELECT * FROM _staging_txs ON CONFLICT DO NOTHING", &[]).await?;
+    tx.execute(
+        "INSERT INTO txs SELECT * FROM _staging_txs ON CONFLICT DO NOTHING",
+        &[],
+    )
+    .await?;
     tx.commit().await?;
 
     metrics::record_sink_write_duration("postgres", "txs", start.elapsed());
@@ -243,19 +247,19 @@ pub async fn write_logs(pool: &Pool, logs: &[LogRow]) -> Result<()> {
     .await?;
 
     let types = &[
-        Type::INT8,       // block_num
+        Type::INT8,        // block_num
         Type::TIMESTAMPTZ, // block_timestamp
-        Type::INT4,       // log_idx
-        Type::INT4,       // tx_idx
-        Type::BYTEA,      // tx_hash
-        Type::BYTEA,      // address
-        Type::BYTEA,      // selector
-        Type::BYTEA,      // topic0
-        Type::BYTEA,      // topic1
-        Type::BYTEA,      // topic2
-        Type::BYTEA,      // topic3
-        Type::BYTEA,      // data
-        Type::BOOL,       // is_virtual_forward
+        Type::INT4,        // log_idx
+        Type::INT4,        // tx_idx
+        Type::BYTEA,       // tx_hash
+        Type::BYTEA,       // address
+        Type::BYTEA,       // selector
+        Type::BYTEA,       // topic0
+        Type::BYTEA,       // topic1
+        Type::BYTEA,       // topic2
+        Type::BYTEA,       // topic3
+        Type::BYTEA,       // data
+        Type::BOOL,        // is_virtual_forward
     ];
 
     let sink = tx
@@ -290,7 +294,11 @@ pub async fn write_logs(pool: &Pool, logs: &[LogRow]) -> Result<()> {
 
     pinned_writer.as_mut().finish().await?;
 
-    tx.execute("INSERT INTO logs SELECT * FROM _staging_logs ON CONFLICT DO NOTHING", &[]).await?;
+    tx.execute(
+        "INSERT INTO logs SELECT * FROM _staging_logs ON CONFLICT DO NOTHING",
+        &[],
+    )
+    .await?;
     tx.commit().await?;
 
     metrics::record_sink_write_duration("postgres", "logs", start.elapsed());
@@ -375,7 +383,11 @@ pub async fn write_receipts(pool: &Pool, receipts: &[ReceiptRow]) -> Result<()> 
 
     pinned_writer.as_mut().finish().await?;
 
-    tx.execute("INSERT INTO receipts SELECT * FROM _staging_receipts ON CONFLICT DO NOTHING", &[]).await?;
+    tx.execute(
+        "INSERT INTO receipts SELECT * FROM _staging_receipts ON CONFLICT DO NOTHING",
+        &[],
+    )
+    .await?;
     tx.commit().await?;
 
     metrics::record_sink_write_duration("postgres", "receipts", start.elapsed());
@@ -387,7 +399,6 @@ pub async fn write_receipts(pool: &Pool, receipts: &[ReceiptRow]) -> Result<()> 
 
     Ok(())
 }
-
 
 /// Batch insert blocks, txs, logs, and receipts in a single PG transaction.
 ///
@@ -549,7 +560,11 @@ pub async fn write_batch(
 
         pinned_writer.as_mut().finish().await?;
 
-        tx.execute("INSERT INTO txs SELECT * FROM _staging_txs ON CONFLICT DO NOTHING", &[]).await?;
+        tx.execute(
+            "INSERT INTO txs SELECT * FROM _staging_txs ON CONFLICT DO NOTHING",
+            &[],
+        )
+        .await?;
     }
 
     // ── logs ──────────────────────────────────────────────────────────────
@@ -616,7 +631,11 @@ pub async fn write_batch(
 
         pinned_writer.as_mut().finish().await?;
 
-        tx.execute("INSERT INTO logs SELECT * FROM _staging_logs ON CONFLICT DO NOTHING", &[]).await?;
+        tx.execute(
+            "INSERT INTO logs SELECT * FROM _staging_logs ON CONFLICT DO NOTHING",
+            &[],
+        )
+        .await?;
     }
 
     // ── receipts ──────────────────────────────────────────────────────────
@@ -683,7 +702,11 @@ pub async fn write_batch(
 
         pinned_writer.as_mut().finish().await?;
 
-        tx.execute("INSERT INTO receipts SELECT * FROM _staging_receipts ON CONFLICT DO NOTHING", &[]).await?;
+        tx.execute(
+            "INSERT INTO receipts SELECT * FROM _staging_receipts ON CONFLICT DO NOTHING",
+            &[],
+        )
+        .await?;
     }
 
     // ── single COMMIT ─────────────────────────────────────────────────────
@@ -921,12 +944,7 @@ pub async fn detect_gaps(pool: &Pool, below: u64) -> Result<Vec<(u64, u64)>> {
 
     Ok(rows
         .iter()
-        .map(|r| {
-            (
-                r.get::<_, i64>(0) as u64,
-                r.get::<_, i64>(1) as u64,
-            )
-        })
+        .map(|r| (r.get::<_, i64>(0) as u64, r.get::<_, i64>(1) as u64))
         .collect())
 }
 
@@ -996,8 +1014,11 @@ pub async fn delete_blocks_from(pool: &Pool, from_block: u64) -> Result<u64> {
     // Delete in order: logs, receipts, txs, blocks (foreign key order)
     conn.execute("DELETE FROM logs WHERE block_num >= $1", &[&from_block_i64])
         .await?;
-    conn.execute("DELETE FROM receipts WHERE block_num >= $1", &[&from_block_i64])
-        .await?;
+    conn.execute(
+        "DELETE FROM receipts WHERE block_num >= $1",
+        &[&from_block_i64],
+    )
+    .await?;
     conn.execute("DELETE FROM txs WHERE block_num >= $1", &[&from_block_i64])
         .await?;
     let deleted = conn

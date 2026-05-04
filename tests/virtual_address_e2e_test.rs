@@ -41,7 +41,10 @@ async fn test_virtual_address_forward_hop_e2e() {
 #[serial(db)]
 #[ignore = "requires DATABASE_URL, foundry anvil in PATH, network access to Tempo testnet RPC, and FORK_BLOCK_NUMBER for deterministic replay"]
 async fn test_virtual_address_forward_hop_sync_range_e2e() {
-    run_with_forked_anvil(|rpc_url| async move { run_virtual_address_e2e_via_sync_range(rpc_url).await }).await;
+    run_with_forked_anvil(|rpc_url| async move {
+        run_virtual_address_e2e_via_sync_range(rpc_url).await
+    })
+    .await;
 }
 
 async fn run_with_forked_anvil<F, Fut>(f: F)
@@ -110,7 +113,8 @@ async fn run_virtual_address_e2e(rpc_url: String) -> anyhow::Result<()> {
     db.truncate_all().await;
 
     let sinks = SinkSet::new(db.pool.clone());
-    let engine = SyncEngine::new(ThrottledPool::from_pool(db.pool.clone()), sinks, &rpc_url).await?;
+    let engine =
+        SyncEngine::new(ThrottledPool::from_pool(db.pool.clone()), sinks, &rpc_url).await?;
     engine.sync_block(block_num).await?;
 
     assert_virtual_address_rows(&db, &tx_hash).await
@@ -151,7 +155,8 @@ async fn run_virtual_address_e2e_via_sync_range(rpc_url: String) -> anyhow::Resu
     db.truncate_all().await;
 
     let sinks = SinkSet::new(db.pool.clone());
-    let engine = SyncEngine::new(ThrottledPool::from_pool(db.pool.clone()), sinks, &rpc_url).await?;
+    let engine =
+        SyncEngine::new(ThrottledPool::from_pool(db.pool.clone()), sinks, &rpc_url).await?;
     engine.sync_range(block_num, block_num).await?;
 
     assert_virtual_address_rows(&db, &tx_hash).await
@@ -178,7 +183,11 @@ async fn assert_virtual_address_rows(db: &TestDb, tx_hash: &str) -> anyhow::Resu
         )
         .await?;
 
-    assert!(rows.len() >= 2, "expected at least 2 logs, got {}", rows.len());
+    assert!(
+        rows.len() >= 2,
+        "expected at least 2 logs, got {}",
+        rows.len()
+    );
 
     let contract_rows: Vec<_> = rows
         .iter()

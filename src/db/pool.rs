@@ -45,7 +45,7 @@ use std::sync::Arc;
 use tokio::sync::Semaphore;
 
 /// Shared pool with backfill throttling.
-/// 
+///
 /// Single pool shared by all (realtime, backfill, API), but backfill
 /// must acquire a semaphore permit before getting a connection.
 /// This ensures backfill can't starve realtime/API, and when backfill
@@ -86,10 +86,14 @@ impl ThrottledPool {
     /// Create with custom pool size and backfill limit.
     /// - pool_size: total connections in the pool
     /// - backfill_limit: max concurrent backfill operations
-    pub async fn with_limits(database_url: &str, pool_size: usize, backfill_limit: usize) -> Result<Self> {
+    pub async fn with_limits(
+        database_url: &str,
+        pool_size: usize,
+        backfill_limit: usize,
+    ) -> Result<Self> {
         ensure_database_exists(database_url).await?;
         let pool = create_pool_with_size(database_url, pool_size).await?;
-        
+
         Ok(Self {
             pool,
             backfill_semaphore: Arc::new(Semaphore::new(backfill_limit)),
@@ -112,10 +116,17 @@ impl ThrottledPool {
     /// Get a connection for backfill (throttled by semaphore).
     /// Blocks if backfill_limit concurrent operations are already running.
     pub async fn get_backfill(&self) -> Result<BackfillConnection> {
-        let permit = self.backfill_semaphore.clone().acquire_owned().await
+        let permit = self
+            .backfill_semaphore
+            .clone()
+            .acquire_owned()
+            .await
             .map_err(|_| anyhow::anyhow!("Backfill semaphore closed"))?;
         let conn = self.pool.get().await?;
-        Ok(BackfillConnection { conn, _permit: permit })
+        Ok(BackfillConnection {
+            conn,
+            _permit: permit,
+        })
     }
 
     /// Returns the underlying pool (for compatibility).
@@ -148,10 +159,10 @@ impl std::ops::DerefMut for BackfillConnection {
 /// Connects to the 'postgres' database to run CREATE DATABASE.
 async fn ensure_database_exists(database_url: &str) -> Result<()> {
     let mut url = Url::parse(database_url).context("Invalid database URL")?;
-    
+
     // Extract the target database name from the path (e.g., "/tidx_moderato" -> "tidx_moderato")
     let db_name = url.path().trim_start_matches('/').to_string();
-    
+
     if db_name.is_empty() || db_name == "postgres" {
         return Ok(());
     }

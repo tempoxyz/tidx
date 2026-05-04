@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use anyhow::Result;
 use notify::{Event, EventKind, RecursiveMode, Watcher};
-use tokio::sync::{mpsc, RwLock};
+use tokio::sync::{RwLock, mpsc};
 use tracing::{error, info, warn};
 
 use super::{ChainConfig, Config, HttpConfig};
@@ -29,7 +29,8 @@ impl ConfigWatcher {
         initial_config: &Config,
         chain_tx: mpsc::Sender<NewChainEvent>,
     ) -> Self {
-        let known_chain_ids: HashSet<u64> = initial_config.chains.iter().map(|c| c.chain_id).collect();
+        let known_chain_ids: HashSet<u64> =
+            initial_config.chains.iter().map(|c| c.chain_id).collect();
 
         Self {
             config_path,
@@ -51,21 +52,17 @@ impl ConfigWatcher {
 
         let (tx, mut rx) = mpsc::channel::<()>(1);
 
-        let mut watcher = notify::recommended_watcher(move |res: Result<Event, notify::Error>| {
-            match res {
+        let mut watcher =
+            notify::recommended_watcher(move |res: Result<Event, notify::Error>| match res {
                 Ok(event) => {
-                    if matches!(
-                        event.kind,
-                        EventKind::Modify(_) | EventKind::Create(_)
-                    ) {
+                    if matches!(event.kind, EventKind::Modify(_) | EventKind::Create(_)) {
                         let _ = tx.blocking_send(());
                     }
                 }
                 Err(e) => {
                     warn!(error = %e, "Config watcher error");
                 }
-            }
-        })?;
+            })?;
 
         let watch_path = config_path.parent().unwrap_or(&config_path);
         watcher.watch(watch_path, RecursiveMode::NonRecursive)?;
@@ -127,7 +124,11 @@ async fn reload_config(
                 "New chain detected, starting indexer"
             );
             known.insert(chain.chain_id);
-            chain_tx.send(NewChainEvent { chain: chain.clone() }).await?;
+            chain_tx
+                .send(NewChainEvent {
+                    chain: chain.clone(),
+                })
+                .await?;
         }
     }
 

@@ -108,9 +108,9 @@ impl SyncState {
     /// Returns the number of blocks remaining to backfill
     pub fn backfill_remaining(&self) -> u64 {
         match self.backfill_num {
-            None => self.tip_num,     // Haven't started, need to fill 0..tip_num
-            Some(0) => 0,             // Complete
-            Some(n) => n,             // Blocks 0..n remain
+            None => self.tip_num, // Haven't started, need to fill 0..tip_num
+            Some(0) => 0,         // Complete
+            Some(n) => n,         // Blocks 0..n remain
         }
     }
 
@@ -119,19 +119,15 @@ impl SyncState {
     /// After backfill completes (backfill_num=0), range is 0 to tip_num.
     pub fn indexed_range(&self) -> (u64, u64) {
         match self.backfill_num {
-            Some(n) => (n, self.tip_num),             // Backfill in progress: n..tip_num
-            None => (self.tip_num, self.tip_num),     // Not started: just the tip
+            Some(n) => (n, self.tip_num), // Backfill in progress: n..tip_num
+            None => (self.tip_num, self.tip_num), // Not started: just the tip
         }
     }
 
     /// Returns total number of indexed blocks
     pub fn total_indexed(&self) -> u64 {
         let (low, high) = self.indexed_range();
-        if high >= low {
-            high - low + 1
-        } else {
-            0
-        }
+        if high >= low { high - low + 1 } else { 0 }
     }
 
     /// Get the current sync rate (blocks per second)

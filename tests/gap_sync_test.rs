@@ -2,8 +2,8 @@ mod common;
 
 use common::testdb::TestDb;
 
-use tidx::sync::writer::{detect_all_gaps, detect_gaps, has_gaps};
 use serial_test::serial;
+use tidx::sync::writer::{detect_all_gaps, detect_gaps, has_gaps};
 
 // ============================================================================
 // detect_all_gaps tests - unified gap detection from genesis to tip
@@ -16,10 +16,16 @@ async fn test_detect_all_gaps_empty_table() {
     db.truncate_all().await;
 
     // Empty table with tip_num > 0 should report entire range as gap (starting from block 1)
-    let gaps = detect_all_gaps(&db.pool, 100).await.expect("Failed to detect gaps");
+    let gaps = detect_all_gaps(&db.pool, 100)
+        .await
+        .expect("Failed to detect gaps");
 
     assert_eq!(gaps.len(), 1, "Should detect one gap for entire range");
-    assert_eq!(gaps[0], (1, 100), "Gap should be 1 -> 100 (block 0 is genesis)");
+    assert_eq!(
+        gaps[0],
+        (1, 100),
+        "Gap should be 1 -> 100 (block 0 is genesis)"
+    );
 }
 
 #[tokio::test]
@@ -29,9 +35,14 @@ async fn test_detect_all_gaps_empty_table_tip_zero() {
     db.truncate_all().await;
 
     // Empty table with tip_num = 0 has no gaps
-    let gaps = detect_all_gaps(&db.pool, 0).await.expect("Failed to detect gaps");
+    let gaps = detect_all_gaps(&db.pool, 0)
+        .await
+        .expect("Failed to detect gaps");
 
-    assert!(gaps.is_empty(), "No gaps when tip_num is 0 and table is empty");
+    assert!(
+        gaps.is_empty(),
+        "No gaps when tip_num is 0 and table is empty"
+    );
 }
 
 #[tokio::test]
@@ -59,7 +70,9 @@ async fn test_detect_all_gaps_genesis_missing() {
         .expect("Failed to insert block");
     }
 
-    let gaps = detect_all_gaps(&db.pool, 10).await.expect("Failed to detect gaps");
+    let gaps = detect_all_gaps(&db.pool, 10)
+        .await
+        .expect("Failed to detect gaps");
 
     assert_eq!(gaps.len(), 1, "Should detect one gap from block 1");
     assert_eq!(gaps[0], (1, 4), "Gap should be 1 -> 4 (block 0 is genesis)");
@@ -90,9 +103,14 @@ async fn test_detect_all_gaps_genesis_present() {
         .expect("Failed to insert block");
     }
 
-    let gaps = detect_all_gaps(&db.pool, 10).await.expect("Failed to detect gaps");
+    let gaps = detect_all_gaps(&db.pool, 10)
+        .await
+        .expect("Failed to detect gaps");
 
-    assert!(gaps.is_empty(), "Should have no gaps when fully synced from genesis");
+    assert!(
+        gaps.is_empty(),
+        "Should have no gaps when fully synced from genesis"
+    );
 }
 
 #[tokio::test]
@@ -121,14 +139,20 @@ async fn test_detect_all_gaps_multiple_gaps_sorted_by_recency() {
         .expect("Failed to insert block");
     }
 
-    let gaps = detect_all_gaps(&db.pool, 16).await.expect("Failed to detect gaps");
+    let gaps = detect_all_gaps(&db.pool, 16)
+        .await
+        .expect("Failed to detect gaps");
 
     assert_eq!(gaps.len(), 3, "Should detect three gaps");
 
     // Gaps should be sorted by end block descending (most recent first)
     assert_eq!(gaps[0], (12, 14), "First gap should be most recent: 12-14");
     assert_eq!(gaps[1], (7, 9), "Second gap should be 7-9");
-    assert_eq!(gaps[2], (1, 4), "Third gap should be from block 1: 1-4 (block 0 is genesis)");
+    assert_eq!(
+        gaps[2],
+        (1, 4),
+        "Third gap should be from block 1: 1-4 (block 0 is genesis)"
+    );
 }
 
 #[tokio::test]
@@ -156,7 +180,9 @@ async fn test_detect_all_gaps_single_block_gap() {
         .expect("Failed to insert block");
     }
 
-    let gaps = detect_all_gaps(&db.pool, 5).await.expect("Failed to detect gaps");
+    let gaps = detect_all_gaps(&db.pool, 5)
+        .await
+        .expect("Failed to detect gaps");
 
     assert_eq!(gaps.len(), 1, "Should detect one gap");
     assert_eq!(gaps[0], (3, 3), "Gap should be single block 3");
@@ -184,20 +210,30 @@ async fn test_detect_all_gaps_only_genesis() {
     .expect("Failed to insert block");
 
     // With tip = 0, no gaps
-    let gaps = detect_all_gaps(&db.pool, 0).await.expect("Failed to detect gaps");
-    assert!(gaps.is_empty(), "No gaps when only genesis exists and tip is 0");
+    let gaps = detect_all_gaps(&db.pool, 0)
+        .await
+        .expect("Failed to detect gaps");
+    assert!(
+        gaps.is_empty(),
+        "No gaps when only genesis exists and tip is 0"
+    );
 
     // With tip = 10 and only block 0, detect_all_gaps uses detect_gaps between existing blocks
-    // Since there's only one block, detect_gaps returns empty, and there's no genesis gap 
+    // Since there's only one block, detect_gaps returns empty, and there's no genesis gap
     // (min block is 0), so no gaps are reported. The gap 1-10 is an "unfilled region" but
     // detect_all_gaps only reports gaps between MIN(blocks) and tip. Since we have block 0,
     // there's no gap from genesis. The gap from 1-10 would be detected as a gap between
     // existing blocks if we had block 11+. This is correct behavior - gap detection finds
     // discontinuities, not "how far we've synced."
-    let gaps = detect_all_gaps(&db.pool, 10).await.expect("Failed to detect gaps");
+    let gaps = detect_all_gaps(&db.pool, 10)
+        .await
+        .expect("Failed to detect gaps");
     // No gaps detected because there are no discontinuities from block 0 onward that are
     // bounded by existing blocks
-    assert!(gaps.is_empty(), "No gaps when only block 0 exists (no upper bound block)");
+    assert!(
+        gaps.is_empty(),
+        "No gaps when only block 0 exists (no upper bound block)"
+    );
 }
 
 #[tokio::test]
@@ -226,13 +262,19 @@ async fn test_detect_all_gaps_filters_beyond_tip() {
     }
 
     // With tip = 10, should only show gaps up to block 10
-    let gaps = detect_all_gaps(&db.pool, 10).await.expect("Failed to detect gaps");
+    let gaps = detect_all_gaps(&db.pool, 10)
+        .await
+        .expect("Failed to detect gaps");
 
     // Gap 7-19 extends beyond tip, but we filter to gaps where end <= tip
     // Since the gap 7-19 has end=19 > tip=10, it should be filtered out
     // Only the gap from block 1 (1-4) should remain
     assert_eq!(gaps.len(), 1, "Should only show gaps within tip range");
-    assert_eq!(gaps[0], (1, 4), "Only gap from block 1 should be reported (block 0 is genesis)");
+    assert_eq!(
+        gaps[0],
+        (1, 4),
+        "Only gap from block 1 should be reported (block 0 is genesis)"
+    );
 }
 
 #[tokio::test]
@@ -260,7 +302,9 @@ async fn test_detect_all_gaps_large_gap_range() {
         .expect("Failed to insert block");
     }
 
-    let gaps = detect_all_gaps(&db.pool, 1000).await.expect("Failed to detect gaps");
+    let gaps = detect_all_gaps(&db.pool, 1000)
+        .await
+        .expect("Failed to detect gaps");
 
     assert_eq!(gaps.len(), 1, "Should detect one large gap");
     assert_eq!(gaps[0], (1, 999), "Gap should be 1 -> 999");
@@ -302,10 +346,18 @@ async fn test_detect_gaps_vs_detect_all_gaps() {
 
     // detect_all_gaps also includes gap from block 1
     let all_gaps = detect_all_gaps(&db.pool, 11).await.expect("Failed");
-    assert_eq!(all_gaps.len(), 2, "detect_all_gaps finds block 1 gap + middle gaps");
+    assert_eq!(
+        all_gaps.len(),
+        2,
+        "detect_all_gaps finds block 1 gap + middle gaps"
+    );
     // Sorted by end descending
     assert_eq!(all_gaps[0], (7, 9), "Most recent gap first");
-    assert_eq!(all_gaps[1], (1, 4), "Gap from block 1 last (block 0 is genesis)");
+    assert_eq!(
+        all_gaps[1],
+        (1, 4),
+        "Gap from block 1 last (block 0 is genesis)"
+    );
 }
 
 // ============================================================================
@@ -337,7 +389,9 @@ async fn test_gap_order_prioritizes_recent() {
         .expect("Failed to insert block");
     }
 
-    let gaps = detect_all_gaps(&db.pool, 100).await.expect("Failed to detect gaps");
+    let gaps = detect_all_gaps(&db.pool, 100)
+        .await
+        .expect("Failed to detect gaps");
 
     assert_eq!(gaps.len(), 2, "Should detect two gaps");
 
@@ -372,7 +426,9 @@ async fn test_gap_detection_with_realtime_jump() {
         .expect("Failed to insert block");
     }
 
-    let gaps = detect_all_gaps(&db.pool, 1000).await.expect("Failed to detect gaps");
+    let gaps = detect_all_gaps(&db.pool, 1000)
+        .await
+        .expect("Failed to detect gaps");
 
     assert_eq!(gaps.len(), 1, "Should detect one large gap from jump");
     assert_eq!(gaps[0], (6, 994), "Gap should be the jumped-over region");
@@ -407,7 +463,9 @@ async fn test_gap_detection_consecutive_single_block_gaps() {
         .expect("Failed to insert block");
     }
 
-    let gaps = detect_all_gaps(&db.pool, 10).await.expect("Failed to detect gaps");
+    let gaps = detect_all_gaps(&db.pool, 10)
+        .await
+        .expect("Failed to detect gaps");
 
     assert_eq!(gaps.len(), 5, "Should detect 5 single-block gaps");
 
@@ -444,18 +502,27 @@ async fn test_gap_size_calculation() {
         .expect("Failed to insert block");
     }
 
-    let gaps = detect_all_gaps(&db.pool, 30).await.expect("Failed to detect gaps");
+    let gaps = detect_all_gaps(&db.pool, 30)
+        .await
+        .expect("Failed to detect gaps");
 
     assert_eq!(gaps.len(), 3, "Should detect three gaps");
 
     // Calculate total gap blocks
     // Gap 1-9: 9 blocks (block 0 is genesis), Gap 11-19: 9 blocks, Gap 21-29: 9 blocks = 27 total
     let total_gap_blocks: u64 = gaps.iter().map(|(s, e)| e - s + 1).sum();
-    assert_eq!(total_gap_blocks, 27, "Total gap should be 27 blocks (9+9+9)");
+    assert_eq!(
+        total_gap_blocks, 27,
+        "Total gap should be 27 blocks (9+9+9)"
+    );
 
     // Verify individual gap sizes (sorted by end descending)
     let sizes: Vec<u64> = gaps.iter().map(|(s, e)| e - s + 1).collect();
-    assert_eq!(sizes, vec![9, 9, 9], "Gap sizes should be 9, 9, 9 (most recent first)");
+    assert_eq!(
+        sizes,
+        vec![9, 9, 9],
+        "Gap sizes should be 9, 9, 9 (most recent first)"
+    );
 }
 
 #[tokio::test]
@@ -483,7 +550,9 @@ async fn test_fully_synced_returns_empty_gaps() {
         .expect("Failed to insert block");
     }
 
-    let gaps = detect_all_gaps(&db.pool, 100).await.expect("Failed to detect gaps");
+    let gaps = detect_all_gaps(&db.pool, 100)
+        .await
+        .expect("Failed to detect gaps");
 
     assert!(gaps.is_empty(), "Fully synced chain should have no gaps");
 }

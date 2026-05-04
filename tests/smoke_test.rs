@@ -3,13 +3,16 @@ mod common;
 use common::tempo::TempoNode;
 use common::testdb::TestDb;
 
+use serial_test::serial;
 use tidx::db::ThrottledPool;
 use tidx::query::EventSignature;
 use tidx::sync::engine::SyncEngine;
 use tidx::sync::sink::SinkSet;
-use tidx::sync::writer::{detect_gaps, get_block_hash, load_sync_state, save_sync_state, update_synced_num, update_tip_num};
+use tidx::sync::writer::{
+    detect_gaps, get_block_hash, load_sync_state, save_sync_state, update_synced_num,
+    update_tip_num,
+};
 use tidx::types::SyncState;
-use serial_test::serial;
 
 #[tokio::test]
 #[serial(db)]
@@ -21,14 +24,24 @@ async fn test_sync_single_block() {
 
     // Wait for block 5
     let target_block = 5u64;
-    tempo.wait_for_block(target_block).await.expect("Block not reached");
+    tempo
+        .wait_for_block(target_block)
+        .await
+        .expect("Block not reached");
 
     let sinks = SinkSet::new(db.pool.clone());
-    let engine = SyncEngine::new(ThrottledPool::from_pool(db.pool.clone()), sinks, &tempo.rpc_url)
-        .await
-        .expect("Failed to create sync engine");
+    let engine = SyncEngine::new(
+        ThrottledPool::from_pool(db.pool.clone()),
+        sinks,
+        &tempo.rpc_url,
+    )
+    .await
+    .expect("Failed to create sync engine");
 
-    engine.sync_block(target_block).await.expect("Failed to sync block");
+    engine
+        .sync_block(target_block)
+        .await
+        .expect("Failed to sync block");
 
     // Verify block exists
     let conn = db.pool.get().await.expect("Failed to get connection");
@@ -52,12 +65,19 @@ async fn test_sync_state_persisted() {
     let db = TestDb::empty().await;
     db.truncate_all().await;
 
-    tempo.wait_for_block(10).await.expect("Block 10 not reached");
+    tempo
+        .wait_for_block(10)
+        .await
+        .expect("Block 10 not reached");
 
     let sinks = SinkSet::new(db.pool.clone());
-    let engine = SyncEngine::new(ThrottledPool::from_pool(db.pool.clone()), sinks, &tempo.rpc_url)
-        .await
-        .expect("Failed to create sync engine");
+    let engine = SyncEngine::new(
+        ThrottledPool::from_pool(db.pool.clone()),
+        sinks,
+        &tempo.rpc_url,
+    )
+    .await
+    .expect("Failed to create sync engine");
 
     engine.sync_block(10).await.expect("Failed to sync block");
 
@@ -86,12 +106,19 @@ async fn test_sync_block_range() {
     let db = TestDb::empty().await;
     db.truncate_all().await;
 
-    tempo.wait_for_block(20).await.expect("Block 20 not reached");
+    tempo
+        .wait_for_block(20)
+        .await
+        .expect("Block 20 not reached");
 
     let sinks = SinkSet::new(db.pool.clone());
-    let engine = SyncEngine::new(ThrottledPool::from_pool(db.pool.clone()), sinks, &tempo.rpc_url)
-        .await
-        .expect("Failed to create sync engine");
+    let engine = SyncEngine::new(
+        ThrottledPool::from_pool(db.pool.clone()),
+        sinks,
+        &tempo.rpc_url,
+    )
+    .await
+    .expect("Failed to create sync engine");
 
     // Sync blocks 1-20
     for block_num in 1..=20 {
@@ -104,7 +131,10 @@ async fn test_sync_block_range() {
     // Verify all 20 blocks in range exist
     let conn = db.pool.get().await.expect("Failed to get connection");
     let count: i64 = conn
-        .query_one("SELECT COUNT(DISTINCT num) FROM blocks WHERE num BETWEEN 1 AND 20", &[])
+        .query_one(
+            "SELECT COUNT(DISTINCT num) FROM blocks WHERE num BETWEEN 1 AND 20",
+            &[],
+        )
         .await
         .expect("Failed to count blocks")
         .get(0);
@@ -122,12 +152,19 @@ async fn test_sync_logs() {
     db.truncate_all().await;
 
     // Wait for enough blocks that bench service has generated some txs with logs
-    tempo.wait_for_block(50).await.expect("Block 50 not reached");
+    tempo
+        .wait_for_block(50)
+        .await
+        .expect("Block 50 not reached");
 
     let sinks = SinkSet::new(db.pool.clone());
-    let engine = SyncEngine::new(ThrottledPool::from_pool(db.pool.clone()), sinks, &tempo.rpc_url)
-        .await
-        .expect("Failed to create sync engine");
+    let engine = SyncEngine::new(
+        ThrottledPool::from_pool(db.pool.clone()),
+        sinks,
+        &tempo.rpc_url,
+    )
+    .await
+    .expect("Failed to create sync engine");
 
     // Sync blocks 1-50
     for block_num in 1..=50 {
@@ -193,7 +230,7 @@ async fn test_seeded_tx_variance() {
         .collect();
 
     println!("Transaction types: {types:?}");
-    
+
     // Early testnet blocks may have no transactions - just log stats
     if types.is_empty() {
         println!("No transactions found - early testnet blocks may be empty");
@@ -217,7 +254,10 @@ async fn test_seeded_tx_variance() {
         .get(0);
 
     let unique_tos: i64 = conn
-        .query_one("SELECT COUNT(DISTINCT \"to\") FROM txs WHERE \"to\" IS NOT NULL", &[])
+        .query_one(
+            "SELECT COUNT(DISTINCT \"to\") FROM txs WHERE \"to\" IS NOT NULL",
+            &[],
+        )
         .await
         .expect("Failed to count unique tos")
         .get(0);
@@ -238,7 +278,10 @@ async fn test_seeded_log_variance() {
 
     // Check selector diversity (different event types)
     let unique_selectors: i64 = conn
-        .query_one("SELECT COUNT(DISTINCT selector) FROM logs WHERE selector IS NOT NULL", &[])
+        .query_one(
+            "SELECT COUNT(DISTINCT selector) FROM logs WHERE selector IS NOT NULL",
+            &[],
+        )
         .await
         .expect("Failed to count selectors")
         .get(0);
@@ -262,12 +305,12 @@ async fn test_seeded_data_stats() {
     println!("Blocks: {blocks}");
     println!("Transactions: {txs}");
     println!("Logs: {logs}");
-    
+
     if blocks == 0 {
         println!("No blocks found - Tempo node may not be seeding data");
         return;
     }
-    
+
     println!("Avg txs/block: {:.1}", txs as f64 / blocks as f64);
     if txs > 0 {
         println!("Avg logs/tx: {:.1}", logs as f64 / txs as f64);
@@ -275,10 +318,7 @@ async fn test_seeded_data_stats() {
 
     // Time range
     let time_range = conn
-        .query_one(
-            "SELECT MIN(timestamp), MAX(timestamp) FROM blocks",
-            &[],
-        )
+        .query_one("SELECT MIN(timestamp), MAX(timestamp) FROM blocks", &[])
         .await
         .expect("Failed to get time range");
 
@@ -305,12 +345,19 @@ async fn test_parent_hash_validation() {
     let db = TestDb::empty().await;
     db.truncate_all().await;
 
-    tempo.wait_for_block(10).await.expect("Block 10 not reached");
+    tempo
+        .wait_for_block(10)
+        .await
+        .expect("Block 10 not reached");
 
     let sinks = SinkSet::new(db.pool.clone());
-    let engine = SyncEngine::new(ThrottledPool::from_pool(db.pool.clone()), sinks, &tempo.rpc_url)
-        .await
-        .expect("Failed to create sync engine");
+    let engine = SyncEngine::new(
+        ThrottledPool::from_pool(db.pool.clone()),
+        sinks,
+        &tempo.rpc_url,
+    )
+    .await
+    .expect("Failed to create sync engine");
 
     // Sync blocks 1-10 sequentially
     for block_num in 1..=10 {
@@ -341,7 +388,10 @@ async fn test_parent_hash_validation() {
         .expect("Failed to check chain")
         .get(0);
 
-    assert_eq!(chain_breaks, 0, "Parent hash chain should be valid for blocks 1-10");
+    assert_eq!(
+        chain_breaks, 0,
+        "Parent hash chain should be valid for blocks 1-10"
+    );
 }
 
 #[tokio::test]
@@ -397,7 +447,9 @@ async fn test_gap_detection() {
         .expect("Failed to insert block");
     }
 
-    let gaps = detect_gaps(&db.pool, u64::MAX).await.expect("Failed to detect gaps");
+    let gaps = detect_gaps(&db.pool, u64::MAX)
+        .await
+        .expect("Failed to detect gaps");
 
     assert_eq!(gaps.len(), 1, "Should detect one gap");
     assert_eq!(gaps[0], (4, 4), "Gap should be block 4");
@@ -428,7 +480,9 @@ async fn test_gap_detection_multiple_gaps() {
         .expect("Failed to insert block");
     }
 
-    let gaps = detect_gaps(&db.pool, u64::MAX).await.expect("Failed to detect gaps");
+    let gaps = detect_gaps(&db.pool, u64::MAX)
+        .await
+        .expect("Failed to detect gaps");
 
     assert_eq!(gaps.len(), 2, "Should detect two gaps");
     assert_eq!(gaps[0], (3, 4), "First gap should be blocks 3-4");
@@ -442,7 +496,9 @@ async fn test_gap_detection_empty_table() {
     db.truncate_all().await;
 
     // Empty table should have no gaps
-    let gaps = detect_gaps(&db.pool, u64::MAX).await.expect("Failed to detect gaps");
+    let gaps = detect_gaps(&db.pool, u64::MAX)
+        .await
+        .expect("Failed to detect gaps");
 
     assert!(gaps.is_empty(), "Empty table should have no gaps");
 }
@@ -460,35 +516,57 @@ async fn test_sync_state_tip_num_and_synced_num() {
     let chain_id = 12345u64;
 
     // Initially no state
-    let state = load_sync_state(&db.pool, chain_id).await.expect("Failed to load");
+    let state = load_sync_state(&db.pool, chain_id)
+        .await
+        .expect("Failed to load");
     assert!(state.is_none(), "Should have no state initially");
 
     // Update tip_num (simulates realtime sync)
-    update_tip_num(&db.pool, chain_id, 100, 105).await.expect("Failed to update tip_num");
+    update_tip_num(&db.pool, chain_id, 100, 105)
+        .await
+        .expect("Failed to update tip_num");
 
-    let state = load_sync_state(&db.pool, chain_id).await.expect("Failed to load").unwrap();
+    let state = load_sync_state(&db.pool, chain_id)
+        .await
+        .expect("Failed to load")
+        .unwrap();
     assert_eq!(state.tip_num, 100, "tip_num should be 100");
     assert_eq!(state.head_num, 105, "head_num should be 105");
     assert_eq!(state.synced_num, 0, "synced_num should start at 0");
 
     // Update synced_num (simulates gap-fill catching up)
-    update_synced_num(&db.pool, chain_id, 50).await.expect("Failed to update synced_num");
+    update_synced_num(&db.pool, chain_id, 50)
+        .await
+        .expect("Failed to update synced_num");
 
-    let state = load_sync_state(&db.pool, chain_id).await.expect("Failed to load").unwrap();
+    let state = load_sync_state(&db.pool, chain_id)
+        .await
+        .expect("Failed to load")
+        .unwrap();
     assert_eq!(state.tip_num, 100, "tip_num should still be 100");
     assert_eq!(state.synced_num, 50, "synced_num should be 50");
 
     // Update tip_num again (realtime advances)
-    update_tip_num(&db.pool, chain_id, 150, 155).await.expect("Failed to update tip_num");
+    update_tip_num(&db.pool, chain_id, 150, 155)
+        .await
+        .expect("Failed to update tip_num");
 
-    let state = load_sync_state(&db.pool, chain_id).await.expect("Failed to load").unwrap();
+    let state = load_sync_state(&db.pool, chain_id)
+        .await
+        .expect("Failed to load")
+        .unwrap();
     assert_eq!(state.tip_num, 150, "tip_num should advance to 150");
     assert_eq!(state.synced_num, 50, "synced_num should still be 50");
 
     // Gap-fill catches up completely
-    update_synced_num(&db.pool, chain_id, 150).await.expect("Failed to update synced_num");
+    update_synced_num(&db.pool, chain_id, 150)
+        .await
+        .expect("Failed to update synced_num");
 
-    let state = load_sync_state(&db.pool, chain_id).await.expect("Failed to load").unwrap();
+    let state = load_sync_state(&db.pool, chain_id)
+        .await
+        .expect("Failed to load")
+        .unwrap();
     assert_eq!(state.tip_num, 150, "tip_num should be 150");
     assert_eq!(state.synced_num, 150, "synced_num should catch up to 150");
 }
@@ -502,14 +580,25 @@ async fn test_sync_state_only_increases() {
     let chain_id = 99999u64;
 
     // Set initial state
-    update_tip_num(&db.pool, chain_id, 100, 100).await.expect("Failed");
-    update_synced_num(&db.pool, chain_id, 50).await.expect("Failed");
+    update_tip_num(&db.pool, chain_id, 100, 100)
+        .await
+        .expect("Failed");
+    update_synced_num(&db.pool, chain_id, 50)
+        .await
+        .expect("Failed");
 
     // Try to set lower values - should be ignored (GREATEST in SQL)
-    update_tip_num(&db.pool, chain_id, 80, 80).await.expect("Failed");
-    update_synced_num(&db.pool, chain_id, 30).await.expect("Failed");
+    update_tip_num(&db.pool, chain_id, 80, 80)
+        .await
+        .expect("Failed");
+    update_synced_num(&db.pool, chain_id, 30)
+        .await
+        .expect("Failed");
 
-    let state = load_sync_state(&db.pool, chain_id).await.expect("Failed to load").unwrap();
+    let state = load_sync_state(&db.pool, chain_id)
+        .await
+        .expect("Failed to load")
+        .unwrap();
     assert_eq!(state.tip_num, 100, "tip_num should not decrease");
     assert_eq!(state.synced_num, 50, "synced_num should not decrease");
     assert_eq!(state.head_num, 100, "head_num should not decrease");
@@ -533,9 +622,14 @@ async fn test_sync_state_save_and_load() {
         started_at: Some(chrono::Utc::now()),
     };
 
-    save_sync_state(&db.pool, &state).await.expect("Failed to save");
+    save_sync_state(&db.pool, &state)
+        .await
+        .expect("Failed to save");
 
-    let loaded = load_sync_state(&db.pool, chain_id).await.expect("Failed to load").unwrap();
+    let loaded = load_sync_state(&db.pool, chain_id)
+        .await
+        .expect("Failed to load")
+        .unwrap();
     assert_eq!(loaded.chain_id, chain_id);
     assert_eq!(loaded.head_num, 1000);
     assert_eq!(loaded.synced_num, 800);
@@ -557,8 +651,14 @@ async fn test_sync_state_methods() {
     };
 
     // Test backfill methods
-    assert!(!state.backfill_complete(), "Backfill not complete when backfill_num > 0");
-    assert!(state.backfill_started(), "Backfill started when backfill_num is Some");
+    assert!(
+        !state.backfill_complete(),
+        "Backfill not complete when backfill_num > 0"
+    );
+    assert!(
+        state.backfill_started(),
+        "Backfill started when backfill_num is Some"
+    );
     assert_eq!(state.backfill_remaining(), 100, "100 blocks remaining");
 
     // Test indexed range
@@ -574,7 +674,10 @@ async fn test_sync_state_methods() {
         backfill_num: Some(0),
         ..state.clone()
     };
-    assert!(complete.backfill_complete(), "Backfill complete when backfill_num = 0");
+    assert!(
+        complete.backfill_complete(),
+        "Backfill complete when backfill_num = 0"
+    );
     assert_eq!(complete.backfill_remaining(), 0);
 }
 
@@ -590,7 +693,7 @@ async fn test_gap_fill_scenario_multiple_restarts() {
     // Run 1: synced blocks 1-100
     // Run 2: chain at 300, jumped to 290-300
     // Run 3: chain at 500, jumped to 490-500
-    
+
     // Insert blocks for run 1: 1-100
     for num in 1i64..=100 {
         conn.execute(
@@ -643,18 +746,28 @@ async fn test_gap_fill_scenario_multiple_restarts() {
     }
 
     // Detect all gaps
-    let gaps = detect_gaps(&db.pool, u64::MAX).await.expect("Failed to detect gaps");
+    let gaps = detect_gaps(&db.pool, u64::MAX)
+        .await
+        .expect("Failed to detect gaps");
 
     // Should have 2 gaps:
     // Gap 1: 101-289 (between run 1 and run 2)
     // Gap 2: 301-489 (between run 2 and run 3)
-    assert_eq!(gaps.len(), 2, "Should detect two gaps from multiple restarts");
+    assert_eq!(
+        gaps.len(),
+        2,
+        "Should detect two gaps from multiple restarts"
+    );
     assert_eq!(gaps[0], (101, 289), "First gap should be 101-289");
     assert_eq!(gaps[1], (301, 489), "Second gap should be 301-489");
 
     // Calculate total gap blocks
     let total_gap_blocks: u64 = gaps.iter().map(|(s, e)| e - s + 1).sum();
-    assert_eq!(total_gap_blocks, 189 + 189, "Total gap should be 378 blocks");
+    assert_eq!(
+        total_gap_blocks,
+        189 + 189,
+        "Total gap should be 378 blocks"
+    );
 }
 
 #[tokio::test]
@@ -682,7 +795,9 @@ async fn test_gap_detection_single_block_gaps() {
         .expect("Failed to insert block");
     }
 
-    let gaps = detect_gaps(&db.pool, u64::MAX).await.expect("Failed to detect gaps");
+    let gaps = detect_gaps(&db.pool, u64::MAX)
+        .await
+        .expect("Failed to detect gaps");
 
     assert_eq!(gaps.len(), 4, "Should detect four single-block gaps");
     assert_eq!(gaps[0], (2, 2), "Gap at block 2");
@@ -716,7 +831,9 @@ async fn test_gap_detection_contiguous_blocks() {
         .expect("Failed to insert block");
     }
 
-    let gaps = detect_gaps(&db.pool, u64::MAX).await.expect("Failed to detect gaps");
+    let gaps = detect_gaps(&db.pool, u64::MAX)
+        .await
+        .expect("Failed to detect gaps");
 
     assert!(gaps.is_empty(), "Contiguous blocks should have no gaps");
 }
@@ -734,12 +851,19 @@ async fn test_sync_receipts() {
     let db = TestDb::empty().await;
     db.truncate_all().await;
 
-    tempo.wait_for_block(50).await.expect("Block 50 not reached");
+    tempo
+        .wait_for_block(50)
+        .await
+        .expect("Block 50 not reached");
 
     let sinks = SinkSet::new(db.pool.clone());
-    let engine = SyncEngine::new(ThrottledPool::from_pool(db.pool.clone()), sinks, &tempo.rpc_url)
-        .await
-        .expect("Failed to create sync engine");
+    let engine = SyncEngine::new(
+        ThrottledPool::from_pool(db.pool.clone()),
+        sinks,
+        &tempo.rpc_url,
+    )
+    .await
+    .expect("Failed to create sync engine");
 
     // Sync blocks 1-50
     for block_num in 1..=50 {
@@ -767,7 +891,10 @@ async fn test_sync_receipts() {
     println!("Synced {receipt_count} receipts from blocks 1-50 (txs: {tx_count})");
 
     // Each transaction should have exactly one receipt
-    assert_eq!(receipt_count, tx_count, "Receipt count should match tx count");
+    assert_eq!(
+        receipt_count, tx_count,
+        "Receipt count should match tx count"
+    );
 
     // If we have receipts, verify structure is correct
     if receipt_count > 0 {
@@ -813,7 +940,10 @@ async fn test_receipt_tx_hash_matches() {
         .expect("Failed to check hash matches")
         .get(0);
 
-    assert_eq!(mismatches, 0, "All receipt tx_hashes should match tx hashes");
+    assert_eq!(
+        mismatches, 0,
+        "All receipt tx_hashes should match tx hashes"
+    );
 }
 
 #[tokio::test]
@@ -864,10 +994,13 @@ async fn test_seeded_receipt_stats() {
 // Query service integration tests - routes through service layer
 // ============================================================================
 
-use tidx::service::{execute_query_postgres, QueryOptions};
+use tidx::service::{QueryOptions, execute_query_postgres};
 
 fn default_options() -> QueryOptions {
-    QueryOptions { timeout_ms: 5000, limit: 1000 }
+    QueryOptions {
+        timeout_ms: 5000,
+        limit: 1000,
+    }
 }
 
 #[tokio::test]
@@ -956,13 +1089,7 @@ async fn test_query_rejects_non_select() {
     let db = TestDb::new().await;
     let opts = default_options();
 
-    let result = execute_query_postgres(
-        &db.pool,
-        "DELETE FROM blocks",
-        &[],
-        &opts,
-    )
-    .await;
+    let result = execute_query_postgres(&db.pool, "DELETE FROM blocks", &[], &opts).await;
 
     assert!(result.is_err());
     assert!(result.unwrap_err().to_string().contains("SELECT"));
@@ -984,7 +1111,12 @@ async fn test_query_rejects_forbidden_keywords() {
 
     assert!(result.is_err());
     // Multiple statements are rejected before checking for specific keywords
-    assert!(result.unwrap_err().to_string().contains("Multiple statements"));
+    assert!(
+        result
+            .unwrap_err()
+            .to_string()
+            .contains("Multiple statements")
+    );
 }
 
 #[tokio::test]
@@ -1284,5 +1416,3 @@ async fn test_query_daily_stats_pattern() {
     assert!(result.columns.contains(&"day".to_string()));
     assert!(result.columns.contains(&"transfer_count".to_string()));
 }
-
-

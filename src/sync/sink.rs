@@ -51,10 +51,7 @@ impl SinkSet {
 
     pub async fn write_txs(&self, txs: &[TxRow]) -> Result<()> {
         if let Some(ch) = &self.ch {
-            tokio::try_join!(
-                writer::write_txs(&self.pool, txs),
-                ch.write_txs(txs),
-            )?;
+            tokio::try_join!(writer::write_txs(&self.pool, txs), ch.write_txs(txs),)?;
         } else {
             writer::write_txs(&self.pool, txs).await?;
         }
@@ -63,10 +60,7 @@ impl SinkSet {
 
     pub async fn write_logs(&self, logs: &[LogRow]) -> Result<()> {
         if let Some(ch) = &self.ch {
-            tokio::try_join!(
-                writer::write_logs(&self.pool, logs),
-                ch.write_logs(logs),
-            )?;
+            tokio::try_join!(writer::write_logs(&self.pool, logs), ch.write_logs(logs),)?;
         } else {
             writer::write_logs(&self.pool, logs).await?;
         }
@@ -84,7 +78,6 @@ impl SinkSet {
         }
         Ok(())
     }
-
 
     /// Write all four tables in a single PG transaction, with CH writes concurrent.
     pub async fn write_all(
@@ -150,8 +143,7 @@ impl SinkSet {
         if from_block > pg_max {
             info!(
                 ch_backfill_block = cursor,
-                pg_max,
-                "ClickHouse backfill up to date"
+                pg_max, "ClickHouse backfill up to date"
             );
             metrics::set_backfill_remaining(chain_id, "clickhouse", 0);
             return Ok(());
@@ -159,7 +151,13 @@ impl SinkSet {
 
         let total = pg_max - from_block + 1;
         metrics::set_backfill_remaining(chain_id, "clickhouse", total as u64);
-        info!(chain_id, from_block, pg_max, total_blocks = total, "Starting ClickHouse backfill");
+        info!(
+            chain_id,
+            from_block,
+            pg_max,
+            total_blocks = total,
+            "Starting ClickHouse backfill"
+        );
 
         let start = std::time::Instant::now();
         let mut blocks_written: i64 = 0;
@@ -200,10 +198,34 @@ impl SinkSet {
 
             let ch_write = async {
                 tokio::try_join!(
-                    async { if !blocks.is_empty() { ch.write_blocks(&blocks).await } else { Ok(()) } },
-                    async { if !txs.is_empty() { ch.write_txs(&txs).await } else { Ok(()) } },
-                    async { if !logs.is_empty() { ch.write_logs(&logs).await } else { Ok(()) } },
-                    async { if !receipts.is_empty() { ch.write_receipts(&receipts).await } else { Ok(()) } },
+                    async {
+                        if !blocks.is_empty() {
+                            ch.write_blocks(&blocks).await
+                        } else {
+                            Ok(())
+                        }
+                    },
+                    async {
+                        if !txs.is_empty() {
+                            ch.write_txs(&txs).await
+                        } else {
+                            Ok(())
+                        }
+                    },
+                    async {
+                        if !logs.is_empty() {
+                            ch.write_logs(&logs).await
+                        } else {
+                            Ok(())
+                        }
+                    },
+                    async {
+                        if !receipts.is_empty() {
+                            ch.write_receipts(&receipts).await
+                        } else {
+                            Ok(())
+                        }
+                    },
                 )
             };
 
@@ -221,10 +243,7 @@ impl SinkSet {
                 let pct = (((batch_end - from_block + 1) as f64 / total as f64) * 100.0) as u64;
                 info!(
                     chain_id,
-                    blocks_written,
-                    pct,
-                    batch_end,
-                    "ClickHouse backfill progress"
+                    blocks_written, pct, batch_end, "ClickHouse backfill progress"
                 );
             }
 
@@ -292,7 +311,11 @@ async fn save_ch_backfill_cursor(pool: &Pool, chain_id: u64, block: i64) -> Resu
 
 // ── PG fetch functions (one query per batch, no cursors) ──────────────────
 
-async fn fetch_blocks(conn: &deadpool_postgres::Object, from: i64, to: i64) -> Result<Vec<BlockRow>> {
+async fn fetch_blocks(
+    conn: &deadpool_postgres::Object,
+    from: i64,
+    to: i64,
+) -> Result<Vec<BlockRow>> {
     let rows = conn
         .query(
             "SELECT num, hash, parent_hash, timestamp, timestamp_ms, gas_limit, gas_used, miner, extra_data \
@@ -388,7 +411,11 @@ async fn fetch_logs(conn: &deadpool_postgres::Object, from: i64, to: i64) -> Res
         .collect())
 }
 
-async fn fetch_receipts(conn: &deadpool_postgres::Object, from: i64, to: i64) -> Result<Vec<ReceiptRow>> {
+async fn fetch_receipts(
+    conn: &deadpool_postgres::Object,
+    from: i64,
+    to: i64,
+) -> Result<Vec<ReceiptRow>> {
     let rows = conn
         .query(
             "SELECT block_num, block_timestamp, tx_idx, tx_hash, \"from\", \"to\", \

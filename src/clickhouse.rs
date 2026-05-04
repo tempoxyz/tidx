@@ -12,7 +12,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use tracing::{error, warn};
 
 use crate::config::ClickHouseConfig;
-use crate::query::{extract_raw_column_predicates, EventSignature};
+use crate::query::{EventSignature, extract_raw_column_predicates};
 
 /// A single ClickHouse instance (connection + URL).
 struct Instance {
