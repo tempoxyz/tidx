@@ -124,7 +124,7 @@ pub async fn run(args: Args) -> Result<()> {
     let (chain_tx, mut chain_rx) = tokio::sync::mpsc::channel::<NewChainEvent>(16);
 
     if !args.no_watch {
-        let watcher = ConfigWatcher::new(args.config.clone(), &config, chain_tx);
+        let watcher = ConfigWatcher::new(args.config.clone(), &config, chain_tx)?;
         let trusted_cidrs = watcher.trusted_cidrs();
         watcher.start()?;
 
@@ -202,7 +202,7 @@ pub async fn run(args: Args) -> Result<()> {
             broadcaster.clone(),
             clickhouse_configs.read().await.clone(),
             &config.http,
-        );
+        )?;
 
         info!(addr = %addr, "Starting HTTP API server");
 

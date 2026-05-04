@@ -30,20 +30,18 @@ impl ConfigWatcher {
         config_path: PathBuf,
         initial_config: &Config,
         chain_tx: mpsc::Sender<NewChainEvent>,
-    ) -> Self {
+    ) -> Result<Self> {
         let known_chain_ids: HashSet<u64> =
             initial_config.chains.iter().map(|c| c.chain_id).collect();
+        let trusted_cidrs = parse_cidrs(&initial_config.http.trusted_cidrs)?;
 
-        Self {
+        Ok(Self {
             config_path,
             http_config: Arc::new(RwLock::new(initial_config.http.clone())),
-            trusted_cidrs: Arc::new(std::sync::RwLock::new(
-                parse_cidrs(&initial_config.http.trusted_cidrs)
-                    .expect("invalid trusted CIDR configuration"),
-            )),
+            trusted_cidrs: Arc::new(std::sync::RwLock::new(trusted_cidrs)),
             chain_tx,
             known_chain_ids: Arc::new(RwLock::new(known_chain_ids)),
-        }
+        })
     }
 
     pub fn http_config(&self) -> SharedHttpConfig {
@@ -155,4 +153,27 @@ async fn reload_config(
 
     info!("Config reloaded");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::PrometheusConfig;
+
+    #[test]
+    fn test_new_rejects_invalid_trusted_cidr() {
+        let config = Config {
+            http: HttpConfig {
+                trusted_cidrs: vec!["100.64.0.0/33".to_string()],
+                ..Default::default()
+            },
+            prometheus: PrometheusConfig::default(),
+            chains: vec![],
+        };
+        let (chain_tx, _chain_rx) = mpsc::channel(1);
+
+        let result = ConfigWatcher::new(PathBuf::from("config.toml"), &config, chain_tx);
+
+        assert!(result.is_err());
+    }
 }

@@ -31,6 +31,7 @@ async fn make_test_service(
 {
     let mut svc: IntoMakeServiceWithConnectInfo<Router, SocketAddr> =
         api::router(pools, chain_id, broadcaster)
+            .unwrap()
             .into_make_service_with_connect_info::<SocketAddr>();
     svc.call(SocketAddr::from(([127, 0, 0, 1], 0)))
         .await

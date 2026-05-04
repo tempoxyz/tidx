@@ -146,7 +146,7 @@ pub fn router(
     pools: HashMap<u64, Pool>,
     default_chain_id: u64,
     broadcaster: Arc<Broadcaster>,
-) -> Router<()> {
+) -> AnyhowResult<Router<()>> {
     router_with_options(
         pools,
         default_chain_id,
@@ -162,10 +162,8 @@ pub fn router_with_options(
     broadcaster: Arc<Broadcaster>,
     clickhouse_configs: HashMap<u64, ChainClickHouseConfig>,
     http_config: &HttpConfig,
-) -> Router<()> {
-    let trusted_cidrs = Arc::new(StdRwLock::new(
-        parse_cidrs(&http_config.trusted_cidrs).expect("invalid trusted CIDR configuration"),
-    ));
+) -> AnyhowResult<Router<()>> {
+    let trusted_cidrs = Arc::new(StdRwLock::new(parse_cidrs(&http_config.trusted_cidrs)?));
 
     let state = AppState {
         pools: Arc::new(RwLock::new(pools)),
@@ -176,7 +174,7 @@ pub fn router_with_options(
         trusted_cidrs,
     };
 
-    build_router(state)
+    Ok(build_router(state))
 }
 
 pub fn router_shared(
@@ -739,6 +737,24 @@ mod tests {
         assert!(parse_cidrs(&cidrs).is_err());
         assert!(parse_cidrs(&["100.64.0.0/33".to_string()]).is_err());
         assert!(parse_cidrs(&["fd7a:115c:a1e0::/129".to_string()]).is_err());
+    }
+
+    #[test]
+    fn test_router_with_options_rejects_invalid_trusted_cidr() {
+        let http_config = HttpConfig {
+            trusted_cidrs: vec!["100.64.0.0/33".to_string()],
+            ..Default::default()
+        };
+
+        let result = router_with_options(
+            HashMap::new(),
+            0,
+            Arc::new(Broadcaster::new()),
+            HashMap::new(),
+            &http_config,
+        );
+
+        assert!(result.is_err());
     }
 
     #[test]
