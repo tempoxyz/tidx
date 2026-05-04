@@ -1,5 +1,14 @@
 # Changelog
 
+## `tidx@0.5.5`
+
+### Patch Changes
+
+- Harden PostgreSQL SQL validation by fixing CTE scope handling, schema-qualified table checks, recursive depth accounting, LIMIT ALL rejection, and traversal of previously unchecked AST clauses. (by @BrendanRyan, [#179](https://github.com/tempoxyz/tidx/pull/179))
+- Validate public ClickHouse queries, block system catalogs and dangerous table functions, enforce ClickHouse request timeouts, and validate view SELECT SQL before execution. (by @BrendanRyan, [#180](https://github.com/tempoxyz/tidx/pull/180))
+- Bound PostgreSQL query result processing by streaming rows with a hard request limit and appending automatic LIMIT clauses on a separate line. (by @BrendanRyan, [#181](https://github.com/tempoxyz/tidx/pull/181))
+- Hardened view administration by failing closed for trusted CIDR checks, rejecting malformed CIDR configuration, hot-reloading active trusted CIDRs, and requiring an explicit admin mutation header. (by @BrendanRyan, [#182](https://github.com/tempoxyz/tidx/pull/182))
+
 ## `tidx@0.5.4`
 
 ### Patch Changes
