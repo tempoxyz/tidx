@@ -7,7 +7,7 @@ use std::sync::{Arc, RwLock as StdRwLock};
 
 use tokio::sync::RwLock;
 
-use anyhow::{anyhow, Result as AnyhowResult};
+use anyhow::{Result as AnyhowResult, anyhow};
 use axum::{
     Json, Router,
     extract::{Query, State},
@@ -75,7 +75,11 @@ impl AppState {
         let ip = addr.ip();
         self.trusted_cidrs
             .read()
-            .map(|cidrs| cidrs.iter().any(|(network, prefix)| ip_in_cidr(&ip, network, *prefix)))
+            .map(|cidrs| {
+                cidrs
+                    .iter()
+                    .any(|(network, prefix)| ip_in_cidr(&ip, network, *prefix))
+            })
             .unwrap_or(false)
     }
 }
@@ -95,8 +99,12 @@ pub fn parse_cidrs(cidrs: &[String]) -> AnyhowResult<Vec<(IpAddr, u8)>> {
                 .parse()
                 .map_err(|e| anyhow!("Invalid CIDR '{cidr}': invalid prefix: {e}"))?;
             match ip {
-                IpAddr::V4(_) if prefix > 32 => Err(anyhow!("Invalid CIDR '{cidr}': IPv4 prefix exceeds 32")),
-                IpAddr::V6(_) if prefix > 128 => Err(anyhow!("Invalid CIDR '{cidr}': IPv6 prefix exceeds 128")),
+                IpAddr::V4(_) if prefix > 32 => {
+                    Err(anyhow!("Invalid CIDR '{cidr}': IPv4 prefix exceeds 32"))
+                }
+                IpAddr::V6(_) if prefix > 128 => {
+                    Err(anyhow!("Invalid CIDR '{cidr}': IPv6 prefix exceeds 128"))
+                }
                 _ => Ok((ip, prefix)),
             }
         })

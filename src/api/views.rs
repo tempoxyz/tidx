@@ -1,10 +1,9 @@
 //! Views API for managing ClickHouse materialized views
 
 use axum::{
-    extract::{ConnectInfo, Path, Query, State},
-    http::HeaderMap,
     Json,
     extract::{ConnectInfo, Path, Query, State},
+    http::HeaderMap,
 };
 use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
@@ -14,9 +13,15 @@ use crate::query::EventSignature;
 
 const ADMIN_MUTATION_HEADER: &str = "x-tidx-admin";
 
-fn require_admin_mutation(headers: &HeaderMap, state: &AppState, addr: &SocketAddr) -> Result<(), ApiError> {
+fn require_admin_mutation(
+    headers: &HeaderMap,
+    state: &AppState,
+    addr: &SocketAddr,
+) -> Result<(), ApiError> {
     if !state.is_trusted_ip(addr) {
-        return Err(ApiError::Forbidden("Mutations only allowed from trusted IPs".to_string()));
+        return Err(ApiError::Forbidden(
+            "Mutations only allowed from trusted IPs".to_string(),
+        ));
     }
 
     if headers
@@ -24,7 +29,9 @@ fn require_admin_mutation(headers: &HeaderMap, state: &AppState, addr: &SocketAd
         .and_then(|value| value.to_str().ok())
         != Some("1")
     {
-        return Err(ApiError::Forbidden("Missing admin mutation header".to_string()));
+        return Err(ApiError::Forbidden(
+            "Missing admin mutation header".to_string(),
+        ));
     }
 
     Ok(())
