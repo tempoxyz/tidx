@@ -425,7 +425,7 @@ async fn handle_query_once(
             })?;
 
         clickhouse
-            .query(&params.sql, &sigs)
+            .query_user(&params.sql, &sigs, options.timeout_ms)
             .await
             .map(|r| QueryResult {
                 columns: r.columns,
