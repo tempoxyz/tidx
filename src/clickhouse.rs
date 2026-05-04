@@ -102,7 +102,7 @@ impl ClickHouseEngine {
         signatures: &[&str],
         timeout_ms: u64,
     ) -> Result<QueryResult> {
-        let sql = self.prepare_query(sql, signatures)?;
+        let sql = Self::prepare_query(sql, signatures)?;
         validate_clickhouse_query(&sql)?;
         self.execute_prepared_query(&sql, timeout_ms).await
     }
@@ -113,11 +113,11 @@ impl ClickHouseEngine {
         signatures: &[&str],
         timeout_ms: u64,
     ) -> Result<QueryResult> {
-        let sql = self.prepare_query(sql, signatures)?;
+        let sql = Self::prepare_query(sql, signatures)?;
         self.execute_prepared_query(&sql, timeout_ms).await
     }
 
-    fn prepare_query(&self, sql: &str, signatures: &[&str]) -> Result<String> {
+    fn prepare_query(sql: &str, signatures: &[&str]) -> Result<String> {
         let sql = if !signatures.is_empty() {
             let sigs: Vec<EventSignature> = signatures
                 .iter()
@@ -187,7 +187,7 @@ impl ClickHouseEngine {
         start: std::time::Instant,
         timeout_ms: u64,
     ) -> Result<QueryResult> {
-        let max_execution_time = ((timeout_ms + 999) / 1000).max(1);
+        let max_execution_time = timeout_ms.div_ceil(1000).max(1);
         let url = format!(
             "{}/?database={}&default_format=JSON&max_execution_time={}",
             inst.url.trim_end_matches('/'),
