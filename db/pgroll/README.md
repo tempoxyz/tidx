@@ -40,7 +40,7 @@ Production Docker commands from `docker/prod`:
   - `PGROLL_POSTGRES_URLS="postgres://.../tidx_moderato?sslmode=disable postgres://.../tidx_mainnet?sslmode=disable" docker compose --profile migrations run --rm pgroll-bootstrap`
 - Normal migration flow before starting/updating `tidx`:
   - `PGROLL_POSTGRES_URLS="postgres://.../tidx_moderato?sslmode=disable postgres://.../tidx_mainnet?sslmode=disable" docker compose --profile migrations run --rm pgroll-migrate`
-  - `pgroll-migrate` verifies the final pgroll version and exits non-zero if migrations do not reach `20260417_add_logs_virtual_forward_indexes` (for example, if bootstrap was skipped on a non-empty database).
+  - `pgroll-migrate` verifies the final pgroll version and exits non-zero if migrations do not reach `20260430_add_blocks_consensus_proposer` (for example, if bootstrap was skipped on a non-empty database).
 
 The production image published by GitHub Actions includes both `tidx pgroll` and the `/db/pgroll` migration files.
 
@@ -48,3 +48,4 @@ Post-baseline migrations in this directory:
 
 - `20260416_add_is_virtual_forward_column.json`
 - `20260417_add_logs_virtual_forward_indexes.json`
+- `20260430_add_blocks_consensus_proposer.json`

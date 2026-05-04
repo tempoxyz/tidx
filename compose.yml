@@ -144,7 +144,7 @@ services:
           sleep 1
         done
         status="$$(tidx pgroll status --postgres-url "$${POSTGRES_URL}" 2>/dev/null || true)"
-        if echo "$${status}" | grep -q '"version": "20260417_add_logs_virtual_forward_indexes"'; then
+        if echo "$${status}" | grep -q '"version": "20260430_add_blocks_consensus_proposer"'; then
           echo 'pgroll migrations already complete'
           exit 0
         fi
