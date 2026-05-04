@@ -236,7 +236,9 @@ pub async fn execute_query_postgres(
             if rows.len() >= limit {
                 return Err(anyhow!("Query returned more than {limit} rows"));
             }
-            let cols = columns.as_ref().expect("columns initialized from first row");
+            let cols = columns
+                .as_ref()
+                .expect("columns initialized from first row");
             rows.push(
                 (0..cols.len())
                     .map(|i| format_column_json(&row, i))
@@ -263,7 +265,8 @@ pub async fn execute_query_postgres(
     };
 
     if columns.is_empty() {
-        columns = conn.prepare(&sql)
+        columns = conn
+            .prepare(&sql)
             .await
             .ok()
             .map(|s| s.columns().iter().map(|c| c.name().to_string()).collect())
@@ -531,7 +534,10 @@ mod tests {
     fn test_append_limit_uses_newline_after_line_comment() {
         let sql = "SELECT * FROM blocks -- trailing comment";
         let limited = append_limit_if_missing(sql, 100);
-        assert_eq!(limited, "SELECT * FROM blocks -- trailing comment\nLIMIT 100");
+        assert_eq!(
+            limited,
+            "SELECT * FROM blocks -- trailing comment\nLIMIT 100"
+        );
     }
 
     #[test]
