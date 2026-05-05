@@ -124,7 +124,7 @@ pub async fn get_all_status(pool: &Pool) -> Result<Vec<SyncStatus>> {
                 tip_num,
                 lag: row.get::<_, i64>(1) - tip_num, // lag from head to tip (realtime)
                 gap_blocks,
-                gaps: Vec::new(),
+                gaps: gaps_i64.clone(),
                 backfill_num,
                 backfill_remaining,
                 sync_rate,
