@@ -1,3 +1,5 @@
+#:schema https://mise.en.dev/schema/mise.json
+
 [tools]
 usql = "latest"
 just = "latest"
@@ -10,9 +12,11 @@ actionlint = "latest"
 "github:foundry-rs/foundry" = "nightly"
 "github:tempoxyz/changelogs" = "latest"
 "github:xataio/pgroll" = { version = "latest", bin = "pgroll" }
+"cargo:https://github.com/mitsuhiko/insta" = { version = "latest", bin = "cargo-insta" }
 
 [shell_alias]
 psql = "usql"
+insta = "cargo-insta"
 
 [env]
 FOUNDRY_DISABLE_NIGHTLY_WARNING = 1
