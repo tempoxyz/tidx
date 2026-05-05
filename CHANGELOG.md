@@ -1,5 +1,11 @@
 # Changelog
 
+## `tidx@0.5.6`
+
+### Patch Changes
+
+- Added a `consensus_proposer` column to the `blocks` table for `TIP-1031` (by @0xrusowsky, [#178](https://github.com/tempoxyz/tidx/pull/178))
+
 ## `tidx@0.5.5`
 
 ### Patch Changes
