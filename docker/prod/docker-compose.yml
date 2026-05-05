@@ -88,7 +88,7 @@ services:
           tidx pgroll init --postgres-url "$${postgres_url}" || true
           tidx pgroll migrate /db/pgroll --complete --postgres-url "$${postgres_url}"
           status="$$(tidx pgroll status --postgres-url "$${postgres_url}")"
-          if ! echo "$${status}" | grep -q '"version": "20260417_add_logs_virtual_forward_indexes"'; then
+          if ! echo "$${status}" | grep -q '"version": "20260430_add_blocks_consensus_proposer"'; then
             echo "pgroll migration did not reach expected version for $${postgres_url}:" >&2
             echo "$${status}" >&2
             exit 1

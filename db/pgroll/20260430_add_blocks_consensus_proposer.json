@@ -1,0 +1,18 @@
+{
+  "operations": [
+    {
+      "add_column": {
+        "table": "blocks",
+        "column": {
+          "name": "consensus_proposer",
+          "type": "bytea",
+          "nullable": true,
+          "check": {
+            "name": "blocks_consensus_proposer_len",
+            "constraint": "consensus_proposer IS NULL OR octet_length(consensus_proposer) = 32"
+          }
+        }
+      }
+    }
+  ]
+}

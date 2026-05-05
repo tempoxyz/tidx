@@ -20,6 +20,8 @@ const LOGS_MIGRATION_20260416: &str =
     include_str!("../../db/clickhouse/migrations/20260416_add_is_virtual_forward.sql");
 const LOGS_MIGRATION_20260417: &str =
     include_str!("../../db/clickhouse/migrations/20260417_add_logs_virtual_forward_index.sql");
+const BLOCKS_MIGRATION_20260430: &str =
+    include_str!("../../db/clickhouse/migrations/20260430_add_blocks_consensus_proposer.sql");
 const RECEIPTS_SCHEMA: &str = include_str!("../../db/clickhouse/receipts.sql");
 
 /// Max rows per ClickHouse INSERT to avoid unbounded memory growth during backfills.
@@ -113,6 +115,13 @@ impl ClickHouseSink {
             .execute()
             .await
             .map_err(|e| anyhow!("Failed to run ClickHouse logs migration 20260417: {e}"))?;
+
+        // TIP-1031: ed25519 consensus proposer pubkey on blocks.
+        self.client
+            .query(BLOCKS_MIGRATION_20260430)
+            .execute()
+            .await
+            .map_err(|e| anyhow!("Failed to run ClickHouse blocks migration 20260430: {e}"))?;
 
         info!(database = %self.database, "ClickHouse schema ready");
         Ok(())
@@ -345,6 +354,7 @@ struct ChBlockWire {
     gas_used: i64,
     miner: String,
     extra_data: Option<String>,
+    consensus_proposer: Option<String>,
 }
 
 impl ChBlockWire {
@@ -359,6 +369,7 @@ impl ChBlockWire {
             gas_used: b.gas_used,
             miner: hex_encode(&b.miner),
             extra_data: b.extra_data.as_ref().map(|v| hex_encode(v)),
+            consensus_proposer: b.consensus_proposer.as_ref().map(|v| hex_encode(v)),
         }
     }
 }
@@ -553,6 +564,7 @@ mod tests {
             gas_used: 15_000_000,
             miner: vec![0xee; 20],
             extra_data: None,
+            consensus_proposer: None,
         };
 
         let wire = ChBlockWire::from_row(&block);

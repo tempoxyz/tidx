@@ -79,6 +79,7 @@ pub async fn seed(pool: &Pool, config: &SeedConfig) -> Result<(u64, i64, u64)> {
                 gas_used: rng.random_range(10_000_000..25_000_000),
                 miner: generate_address(block_num as u64),
                 extra_data: None,
+                consensus_proposer: None,
             });
 
             prev_block_hash = block_hash;

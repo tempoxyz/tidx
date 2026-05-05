@@ -46,7 +46,8 @@ pub async fn write_blocks(pool: &Pool, blocks: &[BlockRow]) -> Result<()> {
     tx.execute(
         "CREATE TEMP TABLE _staging_blocks (
             num INT8, hash BYTEA, parent_hash BYTEA, timestamp TIMESTAMPTZ,
-            timestamp_ms INT8, gas_limit INT8, gas_used INT8, miner BYTEA, extra_data BYTEA
+            timestamp_ms INT8, gas_limit INT8, gas_used INT8, miner BYTEA, extra_data BYTEA,
+            consensus_proposer BYTEA
         ) ON COMMIT DROP",
         &[],
     )
@@ -62,11 +63,12 @@ pub async fn write_blocks(pool: &Pool, blocks: &[BlockRow]) -> Result<()> {
         Type::INT8,        // gas_used
         Type::BYTEA,       // miner
         Type::BYTEA,       // extra_data
+        Type::BYTEA,       // consensus_proposer
     ];
 
     let sink = tx
         .copy_in(
-            "COPY _staging_blocks (num, hash, parent_hash, timestamp, timestamp_ms, gas_limit, gas_used, miner, extra_data) FROM STDIN BINARY",
+            "COPY _staging_blocks (num, hash, parent_hash, timestamp, timestamp_ms, gas_limit, gas_used, miner, extra_data, consensus_proposer) FROM STDIN BINARY",
         )
         .await?;
 
@@ -86,6 +88,7 @@ pub async fn write_blocks(pool: &Pool, blocks: &[BlockRow]) -> Result<()> {
                 &block.gas_used,
                 &block.miner,
                 &block.extra_data as &(dyn tokio_postgres::types::ToSql + Sync),
+                &block.consensus_proposer as &(dyn tokio_postgres::types::ToSql + Sync),
             ])
             .await?;
     }
@@ -420,7 +423,8 @@ pub async fn write_batch(
         tx.execute(
             "CREATE TEMP TABLE _staging_blocks (
                 num INT8, hash BYTEA, parent_hash BYTEA, timestamp TIMESTAMPTZ,
-                timestamp_ms INT8, gas_limit INT8, gas_used INT8, miner BYTEA, extra_data BYTEA
+                timestamp_ms INT8, gas_limit INT8, gas_used INT8, miner BYTEA, extra_data BYTEA,
+                consensus_proposer BYTEA
             ) ON COMMIT DROP",
             &[],
         )
@@ -436,11 +440,12 @@ pub async fn write_batch(
             Type::INT8,        // gas_used
             Type::BYTEA,       // miner
             Type::BYTEA,       // extra_data
+            Type::BYTEA,       // consensus_proposer
         ];
 
         let sink = tx
             .copy_in(
-                "COPY _staging_blocks (num, hash, parent_hash, timestamp, timestamp_ms, gas_limit, gas_used, miner, extra_data) FROM STDIN BINARY",
+                "COPY _staging_blocks (num, hash, parent_hash, timestamp, timestamp_ms, gas_limit, gas_used, miner, extra_data, consensus_proposer) FROM STDIN BINARY",
             )
             .await?;
 
@@ -460,6 +465,7 @@ pub async fn write_batch(
                     &block.gas_used,
                     &block.miner,
                     &block.extra_data as &(dyn tokio_postgres::types::ToSql + Sync),
+                    &block.consensus_proposer as &(dyn tokio_postgres::types::ToSql + Sync),
                 ])
                 .await?;
         }

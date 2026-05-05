@@ -1,6 +1,7 @@
 use alloy::consensus::transaction::Recovered;
-use alloy::consensus::{Transaction as TransactionTrait, Typed2718};
+use alloy::consensus::{BlockHeader as _, Transaction as TransactionTrait, Typed2718};
 use alloy::network::{ReceiptResponse, TransactionResponse};
+use alloy::primitives::B256;
 use chrono::{DateTime, TimeZone, Utc};
 use tempo_alloy::primitives::transaction::SignatureType;
 
@@ -14,25 +15,30 @@ pub fn timestamp_from_secs(secs: u64) -> DateTime<Utc> {
 }
 
 pub fn decode_block(block: &Block) -> BlockRow {
-    let timestamp_secs = block.header.timestamp;
+    let header = &block.header;
+    let timestamp_secs = header.timestamp();
     let timestamp = timestamp_from_secs(timestamp_secs);
     let timestamp_ms = (timestamp_secs * 1000) as i64;
 
     BlockRow {
-        num: block.header.number as i64,
-        hash: block.header.hash.as_slice().to_vec(),
-        parent_hash: block.header.parent_hash.as_slice().to_vec(),
+        num: header.number() as i64,
+        hash: header.hash.as_slice().to_vec(),
+        parent_hash: header.parent_hash().as_slice().to_vec(),
         timestamp,
         timestamp_ms,
-        gas_limit: block.header.gas_limit as i64,
-        gas_used: block.header.gas_used as i64,
-        miner: block.header.beneficiary.as_slice().to_vec(),
-        extra_data: Some(block.header.extra_data.to_vec()),
+        gas_limit: header.gas_limit() as i64,
+        gas_used: header.gas_used() as i64,
+        miner: header.beneficiary().as_slice().to_vec(),
+        extra_data: Some(header.extra_data().to_vec()),
+        consensus_proposer: header
+            .consensus_context
+            .as_ref()
+            .map(|consensus_context| B256::from(&consensus_context.proposer).0.to_vec()),
     }
 }
 
 pub fn decode_transaction(tx: &Transaction, block: &Block, idx: u32) -> TxRow {
-    let block_timestamp = timestamp_from_secs(block.header.timestamp);
+    let block_timestamp = timestamp_from_secs(block.header.timestamp());
     let inner: &Recovered<TempoTxEnvelope> = &tx.inner;
 
     // Extract Tempo-specific fields if this is a 0x76 transaction
@@ -57,7 +63,7 @@ pub fn decode_transaction(tx: &Transaction, block: &Block, idx: u32) -> TxRow {
         };
 
     TxRow {
-        block_num: block.header.number as i64,
+        block_num: block.header.number() as i64,
         block_timestamp,
         idx: idx as i32,
         hash: tx.tx_hash().as_slice().to_vec(),

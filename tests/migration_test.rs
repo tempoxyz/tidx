@@ -1,6 +1,6 @@
 use futures::FutureExt;
 use std::panic::AssertUnwindSafe;
-use tidx::db::{create_pool, run_migrations};
+use tidx::db::{create_pool, run_migrations, run_post_startup_migrations};
 use tokio_postgres::NoTls;
 use url::Url;
 
@@ -57,6 +57,9 @@ async fn test_pg_upgrade_adds_virtual_forward_column_before_indexes() {
         run_migrations(&pool)
             .await
             .expect("Failed to run migrations against old logs schema");
+        run_post_startup_migrations(&pool)
+            .await
+            .expect("Failed to run post-startup migrations against old logs schema");
 
         let conn = pool.get().await.expect("Failed to get post-migration connection");
 

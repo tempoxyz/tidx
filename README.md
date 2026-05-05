@@ -470,6 +470,7 @@ All tables use composite primary keys with timestamps for efficient range querie
 | `gas_used` | `INT8` | Gas used |
 | `miner` | `BYTEA` | Block producer |
 | `extra_data` | `BYTEA` | Extra data field |
+| `consensus_proposer` | `BYTEA` | Ed25519 consensus proposer pubkey (TIP-1031, NULL pre-fork) |
 
 ### txs
 

@@ -827,6 +827,7 @@ fn make_block(num: i64) -> BlockRow {
         gas_used: 21_000 * num,
         miner: vec![0xaa; 20],
         extra_data: Some(vec![0xbb, 0xcc]),
+        consensus_proposer: None,
     }
 }
 

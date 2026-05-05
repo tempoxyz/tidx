@@ -12,6 +12,8 @@ pub struct BlockRow {
     pub gas_used: i64,
     pub miner: Vec<u8>,
     pub extra_data: Option<Vec<u8>>,
+    /// T5+: Ed25519 public key of the consensus proposer for this block. Previously `None`.
+    pub consensus_proposer: Option<Vec<u8>>,
 }
 
 #[derive(Debug, Clone, Default)]

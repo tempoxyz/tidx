@@ -7,7 +7,8 @@ CREATE TABLE IF NOT EXISTS blocks (
     gas_limit       Int64,
     gas_used        Int64,
     miner           String,
-    extra_data      Nullable(String)
+    extra_data      Nullable(String),
+    consensus_proposer Nullable(String)
 ) ENGINE = ReplacingMergeTree()
 PARTITION BY toYYYYMM(timestamp)
 ORDER BY (num)
