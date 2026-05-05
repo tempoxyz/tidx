@@ -54,12 +54,6 @@ pub async fn run_migrations(pool: &Pool) -> Result<()> {
     ))
     .await?;
 
-    // TIP-1031: ed25519 consensus proposer pubkey on blocks.
-    conn.batch_execute(include_str!(
-        "../../db/migrations/20260430_add_blocks_consensus_proposer.sql"
-    ))
-    .await?;
-
     // Heavyweight upgrades such as concurrent index creation run in a
     // best-effort post-startup task so normal boot isn't blocked. Production
     // should still apply them in a pre-deploy migration flow.

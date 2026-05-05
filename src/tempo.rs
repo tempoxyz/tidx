@@ -7,7 +7,6 @@
 use alloy::network::Network;
 use tempo_alloy::TempoNetwork;
 
-pub use tempo_alloy::TempoNetwork;
 pub use tempo_alloy::primitives::TempoTxEnvelope;
 pub use tempo_alloy::rpc::TempoTransactionReceipt;
 
