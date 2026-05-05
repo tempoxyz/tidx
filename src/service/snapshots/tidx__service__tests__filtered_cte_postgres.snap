@@ -3,7 +3,7 @@ source: src/service/mod.rs
 expression: sig.to_cte_sql_postgres_filtered(Some(&used_columns))
 ---
 Transfer AS (
-    SELECT block_num, block_timestamp, log_idx, tx_idx, tx_hash, address, selector, topic1, topic2, topic3, data, abi_address(topic2) AS "to", abi_uint(substring(data FROM 1 FOR 32)) AS "value"
+    SELECT block_num, block_timestamp, log_idx, tx_idx, tx_hash, address, selector, topic1, topic2, topic3, data, is_virtual_forward, abi_address(topic2) AS "to", abi_uint(substring(data FROM 1 FOR 32)) AS "value"
     FROM logs
     WHERE selector = '\xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef'
 )
