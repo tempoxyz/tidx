@@ -462,16 +462,7 @@ impl SyncEngine {
         }
 
         // Validate internal chain continuity
-        for window in blocks.windows(2) {
-            if window[1].header.parent_hash != window[0].header.hash {
-                return Err(anyhow::anyhow!(
-                    "Internal chain break at block {}: parent_hash {:?} != prev hash {:?}",
-                    window[1].header.number,
-                    hex::encode(window[1].header.parent_hash.0),
-                    hex::encode(window[0].header.hash.0)
-                ));
-            }
-        }
+        validate_parent_hash_chain(blocks)?;
 
         Ok(())
     }
@@ -1334,6 +1325,23 @@ async fn tick_gapfill_parallel_no_throttle(
     Ok(())
 }
 
+/// Validate that consecutive blocks in a batch form a valid parent-hash chain.
+/// Returns Ok(()) for empty slices and single-block batches (no previous block to check).
+/// Returns Err if any block's `parent_hash` does not match the preceding block's `hash`.
+fn validate_parent_hash_chain(blocks: &[crate::tempo::Block]) -> Result<()> {
+    for window in blocks.windows(2) {
+        if window[1].header.parent_hash != window[0].header.hash {
+            return Err(anyhow::anyhow!(
+                "Parent hash mismatch at block {}: parent_hash {} != prev hash {}",
+                window[1].header.number,
+                hex::encode(window[1].header.parent_hash.0),
+                hex::encode(window[0].header.hash.0)
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// Check if fully synced (no gaps from genesis to tip)
 #[allow(dead_code)]
 async fn is_fully_synced(pool: &Pool, tip_num: u64) -> Result<bool> {
@@ -1353,6 +1361,9 @@ async fn sync_range_standalone(sinks: &SinkSet, rpc: &RpcClient, from: u64, to: 
         rpc.get_blocks_batch(from..=to),
         rpc.get_receipts_batch_adaptive(from..=to)
     )?;
+
+    // Validate parent hash chain before writing to DB
+    validate_parent_hash_chain(&blocks)?;
 
     let block_timestamps: HashMap<u64, _> = blocks
         .iter()
@@ -1620,6 +1631,94 @@ fn group_consecutive_blocks(blocks: &[u64]) -> Vec<(u64, u64)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use alloy::primitives::B256;
+
+    /// Helper to build a minimal Block with only the fields needed for parent-hash
+    /// chain validation (number, hash, parent_hash).
+    fn make_block(number: u64, hash: B256, parent_hash: B256) -> crate::tempo::Block {
+        use alloy::consensus::Header;
+        use alloy::rpc::types::Block;
+
+        let mut header = Header::default();
+        header.number = number;
+        header.parent_hash = parent_hash;
+
+        Block {
+            header: alloy::rpc::types::Header {
+                inner: header,
+                hash,
+                size: None,
+                total_difficulty: None,
+            },
+            uncles: vec![],
+            transactions: alloy::rpc::types::BlockTransactions::Uncle,
+            withdrawals: None,
+        }
+    }
+
+    #[test]
+    fn test_validate_parent_hash_chain_valid() {
+        let hash_a = B256::repeat_byte(0x0a);
+        let hash_b = B256::repeat_byte(0x0b);
+        let hash_c = B256::repeat_byte(0x0c);
+
+        let blocks = vec![
+            make_block(1, hash_a, B256::ZERO),
+            make_block(2, hash_b, hash_a),
+            make_block(3, hash_c, hash_b),
+        ];
+
+        assert!(validate_parent_hash_chain(&blocks).is_ok());
+    }
+
+    #[test]
+    fn test_validate_parent_hash_chain_mismatch() {
+        let hash_a = B256::repeat_byte(0x0a);
+        let hash_b = B256::repeat_byte(0x0b);
+        let wrong_parent = B256::repeat_byte(0xff);
+
+        let blocks = vec![
+            make_block(1, hash_a, B256::ZERO),
+            make_block(2, hash_b, wrong_parent), // parent_hash != hash_a
+        ];
+
+        let err = validate_parent_hash_chain(&blocks).unwrap_err();
+        assert!(
+            err.to_string().contains("Parent hash mismatch at block 2"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn test_validate_parent_hash_chain_single_block() {
+        let blocks = vec![make_block(42, B256::repeat_byte(0x01), B256::ZERO)];
+        assert!(validate_parent_hash_chain(&blocks).is_ok());
+    }
+
+    #[test]
+    fn test_validate_parent_hash_chain_empty() {
+        assert!(validate_parent_hash_chain(&[]).is_ok());
+    }
+
+    #[test]
+    fn test_validate_parent_hash_chain_mismatch_mid_batch() {
+        let hash_a = B256::repeat_byte(0x0a);
+        let hash_b = B256::repeat_byte(0x0b);
+        let hash_c = B256::repeat_byte(0x0c);
+        let wrong = B256::repeat_byte(0xee);
+
+        let blocks = vec![
+            make_block(10, hash_a, B256::ZERO),
+            make_block(11, hash_b, hash_a), // valid
+            make_block(12, hash_c, wrong),  // invalid: parent != hash_b
+        ];
+
+        let err = validate_parent_hash_chain(&blocks).unwrap_err();
+        assert!(
+            err.to_string().contains("Parent hash mismatch at block 12"),
+            "unexpected error: {err}"
+        );
+    }
 
     #[test]
     fn test_group_consecutive_blocks_empty() {
