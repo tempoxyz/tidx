@@ -12,7 +12,9 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use tracing::{error, warn};
 
 use crate::config::ClickHouseConfig;
-use crate::query::{EventSignature, extract_raw_column_predicates, validate_clickhouse_query};
+use crate::query::{
+    EventSignature, HARD_LIMIT_MAX, extract_raw_column_predicates, validate_clickhouse_query,
+};
 
 /// A single ClickHouse instance (connection + URL).
 struct Instance {
@@ -101,9 +103,11 @@ impl ClickHouseEngine {
         sql: &str,
         signatures: &[&str],
         timeout_ms: u64,
+        limit: i64,
     ) -> Result<QueryResult> {
         let sql = Self::prepare_query(sql, signatures)?;
         validate_clickhouse_query(&sql)?;
+        let sql = Self::wrap_user_query_with_limit(&sql, limit.clamp(1, HARD_LIMIT_MAX));
         self.execute_prepared_query(&sql, Some(timeout_ms)).await
     }
 
@@ -141,6 +145,12 @@ impl ClickHouseEngine {
         };
 
         Ok(sql)
+    }
+
+    fn wrap_user_query_with_limit(sql: &str, limit: i64) -> String {
+        // Always apply an outer LIMIT so the public API's row cap is enforced
+        // even when the inner query omits LIMIT or requests a larger result set.
+        format!("SELECT * FROM ({sql}) AS tidx_query LIMIT {limit}")
     }
 
     async fn execute_prepared_query(
@@ -433,6 +443,19 @@ mod tests {
         assert_eq!(
             url,
             "http://clickhouse-1:8123/?database=tidx_4217&default_format=JSON&max_execution_time=2"
+        );
+    }
+
+    #[test]
+    fn test_wrap_user_query_with_limit_caps_public_results() {
+        let sql = ClickHouseEngine::wrap_user_query_with_limit(
+            "SELECT num, hash FROM blocks ORDER BY num DESC LIMIT 5000",
+            100,
+        );
+
+        assert_eq!(
+            sql,
+            "SELECT * FROM (SELECT num, hash FROM blocks ORDER BY num DESC LIMIT 5000) AS tidx_query LIMIT 100"
         );
     }
 }

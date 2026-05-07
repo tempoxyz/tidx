@@ -2,8 +2,8 @@ use std::collections::HashSet;
 
 use anyhow::{Result, anyhow};
 use sqlparser::ast::{
-    Expr, Function, FunctionArg, FunctionArgExpr, FunctionArguments, ObjectName, Query, SetExpr,
-    Statement, TableFactor, TableWithJoins,
+    Expr, Function, FunctionArg, FunctionArgExpr, FunctionArguments, LimitClause, ObjectName,
+    Query, SetExpr, Statement, TableFactor, TableWithJoins,
 };
 use sqlparser::dialect::GenericDialect;
 use sqlparser::parser::Parser;
@@ -68,6 +68,12 @@ pub fn validate_clickhouse_query(sql: &str) -> Result<()> {
             sql.len(),
             MAX_QUERY_LENGTH
         ));
+    }
+    if regex_lite::Regex::new(r"(?i)\blimit\s+all\b")
+        .expect("valid LIMIT ALL regex")
+        .is_match(sql)
+    {
+        return Err(anyhow!("LIMIT ALL is not allowed"));
     }
 
     let dialect = sqlparser::dialect::ClickHouseDialect {};
@@ -139,10 +145,15 @@ fn validate_query_ast(query: &Query, cte_names: &HashSet<String>, depth: usize) 
         }
     }
 
-    // Validate LIMIT / OFFSET: only allow numeric literals
-    if let Some(limit_clause) = &query.limit_clause {
+    validate_limit_clause(query.limit_clause.as_ref(), true)?;
+
+    Ok(())
+}
+
+fn validate_limit_clause(limit_clause: Option<&LimitClause>, reject_limit_by: bool) -> Result<()> {
+    if let Some(limit_clause) = limit_clause {
         match limit_clause {
-            sqlparser::ast::LimitClause::LimitOffset {
+            LimitClause::LimitOffset {
                 limit,
                 offset,
                 limit_by,
@@ -155,11 +166,11 @@ fn validate_query_ast(query: &Query, cte_names: &HashSet<String>, depth: usize) 
                 if let Some(offset) = offset {
                     validate_limit_expr(&offset.value, "OFFSET")?;
                 }
-                if !limit_by.is_empty() {
+                if reject_limit_by && !limit_by.is_empty() {
                     return Err(anyhow!("LIMIT BY is not allowed"));
                 }
             }
-            sqlparser::ast::LimitClause::OffsetCommaLimit { offset, limit } => {
+            LimitClause::OffsetCommaLimit { offset, limit } => {
                 validate_limit_expr(offset, "OFFSET")?;
                 validate_limit_expr(limit, "LIMIT")?;
             }
@@ -249,6 +260,8 @@ fn validate_clickhouse_query_ast(
             }
         }
     }
+
+    validate_limit_clause(query.limit_clause.as_ref(), false)?;
 
     Ok(())
 }
@@ -1615,6 +1628,30 @@ mod tests {
         assert!(validate_clickhouse_query("SELECT url('http://example.com') FROM logs").is_err());
         assert!(
             validate_clickhouse_query("SELECT remote('host', 'db', 'table') FROM logs").is_err()
+        );
+    }
+
+    #[test]
+    fn test_clickhouse_rejects_limit_all() {
+        assert!(validate_clickhouse_query("SELECT * FROM logs LIMIT ALL").is_err());
+    }
+
+    #[test]
+    fn test_clickhouse_rejects_excessive_limit_values() {
+        assert!(validate_clickhouse_query("SELECT * FROM logs LIMIT 10001").is_err());
+        assert!(validate_clickhouse_query("SELECT * FROM logs LIMIT 1 OFFSET 10001").is_err());
+    }
+
+    #[test]
+    fn test_clickhouse_rejects_non_literal_limit_values() {
+        assert!(validate_clickhouse_query("SELECT * FROM logs LIMIT (SELECT 1)").is_err());
+        assert!(validate_clickhouse_query("SELECT * FROM logs LIMIT 10 OFFSET foo").is_err());
+    }
+
+    #[test]
+    fn test_clickhouse_allows_missing_limit_for_outer_cap() {
+        assert!(
+            validate_clickhouse_query("SELECT num, hash FROM blocks ORDER BY num DESC").is_ok()
         );
     }
 
