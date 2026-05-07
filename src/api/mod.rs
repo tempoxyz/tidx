@@ -238,13 +238,19 @@ const GIT_REV: &str = if let Some(rev) = option_env!("GIT_REV") {
 
 async fn handle_status(State(state): State<AppState>) -> Result<Json<StatusResponse>, ApiError> {
     let mut all_chains = Vec::new();
-    let pools = state.pools.read().await;
-    for (chain_id, pool) in pools.iter() {
-        let chains = crate::service::get_all_status(pool).await.map_err(|e| {
+    let pools: Vec<(u64, Pool)> = state
+        .pools
+        .read()
+        .await
+        .iter()
+        .map(|(chain_id, pool)| (*chain_id, pool.clone()))
+        .collect();
+    for (chain_id, pool) in pools {
+        let chains = crate::service::get_all_status(&pool).await.map_err(|e| {
             ApiError::QueryError(format!("Failed to load status for chain {chain_id}: {e}"))
         })?;
         if chains.is_empty() {
-            all_chains.push(empty_status(*chain_id));
+            all_chains.push(empty_status(chain_id));
         } else {
             all_chains.extend(chains);
         }

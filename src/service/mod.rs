@@ -20,7 +20,7 @@ pub struct SyncStatus {
     pub tip_num: i64,
     pub lag: i64,
     pub gap_blocks: i64,
-    /// Detected gaps in the blocks table: [(start, end), ...]
+    /// Latest exact gaps reported by the sync loop.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub gaps: Vec<(i64, i64)>,
     pub backfill_num: Option<i64>,
@@ -67,17 +67,6 @@ pub async fn get_all_status(pool: &Pool) -> Result<Vec<SyncStatus>> {
         )
         .await?;
 
-    // Detect actual gaps in the blocks table (bounded by max tip_num)
-    let max_tip: u64 = rows
-        .iter()
-        .map(|r| r.get::<_, i64>(3) as u64)
-        .max()
-        .unwrap_or(0);
-    let gaps = crate::sync::writer::detect_gaps(pool, max_tip)
-        .await
-        .unwrap_or_default();
-    let gaps_i64: Vec<(i64, i64)> = gaps.iter().map(|(s, e)| (*s as i64, *e as i64)).collect();
-
     Ok(rows
         .iter()
         .map(|row| {
@@ -116,6 +105,15 @@ pub async fn get_all_status(pool: &Pool) -> Result<Vec<SyncStatus>> {
 
             // Gap = blocks between synced_num and tip_num that may be missing
             let gap_blocks = tip_num.saturating_sub(synced_num);
+            let gaps = metrics::get_gap_status(row.get::<_, i64>(0) as u64, "postgres")
+                .map(|status| {
+                    status
+                        .ranges
+                        .into_iter()
+                        .map(|(start, end)| (start as i64, end as i64))
+                        .collect()
+                })
+                .unwrap_or_default();
 
             SyncStatus {
                 chain_id: row.get(0),
@@ -124,7 +122,7 @@ pub async fn get_all_status(pool: &Pool) -> Result<Vec<SyncStatus>> {
                 tip_num,
                 lag: row.get::<_, i64>(1) - tip_num, // lag from head to tip (realtime)
                 gap_blocks,
-                gaps: gaps_i64.clone(),
+                gaps,
                 backfill_num,
                 backfill_remaining,
                 sync_rate,

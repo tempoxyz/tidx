@@ -876,8 +876,7 @@ async fn tick_gapfill_parallel(
     // With 0.5s block time, tip_num races ahead of synced_num constantly,
     // so we check the range [1, tip_num] cheaply via COUNT vs expected.
     if state.tip_num > 0 && !has_gaps(pool, 1, state.tip_num).await? {
-        metrics::set_gap_blocks(chain_id, "postgres", 0);
-        metrics::set_gap_count(chain_id, "postgres", 0);
+        metrics::set_gap_ranges(chain_id, "postgres", &[]);
         metrics::set_synced(chain_id, realtime_lag == 0);
         if state.synced_num < state.tip_num {
             update_synced_num(pool, chain_id, state.tip_num).await?;
@@ -891,8 +890,7 @@ async fn tick_gapfill_parallel(
 
     if gaps.is_empty() {
         // No gaps - fully synced from genesis to tip
-        metrics::set_gap_blocks(chain_id, "postgres", 0);
-        metrics::set_gap_count(chain_id, "postgres", 0);
+        metrics::set_gap_ranges(chain_id, "postgres", &[]);
         metrics::set_synced(chain_id, realtime_lag == 0);
         if state.synced_num < state.tip_num {
             update_synced_num(pool, chain_id, state.tip_num).await?;
@@ -904,8 +902,7 @@ async fn tick_gapfill_parallel(
 
     let total_gap_blocks: u64 = gaps.iter().map(|(s, e)| e - s + 1).sum();
     let gap_count = gaps.len();
-    metrics::set_gap_blocks(chain_id, "postgres", total_gap_blocks);
-    metrics::set_gap_count(chain_id, "postgres", gap_count as u64);
+    metrics::set_gap_ranges(chain_id, "postgres", &gaps);
     metrics::set_synced(chain_id, false);
 
     // Collect all batch ranges to process (from most recent gaps first)
@@ -1166,6 +1163,7 @@ async fn tick_gapfill_parallel_no_throttle(
     let gaps = detect_all_gaps(pool, state.tip_num).await?;
 
     if gaps.is_empty() {
+        metrics::set_gap_ranges(chain_id, "postgres", &[]);
         if state.synced_num < state.tip_num {
             update_synced_num(pool, chain_id, state.tip_num).await?;
             info!(synced_num = state.tip_num, "Backfill: fully synced");
@@ -1175,6 +1173,7 @@ async fn tick_gapfill_parallel_no_throttle(
 
     let total_gap_blocks: u64 = gaps.iter().map(|(s, e)| e - s + 1).sum();
     let gap_count = gaps.len();
+    metrics::set_gap_ranges(chain_id, "postgres", &gaps);
 
     // Collect all batch ranges to process (from most recent gaps first)
     let mut batch_ranges: Vec<(u64, u64)> = Vec::new();

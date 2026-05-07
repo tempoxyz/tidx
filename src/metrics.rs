@@ -1,4 +1,6 @@
 use metrics::{counter, gauge, histogram};
+use std::sync::OnceLock;
+use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::time::Instant;
 
 // Per-chain metrics with chain_id label
@@ -65,6 +67,13 @@ pub fn set_gap_blocks(chain_id: u64, sink: &str, blocks: u64) {
         ("sink", sink.to_string()),
     ];
     gauge!("tidx_gap_blocks", &labels).set(blocks as f64);
+    let statuses =
+        GAP_STATUSES.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+    let mut statuses = statuses.lock().unwrap();
+    statuses
+        .entry((chain_id, sink.to_string()))
+        .or_default()
+        .blocks = blocks;
 }
 
 pub fn set_gap_count(chain_id: u64, sink: &str, count: u64) {
@@ -73,6 +82,60 @@ pub fn set_gap_count(chain_id: u64, sink: &str, count: u64) {
         ("sink", sink.to_string()),
     ];
     gauge!("tidx_gap_count", &labels).set(count as f64);
+    let statuses =
+        GAP_STATUSES.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+    let mut statuses = statuses.lock().unwrap();
+    let status = statuses.entry((chain_id, sink.to_string())).or_default();
+    status.count = count;
+    if count == 0 {
+        status.ranges.clear();
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct GapStatus {
+    pub blocks: u64,
+    pub count: u64,
+    pub ranges: Vec<(u64, u64)>,
+}
+
+static GAP_STATUSES: OnceLock<
+    std::sync::Mutex<std::collections::HashMap<(u64, String), GapStatus>>,
+> = OnceLock::new();
+
+pub fn set_gap_ranges(chain_id: u64, sink: &str, ranges: &[(u64, u64)]) {
+    let blocks = ranges
+        .iter()
+        .map(|(start, end)| end.saturating_sub(*start) + 1)
+        .sum();
+    let count = ranges.len() as u64;
+    let labels = [
+        ("chain_id", chain_id.to_string()),
+        ("sink", sink.to_string()),
+    ];
+    gauge!("tidx_gap_blocks", &labels).set(blocks as f64);
+    gauge!("tidx_gap_count", &labels).set(count as f64);
+
+    let statuses =
+        GAP_STATUSES.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+    let mut statuses = statuses.lock().unwrap();
+    statuses.insert(
+        (chain_id, sink.to_string()),
+        GapStatus {
+            blocks,
+            count,
+            ranges: ranges.to_vec(),
+        },
+    );
+}
+
+pub fn get_gap_status(chain_id: u64, sink: &str) -> Option<GapStatus> {
+    let statuses = GAP_STATUSES.get()?;
+    statuses
+        .lock()
+        .unwrap()
+        .get(&(chain_id, sink.to_string()))
+        .cloned()
 }
 
 pub fn record_rpc_request(method: &str, duration: std::time::Duration, success: bool) {
@@ -223,9 +286,6 @@ pub fn record_clickhouse_rows(count: u64) {
 // Tracks the highest block number written to each table in each sink.
 // Updated atomically on every write, queried by status endpoints for
 // instant per-table progress without touching the actual tables.
-
-use std::sync::OnceLock;
-use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 
 /// Per-table high-water marks for a single sink.
 pub struct SinkWatermarks {
