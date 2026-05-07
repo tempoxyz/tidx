@@ -1066,6 +1066,32 @@ async fn test_query_logs_with_event_signature() {
 
 #[tokio::test]
 #[serial(db)]
+async fn test_query_event_signature_with_user_cte() {
+    let db = TestDb::new().await;
+    let opts = default_options();
+
+    let result = execute_query_postgres(
+        &db.pool,
+        r#"WITH filtered AS (
+            SELECT "from", "to", "value", block_num
+            FROM transfer
+            WHERE "value" IS NOT NULL
+        )
+        SELECT "from", "to", "value" FROM filtered LIMIT 10"#,
+        &["Transfer(address indexed from, address indexed to, uint256 value)"],
+        &opts,
+    )
+    .await
+    .expect("Query with signature CTE and user CTE failed");
+
+    assert_eq!(result.engine.as_deref(), Some("postgres"));
+    assert!(result.columns.contains(&"from".to_string()));
+    assert!(result.columns.contains(&"to".to_string()));
+    assert!(result.columns.contains(&"value".to_string()));
+}
+
+#[tokio::test]
+#[serial(db)]
 async fn test_query_receipts() {
     let db = TestDb::new().await;
     let opts = default_options();

@@ -7,10 +7,7 @@ use tokio_postgres::types::ToSql;
 
 use crate::db::Pool;
 use crate::metrics;
-use crate::query::{
-    EventSignature, HARD_LIMIT_MAX, extract_column_references, extract_raw_column_predicates,
-    validate_query,
-};
+use crate::query::{HARD_LIMIT_MAX, apply_event_signature_ctes_postgres, validate_query};
 
 #[derive(Debug, Clone, Serialize)]
 pub struct SyncStatus {
@@ -168,35 +165,7 @@ pub async fn execute_query_postgres(
     signatures: &[&str],
     options: &QueryOptions,
 ) -> Result<QueryResult> {
-    // Generate CTE SQL if signatures are provided
-    let sql = if !signatures.is_empty() {
-        let sigs: Vec<EventSignature> = signatures
-            .iter()
-            .map(|s| EventSignature::parse(s))
-            .collect::<Result<_>>()?;
-
-        // Normalize table references and rewrite filters for each signature
-        let mut sql = sql.to_string();
-        for sig in &sigs {
-            sql = sig.normalize_table_references(&sql);
-            sql = sig.rewrite_filters_for_pushdown(&sql);
-        }
-
-        let used_columns = extract_column_references(&sql);
-        let filter = if used_columns.is_empty() {
-            None
-        } else {
-            Some(&used_columns)
-        };
-        let pushdown = extract_raw_column_predicates(&sql);
-        let ctes: Vec<String> = sigs
-            .iter()
-            .map(|sig| sig.to_cte_sql_postgres_with_pushdown(filter, &pushdown))
-            .collect();
-        format!("WITH {} {sql}", ctes.join(", "))
-    } else {
-        sql.to_string()
-    };
+    let sql = apply_event_signature_ctes_postgres(sql, signatures)?;
 
     // Validate query (after CTE wrapping so signature-derived table names are valid)
     validate_query(&sql)?;

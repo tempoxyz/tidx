@@ -9,7 +9,9 @@ use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
 
 use super::{ApiError, AppState};
-use crate::query::{EventSignature, validate_clickhouse_query};
+use crate::query::{
+    EventSignature, apply_event_signature_ctes_clickhouse, validate_clickhouse_query,
+};
 
 const ADMIN_MUTATION_HEADER: &str = "x-tidx-admin";
 
@@ -229,14 +231,6 @@ pub async fn create_view(
         )));
     }
 
-    // Validate SQL is SELECT only
-    let sql_upper = req.sql.trim().to_uppercase();
-    if !sql_upper.starts_with("SELECT") {
-        return Err(ApiError::BadRequest(
-            "SQL must be a SELECT statement".to_string(),
-        ));
-    }
-
     // Parse signature if provided
     let signature = if let Some(ref sig_str) = req.signature {
         Some(
@@ -262,12 +256,11 @@ pub async fn create_view(
     let mv_name = format!("{}_mv", req.name);
     let order_by = req.order_by.join(", ");
 
-    // If signature provided, generate CTE with decoded columns and apply predicate pushdown
-    let sql = if let Some(ref sig) = signature {
-        let sql = sig.normalize_table_references(&req.sql);
-        let sql = sig.rewrite_filters_for_pushdown(&sql);
-        let cte = sig.to_cte_sql_clickhouse();
-        format!("WITH {} {}", cte, sql)
+    // If signature provided, generate event CTEs and merge them with any user CTEs.
+    let sql = if signature.is_some() {
+        let sig = req.signature.as_deref().expect("signature parsed above");
+        apply_event_signature_ctes_clickhouse(&req.sql, &[sig])
+            .map_err(|e| ApiError::BadRequest(format!("Invalid view SQL: {e}")))?
     } else {
         req.sql.clone()
     };
@@ -520,10 +513,7 @@ mod tests {
     // ========================================================================
 
     fn generate_view_sql(signature: &str, user_sql: &str) -> String {
-        let sig = EventSignature::parse(signature).unwrap();
-        let sql = sig.rewrite_filters_for_pushdown(user_sql);
-        let cte = sig.to_cte_sql_clickhouse();
-        format!("WITH {} {}", cte, sql)
+        apply_event_signature_ctes_clickhouse(user_sql, &[signature]).unwrap()
     }
 
     /// Generate runtime SQL (what actually gets executed against ClickHouse)
@@ -664,6 +654,19 @@ mod tests {
             r#"SELECT * FROM Transfer LIMIT 1"#,
         );
         assert_snapshot!(sql);
+    }
+
+    #[test]
+    fn test_runtime_sql_merges_user_cte() {
+        let sql = generate_runtime_sql(
+            "Transfer(address indexed from, address indexed to, uint256 value)",
+            r#"WITH filtered AS (SELECT * FROM transfer WHERE block_num > 1) SELECT * FROM filtered"#,
+        );
+
+        assert!(sql.starts_with("WITH Transfer AS ("));
+        assert!(sql.contains("), filtered AS ("));
+        assert_eq!(sql.matches("WITH ").count(), 1);
+        assert!(validate_clickhouse_query(&sql).is_ok(), "got: {sql}");
     }
 
     // ========================================================================

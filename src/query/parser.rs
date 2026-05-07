@@ -1,8 +1,9 @@
 use anyhow::{Result, anyhow};
 use sha3::{Digest, Keccak256};
-use sqlparser::ast::{BinaryOperator, Expr, Value, visit_expressions};
-use sqlparser::dialect::GenericDialect;
+use sqlparser::ast::{BinaryOperator, Expr, Statement, Value, visit_expressions};
+use sqlparser::dialect::{ClickHouseDialect, Dialect, GenericDialect};
 use sqlparser::parser::Parser;
+use sqlparser::tokenizer::{Location, Token, Tokenizer};
 use std::collections::{HashMap, HashSet};
 use std::ops::ControlFlow;
 
@@ -402,6 +403,210 @@ impl EventSignature {
             }
             _ => None, // Dynamic types not supported for pushdown
         }
+    }
+}
+
+/// Apply event-signature CTEs to a PostgreSQL user query.
+///
+/// If the user query already has a top-level `WITH`, generated event CTEs are
+/// inserted into that `WITH` list before user CTEs so user CTEs can reference
+/// event virtual tables.
+pub fn apply_event_signature_ctes_postgres(sql: &str, signatures: &[&str]) -> Result<String> {
+    apply_event_signature_ctes(sql, signatures, EventCteDialect::Postgres)
+}
+
+/// Apply event-signature CTEs to a ClickHouse user query.
+///
+/// See [`apply_event_signature_ctes_postgres`] for merge semantics.
+pub fn apply_event_signature_ctes_clickhouse(sql: &str, signatures: &[&str]) -> Result<String> {
+    apply_event_signature_ctes(sql, signatures, EventCteDialect::ClickHouse)
+}
+
+#[derive(Clone, Copy)]
+enum EventCteDialect {
+    Postgres,
+    ClickHouse,
+}
+
+impl EventCteDialect {
+    fn parser_dialect(self) -> Box<dyn Dialect> {
+        match self {
+            Self::Postgres => Box::new(GenericDialect {}),
+            Self::ClickHouse => Box::new(ClickHouseDialect {}),
+        }
+    }
+}
+
+fn apply_event_signature_ctes(
+    sql: &str,
+    signatures: &[&str],
+    dialect: EventCteDialect,
+) -> Result<String> {
+    if signatures.is_empty() {
+        return Ok(sql.to_string());
+    }
+
+    let sigs: Vec<EventSignature> = signatures
+        .iter()
+        .map(|s| EventSignature::parse(s))
+        .collect::<Result<_>>()?;
+
+    let mut event_names = HashSet::new();
+    for sig in &sigs {
+        if !event_names.insert(sig.name.to_lowercase()) {
+            return Err(anyhow!(
+                "Duplicate event signature name '{}' is not allowed",
+                sig.name
+            ));
+        }
+    }
+
+    let mut rewritten_sql = sql.to_string();
+    for sig in &sigs {
+        rewritten_sql = sig.normalize_table_references(&rewritten_sql);
+        rewritten_sql = sig.rewrite_filters_for_pushdown(&rewritten_sql);
+    }
+
+    let pushdown = extract_raw_column_predicates(&rewritten_sql);
+    let ctes: Vec<String> = match dialect {
+        EventCteDialect::Postgres => {
+            let used_columns = extract_column_references(&rewritten_sql);
+            let filter = if used_columns.is_empty() {
+                None
+            } else {
+                Some(&used_columns)
+            };
+            sigs.iter()
+                .map(|sig| sig.to_cte_sql_postgres_with_pushdown(filter, &pushdown))
+                .collect()
+        }
+        EventCteDialect::ClickHouse => sigs
+            .iter()
+            .map(|sig| sig.to_cte_sql_clickhouse_with_pushdown(None, &pushdown))
+            .collect(),
+    };
+
+    merge_event_ctes(&rewritten_sql, &ctes, &event_names, dialect)
+}
+
+struct UserWithInfo {
+    has_with: bool,
+    recursive: bool,
+    cte_names: Vec<String>,
+}
+
+fn merge_event_ctes(
+    sql: &str,
+    ctes: &[String],
+    event_names: &HashSet<String>,
+    dialect: EventCteDialect,
+) -> Result<String> {
+    let dialect_impl = dialect.parser_dialect();
+    let with_info = inspect_user_with(sql, dialect_impl.as_ref())?;
+    let joined_ctes = ctes.join(", ");
+
+    if !with_info.has_with {
+        return Ok(format!("WITH {joined_ctes} {sql}"));
+    }
+
+    if with_info.recursive {
+        return Err(anyhow!("Recursive CTEs are not allowed"));
+    }
+
+    for cte_name in &with_info.cte_names {
+        if event_names.contains(cte_name) {
+            return Err(anyhow!(
+                "User CTE name '{}' conflicts with an event signature table",
+                cte_name
+            ));
+        }
+    }
+
+    let with_end = top_level_with_end(sql, dialect_impl.as_ref())?;
+    let (before_with_end, after_with) = sql.split_at(with_end);
+    Ok(format!("{before_with_end} {joined_ctes},{after_with}"))
+}
+
+fn inspect_user_with(sql: &str, dialect: &dyn Dialect) -> Result<UserWithInfo> {
+    let statements =
+        Parser::parse_sql(dialect, sql).map_err(|e| anyhow!("SQL parse error: {e}"))?;
+
+    if statements.is_empty() {
+        return Err(anyhow!("Empty query"));
+    }
+    if statements.len() > 1 {
+        return Err(anyhow!("Multiple statements not allowed"));
+    }
+
+    let Statement::Query(query) = &statements[0] else {
+        return Err(anyhow!("Only SELECT queries are allowed"));
+    };
+
+    let Some(with) = &query.with else {
+        return Ok(UserWithInfo {
+            has_with: false,
+            recursive: false,
+            cte_names: Vec::new(),
+        });
+    };
+
+    Ok(UserWithInfo {
+        has_with: true,
+        recursive: with.recursive,
+        cte_names: with
+            .cte_tables
+            .iter()
+            .map(|cte| cte.alias.name.value.to_lowercase())
+            .collect(),
+    })
+}
+
+fn top_level_with_end(sql: &str, dialect: &dyn Dialect) -> Result<usize> {
+    let mut tokenizer = Tokenizer::new(dialect, sql);
+    let tokens = tokenizer
+        .tokenize_with_location()
+        .map_err(|e| anyhow!("SQL tokenization error: {e}"))?;
+
+    for token in tokens {
+        match token.token {
+            Token::Whitespace(_) => {}
+            Token::Word(word)
+                if word.quote_style.is_none() && word.value.eq_ignore_ascii_case("WITH") =>
+            {
+                return byte_index_for_location(sql, token.span.end)
+                    .ok_or_else(|| anyhow!("Failed to locate WITH clause"));
+            }
+            _ => break,
+        }
+    }
+
+    Err(anyhow!("Failed to locate WITH clause"))
+}
+
+fn byte_index_for_location(sql: &str, location: Location) -> Option<usize> {
+    if location.line == 0 || location.column == 0 {
+        return None;
+    }
+
+    let mut line = 1;
+    let mut column = 1;
+    for (idx, ch) in sql.char_indices() {
+        if line == location.line && column == location.column {
+            return Some(idx);
+        }
+
+        if ch == '\n' {
+            line += 1;
+            column = 1;
+        } else {
+            column += 1;
+        }
+    }
+
+    if line == location.line && column == location.column {
+        Some(sql.len())
+    } else {
+        None
     }
 }
 
@@ -1010,6 +1215,7 @@ impl AbiType {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::query::validate_query;
     use insta::assert_snapshot;
 
     // ========================================================================
@@ -1056,6 +1262,92 @@ mod tests {
         let sig = EventSignature::parse("Paused()").unwrap();
         assert_eq!(sig.name, "Paused");
         assert!(sig.params.is_empty());
+    }
+
+    #[test]
+    fn test_apply_event_cte_to_plain_postgres_select() {
+        let sql = apply_event_signature_ctes_postgres(
+            r#"SELECT "from", "value" FROM Transfer LIMIT 5"#,
+            &["Transfer(address indexed from, address indexed to, uint256 value)"],
+        )
+        .unwrap();
+
+        assert!(sql.starts_with("WITH Transfer AS ("));
+        assert_eq!(sql.matches("WITH ").count(), 1);
+        assert!(sql.contains(r#"SELECT "from", "value" FROM Transfer LIMIT 5"#));
+    }
+
+    #[test]
+    fn test_apply_event_cte_merges_with_user_postgres_cte() {
+        let sql = apply_event_signature_ctes_postgres(
+            r#"WITH filtered AS (SELECT * FROM transfer WHERE "value" > 1000) SELECT * FROM filtered"#,
+            &["Transfer(address indexed from, address indexed to, uint256 value)"],
+        )
+        .unwrap();
+
+        assert!(sql.starts_with("WITH Transfer AS ("));
+        assert_eq!(sql.matches("WITH ").count(), 1);
+        let event_pos = sql.find("Transfer AS").unwrap();
+        let user_pos = sql.find("filtered AS").unwrap();
+        assert!(
+            event_pos < user_pos,
+            "event CTE should be defined first: {sql}"
+        );
+        assert!(sql.contains("FROM Transfer WHERE"));
+        validate_query(&sql).expect("merged Postgres CTE SQL should validate");
+    }
+
+    #[test]
+    fn test_apply_event_cte_merges_multiple_signatures_with_user_cte() {
+        let sql = apply_event_signature_ctes_clickhouse(
+            r#"WITH recent AS (SELECT * FROM Transfer WHERE block_num > 10) SELECT * FROM recent"#,
+            &[
+                "Transfer(address indexed from, address indexed to, uint256 value)",
+                "Approval(address indexed owner, address indexed spender, uint256 value)",
+            ],
+        )
+        .unwrap();
+
+        assert!(sql.starts_with("WITH Transfer AS ("));
+        assert!(sql.contains("), Approval AS ("));
+        assert!(sql.contains("), recent AS ("));
+        assert_eq!(sql.matches("WITH ").count(), 1);
+    }
+
+    #[test]
+    fn test_apply_event_cte_rejects_duplicate_signature_names() {
+        let err = apply_event_signature_ctes_postgres(
+            "SELECT * FROM Transfer",
+            &[
+                "Transfer(address indexed from)",
+                "Transfer(address indexed to)",
+            ],
+        )
+        .unwrap_err();
+
+        assert!(err.to_string().contains("Duplicate event signature name"));
+    }
+
+    #[test]
+    fn test_apply_event_cte_rejects_user_cte_collision() {
+        let err = apply_event_signature_ctes_postgres(
+            "WITH Transfer AS (SELECT * FROM logs) SELECT * FROM Transfer",
+            &["Transfer(address indexed from, address indexed to, uint256 value)"],
+        )
+        .unwrap_err();
+
+        assert!(err.to_string().contains("conflicts"));
+    }
+
+    #[test]
+    fn test_apply_event_cte_rejects_recursive_cte() {
+        let err = apply_event_signature_ctes_postgres(
+            "WITH RECURSIVE r AS (SELECT * FROM Transfer) SELECT * FROM r",
+            &["Transfer(address indexed from, address indexed to, uint256 value)"],
+        )
+        .unwrap_err();
+
+        assert!(err.to_string().contains("Recursive CTEs"));
     }
 
     #[test]

@@ -418,6 +418,20 @@ fn test_inject_block_filter_with_existing_where() {
 }
 
 #[test]
+fn test_inject_block_filter_with_user_cte() {
+    let sql = "WITH filtered AS (SELECT * FROM txs WHERE gas_used > 21000) SELECT * FROM filtered";
+    let filtered = inject_block_filter(sql, 450).unwrap();
+    assert!(
+        filtered.contains("filtered.block_num = 450"),
+        "got: {filtered}"
+    );
+    assert!(
+        filtered.contains("WITH filtered AS"),
+        "should preserve user CTE"
+    );
+}
+
+#[test]
 fn test_inject_block_filter_no_order_by() {
     let sql = "SELECT COUNT(*) FROM blocks LIMIT 1";
     let filtered = inject_block_filter(sql, 500).unwrap();

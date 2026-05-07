@@ -13,7 +13,7 @@ use tracing::{error, warn};
 
 use crate::config::ClickHouseConfig;
 use crate::query::{
-    EventSignature, HARD_LIMIT_MAX, extract_raw_column_predicates, validate_clickhouse_query,
+    HARD_LIMIT_MAX, apply_event_signature_ctes_clickhouse, validate_clickhouse_query,
 };
 
 /// A single ClickHouse instance (connection + URL).
@@ -122,29 +122,7 @@ impl ClickHouseEngine {
     }
 
     fn prepare_query(sql: &str, signatures: &[&str]) -> Result<String> {
-        let sql = if !signatures.is_empty() {
-            let sigs: Vec<EventSignature> = signatures
-                .iter()
-                .map(|s| EventSignature::parse(s))
-                .collect::<Result<_>>()?;
-
-            let mut sql = sql.to_string();
-            for sig in &sigs {
-                sql = sig.normalize_table_references(&sql);
-                sql = sig.rewrite_filters_for_pushdown(&sql);
-            }
-
-            let pushdown = extract_raw_column_predicates(&sql);
-            let ctes: Vec<String> = sigs
-                .iter()
-                .map(|sig| sig.to_cte_sql_clickhouse_with_pushdown(None, &pushdown))
-                .collect();
-            format!("WITH {} {sql}", ctes.join(", "))
-        } else {
-            sql.to_string()
-        };
-
-        Ok(sql)
+        apply_event_signature_ctes_clickhouse(sql, signatures)
     }
 
     fn wrap_user_query_with_limit(sql: &str, limit: i64) -> String {
@@ -405,6 +383,31 @@ mod tests {
 
         let engine = ClickHouseEngine::new(&config, 4217).unwrap();
         assert_eq!(engine.database(), "tidx_4217");
+    }
+
+    #[test]
+    fn test_prepare_query_merges_signature_cte_with_user_cte() {
+        let sql = ClickHouseEngine::prepare_query(
+            r#"WITH recent AS (SELECT * FROM transfer WHERE block_num > 10) SELECT * FROM recent"#,
+            &["Transfer(address indexed from, address indexed to, uint256 value)"],
+        )
+        .unwrap();
+
+        assert!(sql.starts_with("WITH Transfer AS ("));
+        assert!(sql.contains("), recent AS ("));
+        assert_eq!(sql.matches("WITH ").count(), 1);
+        assert!(validate_clickhouse_query(&sql).is_ok(), "got: {sql}");
+    }
+
+    #[test]
+    fn test_prepare_query_rejects_signature_cte_collision() {
+        let err = ClickHouseEngine::prepare_query(
+            "WITH Transfer AS (SELECT * FROM logs) SELECT * FROM Transfer",
+            &["Transfer(address indexed from, address indexed to, uint256 value)"],
+        )
+        .unwrap_err();
+
+        assert!(err.to_string().contains("conflicts"));
     }
 
     #[test]
