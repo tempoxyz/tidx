@@ -25,7 +25,7 @@ RUN cargo build --release
 FROM ubuntu:24.04
 
 ARG TARGETARCH
-ARG PGROLL_VERSION=v0.16.1
+ARG PGROLL_VERSION=v0.16.2
 
 RUN apt-get update --yes \
     && apt-get install --yes --no-install-recommends \
