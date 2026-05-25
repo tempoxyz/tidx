@@ -864,7 +864,8 @@ fn validate_expr(expr: &Expr, cte_names: &HashSet<String>, depth: usize) -> Resu
         }
 
         // ANY/ALL operators
-        Expr::AnyOp { right, .. } | Expr::AllOp { right, .. } => {
+        Expr::AnyOp { left, right, .. } | Expr::AllOp { left, right, .. } => {
+            validate_expr(left, cte_names, depth)?;
             validate_expr(right, cte_names, depth)
         }
 
@@ -1498,6 +1499,15 @@ mod tests {
     #[test]
     fn test_allows_array_literal() {
         assert!(validate_query("SELECT * FROM blocks WHERE num = ANY(ARRAY[1,2,3])").is_ok());
+    }
+
+    #[test]
+    fn test_rejects_any_all_left_operand_bypass() {
+        assert!(
+            validate_query("SELECT (SELECT usename FROM pg_shadow LIMIT 1) = ANY(ARRAY['x'])")
+                .is_err()
+        );
+        assert!(validate_query("SELECT pg_sleep(1) = ALL(ARRAY[1])").is_err());
     }
 
     #[test]
