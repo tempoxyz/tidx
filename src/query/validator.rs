@@ -262,6 +262,11 @@ fn validate_clickhouse_query_ast(
     }
 
     validate_limit_clause(query.limit_clause.as_ref(), false)?;
+    if let Some(LimitClause::LimitOffset { limit_by, .. }) = query.limit_clause.as_ref() {
+        for expr in limit_by {
+            validate_clickhouse_expr(expr, &all_cte_names, depth)?;
+        }
+    }
 
     Ok(())
 }
@@ -391,7 +396,7 @@ fn validate_clickhouse_table_name(name: &ObjectName, cte_names: &HashSet<String>
     }
 
     let bare_name = parts.last().cloned().unwrap_or_default();
-    if ALLOWED_TABLES.contains(&bare_name.as_str()) {
+    if parts.len() == 1 && ALLOWED_TABLES.contains(&bare_name.as_str()) {
         return Ok(());
     }
     if parts.len() == 1 && cte_names.contains(&bare_name) {
@@ -1660,6 +1665,22 @@ mod tests {
         assert!(
             validate_clickhouse_query(
                 "WITH system AS (SELECT * FROM logs) SELECT * FROM system.tables"
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn test_clickhouse_rejects_schema_qualified_allowed_tables() {
+        assert!(validate_clickhouse_query("SELECT * FROM other_tenant.logs").is_err());
+        assert!(validate_clickhouse_query("SELECT * FROM default.blocks").is_err());
+    }
+
+    #[test]
+    fn test_clickhouse_validates_limit_by_expressions() {
+        assert!(
+            validate_clickhouse_query(
+                "SELECT count() FROM logs LIMIT 10 BY (SELECT url('http://169.254.169.254'))"
             )
             .is_err()
         );
