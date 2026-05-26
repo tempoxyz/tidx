@@ -175,8 +175,10 @@ async fn print_status(config: &Config) -> Result<()> {
     println!();
 
     for chain in &config.chains {
-        let rpc = RpcClient::new(&chain.rpc_url);
-        let live_head = rpc.latest_block_number().await.ok();
+        let live_head = match chain.resolved_rpc_url() {
+            Ok(rpc_url) => RpcClient::new(&rpc_url).latest_block_number().await.ok(),
+            Err(_) => None,
+        };
 
         println!(
             "┌─ {} (chain_id: {}) ─────────────────────",
@@ -248,8 +250,10 @@ async fn print_json_status(config: &Config) -> Result<()> {
     let mut chains = Vec::new();
 
     for chain in &config.chains {
-        let rpc = RpcClient::new(&chain.rpc_url);
-        let live_head = rpc.latest_block_number().await.ok();
+        let live_head = match chain.resolved_rpc_url() {
+            Ok(rpc_url) => RpcClient::new(&rpc_url).latest_block_number().await.ok(),
+            Err(_) => None,
+        };
 
         let (state, gaps) = match chain.resolved_pg_url() {
             Ok(pg_url) => match db::create_pool(&pg_url).await {
@@ -273,7 +277,7 @@ async fn print_json_status(config: &Config) -> Result<()> {
         let mut chain_status = serde_json::json!({
             "name": chain.name,
             "chain_id": chain.chain_id,
-            "rpc_url": chain.rpc_url,
+            "rpc_url": chain.redacted_rpc_url(),
             "pg_url": chain.pg_url,
             "head": live_head,
             "tip_num": state.as_ref().map(|s| s.tip_num),

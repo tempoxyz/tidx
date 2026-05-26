@@ -296,10 +296,23 @@ fn spawn_sync_engine(
     broadcaster: Arc<Broadcaster>,
     shutdown_rx: tokio::sync::broadcast::Receiver<()>,
 ) {
+    let rpc_url = match chain.resolved_rpc_url() {
+        Ok(url) => url,
+        Err(e) => {
+            error!(
+                error = %e,
+                chain = %chain.name,
+                "Failed to resolve RPC URL"
+            );
+            return;
+        }
+    };
+    let redacted_rpc_url = tidx::config::redact_url_credentials(&rpc_url);
+
     info!(
         chain = %chain.name,
         chain_id = chain.chain_id,
-        rpc = %chain.rpc_url,
+        rpc = %redacted_rpc_url,
         backfill_limit = throttled_pool.backfill_semaphore.available_permits(),
         "Starting sync for chain (throttled pool: 16 connections, backfill limited)"
     );
@@ -398,7 +411,7 @@ fn spawn_sync_engine(
 
         // Create sync engine with throttled pool and configured sinks (retry on transient RPC failures)
         let mut engine = loop {
-            match SyncEngine::new(throttled_pool.clone(), sinks.clone(), &chain.rpc_url).await {
+            match SyncEngine::new(throttled_pool.clone(), sinks.clone(), &rpc_url).await {
                 Ok(e) => {
                     break e
                         .with_broadcaster(broadcaster)
