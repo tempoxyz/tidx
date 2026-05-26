@@ -177,11 +177,11 @@ pub async fn execute_query_postgres(
     // Only replace hex values (40+ chars), not short '0x' prefixes used in concat()
     let sql = crate::query::convert_hex_literals_postgres(&sql);
 
-    let conn = pool.get().await?;
+    let mut conn = pool.get().await?;
+    let tx = conn.transaction().await?;
 
-    // Set statement timeout for this session
-    conn.execute(
-        &format!("SET statement_timeout = {}", options.timeout_ms),
+    tx.execute(
+        &format!("SET LOCAL statement_timeout = {}", options.timeout_ms),
         &[],
     )
     .await?;
@@ -191,7 +191,7 @@ pub async fn execute_query_postgres(
     let limit = options.limit as usize;
     let result = tokio::time::timeout(timeout, async {
         let params = std::iter::empty::<&(dyn ToSql + Sync)>();
-        let stream = conn.query_raw(&sql, params).await?;
+        let stream = tx.query_raw(&sql, params).await?;
         futures::pin_mut!(stream);
         let mut columns: Option<Vec<String>> = None;
         let mut rows = Vec::new();
@@ -230,6 +230,8 @@ pub async fn execute_query_postgres(
         }
         Err(_) => return Err(anyhow!("Query timeout")),
     };
+
+    tx.commit().await?;
 
     if columns.is_empty() {
         columns = conn

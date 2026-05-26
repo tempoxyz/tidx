@@ -13,9 +13,8 @@ pub async fn create_pool_with_size(database_url: &str, max_size: usize) -> Resul
     ensure_database_exists(database_url).await?;
 
     // Kill idle-in-transaction connections after 60s to prevent lock contention on restart
-    // NOTE: statement_timeout is NOT set globally — API queries need a timeout to
-    // prevent runaway queries. Sync/backfill writers SET statement_timeout = 0
-    // per-connection for their large COPY/DELETE batches.
+    // NOTE: statement_timeout is NOT set globally. API queries use SET LOCAL
+    // inside transactions, and Clean recycling clears leaked session state.
     let url_with_timeout = if database_url.contains('?') {
         format!(
             "{}&options=-c%20idle_in_transaction_session_timeout%3D60000%20-c%20pgroll.no_inferred_migrations%3DTRUE",
@@ -33,6 +32,9 @@ pub async fn create_pool_with_size(database_url: &str, max_size: usize) -> Resul
     config.pool = Some(deadpool_postgres::PoolConfig {
         max_size,
         ..Default::default()
+    });
+    config.manager = Some(deadpool_postgres::ManagerConfig {
+        recycling_method: deadpool_postgres::RecyclingMethod::Clean,
     });
 
     let pool = config.create_pool(Some(Runtime::Tokio1), NoTls)?;
