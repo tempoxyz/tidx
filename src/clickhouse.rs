@@ -16,6 +16,8 @@ use crate::query::{
     HARD_LIMIT_MAX, apply_event_signature_ctes_clickhouse, validate_clickhouse_query,
 };
 
+const MAX_QUERY_RESULT_BYTES: usize = 10 * 1024 * 1024;
+
 /// A single ClickHouse instance (connection + URL).
 struct Instance {
     http_client: reqwest::Client,
@@ -174,9 +176,10 @@ impl ClickHouseEngine {
 
     fn query_url(&self, inst: &Instance, timeout_ms: Option<u64>) -> String {
         let base = format!(
-            "{}/?database={}&default_format=JSON",
+            "{}/?database={}&default_format=JSON&max_result_bytes={}&result_overflow_mode=throw",
             inst.url.trim_end_matches('/'),
-            self.database
+            self.database,
+            MAX_QUERY_RESULT_BYTES
         );
         if let Some(timeout_ms) = timeout_ms {
             let max_execution_time = timeout_ms.div_ceil(1000).max(1);
@@ -219,14 +222,11 @@ impl ClickHouseEngine {
         };
 
         if !resp.status().is_success() {
-            let error_text = resp.text().await.unwrap_or_default();
+            let error_text = read_limited_response(resp).await.unwrap_or_default();
             return Err(anyhow!("ClickHouse query failed: {error_text}"));
         }
 
-        let json_response = resp
-            .text()
-            .await
-            .map_err(|e| anyhow!("Failed to read response: {e}"))?;
+        let json_response = read_limited_response(resp).await?;
 
         if json_response.trim().is_empty() {
             return Ok(QueryResult {
@@ -287,6 +287,26 @@ impl ClickHouseEngine {
     pub fn instance_count(&self) -> usize {
         self.instances.len()
     }
+}
+
+async fn read_limited_response(mut resp: reqwest::Response) -> Result<String> {
+    let mut body = Vec::new();
+
+    while let Some(chunk) = resp
+        .chunk()
+        .await
+        .map_err(|e| anyhow!("Failed to read response: {e}"))?
+    {
+        if body.len().saturating_add(chunk.len()) > MAX_QUERY_RESULT_BYTES {
+            return Err(anyhow!(
+                "ClickHouse response exceeded {} bytes",
+                MAX_QUERY_RESULT_BYTES
+            ));
+        }
+        body.extend_from_slice(&chunk);
+    }
+
+    String::from_utf8(body).map_err(|e| anyhow!("ClickHouse response was not valid UTF-8: {e}"))
 }
 
 /// Returns true for errors that indicate the ClickHouse instance is unreachable
@@ -425,7 +445,7 @@ mod tests {
 
         assert_eq!(
             url,
-            "http://clickhouse-1:8123/?database=tidx_4217&default_format=JSON"
+            "http://clickhouse-1:8123/?database=tidx_4217&default_format=JSON&max_result_bytes=10485760&result_overflow_mode=throw"
         );
         assert!(!url.contains("max_execution_time"));
     }
@@ -445,7 +465,7 @@ mod tests {
 
         assert_eq!(
             url,
-            "http://clickhouse-1:8123/?database=tidx_4217&default_format=JSON&max_execution_time=2"
+            "http://clickhouse-1:8123/?database=tidx_4217&default_format=JSON&max_result_bytes=10485760&result_overflow_mode=throw&max_execution_time=2"
         );
     }
 

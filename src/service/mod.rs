@@ -158,6 +158,9 @@ impl Default for QueryOptions {
     }
 }
 
+const MAX_QUERY_RESULT_BYTES: usize = 10 * 1024 * 1024;
+const MAX_CELL_BYTES: usize = 1024 * 1024;
+
 /// Execute a query on PostgreSQL.
 pub async fn execute_query_postgres(
     pool: &Pool,
@@ -195,6 +198,7 @@ pub async fn execute_query_postgres(
         futures::pin_mut!(stream);
         let mut columns: Option<Vec<String>> = None;
         let mut rows = Vec::new();
+        let mut result_bytes = 0usize;
 
         while let Some(row) = stream.try_next().await? {
             if columns.is_none() {
@@ -206,11 +210,22 @@ pub async fn execute_query_postgres(
             let cols = columns
                 .as_ref()
                 .expect("columns initialized from first row");
-            rows.push(
-                (0..cols.len())
-                    .map(|i| format_column_json(&row, i))
-                    .collect::<Vec<_>>(),
+            let row_values = (0..cols.len())
+                .map(|i| try_format_column_json(&row, i))
+                .collect::<Result<Vec<_>>>()?;
+            result_bytes = result_bytes.saturating_add(
+                row_values
+                    .iter()
+                    .map(estimated_json_value_bytes)
+                    .sum::<usize>(),
             );
+            if result_bytes > MAX_QUERY_RESULT_BYTES {
+                return Err(anyhow!(
+                    "Query result exceeded {} bytes",
+                    MAX_QUERY_RESULT_BYTES
+                ));
+            }
+            rows.push(row_values);
         }
 
         Ok::<_, anyhow::Error>((columns.unwrap_or_default(), rows))
@@ -269,9 +284,13 @@ fn append_limit_if_missing(sql: &str, limit: i64) -> String {
 }
 
 pub fn format_column_json(row: &tokio_postgres::Row, idx: usize) -> serde_json::Value {
+    try_format_column_json(row, idx).unwrap_or(serde_json::Value::Null)
+}
+
+fn try_format_column_json(row: &tokio_postgres::Row, idx: usize) -> Result<serde_json::Value> {
     let col = &row.columns()[idx];
 
-    match col.type_().name() {
+    let value = match col.type_().name() {
         "int2" => row
             .try_get::<_, i16>(idx)
             .ok()
@@ -306,16 +325,26 @@ pub fn format_column_json(row: &tokio_postgres::Row, idx: usize) -> serde_json::
             .ok()
             .and_then(serde_json::Number::from_f64)
             .map_or(serde_json::Value::Null, serde_json::Value::Number),
-        "bytea" => row
-            .try_get::<_, Vec<u8>>(idx)
-            .ok()
-            .map_or(serde_json::Value::Null, |v| {
-                serde_json::Value::String(format!("0x{}", hex::encode(v)))
-            }),
-        "text" | "varchar" | "name" => row
-            .try_get::<_, String>(idx)
-            .ok()
-            .map_or(serde_json::Value::Null, serde_json::Value::String),
+        "bytea" => match row.try_get::<_, &[u8]>(idx) {
+            Ok(v) if v.len() > MAX_CELL_BYTES => {
+                return Err(anyhow!(
+                    "Query result cell exceeded {} bytes",
+                    MAX_CELL_BYTES
+                ));
+            }
+            Ok(v) => serde_json::Value::String(format!("0x{}", hex::encode(v))),
+            Err(_) => serde_json::Value::Null,
+        },
+        "text" | "varchar" | "name" => match row.try_get::<_, &str>(idx) {
+            Ok(v) if v.len() > MAX_CELL_BYTES => {
+                return Err(anyhow!(
+                    "Query result cell exceeded {} bytes",
+                    MAX_CELL_BYTES
+                ));
+            }
+            Ok(v) => serde_json::Value::String(v.to_string()),
+            Err(_) => serde_json::Value::Null,
+        },
         "timestamptz" | "timestamp" => row
             .try_get::<_, DateTime<Utc>>(idx)
             .ok()
@@ -327,6 +356,22 @@ pub fn format_column_json(row: &tokio_postgres::Row, idx: usize) -> serde_json::
             .ok()
             .map_or(serde_json::Value::Null, serde_json::Value::Bool),
         _ => serde_json::Value::Null,
+    };
+
+    Ok(value)
+}
+
+fn estimated_json_value_bytes(value: &serde_json::Value) -> usize {
+    match value {
+        serde_json::Value::Null => 4,
+        serde_json::Value::Bool(_) => 5,
+        serde_json::Value::Number(n) => n.to_string().len(),
+        serde_json::Value::String(s) => s.len(),
+        serde_json::Value::Array(values) => values.iter().map(estimated_json_value_bytes).sum(),
+        serde_json::Value::Object(values) => values
+            .iter()
+            .map(|(key, value)| key.len() + estimated_json_value_bytes(value))
+            .sum(),
     }
 }
 
@@ -511,6 +556,16 @@ mod tests {
     fn test_append_limit_preserves_existing_limit() {
         let sql = "SELECT * FROM blocks LIMIT 10";
         assert_eq!(append_limit_if_missing(sql, 100), sql);
+    }
+
+    #[test]
+    fn test_estimated_json_value_bytes_counts_nested_strings() {
+        let value = serde_json::json!({
+            "rows": [["abc"], ["defg"]],
+            "ok": true
+        });
+
+        assert!(estimated_json_value_bytes(&value) >= 10);
     }
 
     // ========================================================================

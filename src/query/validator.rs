@@ -222,6 +222,7 @@ const CLICKHOUSE_DANGEROUS_FUNCTIONS: &[&str] = &[
     "hdfs",
     "mongodb",
     "redis",
+    "repeat",
 ];
 
 fn validate_clickhouse_query_ast(
@@ -1009,7 +1010,6 @@ const ALLOWED_FUNCTIONS: &[&str] = &[
     "position",
     "strpos",
     "starts_with",
-    "repeat",
     "reverse",
     "to_hex",
     // Bytea / hex
@@ -1382,6 +1382,11 @@ mod tests {
     }
 
     #[test]
+    fn test_rejects_string_amplification_functions() {
+        assert!(validate_query("SELECT repeat('x', 1000000) FROM blocks").is_err());
+    }
+
+    #[test]
     fn test_allows_abi_helpers() {
         assert!(validate_query("SELECT abi_uint(input) FROM txs").is_ok());
         assert!(validate_query("SELECT abi_address(input) FROM txs").is_ok());
@@ -1629,6 +1634,7 @@ mod tests {
         assert!(
             validate_clickhouse_query("SELECT remote('host', 'db', 'table') FROM logs").is_err()
         );
+        assert!(validate_clickhouse_query("SELECT repeat('x', 1000000) FROM logs").is_err());
     }
 
     #[test]
