@@ -3,6 +3,7 @@ mod common;
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::Duration;
 
 use axum::Router;
 use axum::body::Body;
@@ -376,6 +377,38 @@ async fn test_query_live_returns_sse() {
         content_type.unwrap_or("").contains("text/event-stream"),
         "expected SSE content-type, got {content_type:?}"
     );
+}
+
+#[tokio::test]
+#[serial(db)]
+async fn test_query_live_rejects_when_stream_capacity_reached() {
+    let broadcaster = Arc::new(Broadcaster::new());
+    let _receivers: Vec<_> = (0..20).map(|_| broadcaster.subscribe()).collect();
+    let mut app = make_test_service(HashMap::new(), 1, broadcaster).await;
+
+    let response = app
+        .call(
+            Request::builder()
+                .method("GET")
+                .uri("/query?sql=SELECT%20num%20FROM%20blocks%20LIMIT%201&chainId=1&live=true")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let body = tokio::time::timeout(
+        Duration::from_secs(1),
+        axum::body::to_bytes(response.into_body(), usize::MAX),
+    )
+    .await
+    .expect("capacity stream should end")
+    .unwrap();
+    let body = std::str::from_utf8(&body).unwrap();
+    assert!(body.contains("event: error"), "got: {body}");
+    assert!(body.contains("Live stream capacity reached"), "got: {body}");
 }
 
 // Unit tests for inject_block_filter (no DB required)

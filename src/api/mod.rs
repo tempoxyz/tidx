@@ -461,12 +461,23 @@ type SseStream = std::pin::Pin<Box<dyn Stream<Item = Result<SseEvent, Infallible
 
 /// Maximum blocks to catch up in a single update (prevents query multiplication attack)
 const MAX_CATCHUP_BLOCKS: u64 = 10;
+const MAX_LIVE_CONNECTIONS: usize = 20;
 
 async fn handle_query_live(
     state: AppState,
     params: QueryParams,
     signatures: Vec<String>,
 ) -> Sse<KeepAliveStream<SseStream>> {
+    if state.broadcaster.receiver_count() >= MAX_LIVE_CONNECTIONS {
+        let stream: SseStream = Box::pin(async_stream::stream! {
+            yield Ok(SseEvent::default()
+                .event("error")
+                .json_data(serde_json::json!({ "ok": false, "error": "Live stream capacity reached" }))
+                .unwrap());
+        });
+        return Sse::new(stream).keep_alive(KeepAlive::default());
+    }
+
     let pool = match state.get_pool(Some(params.chain_id)).await {
         Some(p) => p,
         None => {
