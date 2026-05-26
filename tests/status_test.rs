@@ -107,6 +107,69 @@ async fn test_status_includes_postgres_watermarks() {
 
 #[tokio::test]
 #[serial(db)]
+async fn test_status_does_not_run_gap_detection() {
+    let db = TestDb::empty().await;
+    db.truncate_all().await;
+    let conn = db.pool.get().await.expect("Failed to get connection");
+
+    // Insert a sync state with a deliberate block gap. /status should remain
+    // cheap and not run detect_gaps on the request path.
+    conn.execute(
+        r#"
+        INSERT INTO sync_state (chain_id, head_num, synced_num, tip_num, backfill_num)
+        VALUES (1, 10, 6, 10, 0)
+        "#,
+        &[],
+    )
+    .await
+    .expect("Failed to insert sync state");
+
+    for num in [0i64, 1, 2, 5, 6, 10] {
+        conn.execute(
+            r#"
+            INSERT INTO blocks (num, hash, parent_hash, timestamp, timestamp_ms, gas_limit, gas_used, miner, extra_data)
+            VALUES ($1, $2, $3, NOW(), 0, 0, 0, $4, $5)
+            "#,
+            &[
+                &num,
+                &vec![num as u8; 32],
+                &vec![0u8; 32],
+                &vec![0u8; 20],
+                &Vec::<u8>::new(),
+            ],
+        )
+        .await
+        .expect("Failed to insert block");
+    }
+
+    let broadcaster = Arc::new(Broadcaster::new());
+    let (pools, chain_id) = make_pools(db.pool.clone());
+    let mut app = make_test_service(pools, chain_id, broadcaster).await;
+
+    let response = app
+        .call(
+            Request::builder()
+                .uri("/status")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+    let chains = json["chains"].as_array().expect("chains should be array");
+    assert_eq!(chains[0]["gap_blocks"], 4);
+    assert!(chains[0]["gaps"].is_null());
+}
+
+#[tokio::test]
+#[serial(db)]
 async fn test_status_includes_configured_chain_when_sync_state_is_empty() {
     let db = TestDb::empty().await;
     db.truncate_all().await;
