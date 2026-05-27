@@ -455,21 +455,103 @@ curl "https://tidx.example.com/query?chainId=42431&engine=clickhouse&sql=SELECT 
 
 #### Built-in Token Transfers and Holders
 
-ClickHouse direct-write deployments maintain a built-in `token_transfer_events` table from `Transfer(address,address,uint256)` logs:
+ClickHouse direct-write deployments ship with three built-in objects that decode and aggregate `Transfer(address,address,uint256)` logs at insert time. They form a chain — each one feeds the next — and are kept in sync on reorg.
 
-```bash
-curl "https://tidx.example.com/query?chainId=42431&engine=clickhouse&sql=SELECT token, amount, tx_hash FROM token_transfer_events WHERE token = '0x...' ORDER BY block_num DESC, log_idx DESC LIMIT 10"
+```
+logs ──MV──▶ token_transfer_events ──MV──▶ token_holder_deltas ──VIEW──▶ token_holders
 ```
 
-`token_transfer_events` stores decoded transfer event rows with block/log coordinates, transaction hash, token, sender, recipient, amount, and virtual-forward marker. It is block-addressable for reorg cleanup and is the shared source for built-in token balance views.
+| Object | Kind | Source | Description |
+|---|---|---|---|
+| `token_transfer_events` | `ReplacingMergeTree` | `logs` | One row per canonical `Transfer` log: `(block_num, block_timestamp, tx_idx, log_idx, tx_hash, token, from, to, amount, is_virtual_forward)`. |
+| `token_holder_deltas` | `ReplacingMergeTree` | `token_transfer_events` | Two rows per transfer (recipient `leg=+1`, sender `leg=-1`); skips zero-address legs. Deduplicates by `(token, holder, block_num, tx_hash, log_idx, leg)` so retried inserts collapse on merge. |
+| `token_holders` | `VIEW` | `token_holder_deltas` (with `FINAL`) | Current positive balance per `(token, holder)` rolled up from the delta events. |
 
-The built-in `token_holders` view reads from transfer-derived balance deltas:
+##### `token_transfer_events`
+
+Decoded transfers, addressable by block:
 
 ```bash
-curl "https://tidx.example.com/query?chainId=42431&engine=clickhouse&sql=SELECT token, holder, balance FROM token_holders WHERE token = '0x...' ORDER BY balance DESC LIMIT 10"
+curl -G "https://tidx.example.com/query" \
+  --data-urlencode "chainId=42431" \
+  --data-urlencode "engine=clickhouse" \
+  --data-urlencode "sql=SELECT token, \`from\`, \`to\`, toString(amount) AS amount, tx_hash
+    FROM token_transfer_events
+    WHERE token = '0x20c000000000000000000000e65cb5a40b7885ae'
+    ORDER BY block_num DESC, log_idx DESC
+    LIMIT 3"
 ```
 
-`token_holder_deltas` is also block-addressable. Reorg cleanup deletes affected transfer events and holder deltas alongside logs, so balances are recomputed from canonical transfer rows.
+```json
+{"ok":true,"columns":["token","from","to","amount","tx_hash"],"rows":[
+  ["0x20c000000000000000000000e65cb5a40b7885ae","0x70997970c51812dc3a010c7d01b50e0d17dc79c8","0xfeec000000000000000000000000000000000000","17431","0x9d…ab"],
+  ["0x20c000000000000000000000e65cb5a40b7885ae","0x3c44cdddb6a900fa2b585dd299e03d12fa4293bc","0x70997970c51812dc3a010c7d01b50e0d17dc79c8","42","0x77…3c"],
+  ["0x20c000000000000000000000e65cb5a40b7885ae","0x90f79bf6eb2c4f870365e785982e1f101e93b906","0x3c44cdddb6a900fa2b585dd299e03d12fa4293bc","99","0x12…ef"]
+]}
+```
+
+##### `token_holder_deltas`
+
+Per-leg, per-block balance changes. Useful for point-in-time balances and per-block analytics:
+
+```bash
+curl -G "https://tidx.example.com/query" \
+  --data-urlencode "chainId=42431" \
+  --data-urlencode "engine=clickhouse" \
+  --data-urlencode "sql=SELECT block_num, toString(balance_delta) AS delta, leg
+    FROM token_holder_deltas
+    WHERE token = '0x20c000000000000000000000e65cb5a40b7885ae'
+      AND holder = '0x70997970c51812dc3a010c7d01b50e0d17dc79c8'
+    ORDER BY block_num DESC, log_idx DESC
+    LIMIT 5"
+```
+
+```json
+{"ok":true,"columns":["block_num","delta","leg"],"rows":[
+  [1062,"-17431",-1],
+  [1059,"42",1],
+  [1051,"-180",-1],
+  [1043,"500",1],
+  [1027,"-23",-1]
+]}
+```
+
+To reconstruct a holder's balance at block `N`:
+
+```sql
+SELECT sum(balance_delta)
+FROM token_holder_deltas FINAL
+WHERE token = '0x…' AND holder = '0x…' AND block_num <= 1050
+```
+
+##### `token_holders`
+
+Convenience view summing the deltas into the current balance per `(token, holder)`, filtered to positive balances:
+
+```bash
+curl -G "https://tidx.example.com/query" \
+  --data-urlencode "chainId=42431" \
+  --data-urlencode "engine=clickhouse" \
+  --data-urlencode "sql=SELECT holder, toString(balance) AS balance
+    FROM token_holders
+    WHERE token = '0x20c000000000000000000000e65cb5a40b7885ae'
+    ORDER BY balance DESC
+    LIMIT 5"
+```
+
+```json
+{"ok":true,"columns":["holder","balance"],"rows":[
+  ["0x70997970c51812dc3a010c7d01b50e0d17dc79c8","68056473384187692692674921486353642324"],
+  ["0x3c44cdddb6a900fa2b585dd299e03d12fa4293bc","68056473384187692692674921486353642370"],
+  ["0x15d34aaf54267db7d7c367839aaf71a00a2c6a65","68056473384187692692674921486353642328"],
+  ["0x90f79bf6eb2c4f870365e785982e1f101e93b906","68056473384187692692674921486353642286"],
+  ["0xf39fd6e51aad88f6f4ce6ab8827279cfffb92266","68056473384187692692674921486353642272"]
+]}
+```
+
+##### Reorg handling
+
+`token_transfer_events` and `token_holder_deltas` are both block-addressable. On reorg, `tidx` deletes the affected rows from the derived tables **before** the underlying logs, then re-ingests; the materialized views replay automatically and the `ReplacingMergeTree` sort keys dedupe any rows that would otherwise duplicate. `token_holders` reads from `token_holder_deltas FINAL` so balances reflect the post-merge state.
 
 ## Schemas
 
