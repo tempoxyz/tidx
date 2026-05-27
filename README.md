@@ -455,20 +455,9 @@ curl "https://tidx.example.com/query?chainId=42431&engine=clickhouse&sql=SELECT 
 
 ## Tables
 
-Tidx exposes four categories of tables. Pick the one that matches your query shape:
+The sync engine writes raw chain data to `blocks`, `txs`, `logs`, `receipts`, and `sync_state` in both PostgreSQL and ClickHouse. ClickHouse additionally maintains built-in materialized views for token transfers and holder balances. You can also generate a virtual event-decoded table at query time with `?signature=Event(...)`, or register your own materialized views via the [`/views` API](#views-api).
 
-| Category | Available in | Maintained by | Use for |
-|---|---|---|---|
-| [Base tables](#base-tables) | PostgreSQL + ClickHouse | sync engine writes | Raw chain data: blocks, txs, logs, receipts, sync state |
-| [Event-decoded virtual tables](#event-decoded-virtual-tables) | PostgreSQL + ClickHouse | generated per-query from `?signature=…` | Ad-hoc queries against a specific event without registering anything |
-| [Built-in materialized views](#built-in-materialized-views-clickhouse) | ClickHouse only | shipped + auto-maintained | Token transfers and holder balances out of the box |
-| [User-defined materialized views](#user-defined-materialized-views-clickhouse) | ClickHouse only | created via [`/views` API](#views-api) | Custom pre-computed analytics |
-
-### Base tables
-
-These tables are written directly by the sync engine and exist in both backends. PostgreSQL stores them with `BYTEA` columns; ClickHouse stores them with `String` columns and a couple of OLAP-friendly indexes. They use composite primary keys with timestamps for efficient range queries.
-
-#### blocks
+### blocks
 
 | Column | Type | Description |
 |--------|------|-------------|
@@ -483,7 +472,7 @@ These tables are written directly by the sync engine and exist in both backends.
 | `extra_data` | `BYTEA` | Extra data field |
 | `consensus_proposer` | `BYTEA` | Ed25519 consensus proposer pubkey (TIP-1031, NULL pre-fork) |
 
-#### txs
+### txs
 
 | Column | Type | Description |
 |--------|------|-------------|
@@ -509,7 +498,7 @@ These tables are written directly by the sync engine and exist in both backends.
 | `valid_after` | `INT8` | Validity window end |
 | `signature_type` | `INT2` | Signature type |
 
-#### logs
+### logs
 
 | Column | Type | Description |
 |--------|------|-------------|
@@ -523,7 +512,7 @@ These tables are written directly by the sync engine and exist in both backends.
 | `topics` | `BYTEA[]` | All topics |
 | `data` | `BYTEA` | Event data |
 
-#### receipts
+### receipts
 
 | Column | Type | Description |
 |--------|------|-------------|
@@ -540,7 +529,7 @@ These tables are written directly by the sync engine and exist in both backends.
 | `status` | `INT2` | Success (1) or failure (0) |
 | `fee_payer` | `BYTEA` | Tempo fee payer (if sponsored) |
 
-#### sync_state
+### sync_state
 
 | Column | Type | Description |
 |--------|------|-------------|
@@ -552,40 +541,25 @@ These tables are written directly by the sync engine and exist in both backends.
 | `started_at` | `TIMESTAMPTZ` | Sync start time |
 | `updated_at` | `TIMESTAMPTZ` | Last update time |
 
-### Event-decoded virtual tables
+### token_transfer_events
 
-Pass `?signature=Event(type1,type2,...)` to `/query` and tidx will expose a virtual table named after the event with one column per indexed/non-indexed parameter. The table is generated as a CTE at query time, so no schema registration is needed and any event signature works on demand:
+> [!NOTE]
+> ClickHouse only — query with `engine=clickhouse`. Materialized view over `logs`, kept in sync on reorg.
 
-```bash
-curl -G "https://tidx.example.com/query" \
-  --data-urlencode "chainId=4217" \
-  --data-urlencode "signature=Transfer(address,address,uint256)" \
-  --data-urlencode "sql=SELECT \"from\", \"to\", value
-    FROM Transfer
-    WHERE \"from\" = '0xabc…'
-    ORDER BY block_num DESC
-    LIMIT 10"
-```
+One row per canonical `Transfer(address,address,uint256)` log, decoded at insert time. `ReplacingMergeTree` keyed on `(token, block_num, log_idx, tx_hash)`.
 
-Use the same `?signature=` form with `&engine=clickhouse` for OLAP scans. For Transfer logs specifically, the [built-in materialized views](#built-in-materialized-views-clickhouse) below are pre-decoded and cheaper.
-
-### Built-in materialized views (ClickHouse)
-
-ClickHouse direct-write deployments ship with three built-in objects that decode and aggregate `Transfer(address,address,uint256)` logs at insert time. They form a chain — each one feeds the next — and are kept in sync on reorg.
-
-```
-logs ──MV──▶ token_transfer_events ──MV──▶ token_holder_deltas ──VIEW──▶ token_holders
-```
-
-| Object | Kind | Source | Description |
-|---|---|---|---|
-| `token_transfer_events` | `ReplacingMergeTree` | `logs` | One row per canonical `Transfer` log: `(block_num, block_timestamp, tx_idx, log_idx, tx_hash, token, from, to, amount, is_virtual_forward)`. |
-| `token_holder_deltas` | `ReplacingMergeTree` | `token_transfer_events` | Two rows per transfer (recipient `leg=+1`, sender `leg=-1`); skips zero-address legs. Deduplicates by `(token, holder, block_num, tx_hash, log_idx, leg)` so retried inserts collapse on merge. |
-| `token_holders` | `VIEW` | `token_holder_deltas` (with `FINAL`) | Current positive balance per `(token, holder)` rolled up from the delta events. |
-
-#### token_transfer_events
-
-Decoded transfers, addressable by block:
+| Column | Type | Description |
+|--------|------|-------------|
+| `block_num` | `Int64` | Block number |
+| `block_timestamp` | `DateTime64(3, 'UTC')` | Block timestamp |
+| `tx_idx` | `Int32` | Transaction index |
+| `log_idx` | `Int32` | Log index |
+| `tx_hash` | `String` | Transaction hash |
+| `token` | `String` | Emitting token contract |
+| `from` | `String` | Sender address |
+| `to` | `String` | Recipient address |
+| `amount` | `UInt256` | Transfer amount |
+| `is_virtual_forward` | `UInt8` | 1 if this transfer was inserted via a virtual-forward path |
 
 ```bash
 curl -G "https://tidx.example.com/query" \
@@ -606,9 +580,23 @@ curl -G "https://tidx.example.com/query" \
 ]}
 ```
 
-#### token_holder_deltas
+### token_holder_deltas
 
-Per-leg, per-block balance changes. Useful for point-in-time balances and per-block analytics:
+> [!NOTE]
+> ClickHouse only — query with `engine=clickhouse`. Materialized view over `token_transfer_events`, kept in sync on reorg.
+
+Two rows per transfer (recipient `leg=+1`, sender `leg=-1`); skips zero-address legs. `ReplacingMergeTree` deduplicates by `(token, holder, block_num, tx_hash, log_idx, leg)` so retried inserts collapse on merge.
+
+| Column | Type | Description |
+|--------|------|-------------|
+| `block_num` | `Int64` | Block number |
+| `block_timestamp` | `DateTime64(3, 'UTC')` | Block timestamp |
+| `tx_hash` | `String` | Transaction hash |
+| `log_idx` | `Int32` | Log index |
+| `token` | `String` | Token contract |
+| `holder` | `String` | Holder address (sender or recipient) |
+| `leg` | `Int8` | `+1` for recipient credit, `-1` for sender debit |
+| `balance_delta` | `Int256` | Signed delta applied to `holder` for `token` at this block |
 
 ```bash
 curl -G "https://tidx.example.com/query" \
@@ -640,9 +628,18 @@ FROM token_holder_deltas FINAL
 WHERE token = '0x…' AND holder = '0x…' AND block_num <= 1050
 ```
 
-#### token_holders
+### token_holders
 
-Convenience view summing the deltas into the current balance per `(token, holder)`, filtered to positive balances:
+> [!NOTE]
+> ClickHouse only — query with `engine=clickhouse`. View over `token_holder_deltas FINAL`, always reflects the post-merge state.
+
+Current positive balance per `(token, holder)`, rolled up from `token_holder_deltas`. Filtered to `balance > 0`.
+
+| Column | Type | Description |
+|--------|------|-------------|
+| `token` | `String` | Token contract |
+| `holder` | `String` | Holder address |
+| `balance` | `Int256` | Current balance (positive only) |
 
 ```bash
 curl -G "https://tidx.example.com/query" \
@@ -665,13 +662,29 @@ curl -G "https://tidx.example.com/query" \
 ]}
 ```
 
-#### Reorg handling
+### Event-decoded virtual tables
 
-`token_transfer_events` and `token_holder_deltas` are both block-addressable. On reorg, `tidx` deletes the affected rows from the derived tables **before** the underlying logs, then re-ingests; the materialized views replay automatically and the `ReplacingMergeTree` sort keys dedupe any rows that would otherwise duplicate. `token_holders` reads from `token_holder_deltas FINAL` so balances reflect the post-merge state.
+Pass `?signature=Event(type1,type2,...)` to `/query` and tidx exposes a virtual table named after the event with one column per parameter. The table is generated as a CTE at query time, so no schema registration is needed and any event signature works on demand. Works against both `engine=postgres` and `engine=clickhouse`:
 
-### User-defined materialized views (ClickHouse)
+```bash
+curl -G "https://tidx.example.com/query" \
+  --data-urlencode "chainId=4217" \
+  --data-urlencode "signature=Transfer(address,address,uint256)" \
+  --data-urlencode "sql=SELECT \"from\", \"to\", value
+    FROM Transfer
+    WHERE \"from\" = '0xabc…'
+    ORDER BY block_num DESC
+    LIMIT 10"
+```
 
-Define your own pre-computed analytics via the [`/views` API](#views-api). Created views live in `analytics_{chainId}`, auto-populate on inserts, and are auto-prefixed when you reference them from `/query?engine=clickhouse`. See the Views API section above for the full create/list/delete/query surface.
+For Transfer logs specifically, [`token_transfer_events`](#token_transfer_events) is pre-decoded and cheaper.
+
+### User-defined materialized views
+
+> [!NOTE]
+> ClickHouse only. Create via the [`/views` API](#views-api).
+
+Custom pre-computed analytics. Created views live in `analytics_{chainId}`, auto-populate on inserts, and are auto-prefixed when you reference them from `/query?engine=clickhouse`. See the Views API section above for the full create/list/delete/query surface.
 
 ## Sync Architecture
 
