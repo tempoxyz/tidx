@@ -33,7 +33,7 @@
 - [Configuration](#configuration)
 - [CLI](#cli)
 - [HTTP API](#http-api)
-- [Database Schema](#database-schema)
+- [Tables](#tables)
 - [Sync Architecture](#sync-architecture)
 - [Development](#development)
 - [License](#license)
@@ -453,7 +453,123 @@ Views are auto-prefixed with `analytics_{chainId}` when using `engine=clickhouse
 curl "https://tidx.example.com/query?chainId=42431&engine=clickhouse&sql=SELECT * FROM token_holders WHERE token = '0x...' ORDER BY balance DESC LIMIT 10"
 ```
 
-#### Built-in Token Transfers and Holders
+## Tables
+
+Tidx exposes four categories of tables. Pick the one that matches your query shape:
+
+| Category | Available in | Maintained by | Use for |
+|---|---|---|---|
+| [Base tables](#base-tables) | PostgreSQL + ClickHouse | sync engine writes | Raw chain data: blocks, txs, logs, receipts, sync state |
+| [Event-decoded virtual tables](#event-decoded-virtual-tables) | PostgreSQL + ClickHouse | generated per-query from `?signature=…` | Ad-hoc queries against a specific event without registering anything |
+| [Built-in materialized views](#built-in-materialized-views-clickhouse) | ClickHouse only | shipped + auto-maintained | Token transfers and holder balances out of the box |
+| [User-defined materialized views](#user-defined-materialized-views-clickhouse) | ClickHouse only | created via [`/views` API](#views-api) | Custom pre-computed analytics |
+
+### Base tables
+
+These tables are written directly by the sync engine and exist in both backends. PostgreSQL stores them with `BYTEA` columns; ClickHouse stores them with `String` columns and a couple of OLAP-friendly indexes. They use composite primary keys with timestamps for efficient range queries.
+
+#### blocks
+
+| Column | Type | Description |
+|--------|------|-------------|
+| `num` | `INT8` | Block number |
+| `hash` | `BYTEA` | Block hash |
+| `parent_hash` | `BYTEA` | Parent block hash |
+| `timestamp` | `TIMESTAMPTZ` | Block timestamp |
+| `timestamp_ms` | `INT8` | Block timestamp (milliseconds) |
+| `gas_limit` | `INT8` | Gas limit |
+| `gas_used` | `INT8` | Gas used |
+| `miner` | `BYTEA` | Block producer |
+| `extra_data` | `BYTEA` | Extra data field |
+| `consensus_proposer` | `BYTEA` | Ed25519 consensus proposer pubkey (TIP-1031, NULL pre-fork) |
+
+#### txs
+
+| Column | Type | Description |
+|--------|------|-------------|
+| `block_num` | `INT8` | Block number |
+| `block_timestamp` | `TIMESTAMPTZ` | Block timestamp |
+| `idx` | `INT4` | Transaction index |
+| `hash` | `BYTEA` | Transaction hash |
+| `type` | `INT2` | Transaction type |
+| `from` | `BYTEA` | Sender address |
+| `to` | `BYTEA` | Recipient address |
+| `value` | `TEXT` | Transfer value (wei) |
+| `input` | `BYTEA` | Calldata |
+| `gas_limit` | `INT8` | Gas limit |
+| `max_fee_per_gas` | `TEXT` | Max fee per gas |
+| `max_priority_fee_per_gas` | `TEXT` | Max priority fee |
+| `gas_used` | `INT8` | Gas consumed |
+| `nonce_key` | `BYTEA` | Nonce key (2D nonces) |
+| `nonce` | `INT8` | Nonce value |
+| `fee_token` | `BYTEA` | Fee token address |
+| `calls` | `JSONB` | Batch call data |
+| `call_count` | `INT2` | Number of calls |
+| `valid_before` | `INT8` | Validity window start |
+| `valid_after` | `INT8` | Validity window end |
+| `signature_type` | `INT2` | Signature type |
+
+#### logs
+
+| Column | Type | Description |
+|--------|------|-------------|
+| `block_num` | `INT8` | Block number |
+| `block_timestamp` | `TIMESTAMPTZ` | Block timestamp |
+| `log_idx` | `INT4` | Log index |
+| `tx_idx` | `INT4` | Transaction index |
+| `tx_hash` | `BYTEA` | Transaction hash |
+| `address` | `BYTEA` | Emitting contract |
+| `selector` | `BYTEA` | Event selector (topic0) |
+| `topics` | `BYTEA[]` | All topics |
+| `data` | `BYTEA` | Event data |
+
+#### receipts
+
+| Column | Type | Description |
+|--------|------|-------------|
+| `block_num` | `INT8` | Block number |
+| `block_timestamp` | `TIMESTAMPTZ` | Block timestamp |
+| `tx_idx` | `INT4` | Transaction index |
+| `tx_hash` | `BYTEA` | Transaction hash |
+| `from` | `BYTEA` | Sender address |
+| `to` | `BYTEA` | Recipient address |
+| `contract_address` | `BYTEA` | Created contract (if deploy) |
+| `gas_used` | `INT8` | Gas consumed |
+| `cumulative_gas_used` | `INT8` | Cumulative gas in block |
+| `effective_gas_price` | `TEXT` | Actual gas price paid |
+| `status` | `INT2` | Success (1) or failure (0) |
+| `fee_payer` | `BYTEA` | Tempo fee payer (if sponsored) |
+
+#### sync_state
+
+| Column | Type | Description |
+|--------|------|-------------|
+| `chain_id` | `INT8` | Chain identifier |
+| `head_num` | `INT8` | Remote chain head from RPC |
+| `synced_num` | `INT8` | Highest contiguous block (no gaps from backfill_num to here) |
+| `tip_num` | `INT8` | Highest block near chain head (realtime follows this) |
+| `backfill_num` | `INT8` | Lowest synced block going backwards (NULL=not started, 0=complete) |
+| `started_at` | `TIMESTAMPTZ` | Sync start time |
+| `updated_at` | `TIMESTAMPTZ` | Last update time |
+
+### Event-decoded virtual tables
+
+Pass `?signature=Event(type1,type2,...)` to `/query` and tidx will expose a virtual table named after the event with one column per indexed/non-indexed parameter. The table is generated as a CTE at query time, so no schema registration is needed and any event signature works on demand:
+
+```bash
+curl -G "https://tidx.example.com/query" \
+  --data-urlencode "chainId=4217" \
+  --data-urlencode "signature=Transfer(address,address,uint256)" \
+  --data-urlencode "sql=SELECT \"from\", \"to\", value
+    FROM Transfer
+    WHERE \"from\" = '0xabc…'
+    ORDER BY block_num DESC
+    LIMIT 10"
+```
+
+Use the same `?signature=` form with `&engine=clickhouse` for OLAP scans. For Transfer logs specifically, the [built-in materialized views](#built-in-materialized-views-clickhouse) below are pre-decoded and cheaper.
+
+### Built-in materialized views (ClickHouse)
 
 ClickHouse direct-write deployments ship with three built-in objects that decode and aggregate `Transfer(address,address,uint256)` logs at insert time. They form a chain — each one feeds the next — and are kept in sync on reorg.
 
@@ -467,7 +583,7 @@ logs ──MV──▶ token_transfer_events ──MV──▶ token_holder_delt
 | `token_holder_deltas` | `ReplacingMergeTree` | `token_transfer_events` | Two rows per transfer (recipient `leg=+1`, sender `leg=-1`); skips zero-address legs. Deduplicates by `(token, holder, block_num, tx_hash, log_idx, leg)` so retried inserts collapse on merge. |
 | `token_holders` | `VIEW` | `token_holder_deltas` (with `FINAL`) | Current positive balance per `(token, holder)` rolled up from the delta events. |
 
-##### `token_transfer_events`
+#### token_transfer_events
 
 Decoded transfers, addressable by block:
 
@@ -490,7 +606,7 @@ curl -G "https://tidx.example.com/query" \
 ]}
 ```
 
-##### `token_holder_deltas`
+#### token_holder_deltas
 
 Per-leg, per-block balance changes. Useful for point-in-time balances and per-block analytics:
 
@@ -524,7 +640,7 @@ FROM token_holder_deltas FINAL
 WHERE token = '0x…' AND holder = '0x…' AND block_num <= 1050
 ```
 
-##### `token_holders`
+#### token_holders
 
 Convenience view summing the deltas into the current balance per `(token, holder)`, filtered to positive balances:
 
@@ -549,97 +665,13 @@ curl -G "https://tidx.example.com/query" \
 ]}
 ```
 
-##### Reorg handling
+#### Reorg handling
 
 `token_transfer_events` and `token_holder_deltas` are both block-addressable. On reorg, `tidx` deletes the affected rows from the derived tables **before** the underlying logs, then re-ingests; the materialized views replay automatically and the `ReplacingMergeTree` sort keys dedupe any rows that would otherwise duplicate. `token_holders` reads from `token_holder_deltas FINAL` so balances reflect the post-merge state.
 
-## Schemas
+### User-defined materialized views (ClickHouse)
 
-All tables use composite primary keys with timestamps for efficient range queries:
-
-### blocks
-
-| Column | Type | Description |
-|--------|------|-------------|
-| `num` | `INT8` | Block number |
-| `hash` | `BYTEA` | Block hash |
-| `parent_hash` | `BYTEA` | Parent block hash |
-| `timestamp` | `TIMESTAMPTZ` | Block timestamp |
-| `timestamp_ms` | `INT8` | Block timestamp (milliseconds) |
-| `gas_limit` | `INT8` | Gas limit |
-| `gas_used` | `INT8` | Gas used |
-| `miner` | `BYTEA` | Block producer |
-| `extra_data` | `BYTEA` | Extra data field |
-| `consensus_proposer` | `BYTEA` | Ed25519 consensus proposer pubkey (TIP-1031, NULL pre-fork) |
-
-### txs
-
-| Column | Type | Description |
-|--------|------|-------------|
-| `block_num` | `INT8` | Block number |
-| `block_timestamp` | `TIMESTAMPTZ` | Block timestamp |
-| `idx` | `INT4` | Transaction index |
-| `hash` | `BYTEA` | Transaction hash |
-| `type` | `INT2` | Transaction type |
-| `from` | `BYTEA` | Sender address |
-| `to` | `BYTEA` | Recipient address |
-| `value` | `TEXT` | Transfer value (wei) |
-| `input` | `BYTEA` | Calldata |
-| `gas_limit` | `INT8` | Gas limit |
-| `max_fee_per_gas` | `TEXT` | Max fee per gas |
-| `max_priority_fee_per_gas` | `TEXT` | Max priority fee |
-| `gas_used` | `INT8` | Gas consumed |
-| `nonce_key` | `BYTEA` | Nonce key (2D nonces) |
-| `nonce` | `INT8` | Nonce value |
-| `fee_token` | `BYTEA` | Fee token address |
-| `calls` | `JSONB` | Batch call data |
-| `call_count` | `INT2` | Number of calls |
-| `valid_before` | `INT8` | Validity window start |
-| `valid_after` | `INT8` | Validity window end |
-| `signature_type` | `INT2` | Signature type |
-
-### logs
-
-| Column | Type | Description |
-|--------|------|-------------|
-| `block_num` | `INT8` | Block number |
-| `block_timestamp` | `TIMESTAMPTZ` | Block timestamp |
-| `log_idx` | `INT4` | Log index |
-| `tx_idx` | `INT4` | Transaction index |
-| `tx_hash` | `BYTEA` | Transaction hash |
-| `address` | `BYTEA` | Emitting contract |
-| `selector` | `BYTEA` | Event selector (topic0) |
-| `topics` | `BYTEA[]` | All topics |
-| `data` | `BYTEA` | Event data |
-
-### receipts
-
-| Column | Type | Description |
-|--------|------|-------------|
-| `block_num` | `INT8` | Block number |
-| `block_timestamp` | `TIMESTAMPTZ` | Block timestamp |
-| `tx_idx` | `INT4` | Transaction index |
-| `tx_hash` | `BYTEA` | Transaction hash |
-| `from` | `BYTEA` | Sender address |
-| `to` | `BYTEA` | Recipient address |
-| `contract_address` | `BYTEA` | Created contract (if deploy) |
-| `gas_used` | `INT8` | Gas consumed |
-| `cumulative_gas_used` | `INT8` | Cumulative gas in block |
-| `effective_gas_price` | `TEXT` | Actual gas price paid |
-| `status` | `INT2` | Success (1) or failure (0) |
-| `fee_payer` | `BYTEA` | Tempo fee payer (if sponsored) |
-
-### sync_state
-
-| Column | Type | Description |
-|--------|------|-------------|
-| `chain_id` | `INT8` | Chain identifier |
-| `head_num` | `INT8` | Remote chain head from RPC |
-| `synced_num` | `INT8` | Highest contiguous block (no gaps from backfill_num to here) |
-| `tip_num` | `INT8` | Highest block near chain head (realtime follows this) |
-| `backfill_num` | `INT8` | Lowest synced block going backwards (NULL=not started, 0=complete) |
-| `started_at` | `TIMESTAMPTZ` | Sync start time |
-| `updated_at` | `TIMESTAMPTZ` | Last update time |
+Define your own pre-computed analytics via the [`/views` API](#views-api). Created views live in `analytics_{chainId}`, auto-populate on inserts, and are auto-prefixed when you reference them from `/query?engine=clickhouse`. See the Views API section above for the full create/list/delete/query surface.
 
 ## Sync Architecture
 
