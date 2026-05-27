@@ -3,9 +3,7 @@ mod catalog;
 mod token_holders;
 mod token_transfers;
 
-pub use catalog::{
-    BackfillPolicy, BlockScopedTable, ClickHouseObject, ClickHouseObjectKind,
-};
+pub use catalog::{BackfillPolicy, BlockScopedTable, ClickHouseObject, ClickHouseObjectKind};
 
 pub fn base_objects() -> &'static [ClickHouseObject] {
     base::TABLES

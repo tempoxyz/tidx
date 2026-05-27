@@ -181,10 +181,7 @@ impl ClickHouseSink {
         Ok(())
     }
 
-    async fn ensure_derived_objects(
-        &self,
-        tracking: &mut HashMap<String, String>,
-    ) -> Result<()> {
+    async fn ensure_derived_objects(&self, tracking: &mut HashMap<String, String>) -> Result<()> {
         for object in derived_objects() {
             let ddl = object.ddl();
             let checksum = checksum_of(&ddl);
@@ -219,7 +216,8 @@ impl ClickHouseSink {
                 ClickHouseObjectKind::MaterializedView { .. } => "materialized_view",
                 ClickHouseObjectKind::Migration(_) => "migration",
             };
-            self.record_applied(object.name, &checksum, kind_label).await?;
+            self.record_applied(object.name, &checksum, kind_label)
+                .await?;
             tracking.insert(object.name.to_string(), checksum);
             debug!(object = object.name, database = %self.database, "ClickHouse object ready");
         }
