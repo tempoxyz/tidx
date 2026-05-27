@@ -469,7 +469,7 @@ mod tests {
 
     #[test]
     fn test_valid_view_name() {
-        assert!(is_valid_view_name("token_holders"));
+        assert!(is_valid_view_name("token_balances"));
         assert!(is_valid_view_name("my_view_123"));
         assert!(is_valid_view_name("View1"));
 

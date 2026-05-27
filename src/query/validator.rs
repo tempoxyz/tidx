@@ -1287,8 +1287,8 @@ mod tests {
 
     #[test]
     fn test_postgres_rejects_clickhouse_derived_tables() {
-        assert!(validate_query("SELECT * FROM token_transfer_events").is_err());
-        assert!(validate_query("SELECT * FROM token_holders").is_err());
+        assert!(validate_query("SELECT * FROM token_transfers").is_err());
+        assert!(validate_query("SELECT * FROM token_balances").is_err());
         assert!(validate_query("SELECT * FROM token_holder_deltas").is_err());
     }
 
@@ -1635,13 +1635,13 @@ mod tests {
     fn test_clickhouse_allows_token_holder_views() {
         assert!(
             validate_clickhouse_query(
-                r#"SELECT token, "from", "to", amount FROM token_transfer_events ORDER BY block_num DESC LIMIT 10"#
+                r#"SELECT token, "from", "to", amount FROM token_transfers ORDER BY block_num DESC LIMIT 10"#
             )
             .is_ok()
         );
         assert!(
             validate_clickhouse_query(
-                "SELECT token, holder, balance FROM token_holders ORDER BY balance DESC LIMIT 10"
+                "SELECT token, holder, balance FROM token_balances ORDER BY balance DESC LIMIT 10"
             )
             .is_ok()
         );

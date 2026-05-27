@@ -1,6 +1,9 @@
 mod base;
 mod catalog;
-mod token_holders;
+mod token_approvals;
+mod token_balances;
+mod token_supply;
+mod token_transfer_stats;
 mod token_transfers;
 
 pub use catalog::{BackfillPolicy, BlockScopedTable, ClickHouseObject, ClickHouseObjectKind};
@@ -16,7 +19,10 @@ pub fn migrations() -> &'static [ClickHouseObject] {
 pub fn derived_objects() -> impl DoubleEndedIterator<Item = &'static ClickHouseObject> {
     token_transfers::OBJECTS
         .iter()
-        .chain(token_holders::OBJECTS.iter())
+        .chain(token_balances::OBJECTS.iter())
+        .chain(token_supply::OBJECTS.iter())
+        .chain(token_approvals::OBJECTS.iter())
+        .chain(token_transfer_stats::OBJECTS.iter())
 }
 
 /// Tables and views that the public `/query` HTTP surface may reference.
@@ -69,20 +75,30 @@ mod tests {
 
     #[test]
     fn token_holder_tables_are_registered_for_routing() {
-        assert!(is_public_query_table("token_transfer_events"));
-        assert!(is_known_table("token_transfer_events"));
-        assert_eq!(block_column("token_transfer_events"), Some("block_num"));
-        assert!(is_public_query_table("token_holders"));
+        assert!(is_public_query_table("token_transfers"));
+        assert!(is_known_table("token_transfers"));
+        assert_eq!(block_column("token_transfers"), Some("block_num"));
+        assert!(is_public_query_table("token_balances"));
         assert!(is_known_table("token_holder_deltas"));
         assert_eq!(block_column("token_holder_deltas"), Some("block_num"));
     }
 
     #[test]
+    fn new_aggregate_objects_are_registered_for_public_query() {
+        assert!(is_public_query_table("token_supply"));
+        assert!(is_public_query_table("token_approvals"));
+        assert_eq!(block_column("token_approvals"), Some("block_num"));
+        assert!(is_public_query_table("token_transfer_stats"));
+    }
+
+    #[test]
     fn materialized_views_are_known_but_not_public_query_tables() {
-        assert!(!is_public_query_table("token_transfer_events_mv"));
-        assert!(is_known_table("token_transfer_events_mv"));
+        assert!(!is_public_query_table("token_transfers_mv"));
+        assert!(is_known_table("token_transfers_mv"));
         assert!(!is_public_query_table("token_holder_deltas_mv"));
         assert!(is_known_table("token_holder_deltas_mv"));
+        assert!(!is_public_query_table("token_approvals_mv"));
+        assert!(is_known_table("token_approvals_mv"));
     }
 
     #[test]
@@ -90,16 +106,21 @@ mod tests {
         let tables: Vec<_> = reorg_tables().map(|table| table.name).collect();
         let transfers = tables
             .iter()
-            .position(|table| *table == "token_transfer_events")
+            .position(|table| *table == "token_transfers")
             .unwrap();
         let deltas = tables
             .iter()
             .position(|table| *table == "token_holder_deltas")
             .unwrap();
+        let approvals = tables
+            .iter()
+            .position(|table| *table == "token_approvals")
+            .unwrap();
         let logs = tables.iter().position(|table| *table == "logs").unwrap();
         assert!(deltas < transfers);
         assert!(transfers < logs);
         assert!(deltas < logs);
+        assert!(approvals < logs);
     }
 
     #[test]

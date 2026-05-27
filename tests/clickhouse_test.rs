@@ -953,7 +953,7 @@ async fn test_sink_ensure_schema_creates_tables() {
         "txs",
         "logs",
         "receipts",
-        "token_transfer_events",
+        "token_transfers",
         "token_holder_deltas",
     ] {
         let count = ch
@@ -964,9 +964,9 @@ async fn test_sink_ensure_schema_creates_tables() {
     }
 
     let count = ch
-        .table_count("token_holders")
+        .table_count("token_balances")
         .await
-        .expect("token_holders view should exist");
+        .expect("token_balances view should exist");
     assert_eq!(count, 0);
 }
 
@@ -1058,7 +1058,7 @@ async fn test_sink_write_logs_roundtrips_virtual_forward_flag() {
 
 #[tokio::test]
 #[serial(clickhouse)]
-async fn test_sink_token_transfer_events_decodes_transfers_and_reorgs() {
+async fn test_sink_token_transfers_decodes_transfers_and_reorgs() {
     let Some((sink, ch)) = setup_sink().await else {
         return;
     };
@@ -1076,7 +1076,7 @@ async fn test_sink_token_transfer_events_decodes_transfers_and_reorgs() {
 
     sink.write_logs(&logs).await.expect("write_logs failed");
 
-    let rows = token_transfer_events(&ch).await;
+    let rows = token_transfers(&ch).await;
     assert_eq!(rows.len(), 3);
     assert_eq!(rows[0].token, "0xdadadadadadadadadadadadadadadadadadadada");
     assert_eq!(rows[0].from, zero);
@@ -1090,14 +1090,14 @@ async fn test_sink_token_transfer_events_decodes_transfers_and_reorgs() {
 
     sink.delete_from(3).await.expect("delete_from failed");
 
-    let rows = token_transfer_events(&ch).await;
+    let rows = token_transfers(&ch).await;
     assert_eq!(rows.len(), 2);
     assert!(rows.iter().all(|row| row.block_num < 3));
 }
 
 #[tokio::test]
 #[serial(clickhouse)]
-async fn test_sink_token_holders_view_tracks_balances_and_reorgs() {
+async fn test_sink_token_balances_view_tracks_balances_and_reorgs() {
     let Some((sink, ch)) = setup_sink().await else {
         return;
     };
@@ -1164,7 +1164,7 @@ async fn test_sink_ensure_schema_backfills_token_transfer_views() {
 
     sink.ensure_schema().await.expect("ensure_schema failed");
 
-    let transfers = token_transfer_events(&ch).await;
+    let transfers = token_transfers(&ch).await;
     assert_eq!(transfers.len(), 3);
 
     let balances = token_holder_balances(&ch).await;
@@ -1182,7 +1182,7 @@ struct TokenTransferEvent {
     is_virtual_forward: u64,
 }
 
-async fn token_transfer_events(ch: &TestClickHouse) -> Vec<TokenTransferEvent> {
+async fn token_transfers(ch: &TestClickHouse) -> Vec<TokenTransferEvent> {
     let result = ch
         .query_json(
             r#"
@@ -1193,12 +1193,12 @@ async fn token_transfer_events(ch: &TestClickHouse) -> Vec<TokenTransferEvent> {
                 `to`,
                 toString(amount) AS amount,
                 is_virtual_forward
-            FROM token_transfer_events
+            FROM token_transfers
             ORDER BY block_num, log_idx
             "#,
         )
         .await
-        .expect("token_transfer_events query failed");
+        .expect("token_transfers query failed");
     result["data"]
         .as_array()
         .unwrap()
@@ -1224,10 +1224,10 @@ async fn token_transfer_events(ch: &TestClickHouse) -> Vec<TokenTransferEvent> {
 async fn token_holder_balances(ch: &TestClickHouse) -> std::collections::HashMap<String, String> {
     let result = ch
         .query_json(
-            "SELECT holder, toString(balance) AS balance FROM token_holders ORDER BY holder",
+            "SELECT holder, toString(balance) AS balance FROM token_balances ORDER BY holder",
         )
         .await
-        .expect("token_holders query failed");
+        .expect("token_balances query failed");
     result["data"]
         .as_array()
         .unwrap()

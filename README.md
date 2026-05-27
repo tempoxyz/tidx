@@ -377,7 +377,7 @@ curl "https://tidx.example.com/views?chainId=42431"
   "ok": true,
   "views": [
     {
-      "name": "token_holders",
+      "name": "whale_holders",
       "engine": "MaterializedView",
       "database": "analytics_42431",
       "columns": [
@@ -397,7 +397,7 @@ curl -X POST "https://tidx.example.com/views" \
   -H "Content-Type: application/json" \
   -d '{
     "chainId": 42431,
-    "name": "token_holders",
+    "name": "whale_holders",
     "sql": "SELECT token, holder, sum(balance) AS balance FROM token_balances GROUP BY token, holder HAVING balance > 0",
     "orderBy": ["token", "holder"]
   }'
@@ -419,14 +419,14 @@ This creates:
 #### Get View Details
 
 ```bash
-curl "https://tidx.example.com/views/token_holders?chainId=42431"
+curl "https://tidx.example.com/views/whale_holders?chainId=42431"
 ```
 
 ```json
 {
   "ok": true,
-  "view": {"name": "token_holders", "engine": "View", "database": "analytics_42431"},
-  "definition": "CREATE VIEW analytics_42431.token_holders AS SELECT ...",
+  "view": {"name": "whale_holders", "engine": "View", "database": "analytics_42431"},
+  "definition": "CREATE VIEW analytics_42431.whale_holders AS SELECT ...",
   "row_count": 1234567
 }
 ```
@@ -434,13 +434,13 @@ curl "https://tidx.example.com/views/token_holders?chainId=42431"
 #### Delete View (trusted IP only)
 
 ```bash
-curl -X DELETE "https://tidx.example.com/views/token_holders?chainId=42431"
+curl -X DELETE "https://tidx.example.com/views/whale_holders?chainId=42431"
 ```
 
 ```json
 {
   "ok": true,
-  "deleted": ["token_holders_mv", "token_holders"]
+  "deleted": ["token_holders_mv", "whale_holders"]
 }
 ```
 
@@ -450,12 +450,12 @@ Views are auto-prefixed with `analytics_{chainId}` when using `engine=clickhouse
 
 ```bash
 # Query the view (auto-prefixed)
-curl "https://tidx.example.com/query?chainId=42431&engine=clickhouse&sql=SELECT * FROM token_holders WHERE token = '0x...' ORDER BY balance DESC LIMIT 10"
+curl "https://tidx.example.com/query?chainId=42431&engine=clickhouse&sql=SELECT * FROM whale_holders WHERE token = '0x...' ORDER BY balance DESC LIMIT 10"
 ```
 
 ## Tables
 
-The sync engine writes raw chain data to `blocks`, `txs`, `logs`, `receipts`, and `sync_state` in both PostgreSQL and ClickHouse. You can generate event tables at query time with `?signature=Event(...)`. ClickHouse additionally maintains built-in materialized views for token transfers and holder balances, and you can register your own materialized views via the [`/views` API](#views-api).
+The sync engine writes raw chain data to `blocks`, `txs`, `logs`, `receipts`, and `sync_state` in both PostgreSQL and ClickHouse. You can generate event tables at query time with `?signature=Event(...)`. ClickHouse additionally maintains built-in materialized views for token transfers, approvals, balances, supply, and per-day transfer stats, and you can register your own materialized views via the [`/views` API](#views-api).
 
 ### blocks
 
@@ -556,9 +556,9 @@ curl -G "https://tidx.example.com/query" \
     LIMIT 10"
 ```
 
-For Transfer logs specifically, [`token_transfer_events`](#token_transfer_events) is pre-decoded and cheaper.
+For Transfer logs specifically, [`token_transfers`](#token_transfers) is pre-decoded and cheaper.
 
-### token_transfer_events
+### token_transfers
 
 > [!NOTE]
 > ClickHouse only — query with `engine=clickhouse`. Materialized view over `logs`, kept in sync on reorg.
@@ -583,7 +583,7 @@ curl -G "https://tidx.example.com/query" \
   --data-urlencode "chainId=42431" \
   --data-urlencode "engine=clickhouse" \
   --data-urlencode "sql=SELECT token, \`from\`, \`to\`, toString(amount) AS amount, tx_hash
-    FROM token_transfer_events
+    FROM token_transfers
     WHERE token = '0x20c000000000000000000000e65cb5a40b7885ae'
     ORDER BY block_num DESC, log_idx DESC
     LIMIT 3"
@@ -600,7 +600,7 @@ curl -G "https://tidx.example.com/query" \
 ### token_holder_deltas
 
 > [!NOTE]
-> ClickHouse only — query with `engine=clickhouse`. Materialized view over `token_transfer_events`, kept in sync on reorg.
+> ClickHouse only — query with `engine=clickhouse`. Materialized view over `token_transfers`, kept in sync on reorg.
 
 Two rows per transfer (recipient `leg=+1`, sender `leg=-1`); skips zero-address legs. `ReplacingMergeTree` deduplicates by `(token, holder, block_num, tx_hash, log_idx, leg)` so retried inserts collapse on merge.
 
@@ -645,7 +645,7 @@ FROM token_holder_deltas FINAL
 WHERE token = '0x…' AND holder = '0x…' AND block_num <= 1050
 ```
 
-### token_holders
+### token_balances
 
 > [!NOTE]
 > ClickHouse only — query with `engine=clickhouse`. View over `token_holder_deltas FINAL`, always reflects the post-merge state.
@@ -663,7 +663,7 @@ curl -G "https://tidx.example.com/query" \
   --data-urlencode "chainId=42431" \
   --data-urlencode "engine=clickhouse" \
   --data-urlencode "sql=SELECT holder, toString(balance) AS balance
-    FROM token_holders
+    FROM token_balances
     WHERE token = '0x20c000000000000000000000e65cb5a40b7885ae'
     ORDER BY balance DESC
     LIMIT 5"
@@ -676,6 +676,108 @@ curl -G "https://tidx.example.com/query" \
   ["0x15d34aaf54267db7d7c367839aaf71a00a2c6a65","68056473384187692692674921486353642328"],
   ["0x90f79bf6eb2c4f870365e785982e1f101e93b906","68056473384187692692674921486353642286"],
   ["0xf39fd6e51aad88f6f4ce6ab8827279cfffb92266","68056473384187692692674921486353642272"]
+]}
+```
+
+### token_supply
+
+> [!NOTE]
+> ClickHouse only — query with `engine=clickhouse`. View over `token_transfers FINAL`, computes net mints minus burns from zero-address legs.
+
+Outstanding supply per token, derived from `Transfer` events whose sender or recipient is `0x0`. Mints (`from = 0x0`) add to supply, burns (`to = 0x0`) subtract. Filtered to `supply > 0`.
+
+| Column | Type | Description |
+|--------|------|-------------|
+| `token` | `String` | Token contract |
+| `supply` | `Int256` | Cumulative mints − cumulative burns |
+
+```bash
+curl -G "https://tidx.example.com/query" \
+  --data-urlencode "chainId=42431" \
+  --data-urlencode "engine=clickhouse" \
+  --data-urlencode "sql=SELECT token, toString(supply) AS supply
+    FROM token_supply
+    ORDER BY supply DESC
+    LIMIT 5"
+```
+
+```json
+{"ok":true,"columns":["token","supply"],"rows":[
+  ["0x20c000000000000000000000e65cb5a40b7885ae","340282366920938463463374607431768211455"],
+  ["0x20c0000000000000000000003f9a1b2c4d5e6f70","100000000000000000000000"]
+]}
+```
+
+### token_approvals
+
+> [!NOTE]
+> ClickHouse only — query with `engine=clickhouse`. Materialized view over `logs`, kept in sync on reorg.
+
+One row per canonical `Approval(address,address,uint256)` log, decoded at insert time. `ReplacingMergeTree` keyed on `(token, block_num, log_idx, tx_hash)`. Stores raw approval events — to get the latest allowance per `(token, owner, spender)`, query with `ORDER BY block_num DESC, log_idx DESC LIMIT 1`.
+
+| Column | Type | Description |
+|--------|------|-------------|
+| `block_num` | `Int64` | Block number |
+| `block_timestamp` | `DateTime64(3, 'UTC')` | Block timestamp |
+| `tx_idx` | `Int32` | Transaction index |
+| `log_idx` | `Int32` | Log index |
+| `tx_hash` | `String` | Transaction hash |
+| `token` | `String` | Emitting token contract |
+| `owner` | `String` | Approving address (token holder) |
+| `spender` | `String` | Approved spender |
+| `amount` | `UInt256` | Allowance set on this event |
+
+```bash
+curl -G "https://tidx.example.com/query" \
+  --data-urlencode "chainId=42431" \
+  --data-urlencode "engine=clickhouse" \
+  --data-urlencode "sql=SELECT owner, spender, toString(amount) AS amount, block_num
+    FROM token_approvals
+    WHERE token = '0x20c000000000000000000000e65cb5a40b7885ae'
+    ORDER BY block_num DESC, log_idx DESC
+    LIMIT 3"
+```
+
+```json
+{"ok":true,"columns":["owner","spender","amount","block_num"],"rows":[
+  ["0x70997970c51812dc3a010c7d01b50e0d17dc79c8","0x3c44cdddb6a900fa2b585dd299e03d12fa4293bc","115792089237316195423570985008687907853269984665640564039457584007913129639935",1083],
+  ["0x70997970c51812dc3a010c7d01b50e0d17dc79c8","0x3c44cdddb6a900fa2b585dd299e03d12fa4293bc","0",1071],
+  ["0x3c44cdddb6a900fa2b585dd299e03d12fa4293bc","0x15d34aaf54267db7d7c367839aaf71a00a2c6a65","500",1042]
+]}
+```
+
+### token_transfer_stats
+
+> [!NOTE]
+> ClickHouse only — query with `engine=clickhouse`. View over `token_transfers FINAL`, aggregated per `(day, token)`.
+
+Per-day per-token rollups of transfer activity. Aggregated at query time so reorgs and retries are inherited from the underlying `token_transfers` table.
+
+| Column | Type | Description |
+|--------|------|-------------|
+| `day` | `Date` | Day (UTC) bucket from `block_timestamp` |
+| `token` | `String` | Token contract |
+| `transfer_count` | `UInt64` | Number of `Transfer` events on that day |
+| `volume` | `UInt256` | Sum of `amount` across all transfers on that day |
+| `unique_senders` | `UInt64` | Distinct `from` addresses on that day |
+| `unique_recipients` | `UInt64` | Distinct `to` addresses on that day |
+
+```bash
+curl -G "https://tidx.example.com/query" \
+  --data-urlencode "chainId=42431" \
+  --data-urlencode "engine=clickhouse" \
+  --data-urlencode "sql=SELECT day, transfer_count, toString(volume) AS volume, unique_senders, unique_recipients
+    FROM token_transfer_stats
+    WHERE token = '0x20c000000000000000000000e65cb5a40b7885ae'
+    ORDER BY day DESC
+    LIMIT 5"
+```
+
+```json
+{"ok":true,"columns":["day","transfer_count","volume","unique_senders","unique_recipients"],"rows":[
+  ["2026-05-27",18342,"984320012345678901234567",1024,987],
+  ["2026-05-26",17211,"872100012345678901234567",1011,973],
+  ["2026-05-25",16982,"851234012345678901234567",998,961]
 ]}
 ```
 

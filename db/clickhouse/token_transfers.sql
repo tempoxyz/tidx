@@ -1,4 +1,4 @@
-CREATE TABLE IF NOT EXISTS token_transfer_events (
+CREATE TABLE IF NOT EXISTS token_transfers (
     block_num          Int64,
     block_timestamp    DateTime64(3, 'UTC'),
     tx_idx             Int32,

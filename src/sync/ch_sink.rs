@@ -832,8 +832,8 @@ mod tests {
 
     #[test]
     fn test_token_holder_deltas_table_is_known() {
-        assert!(validate_table_name("token_transfer_events").is_ok());
+        assert!(validate_table_name("token_transfers").is_ok());
         assert!(validate_table_name("token_holder_deltas").is_ok());
-        assert!(validate_table_name("token_holders").is_ok());
+        assert!(validate_table_name("token_balances").is_ok());
     }
 }

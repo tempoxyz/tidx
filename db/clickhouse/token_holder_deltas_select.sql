@@ -7,7 +7,7 @@ SELECT
     tupleElement(leg_tuple, 1) AS holder,
     tupleElement(leg_tuple, 2) AS leg,
     tupleElement(leg_tuple, 3) AS balance_delta
-FROM token_transfer_events
+FROM token_transfers
 ARRAY JOIN
     [
         (`to`,   CAST(1 AS Int8),  CAST(amount AS Int256)),

@@ -4,13 +4,13 @@ const TOKEN_HOLDER_DELTAS_SCHEMA: &str =
     include_str!("../../db/clickhouse/token_holder_deltas.sql");
 const TOKEN_HOLDER_DELTAS_SELECT: &str =
     include_str!("../../db/clickhouse/token_holder_deltas_select.sql");
-const TOKEN_HOLDERS_VIEW: &str = include_str!("../../db/clickhouse/token_holders.sql");
+const TOKEN_BALANCES_VIEW: &str = include_str!("../../db/clickhouse/token_balances.sql");
 
 pub const OBJECTS: &[ClickHouseObject] = &[
     ClickHouseObject {
         name: "token_holder_deltas",
         kind: ClickHouseObjectKind::Table(TOKEN_HOLDER_DELTAS_SCHEMA),
-        depends_on: &["token_transfer_events"],
+        depends_on: &["token_transfers"],
         public_query: true,
         block_column: Some("block_num"),
         backfill: Some(BackfillPolicy::IfEmpty {
@@ -23,14 +23,14 @@ pub const OBJECTS: &[ClickHouseObject] = &[
             target_table: "token_holder_deltas",
             select_sql: TOKEN_HOLDER_DELTAS_SELECT,
         },
-        depends_on: &["token_transfer_events", "token_holder_deltas"],
+        depends_on: &["token_transfers", "token_holder_deltas"],
         public_query: false,
         block_column: None,
         backfill: None,
     },
     ClickHouseObject {
-        name: "token_holders",
-        kind: ClickHouseObjectKind::View(TOKEN_HOLDERS_VIEW),
+        name: "token_balances",
+        kind: ClickHouseObjectKind::View(TOKEN_BALANCES_VIEW),
         depends_on: &["token_holder_deltas"],
         public_query: true,
         block_column: None,
@@ -51,7 +51,7 @@ mod tests {
         let ddl = mv.ddl();
         assert!(ddl.starts_with("CREATE MATERIALIZED VIEW IF NOT EXISTS token_holder_deltas_mv"));
         assert!(ddl.contains("TO token_holder_deltas AS\nSELECT"));
-        assert!(ddl.contains("FROM token_transfer_events"));
+        assert!(ddl.contains("FROM token_transfers"));
     }
 
     #[test]
@@ -75,10 +75,10 @@ mod tests {
     }
 
     #[test]
-    fn token_holders_view_uses_final_for_dedup() {
+    fn token_balances_view_uses_final_for_dedup() {
         let view = OBJECTS
             .iter()
-            .find(|object| object.name == "token_holders")
+            .find(|object| object.name == "token_balances")
             .unwrap();
         assert!(view.is_view());
         let ddl = view.ddl();

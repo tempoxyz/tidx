@@ -1,4 +1,4 @@
-CREATE VIEW IF NOT EXISTS token_holders AS
+CREATE VIEW IF NOT EXISTS token_balances AS
 SELECT
     token,
     holder,
