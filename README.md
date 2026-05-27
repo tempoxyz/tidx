@@ -453,6 +453,24 @@ Views are auto-prefixed with `analytics_{chainId}` when using `engine=clickhouse
 curl "https://tidx.example.com/query?chainId=42431&engine=clickhouse&sql=SELECT * FROM token_holders WHERE token = '0x...' ORDER BY balance DESC LIMIT 10"
 ```
 
+#### Built-in Token Transfers and Holders
+
+ClickHouse direct-write deployments maintain a built-in `token_transfer_events` table from `Transfer(address,address,uint256)` logs:
+
+```bash
+curl "https://tidx.example.com/query?chainId=42431&engine=clickhouse&sql=SELECT token, amount, tx_hash FROM token_transfer_events WHERE token = '0x...' ORDER BY block_num DESC, log_idx DESC LIMIT 10"
+```
+
+`token_transfer_events` stores decoded transfer event rows with block/log coordinates, transaction hash, token, sender, recipient, amount, and virtual-forward marker. It is block-addressable for reorg cleanup and is the shared source for built-in token balance views.
+
+The built-in `token_holders` view reads from transfer-derived balance deltas:
+
+```bash
+curl "https://tidx.example.com/query?chainId=42431&engine=clickhouse&sql=SELECT token, holder, balance FROM token_holders WHERE token = '0x...' ORDER BY balance DESC LIMIT 10"
+```
+
+`token_holder_deltas` is also block-addressable. Reorg cleanup deletes affected transfer events and holder deltas alongside logs, so balances are recomputed from canonical transfer rows.
+
 ## Schemas
 
 All tables use composite primary keys with timestamps for efficient range queries:
@@ -608,5 +626,3 @@ make clean             Stop services and clean
 ## Acknowledgments
 
 - [golden-axe](https://github.com/indexsupply/golden-axe) — Inspiration for everything.
-
-

@@ -1,6 +1,7 @@
 pub mod api;
 pub mod broadcast;
 pub mod clickhouse;
+pub mod clickhouse_schema;
 pub mod config;
 pub mod db;
 pub mod metrics;

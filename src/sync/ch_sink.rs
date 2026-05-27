@@ -9,20 +9,11 @@ use serde::Serialize;
 use std::time::{Duration, Instant};
 use tracing::{debug, error, info, warn};
 
+use crate::clickhouse_schema::{
+    BackfillPolicy, base_objects, derived_backfills, derived_objects, migrations, reorg_tables,
+};
 use crate::metrics;
 use crate::types::{BlockRow, LogRow, ReceiptRow, TxRow};
-
-/// Schema SQL files embedded at compile time.
-const BLOCKS_SCHEMA: &str = include_str!("../../db/clickhouse/blocks.sql");
-const TXS_SCHEMA: &str = include_str!("../../db/clickhouse/txs.sql");
-const LOGS_SCHEMA: &str = include_str!("../../db/clickhouse/logs.sql");
-const LOGS_MIGRATION_20260416: &str =
-    include_str!("../../db/clickhouse/migrations/20260416_add_is_virtual_forward.sql");
-const LOGS_MIGRATION_20260417: &str =
-    include_str!("../../db/clickhouse/migrations/20260417_add_logs_virtual_forward_index.sql");
-const BLOCKS_MIGRATION_20260430: &str =
-    include_str!("../../db/clickhouse/migrations/20260430_add_blocks_consensus_proposer.sql");
-const RECEIPTS_SCHEMA: &str = include_str!("../../db/clickhouse/receipts.sql");
 
 /// Max rows per ClickHouse INSERT to avoid unbounded memory growth during backfills.
 const CH_INSERT_CHUNK_SIZE: usize = 10_000;
@@ -90,40 +81,65 @@ impl ClickHouseSink {
             .await
             .map_err(|e| anyhow!("Failed to create ClickHouse database: {e}"))?;
 
-        for (name, ddl) in [
-            ("blocks", BLOCKS_SCHEMA),
-            ("txs", TXS_SCHEMA),
-            ("logs", LOGS_SCHEMA),
-            ("receipts", RECEIPTS_SCHEMA),
-        ] {
+        for object in base_objects() {
+            let ddl = object.ddl();
             self.client
-                .query(ddl)
+                .query(&ddl)
                 .execute()
                 .await
-                .map_err(|e| anyhow!("Failed to create ClickHouse table {name}: {e}"))?;
-            debug!(table = name, database = %self.database, "ClickHouse table ready");
+                .map_err(|e| anyhow!("Failed to create ClickHouse table {}: {e}", object.name))?;
+            debug!(table = object.name, database = %self.database, "ClickHouse table ready");
         }
 
-        self.client
-            .query(LOGS_MIGRATION_20260416)
-            .execute()
-            .await
-            .map_err(|e| anyhow!("Failed to run ClickHouse logs migration 20260416: {e}"))?;
+        for migration in migrations() {
+            let ddl = migration.ddl();
+            self.client.query(&ddl).execute().await.map_err(|e| {
+                anyhow!("Failed to run ClickHouse migration {}: {e}", migration.name)
+            })?;
+        }
 
-        self.client
-            .query(LOGS_MIGRATION_20260417)
-            .execute()
-            .await
-            .map_err(|e| anyhow!("Failed to run ClickHouse logs migration 20260417: {e}"))?;
-
-        // TIP-1031: ed25519 consensus proposer pubkey on blocks.
-        self.client
-            .query(BLOCKS_MIGRATION_20260430)
-            .execute()
-            .await
-            .map_err(|e| anyhow!("Failed to run ClickHouse blocks migration 20260430: {e}"))?;
+        self.ensure_derived_objects().await?;
 
         info!(database = %self.database, "ClickHouse schema ready");
+        Ok(())
+    }
+
+    async fn ensure_derived_objects(&self) -> Result<()> {
+        for object in derived_objects() {
+            let ddl = object.ddl();
+            self.client
+                .query(&ddl)
+                .execute()
+                .await
+                .map_err(|e| anyhow!("Failed to create ClickHouse object {}: {e}", object.name))?;
+            debug!(object = object.name, database = %self.database, "ClickHouse object ready");
+        }
+
+        self.backfill_derived_objects_if_empty().await
+    }
+
+    async fn backfill_derived_objects_if_empty(&self) -> Result<()> {
+        for object in derived_backfills() {
+            let Some(BackfillPolicy::IfEmpty { select_sql }) = object.backfill else {
+                continue;
+            };
+            let count: u64 = self
+                .client
+                .query(&format!("SELECT count() FROM {}", object.name))
+                .fetch_one()
+                .await
+                .map_err(|e| anyhow!("Failed to count ClickHouse table {}: {e}", object.name))?;
+            if count > 0 {
+                continue;
+            }
+
+            self.client
+                .query(&format!("INSERT INTO {} {}", object.name, select_sql))
+                .execute()
+                .await
+                .map_err(|e| anyhow!("Failed to backfill ClickHouse table {}: {e}", object.name))?;
+        }
+
         Ok(())
     }
 
@@ -220,15 +236,12 @@ impl ClickHouseSink {
     }
 
     /// Query the highest block number for a specific table.
-    /// Uses "num" for blocks table, "block_num" for others.
+    /// Uses the block column declared in the ClickHouse schema registry.
     /// Returns None if the table is empty.
     pub async fn max_block_in_table(&self, table: &str) -> Result<Option<i64>> {
         let table = validate_table_name(table)?;
-        let col = if table == "blocks" {
-            "num"
-        } else {
-            "block_num"
-        };
+        let col = crate::clickhouse_schema::block_column(table)
+            .ok_or_else(|| anyhow!("ClickHouse table has no block column: {table}"))?;
         let count: u64 = self
             .client
             .query(&format!("SELECT count() FROM {table}"))
@@ -259,15 +272,10 @@ impl ClickHouseSink {
 
     /// Delete all data from a given block number onwards (reorg support).
     pub async fn delete_from(&self, block_num: u64) -> Result<()> {
-        let tables = ["logs", "receipts", "txs", "blocks"];
-        let block_col = |t: &str| if t == "blocks" { "num" } else { "block_num" };
-
-        for table in &tables {
+        for table in reorg_tables() {
             let sql = format!(
                 "ALTER TABLE {} DELETE WHERE {} >= {}",
-                table,
-                block_col(table),
-                block_num
+                table.name, table.block_column, block_num
             );
             self.client
                 .query(&sql)
@@ -275,8 +283,8 @@ impl ClickHouseSink {
                 .execute()
                 .await
                 .map_err(|e| {
-                    error!(table = *table, error = %e, "ClickHouse delete failed");
-                    anyhow!("ClickHouse delete from {table} failed: {e}")
+                    error!(table = table.name, error = %e, "ClickHouse delete failed");
+                    anyhow!("ClickHouse delete from {} failed: {e}", table.name)
                 })?;
         }
 
@@ -514,16 +522,11 @@ fn hex_encode(bytes: &[u8]) -> String {
     format!("0x{}", hex::encode(bytes))
 }
 
-/// Known table names that are safe to interpolate into SQL.
-const KNOWN_TABLES: &[&str] = &["blocks", "txs", "logs", "receipts"];
-
 /// Validate that a table name is one of the known tables.
 /// Returns the validated name or an error for unknown tables.
 fn validate_table_name(table: &str) -> Result<&str> {
-    KNOWN_TABLES
-        .iter()
-        .find(|&&t| t == table)
-        .copied()
+    crate::clickhouse_schema::is_known_table(table)
+        .then_some(table)
         .ok_or_else(|| anyhow!("Unknown ClickHouse table: {table}"))
 }
 
@@ -620,5 +623,12 @@ mod tests {
         );
         assert!(ClickHouseSink::new("http://localhost:8123", "123bad", None, None).is_err());
         assert!(ClickHouseSink::new("http://localhost:8123", "", None, None).is_err());
+    }
+
+    #[test]
+    fn test_token_holder_deltas_table_is_known() {
+        assert!(validate_table_name("token_transfer_events").is_ok());
+        assert!(validate_table_name("token_holder_deltas").is_ok());
+        assert!(validate_table_name("token_holders").is_ok());
     }
 }

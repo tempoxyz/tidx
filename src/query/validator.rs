@@ -8,7 +8,7 @@ use sqlparser::ast::{
 use sqlparser::dialect::GenericDialect;
 use sqlparser::parser::Parser;
 
-const ALLOWED_TABLES: &[&str] = &["blocks", "txs", "logs", "receipts"];
+const POSTGRES_ALLOWED_TABLES: &[&str] = &["blocks", "txs", "logs", "receipts"];
 
 const MAX_QUERY_LENGTH: usize = 65_536;
 const MAX_SUBQUERY_DEPTH: usize = 4;
@@ -397,7 +397,7 @@ fn validate_clickhouse_table_name(name: &ObjectName, cte_names: &HashSet<String>
     }
 
     let bare_name = parts.last().cloned().unwrap_or_default();
-    if parts.len() == 1 && ALLOWED_TABLES.contains(&bare_name.as_str()) {
+    if parts.len() == 1 && crate::clickhouse_schema::is_public_query_table(&bare_name) {
         return Ok(());
     }
     if parts.len() == 1 && cte_names.contains(&bare_name) {
@@ -757,7 +757,7 @@ fn validate_table_name(name: &ObjectName, cte_names: &HashSet<String>) -> Result
 
     let bare_name = name_parts.last().cloned().unwrap_or_default();
 
-    if ALLOWED_TABLES.contains(&bare_name.as_str()) {
+    if POSTGRES_ALLOWED_TABLES.contains(&bare_name.as_str()) {
         return Ok(());
     }
 
@@ -1286,6 +1286,13 @@ mod tests {
     }
 
     #[test]
+    fn test_postgres_rejects_clickhouse_derived_tables() {
+        assert!(validate_query("SELECT * FROM token_transfer_events").is_err());
+        assert!(validate_query("SELECT * FROM token_holders").is_err());
+        assert!(validate_query("SELECT * FROM token_holder_deltas").is_err());
+    }
+
+    #[test]
     fn test_allows_cte_defined_table() {
         assert!(
             validate_query("WITH my_cte AS (SELECT * FROM blocks) SELECT * FROM my_cte").is_ok()
@@ -1619,6 +1626,28 @@ mod tests {
         assert!(
             validate_clickhouse_query(
                 "SELECT lower(substring(tx_hash, 3)), count() FROM logs GROUP BY tx_hash LIMIT 10"
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn test_clickhouse_allows_token_holder_views() {
+        assert!(
+            validate_clickhouse_query(
+                r#"SELECT token, "from", "to", amount FROM token_transfer_events ORDER BY block_num DESC LIMIT 10"#
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_clickhouse_query(
+                "SELECT token, holder, balance FROM token_holders ORDER BY balance DESC LIMIT 10"
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_clickhouse_query(
+                "SELECT token, holder, sum(balance_delta) FROM token_holder_deltas GROUP BY token, holder LIMIT 10"
             )
             .is_ok()
         );

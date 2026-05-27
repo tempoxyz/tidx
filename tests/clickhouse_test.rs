@@ -10,6 +10,7 @@ mod common;
 
 use common::clickhouse::TestClickHouse;
 use serial_test::serial;
+use tidx::clickhouse_schema::{base_objects, migrations};
 use tidx::query::EventSignature;
 use tidx::sync::ch_sink::ClickHouseSink;
 use tidx::sync::sink::SinkSet;
@@ -886,6 +887,40 @@ fn make_log(block_num: i64, log_idx: i32) -> LogRow {
     }
 }
 
+fn make_transfer_log(block_num: i64, log_idx: i32, from: &str, to: &str, value: u128) -> LogRow {
+    use chrono::TimeZone;
+    let ts = chrono::Utc.with_ymd_and_hms(2025, 1, 15, 12, 0, 0).unwrap()
+        + chrono::Duration::seconds(block_num);
+    let topic0 =
+        hex::decode("ddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef").unwrap();
+    let mut data = vec![0; 16];
+    data.extend_from_slice(&value.to_be_bytes());
+
+    LogRow {
+        block_num,
+        block_timestamp: ts,
+        log_idx,
+        tx_idx: 0,
+        tx_hash: vec![block_num as u8; 32],
+        address: vec![0xda; 20],
+        selector: Some(topic0.clone()),
+        topic0: Some(topic0),
+        topic1: Some(padded_topic_address(from)),
+        topic2: Some(padded_topic_address(to)),
+        topic3: None,
+        data,
+        is_virtual_forward: false,
+    }
+}
+
+fn padded_topic_address(address: &str) -> Vec<u8> {
+    let bytes = hex::decode(address.trim_start_matches("0x")).unwrap();
+    assert_eq!(bytes.len(), 20);
+    let mut topic = vec![0; 12];
+    topic.extend_from_slice(&bytes);
+    topic
+}
+
 fn make_receipt(block_num: i64, tx_idx: i32) -> ReceiptRow {
     use chrono::TimeZone;
     let ts = chrono::Utc.with_ymd_and_hms(2025, 1, 15, 12, 0, 0).unwrap()
@@ -913,13 +948,26 @@ async fn test_sink_ensure_schema_creates_tables() {
         return;
     };
 
-    for table in ["blocks", "txs", "logs", "receipts"] {
+    for table in [
+        "blocks",
+        "txs",
+        "logs",
+        "receipts",
+        "token_transfer_events",
+        "token_holder_deltas",
+    ] {
         let count = ch
             .table_count(table)
             .await
             .unwrap_or_else(|_| panic!("Table {table} should exist"));
         assert_eq!(count, 0, "{table} should be empty after schema creation");
     }
+
+    let count = ch
+        .table_count("token_holders")
+        .await
+        .expect("token_holders view should exist");
+    assert_eq!(count, 0);
 }
 
 #[tokio::test]
@@ -1006,6 +1054,191 @@ async fn test_sink_write_logs_roundtrips_virtual_forward_flag() {
     assert_eq!(rows.len(), 2);
     assert_eq!(rows[0]["is_virtual_forward"].as_u64(), Some(0));
     assert_eq!(rows[1]["is_virtual_forward"].as_u64(), Some(1));
+}
+
+#[tokio::test]
+#[serial(clickhouse)]
+async fn test_sink_token_transfer_events_decodes_transfers_and_reorgs() {
+    let Some((sink, ch)) = setup_sink().await else {
+        return;
+    };
+
+    let zero = "0x0000000000000000000000000000000000000000";
+    let alice = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    let bob = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+
+    let mut logs = vec![
+        make_transfer_log(1, 0, zero, alice, 100),
+        make_transfer_log(2, 0, alice, bob, 40),
+        make_transfer_log(3, 0, bob, zero, 10),
+    ];
+    logs[2].is_virtual_forward = true;
+
+    sink.write_logs(&logs).await.expect("write_logs failed");
+
+    let rows = token_transfer_events(&ch).await;
+    assert_eq!(rows.len(), 3);
+    assert_eq!(rows[0].token, "0xdadadadadadadadadadadadadadadadadadadada");
+    assert_eq!(rows[0].from, zero);
+    assert_eq!(rows[0].to, alice);
+    assert_eq!(rows[0].amount, "100");
+    assert_eq!(rows[0].is_virtual_forward, 0);
+    assert_eq!(rows[2].from, bob);
+    assert_eq!(rows[2].to, zero);
+    assert_eq!(rows[2].amount, "10");
+    assert_eq!(rows[2].is_virtual_forward, 1);
+
+    sink.delete_from(3).await.expect("delete_from failed");
+
+    let rows = token_transfer_events(&ch).await;
+    assert_eq!(rows.len(), 2);
+    assert!(rows.iter().all(|row| row.block_num < 3));
+}
+
+#[tokio::test]
+#[serial(clickhouse)]
+async fn test_sink_token_holders_view_tracks_balances_and_reorgs() {
+    let Some((sink, ch)) = setup_sink().await else {
+        return;
+    };
+
+    let zero = "0x0000000000000000000000000000000000000000";
+    let alice = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    let bob = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+
+    let logs = vec![
+        make_transfer_log(1, 0, zero, alice, 100),
+        make_transfer_log(2, 0, alice, bob, 40),
+        make_transfer_log(3, 0, bob, zero, 10),
+    ];
+    sink.write_logs(&logs).await.expect("write_logs failed");
+
+    let balances = token_holder_balances(&ch).await;
+    assert_eq!(balances.get(alice).map(String::as_str), Some("60"));
+    assert_eq!(balances.get(bob).map(String::as_str), Some("30"));
+    assert!(!balances.contains_key(zero));
+
+    sink.delete_from(3).await.expect("delete_from failed");
+
+    let balances = token_holder_balances(&ch).await;
+    assert_eq!(balances.get(alice).map(String::as_str), Some("60"));
+    assert_eq!(balances.get(bob).map(String::as_str), Some("40"));
+}
+
+#[tokio::test]
+#[serial(clickhouse)]
+async fn test_sink_ensure_schema_backfills_token_transfer_views() {
+    let ch = TestClickHouse::new(SINK_DB)
+        .await
+        .expect("Failed to create CH client");
+    if ch.wait_for_ready().await.is_err() {
+        println!("ClickHouse not available, skipping test");
+        return;
+    }
+    ch.reset_database().await.expect("Failed to reset database");
+
+    for object in base_objects() {
+        let ddl = object.ddl();
+        ch.query(&ddl)
+            .await
+            .unwrap_or_else(|_| panic!("base object {} should be created", object.name));
+    }
+    for migration in migrations() {
+        let ddl = migration.ddl();
+        ch.query(&ddl)
+            .await
+            .unwrap_or_else(|_| panic!("migration {} should run", migration.name));
+    }
+
+    let sink = ClickHouseSink::new(&ch.url, SINK_DB, None, None).expect("Failed to create sink");
+    let zero = "0x0000000000000000000000000000000000000000";
+    let alice = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    let bob = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+
+    let logs = vec![
+        make_transfer_log(1, 0, zero, alice, 100),
+        make_transfer_log(2, 0, alice, bob, 40),
+        make_transfer_log(3, 0, bob, zero, 10),
+    ];
+    sink.write_logs(&logs).await.expect("write_logs failed");
+
+    sink.ensure_schema().await.expect("ensure_schema failed");
+
+    let transfers = token_transfer_events(&ch).await;
+    assert_eq!(transfers.len(), 3);
+
+    let balances = token_holder_balances(&ch).await;
+    assert_eq!(balances.get(alice).map(String::as_str), Some("60"));
+    assert_eq!(balances.get(bob).map(String::as_str), Some("30"));
+    assert!(!balances.contains_key(zero));
+}
+
+struct TokenTransferEvent {
+    block_num: i64,
+    token: String,
+    from: String,
+    to: String,
+    amount: String,
+    is_virtual_forward: u64,
+}
+
+async fn token_transfer_events(ch: &TestClickHouse) -> Vec<TokenTransferEvent> {
+    let result = ch
+        .query_json(
+            r#"
+            SELECT
+                block_num,
+                token,
+                `from`,
+                `to`,
+                toString(amount) AS amount,
+                is_virtual_forward
+            FROM token_transfer_events
+            ORDER BY block_num, log_idx
+            "#,
+        )
+        .await
+        .expect("token_transfer_events query failed");
+    result["data"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|row| TokenTransferEvent {
+            block_num: row["block_num"]
+                .as_i64()
+                .or_else(|| {
+                    row["block_num"]
+                        .as_str()
+                        .and_then(|value| value.parse().ok())
+                })
+                .unwrap(),
+            token: row["token"].as_str().unwrap().to_string(),
+            from: row["from"].as_str().unwrap().to_string(),
+            to: row["to"].as_str().unwrap().to_string(),
+            amount: row["amount"].as_str().unwrap().to_string(),
+            is_virtual_forward: row["is_virtual_forward"].as_u64().unwrap(),
+        })
+        .collect()
+}
+
+async fn token_holder_balances(ch: &TestClickHouse) -> std::collections::HashMap<String, String> {
+    let result = ch
+        .query_json(
+            "SELECT holder, toString(balance) AS balance FROM token_holders ORDER BY holder",
+        )
+        .await
+        .expect("token_holders query failed");
+    result["data"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|row| {
+            (
+                row["holder"].as_str().unwrap().to_string(),
+                row["balance"].as_str().unwrap().to_string(),
+            )
+        })
+        .collect()
 }
 
 #[tokio::test]
