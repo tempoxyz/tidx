@@ -8,7 +8,7 @@ const TOKEN_TRANSFER_EVENTS_SELECT: &str =
 pub const OBJECTS: &[ClickHouseObject] = &[
     ClickHouseObject {
         name: "token_transfer_events",
-        kind: ClickHouseObjectKind::Static(TOKEN_TRANSFER_EVENTS_SCHEMA),
+        kind: ClickHouseObjectKind::Table(TOKEN_TRANSFER_EVENTS_SCHEMA),
         depends_on: &["logs"],
         public_query: true,
         block_column: Some("block_num"),

@@ -15,7 +15,7 @@ const BLOCKS_MIGRATION_20260430: &str =
 pub const TABLES: &[ClickHouseObject] = &[
     ClickHouseObject {
         name: "blocks",
-        kind: ClickHouseObjectKind::Static(BLOCKS_SCHEMA),
+        kind: ClickHouseObjectKind::Table(BLOCKS_SCHEMA),
         depends_on: &[],
         public_query: true,
         block_column: Some("num"),
@@ -23,7 +23,7 @@ pub const TABLES: &[ClickHouseObject] = &[
     },
     ClickHouseObject {
         name: "txs",
-        kind: ClickHouseObjectKind::Static(TXS_SCHEMA),
+        kind: ClickHouseObjectKind::Table(TXS_SCHEMA),
         depends_on: &["blocks"],
         public_query: true,
         block_column: Some("block_num"),
@@ -31,7 +31,7 @@ pub const TABLES: &[ClickHouseObject] = &[
     },
     ClickHouseObject {
         name: "logs",
-        kind: ClickHouseObjectKind::Static(LOGS_SCHEMA),
+        kind: ClickHouseObjectKind::Table(LOGS_SCHEMA),
         depends_on: &["blocks", "txs"],
         public_query: true,
         block_column: Some("block_num"),
@@ -39,7 +39,7 @@ pub const TABLES: &[ClickHouseObject] = &[
     },
     ClickHouseObject {
         name: "receipts",
-        kind: ClickHouseObjectKind::Static(RECEIPTS_SCHEMA),
+        kind: ClickHouseObjectKind::Table(RECEIPTS_SCHEMA),
         depends_on: &["blocks", "txs"],
         public_query: true,
         block_column: Some("block_num"),
@@ -50,7 +50,7 @@ pub const TABLES: &[ClickHouseObject] = &[
 pub const MIGRATIONS: &[ClickHouseObject] = &[
     ClickHouseObject {
         name: "logs_20260416_is_virtual_forward",
-        kind: ClickHouseObjectKind::Static(LOGS_MIGRATION_20260416),
+        kind: ClickHouseObjectKind::Migration(LOGS_MIGRATION_20260416),
         depends_on: &["logs"],
         public_query: false,
         block_column: None,
@@ -58,7 +58,7 @@ pub const MIGRATIONS: &[ClickHouseObject] = &[
     },
     ClickHouseObject {
         name: "logs_20260417_virtual_forward_index",
-        kind: ClickHouseObjectKind::Static(LOGS_MIGRATION_20260417),
+        kind: ClickHouseObjectKind::Migration(LOGS_MIGRATION_20260417),
         depends_on: &["logs"],
         public_query: false,
         block_column: None,
@@ -66,7 +66,7 @@ pub const MIGRATIONS: &[ClickHouseObject] = &[
     },
     ClickHouseObject {
         name: "blocks_20260430_consensus_proposer",
-        kind: ClickHouseObjectKind::Static(BLOCKS_MIGRATION_20260430),
+        kind: ClickHouseObjectKind::Migration(BLOCKS_MIGRATION_20260430),
         depends_on: &["blocks"],
         public_query: false,
         block_column: None,

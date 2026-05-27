@@ -1,12 +1,15 @@
 CREATE TABLE IF NOT EXISTS token_holder_deltas (
     block_num       Int64,
     block_timestamp DateTime64(3, 'UTC'),
+    tx_hash         String,
+    log_idx         Int32,
     token           String,
     holder          String,
+    leg             Int8,
     balance_delta   Int256,
 
     INDEX idx_token token TYPE bloom_filter GRANULARITY 1,
     INDEX idx_holder holder TYPE bloom_filter GRANULARITY 1
-) ENGINE = SummingMergeTree()
+) ENGINE = ReplacingMergeTree()
 PARTITION BY toYYYYMM(block_timestamp)
-ORDER BY (token, holder, block_num)
+ORDER BY (token, holder, block_num, tx_hash, log_idx, leg)

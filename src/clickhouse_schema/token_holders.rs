@@ -9,7 +9,7 @@ const TOKEN_HOLDERS_VIEW: &str = include_str!("../../db/clickhouse/token_holders
 pub const OBJECTS: &[ClickHouseObject] = &[
     ClickHouseObject {
         name: "token_holder_deltas",
-        kind: ClickHouseObjectKind::Static(TOKEN_HOLDER_DELTAS_SCHEMA),
+        kind: ClickHouseObjectKind::Table(TOKEN_HOLDER_DELTAS_SCHEMA),
         depends_on: &["token_transfer_events"],
         public_query: true,
         block_column: Some("block_num"),
@@ -30,7 +30,7 @@ pub const OBJECTS: &[ClickHouseObject] = &[
     },
     ClickHouseObject {
         name: "token_holders",
-        kind: ClickHouseObjectKind::Static(TOKEN_HOLDERS_VIEW),
+        kind: ClickHouseObjectKind::View(TOKEN_HOLDERS_VIEW),
         depends_on: &["token_holder_deltas"],
         public_query: true,
         block_column: None,
@@ -64,6 +64,25 @@ mod tests {
             panic!("token holder delta table should declare its backfill");
         };
         assert_eq!(select_sql, TOKEN_HOLDER_DELTAS_SELECT);
-        assert!(select_sql.contains("GROUP BY block_num"));
+        // The MV select uses ARRAY JOIN over a tuple of (holder, leg, delta)
+        // instead of UNION ALL, because ClickHouse materialized views only
+        // trigger on the FIRST branch of a UNION ALL — using UNION ALL silently
+        // drops the sender (-1) leg and corrupts holder balances.
+        assert!(select_sql.contains("ARRAY JOIN"));
+        assert!(select_sql.contains("CAST(1 AS Int8)"));
+        assert!(select_sql.contains("CAST(-1 AS Int8)"));
+        assert!(!select_sql.contains("UNION ALL"));
+    }
+
+    #[test]
+    fn token_holders_view_uses_final_for_dedup() {
+        let view = OBJECTS
+            .iter()
+            .find(|object| object.name == "token_holders")
+            .unwrap();
+        assert!(view.is_view());
+        let ddl = view.ddl();
+        assert!(ddl.contains("FROM token_holder_deltas FINAL"));
+        assert!(ddl.contains("HAVING balance > 0"));
     }
 }
