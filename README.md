@@ -455,7 +455,7 @@ curl "https://tidx.example.com/query?chainId=42431&engine=clickhouse&sql=SELECT 
 
 ## Tables
 
-The sync engine writes raw chain data to `blocks`, `txs`, `logs`, `receipts`, and `sync_state` in both PostgreSQL and ClickHouse. ClickHouse additionally maintains built-in materialized views for token transfers and holder balances. You can also generate a virtual event-decoded table at query time with `?signature=Event(...)`, or register your own materialized views via the [`/views` API](#views-api).
+The sync engine writes raw chain data to `blocks`, `txs`, `logs`, `receipts`, and `sync_state` in both PostgreSQL and ClickHouse. You can generate event tables at query time with `?signature=Event(...)`. ClickHouse additionally maintains built-in materialized views for token transfers and holder balances, and you can register your own materialized views via the [`/views` API](#views-api).
 
 ### blocks
 
@@ -540,6 +540,23 @@ The sync engine writes raw chain data to `blocks`, `txs`, `logs`, `receipts`, an
 | `backfill_num` | `INT8` | Lowest synced block going backwards (NULL=not started, 0=complete) |
 | `started_at` | `TIMESTAMPTZ` | Sync start time |
 | `updated_at` | `TIMESTAMPTZ` | Last update time |
+
+### Event tables
+
+Pass `?signature=Event(type1,type2,...)` to `/query` and tidx exposes a virtual table named after the event with one column per parameter. The table is generated as a CTE at query time, so no schema registration is needed and any event signature works on demand. Works against both `engine=postgres` and `engine=clickhouse`:
+
+```bash
+curl -G "https://tidx.example.com/query" \
+  --data-urlencode "chainId=4217" \
+  --data-urlencode "signature=Transfer(address,address,uint256)" \
+  --data-urlencode "sql=SELECT \"from\", \"to\", value
+    FROM Transfer
+    WHERE \"from\" = '0xabc…'
+    ORDER BY block_num DESC
+    LIMIT 10"
+```
+
+For Transfer logs specifically, [`token_transfer_events`](#token_transfer_events) is pre-decoded and cheaper.
 
 ### token_transfer_events
 
@@ -661,30 +678,6 @@ curl -G "https://tidx.example.com/query" \
   ["0xf39fd6e51aad88f6f4ce6ab8827279cfffb92266","68056473384187692692674921486353642272"]
 ]}
 ```
-
-### Event-decoded virtual tables
-
-Pass `?signature=Event(type1,type2,...)` to `/query` and tidx exposes a virtual table named after the event with one column per parameter. The table is generated as a CTE at query time, so no schema registration is needed and any event signature works on demand. Works against both `engine=postgres` and `engine=clickhouse`:
-
-```bash
-curl -G "https://tidx.example.com/query" \
-  --data-urlencode "chainId=4217" \
-  --data-urlencode "signature=Transfer(address,address,uint256)" \
-  --data-urlencode "sql=SELECT \"from\", \"to\", value
-    FROM Transfer
-    WHERE \"from\" = '0xabc…'
-    ORDER BY block_num DESC
-    LIMIT 10"
-```
-
-For Transfer logs specifically, [`token_transfer_events`](#token_transfer_events) is pre-decoded and cheaper.
-
-### User-defined materialized views
-
-> [!NOTE]
-> ClickHouse only. Create via the [`/views` API](#views-api).
-
-Custom pre-computed analytics. Created views live in `analytics_{chainId}`, auto-populate on inserts, and are auto-prefixed when you reference them from `/query?engine=clickhouse`. See the Views API section above for the full create/list/delete/query surface.
 
 ## Sync Architecture
 
