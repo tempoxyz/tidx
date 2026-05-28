@@ -188,38 +188,60 @@ impl SyncProgress {
     }
 
     pub fn report_backfill(&mut self, current_block: u64, target_block: u64, blocks_synced: u64) {
+        let remaining = reverse_backfill_remaining(current_block, target_block);
+        if let Some(rate) = self.record_backfill_step(current_block, remaining, blocks_synced) {
+            tracing::info!(
+                chain_id = self.chain_id,
+                block = current_block,
+                remaining = remaining,
+                rate = format!("{:.1} blk/s", rate),
+                eta = format_eta(backfill_eta_secs(remaining, rate)),
+                "Backfill progress"
+            );
+        }
+    }
+
+    pub fn report_gap_fill(
+        &mut self,
+        completed_blocks: u64,
+        total_blocks: u64,
+        blocks_synced: u64,
+    ) {
+        let remaining = gap_fill_remaining(completed_blocks, total_blocks);
+        if let Some(rate) = self.record_backfill_step(completed_blocks, remaining, blocks_synced) {
+            tracing::info!(
+                chain_id = self.chain_id,
+                completed = completed_blocks,
+                total = total_blocks,
+                remaining = remaining,
+                rate = format!("{:.1} blk/s", rate),
+                eta = format_eta(backfill_eta_secs(remaining, rate)),
+                "Gap-fill progress"
+            );
+        }
+    }
+
+    fn record_backfill_step(
+        &mut self,
+        progress_block: u64,
+        remaining: u64,
+        blocks_synced: u64,
+    ) -> Option<f64> {
         self.blocks_since_report += blocks_synced;
-        set_backfill_block(self.chain_id, "postgres", current_block);
-        set_backfill_remaining(
-            self.chain_id,
-            "postgres",
-            current_block.saturating_sub(target_block),
-        );
+        set_backfill_block(self.chain_id, "postgres", progress_block);
+        set_backfill_remaining(self.chain_id, "postgres", remaining);
 
         let elapsed = self.last_report.elapsed();
         if elapsed.as_secs() >= 5 {
             let rate = self.blocks_since_report as f64 / elapsed.as_secs_f64();
             set_sync_rate(self.chain_id, rate);
 
-            let remaining = current_block.saturating_sub(target_block);
-            let eta_secs = if rate > 0.0 {
-                remaining as f64 / rate
-            } else {
-                0.0
-            };
-
-            tracing::info!(
-                chain_id = self.chain_id,
-                block = current_block,
-                remaining = remaining,
-                rate = format!("{:.1} blk/s", rate),
-                eta = format_eta(eta_secs),
-                "Backfill progress"
-            );
-
             self.last_report = Instant::now();
-            self.last_block = current_block;
+            self.last_block = progress_block;
             self.blocks_since_report = 0;
+            Some(rate)
+        } else {
+            None
         }
     }
 
@@ -426,8 +448,30 @@ pub fn get_sink_block_rate(sink: &str) -> Option<f64> {
     map.get(sink).map(|w| w.current_rate).filter(|r| *r > 0.0)
 }
 
-fn format_eta(secs: f64) -> String {
-    if secs <= 0.0 || secs.is_nan() || secs.is_infinite() {
+fn reverse_backfill_remaining(current_block: u64, target_block: u64) -> u64 {
+    current_block.saturating_sub(target_block)
+}
+
+fn gap_fill_remaining(completed_blocks: u64, total_blocks: u64) -> u64 {
+    total_blocks.saturating_sub(completed_blocks)
+}
+
+fn backfill_eta_secs(remaining: u64, rate: f64) -> Option<f64> {
+    if remaining == 0 {
+        Some(0.0)
+    } else if rate > 0.0 && rate.is_finite() {
+        Some(remaining as f64 / rate)
+    } else {
+        None
+    }
+}
+
+fn format_eta(secs: Option<f64>) -> String {
+    let Some(secs) = secs else {
+        return "unknown".to_string();
+    };
+
+    if secs < 0.0 || secs.is_nan() || secs.is_infinite() {
         return "unknown".to_string();
     }
 
@@ -440,5 +484,34 @@ fn format_eta(secs: f64) -> String {
         format!("{}h {}m", secs / 3600, (secs % 3600) / 60)
     } else {
         format!("{}d {}h", secs / 86400, (secs % 86400) / 3600)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn gap_fill_remaining_counts_down_from_total_blocks() {
+        assert_eq!(gap_fill_remaining(83_900, 100_000), 16_100);
+        assert_eq!(gap_fill_remaining(100_000, 100_000), 0);
+    }
+
+    #[test]
+    fn reverse_backfill_remaining_counts_down_to_target_block() {
+        assert_eq!(reverse_backfill_remaining(83_900, 0), 83_900);
+        assert_eq!(reverse_backfill_remaining(83_900, 83_900), 0);
+    }
+
+    #[test]
+    fn backfill_eta_reports_zero_when_complete() {
+        assert_eq!(backfill_eta_secs(0, 0.0), Some(0.0));
+        assert_eq!(format_eta(backfill_eta_secs(0, 0.0)), "0s");
+    }
+
+    #[test]
+    fn backfill_eta_is_unknown_when_remaining_work_has_no_rate() {
+        assert_eq!(backfill_eta_secs(10, 0.0), None);
+        assert_eq!(format_eta(backfill_eta_secs(10, 0.0)), "unknown");
     }
 }

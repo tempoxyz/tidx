@@ -1001,7 +1001,7 @@ async fn tick_gapfill_parallel(
                     "postgres",
                     total_gap_blocks.saturating_sub(completed),
                 );
-                progress.report_backfill(completed, total_gap_blocks, batch_count);
+                progress.report_gap_fill(completed, total_gap_blocks, batch_count);
 
                 debug!(
                     from = start,
@@ -1233,7 +1233,7 @@ async fn tick_gapfill_parallel_no_throttle(
                     "postgres",
                     total_gap_blocks.saturating_sub(completed),
                 );
-                progress.report_backfill(completed, total_gap_blocks, batch_count);
+                progress.report_gap_fill(completed, total_gap_blocks, batch_count);
 
                 debug!(
                     from = start,
