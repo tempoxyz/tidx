@@ -995,7 +995,6 @@ curl -G "https://tidx.example.com/query" \
 ]}
 ```
 
-
 ## Sync Architecture
 
 tidx uses two concurrent sync operations: **Realtime** follows the chain head, while **Gap Sync** fills all missing blocks from most recent to earliest.
