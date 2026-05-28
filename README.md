@@ -575,298 +575,62 @@ ClickHouse maintains these on insert and prunes them on reorg. Token-keyed table
 
 | Name | Purpose |
 |------|---------|
-| [`token_transfers`](#token_transfers) | Decoded `Transfer` events. |
-| [`token_holder_deltas`](#token_holder_deltas) | Per-event ± balance change, two rows per transfer. |
-| [`token_balances`](#token_balances) | Current positive balance per `(token, holder)`. |
-| [`token_supply`](#token_supply) | Per-token mints − burns (zero-address legs). |
-| [`token_approvals`](#token_approvals) | Decoded `Approval` events. |
-| [`token_approvals_current`](#token_approvals_current) | Latest allowance per `(token, owner, spender)`. |
-| [`token_metadata`](#token_metadata) | Per-token first/last seen + lifetime transfer count. |
-| [`token_transfer_stats`](#token_transfer_stats) | Per-`(day, token)` count, volume, unique senders/recipients. |
-| [`address_transfers`](#address_transfers) | Transfer feed keyed by account; `'in'`/`'out'`. |
-| [`address_holder_deltas`](#address_holder_deltas) | Holder-first mirror of `token_holder_deltas`. |
 | [`address_balances`](#address_balances) | Current positive balance per `(holder, token)`. |
+| [`address_holder_deltas`](#address_holder_deltas) | Holder-first mirror of `token_holder_deltas`. |
+| [`address_transfers`](#address_transfers) | Transfer feed keyed by account; `'in'`/`'out'`. |
 | [`address_txs`](#address_txs) | Tx feed keyed by account; `'from'`/`'to'`. |
 | [`contract_creations`](#contract_creations) | One row per contract deployment. |
+| [`token_approvals`](#token_approvals) | Decoded `Approval` events. |
+| [`token_approvals_current`](#token_approvals_current) | Latest allowance per `(token, owner, spender)`. |
+| [`token_balances`](#token_balances) | Current positive balance per `(token, holder)`. |
+| [`token_holder_deltas`](#token_holder_deltas) | Per-event ± balance change, two rows per transfer. |
+| [`token_metadata`](#token_metadata) | Per-token first/last seen + lifetime transfer count. |
+| [`token_supply`](#token_supply) | Per-token mints − burns (zero-address legs). |
+| [`token_transfer_stats`](#token_transfer_stats) | Per-`(day, token)` count, volume, unique senders/recipients. |
+| [`token_transfers`](#token_transfers) | Decoded `Transfer` events. |
 
 User-defined views registered through the [`/views` API](#views-api) live alongside these in `analytics_{chainId}` and are queryable the same way.
 
-#### token_transfers
+#### address_balances
 
 > [!NOTE]
-> Materialized view over `logs`, kept in sync on reorg.
+> View over `address_holder_deltas FINAL`, grouped by `(holder, token)`.
 
-One row per canonical `Transfer(address,address,uint256)` log, decoded at insert time. `ReplacingMergeTree` keyed on `(token, block_num, log_idx, tx_hash)`.
+Current positive balances grouped by holder first — answers "what does this address hold?" in one sort-key range. `token_balances` answers the inverse "who holds this token?" — same underlying transfer events, two different sort orders.
 
 | Column | Type | Description |
 |--------|------|-------------|
-| `block_num` | `Int64` | Block number |
-| `block_timestamp` | `DateTime64(3, 'UTC')` | Block timestamp |
-| `tx_idx` | `Int32` | Transaction index |
-| `log_idx` | `Int32` | Log index |
-| `tx_hash` | `String` | Transaction hash |
-| `token` | `String` | Emitting token contract |
-| `from` | `String` | Sender address |
-| `to` | `String` | Recipient address |
-| `amount` | `UInt256` | Transfer amount |
-| `is_virtual_forward` | `UInt8` | 1 if this transfer was inserted via a virtual-forward path |
-
-```bash
-curl -G "https://tidx.example.com/query" \
-  --data-urlencode "chainId=42431" \
-  --data-urlencode "engine=clickhouse" \
-  --data-urlencode "sql=SELECT token, \`from\`, \`to\`, toString(amount) AS amount, tx_hash
-    FROM token_transfers
-    WHERE token = '0x20c000000000000000000000e65cb5a40b7885ae'
-    ORDER BY block_num DESC, log_idx DESC
-    LIMIT 3"
-```
-
-```json
-{"ok":true,"columns":["token","from","to","amount","tx_hash"],"rows":[
-  ["0x20c000000000000000000000e65cb5a40b7885ae","0x70997970c51812dc3a010c7d01b50e0d17dc79c8","0xfeec000000000000000000000000000000000000","17431","0x9d…ab"],
-  ["0x20c000000000000000000000e65cb5a40b7885ae","0x3c44cdddb6a900fa2b585dd299e03d12fa4293bc","0x70997970c51812dc3a010c7d01b50e0d17dc79c8","42","0x77…3c"],
-  ["0x20c000000000000000000000e65cb5a40b7885ae","0x90f79bf6eb2c4f870365e785982e1f101e93b906","0x3c44cdddb6a900fa2b585dd299e03d12fa4293bc","99","0x12…ef"]
-]}
-```
-
-#### token_holder_deltas
-
-> [!NOTE]
-> Materialized view over `token_transfers`, kept in sync on reorg.
-
-Two rows per transfer (recipient `leg=+1`, sender `leg=-1`); skips zero-address legs. `ReplacingMergeTree` deduplicates by `(token, holder, block_num, tx_hash, log_idx, leg)` so retried inserts collapse on merge.
-
-| Column | Type | Description |
-|--------|------|-------------|
-| `block_num` | `Int64` | Block number |
-| `block_timestamp` | `DateTime64(3, 'UTC')` | Block timestamp |
-| `tx_hash` | `String` | Transaction hash |
-| `log_idx` | `Int32` | Log index |
-| `token` | `String` | Token contract |
-| `holder` | `String` | Holder address (sender or recipient) |
-| `leg` | `Int8` | `+1` for recipient credit, `-1` for sender debit |
-| `balance_delta` | `Int256` | Signed delta applied to `holder` for `token` at this block |
-
-```bash
-curl -G "https://tidx.example.com/query" \
-  --data-urlencode "chainId=42431" \
-  --data-urlencode "engine=clickhouse" \
-  --data-urlencode "sql=SELECT block_num, toString(balance_delta) AS delta, leg
-    FROM token_holder_deltas
-    WHERE token = '0x20c000000000000000000000e65cb5a40b7885ae'
-      AND holder = '0x70997970c51812dc3a010c7d01b50e0d17dc79c8'
-    ORDER BY block_num DESC, log_idx DESC
-    LIMIT 5"
-```
-
-```json
-{"ok":true,"columns":["block_num","delta","leg"],"rows":[
-  [1062,"-17431",-1],
-  [1059,"42",1],
-  [1051,"-180",-1],
-  [1043,"500",1],
-  [1027,"-23",-1]
-]}
-```
-
-To reconstruct a holder's balance at block `N`:
-
-```sql
-SELECT sum(balance_delta)
-FROM token_holder_deltas FINAL
-WHERE token = '0x…' AND holder = '0x…' AND block_num <= 1050
-```
-
-#### token_balances
-
-> [!NOTE]
-> View over `token_holder_deltas FINAL`, always reflects the post-merge state.
-
-Current positive balance per `(token, holder)`, rolled up from `token_holder_deltas`. Filtered to `balance > 0`.
-
-| Column | Type | Description |
-|--------|------|-------------|
-| `token` | `String` | Token contract |
 | `holder` | `String` | Holder address |
+| `token` | `String` | Token contract |
 | `balance` | `Int256` | Current balance (positive only) |
 
 ```bash
 curl -G "https://tidx.example.com/query" \
   --data-urlencode "chainId=42431" \
   --data-urlencode "engine=clickhouse" \
-  --data-urlencode "sql=SELECT holder, toString(balance) AS balance
-    FROM token_balances
-    WHERE token = '0x20c000000000000000000000e65cb5a40b7885ae'
-    ORDER BY balance DESC
-    LIMIT 5"
+  --data-urlencode "sql=SELECT token, toString(balance) AS balance
+    FROM address_balances
+    WHERE holder = '0x70997970c51812dc3a010c7d01b50e0d17dc79c8'
+    ORDER BY balance DESC"
 ```
 
-```json
-{"ok":true,"columns":["holder","balance"],"rows":[
-  ["0x70997970c51812dc3a010c7d01b50e0d17dc79c8","68056473384187692692674921486353642324"],
-  ["0x3c44cdddb6a900fa2b585dd299e03d12fa4293bc","68056473384187692692674921486353642370"],
-  ["0x15d34aaf54267db7d7c367839aaf71a00a2c6a65","68056473384187692692674921486353642328"],
-  ["0x90f79bf6eb2c4f870365e785982e1f101e93b906","68056473384187692692674921486353642286"],
-  ["0xf39fd6e51aad88f6f4ce6ab8827279cfffb92266","68056473384187692692674921486353642272"]
-]}
-```
-
-#### token_supply
+#### address_holder_deltas
 
 > [!NOTE]
-> View over `token_transfers FINAL`, computes net mints minus burns from zero-address legs.
+> Materialized view over `token_transfers`, kept in sync on reorg.
 
-Outstanding supply per token, derived from `Transfer` events whose sender or recipient is `0x0`. Mints (`from = 0x0`) add to supply, burns (`to = 0x0`) subtract. Filtered to `supply > 0`.
-
-| Column | Type | Description |
-|--------|------|-------------|
-| `token` | `String` | Token contract |
-| `supply` | `Int256` | Cumulative mints − cumulative burns |
-
-```bash
-curl -G "https://tidx.example.com/query" \
-  --data-urlencode "chainId=42431" \
-  --data-urlencode "engine=clickhouse" \
-  --data-urlencode "sql=SELECT token, toString(supply) AS supply
-    FROM token_supply
-    ORDER BY supply DESC
-    LIMIT 5"
-```
-
-```json
-{"ok":true,"columns":["token","supply"],"rows":[
-  ["0x20c000000000000000000000e65cb5a40b7885ae","340282366920938463463374607431768211455"],
-  ["0x20c0000000000000000000003f9a1b2c4d5e6f70","100000000000000000000000"]
-]}
-```
-
-#### token_approvals
-
-> [!NOTE]
-> Materialized view over `logs`, kept in sync on reorg.
-
-One row per canonical `Approval(address,address,uint256)` log, decoded at insert time. `ReplacingMergeTree` keyed on `(token, block_num, log_idx, tx_hash)`. Stores raw approval events — to get the latest allowance per `(token, owner, spender)`, query with `ORDER BY block_num DESC, log_idx DESC LIMIT 1`.
+Same deltas as `token_holder_deltas` but ordered `(holder, token, block_num, …)` so per-holder balance reconstructions are a sort-key seek. Two rows per transfer (recipient `leg=+1`, sender `leg=-1`); skips zero-address legs.
 
 | Column | Type | Description |
 |--------|------|-------------|
 | `block_num` | `Int64` | Block number |
 | `block_timestamp` | `DateTime64(3, 'UTC')` | Block timestamp |
-| `tx_idx` | `Int32` | Transaction index |
-| `log_idx` | `Int32` | Log index |
 | `tx_hash` | `String` | Transaction hash |
-| `token` | `String` | Emitting token contract |
-| `owner` | `String` | Approving address (token holder) |
-| `spender` | `String` | Approved spender |
-| `amount` | `UInt256` | Allowance set on this event |
-
-```bash
-curl -G "https://tidx.example.com/query" \
-  --data-urlencode "chainId=42431" \
-  --data-urlencode "engine=clickhouse" \
-  --data-urlencode "sql=SELECT owner, spender, toString(amount) AS amount, block_num
-    FROM token_approvals
-    WHERE token = '0x20c000000000000000000000e65cb5a40b7885ae'
-    ORDER BY block_num DESC, log_idx DESC
-    LIMIT 3"
-```
-
-```json
-{"ok":true,"columns":["owner","spender","amount","block_num"],"rows":[
-  ["0x70997970c51812dc3a010c7d01b50e0d17dc79c8","0x3c44cdddb6a900fa2b585dd299e03d12fa4293bc","115792089237316195423570985008687907853269984665640564039457584007913129639935",1083],
-  ["0x70997970c51812dc3a010c7d01b50e0d17dc79c8","0x3c44cdddb6a900fa2b585dd299e03d12fa4293bc","0",1071],
-  ["0x3c44cdddb6a900fa2b585dd299e03d12fa4293bc","0x15d34aaf54267db7d7c367839aaf71a00a2c6a65","500",1042]
-]}
-```
-
-#### token_transfer_stats
-
-> [!NOTE]
-> View over `token_transfers FINAL`, aggregated per `(day, token)`.
-
-Per-day per-token rollups of transfer activity. Aggregated at query time so reorgs and retries are inherited from the underlying `token_transfers` table.
-
-| Column | Type | Description |
-|--------|------|-------------|
-| `day` | `Date` | Day (UTC) bucket from `block_timestamp` |
+| `log_idx` | `Int32` | Log index |
+| `holder` | `String` | Holder address |
 | `token` | `String` | Token contract |
-| `transfer_count` | `UInt64` | Number of `Transfer` events on that day |
-| `volume` | `UInt256` | Sum of `amount` across all transfers on that day |
-| `unique_senders` | `UInt64` | Distinct `from` addresses on that day |
-| `unique_recipients` | `UInt64` | Distinct `to` addresses on that day |
-
-```bash
-curl -G "https://tidx.example.com/query" \
-  --data-urlencode "chainId=42431" \
-  --data-urlencode "engine=clickhouse" \
-  --data-urlencode "sql=SELECT day, transfer_count, toString(volume) AS volume, unique_senders, unique_recipients
-    FROM token_transfer_stats
-    WHERE token = '0x20c000000000000000000000e65cb5a40b7885ae'
-    ORDER BY day DESC
-    LIMIT 5"
-```
-
-```json
-{"ok":true,"columns":["day","transfer_count","volume","unique_senders","unique_recipients"],"rows":[
-  ["2026-05-27",18342,"984320012345678901234567",1024,987],
-  ["2026-05-26",17211,"872100012345678901234567",1011,973],
-  ["2026-05-25",16982,"851234012345678901234567",998,961]
-]}
-```
-
-#### token_approvals_current
-
-> [!NOTE]
-> View over `token_approvals FINAL`, `argMax` per `(token, owner, spender)`.
-
-Current allowance per `(token, owner, spender)` — collapses `token_approvals` history down to the last set value, filtered to `amount > 0`. Cheap lookup for "what can `spender` move on behalf of `owner`?"
-
-| Column | Type | Description |
-|--------|------|-------------|
-| `token` | `String` | Token contract |
-| `owner` | `String` | Approving address |
-| `spender` | `String` | Approved spender |
-| `amount` | `UInt256` | Latest allowance for the pair |
-| `last_block_num` | `Int64` | Block of the latest `Approval` event |
-| `last_block_timestamp` | `DateTime64(3, 'UTC')` | Timestamp of that event |
-| `last_tx_hash` | `String` | Transaction hash of that event |
-
-```bash
-curl -G "https://tidx.example.com/query" \
-  --data-urlencode "chainId=42431" \
-  --data-urlencode "engine=clickhouse" \
-  --data-urlencode "sql=SELECT spender, toString(amount) AS amount, last_block_num
-    FROM token_approvals_current
-    WHERE token = '0x20c000000000000000000000e65cb5a40b7885ae'
-      AND owner = '0x70997970c51812dc3a010c7d01b50e0d17dc79c8'
-    ORDER BY amount DESC"
-```
-
-#### token_metadata
-
-> [!NOTE]
-> View over `token_transfers FINAL`, aggregated per `token`.
-
-Discovery / activity rollup per token contract. Every token that has ever emitted a `Transfer` shows up here with first/last seen block and timestamp plus a lifetime transfer count. Pair with a verified-tokens allowlist at query time to power `/tokens` listings.
-
-| Column | Type | Description |
-|--------|------|-------------|
-| `token` | `String` | Token contract |
-| `first_seen_block` | `Int64` | Block of the first observed `Transfer` |
-| `last_seen_block` | `Int64` | Block of the most recent `Transfer` |
-| `first_seen_timestamp` | `DateTime64(3, 'UTC')` | Timestamp of the first `Transfer` |
-| `last_seen_timestamp` | `DateTime64(3, 'UTC')` | Timestamp of the most recent `Transfer` |
-| `transfer_count` | `UInt64` | Total `Transfer` events ever emitted by this token |
-
-```bash
-curl -G "https://tidx.example.com/query" \
-  --data-urlencode "chainId=42431" \
-  --data-urlencode "engine=clickhouse" \
-  --data-urlencode "sql=SELECT token, transfer_count, first_seen_block, last_seen_block
-    FROM token_metadata
-    ORDER BY transfer_count DESC
-    LIMIT 5"
-```
+| `leg` | `Int8` | `+1` for credit, `-1` for debit |
+| `balance_delta` | `Int256` | Signed delta applied to `(holder, token)` |
 
 #### address_transfers
 
@@ -897,47 +661,6 @@ curl -G "https://tidx.example.com/query" \
     WHERE address = '0x70997970c51812dc3a010c7d01b50e0d17dc79c8'
     ORDER BY block_num DESC, log_idx DESC
     LIMIT 5"
-```
-
-#### address_holder_deltas
-
-> [!NOTE]
-> Materialized view over `token_transfers`, kept in sync on reorg.
-
-Same deltas as `token_holder_deltas` but ordered `(holder, token, block_num, …)` so per-holder balance reconstructions are a sort-key seek. Two rows per transfer (recipient `leg=+1`, sender `leg=-1`); skips zero-address legs.
-
-| Column | Type | Description |
-|--------|------|-------------|
-| `block_num` | `Int64` | Block number |
-| `block_timestamp` | `DateTime64(3, 'UTC')` | Block timestamp |
-| `tx_hash` | `String` | Transaction hash |
-| `log_idx` | `Int32` | Log index |
-| `holder` | `String` | Holder address |
-| `token` | `String` | Token contract |
-| `leg` | `Int8` | `+1` for credit, `-1` for debit |
-| `balance_delta` | `Int256` | Signed delta applied to `(holder, token)` |
-
-#### address_balances
-
-> [!NOTE]
-> View over `address_holder_deltas FINAL`, grouped by `(holder, token)`.
-
-Current positive balances grouped by holder first — answers "what does this address hold?" in one sort-key range. `token_balances` answers the inverse "who holds this token?" — same underlying transfer events, two different sort orders.
-
-| Column | Type | Description |
-|--------|------|-------------|
-| `holder` | `String` | Holder address |
-| `token` | `String` | Token contract |
-| `balance` | `Int256` | Current balance (positive only) |
-
-```bash
-curl -G "https://tidx.example.com/query" \
-  --data-urlencode "chainId=42431" \
-  --data-urlencode "engine=clickhouse" \
-  --data-urlencode "sql=SELECT token, toString(balance) AS balance
-    FROM address_balances
-    WHERE holder = '0x70997970c51812dc3a010c7d01b50e0d17dc79c8'
-    ORDER BY balance DESC"
 ```
 
 #### address_txs
@@ -995,6 +718,283 @@ curl -G "https://tidx.example.com/query" \
     ORDER BY block_num DESC, tx_idx DESC
     LIMIT 5"
 ```
+#### token_approvals
+
+> [!NOTE]
+> Materialized view over `logs`, kept in sync on reorg.
+
+One row per canonical `Approval(address,address,uint256)` log, decoded at insert time. `ReplacingMergeTree` keyed on `(token, block_num, log_idx, tx_hash)`. Stores raw approval events — to get the latest allowance per `(token, owner, spender)`, query with `ORDER BY block_num DESC, log_idx DESC LIMIT 1`.
+
+| Column | Type | Description |
+|--------|------|-------------|
+| `block_num` | `Int64` | Block number |
+| `block_timestamp` | `DateTime64(3, 'UTC')` | Block timestamp |
+| `tx_idx` | `Int32` | Transaction index |
+| `log_idx` | `Int32` | Log index |
+| `tx_hash` | `String` | Transaction hash |
+| `token` | `String` | Emitting token contract |
+| `owner` | `String` | Approving address (token holder) |
+| `spender` | `String` | Approved spender |
+| `amount` | `UInt256` | Allowance set on this event |
+
+```bash
+curl -G "https://tidx.example.com/query" \
+  --data-urlencode "chainId=42431" \
+  --data-urlencode "engine=clickhouse" \
+  --data-urlencode "sql=SELECT owner, spender, toString(amount) AS amount, block_num
+    FROM token_approvals
+    WHERE token = '0x20c000000000000000000000e65cb5a40b7885ae'
+    ORDER BY block_num DESC, log_idx DESC
+    LIMIT 3"
+```
+
+```json
+{"ok":true,"columns":["owner","spender","amount","block_num"],"rows":[
+  ["0x70997970c51812dc3a010c7d01b50e0d17dc79c8","0x3c44cdddb6a900fa2b585dd299e03d12fa4293bc","115792089237316195423570985008687907853269984665640564039457584007913129639935",1083],
+  ["0x70997970c51812dc3a010c7d01b50e0d17dc79c8","0x3c44cdddb6a900fa2b585dd299e03d12fa4293bc","0",1071],
+  ["0x3c44cdddb6a900fa2b585dd299e03d12fa4293bc","0x15d34aaf54267db7d7c367839aaf71a00a2c6a65","500",1042]
+]}
+```
+
+#### token_approvals_current
+
+> [!NOTE]
+> View over `token_approvals FINAL`, `argMax` per `(token, owner, spender)`.
+
+Current allowance per `(token, owner, spender)` — collapses `token_approvals` history down to the last set value, filtered to `amount > 0`. Cheap lookup for "what can `spender` move on behalf of `owner`?"
+
+| Column | Type | Description |
+|--------|------|-------------|
+| `token` | `String` | Token contract |
+| `owner` | `String` | Approving address |
+| `spender` | `String` | Approved spender |
+| `amount` | `UInt256` | Latest allowance for the pair |
+| `last_block_num` | `Int64` | Block of the latest `Approval` event |
+| `last_block_timestamp` | `DateTime64(3, 'UTC')` | Timestamp of that event |
+| `last_tx_hash` | `String` | Transaction hash of that event |
+
+```bash
+curl -G "https://tidx.example.com/query" \
+  --data-urlencode "chainId=42431" \
+  --data-urlencode "engine=clickhouse" \
+  --data-urlencode "sql=SELECT spender, toString(amount) AS amount, last_block_num
+    FROM token_approvals_current
+    WHERE token = '0x20c000000000000000000000e65cb5a40b7885ae'
+      AND owner = '0x70997970c51812dc3a010c7d01b50e0d17dc79c8'
+    ORDER BY amount DESC"
+```
+
+#### token_balances
+
+> [!NOTE]
+> View over `token_holder_deltas FINAL`, always reflects the post-merge state.
+
+Current positive balance per `(token, holder)`, rolled up from `token_holder_deltas`. Filtered to `balance > 0`.
+
+| Column | Type | Description |
+|--------|------|-------------|
+| `token` | `String` | Token contract |
+| `holder` | `String` | Holder address |
+| `balance` | `Int256` | Current balance (positive only) |
+
+```bash
+curl -G "https://tidx.example.com/query" \
+  --data-urlencode "chainId=42431" \
+  --data-urlencode "engine=clickhouse" \
+  --data-urlencode "sql=SELECT holder, toString(balance) AS balance
+    FROM token_balances
+    WHERE token = '0x20c000000000000000000000e65cb5a40b7885ae'
+    ORDER BY balance DESC
+    LIMIT 5"
+```
+
+```json
+{"ok":true,"columns":["holder","balance"],"rows":[
+  ["0x70997970c51812dc3a010c7d01b50e0d17dc79c8","68056473384187692692674921486353642324"],
+  ["0x3c44cdddb6a900fa2b585dd299e03d12fa4293bc","68056473384187692692674921486353642370"],
+  ["0x15d34aaf54267db7d7c367839aaf71a00a2c6a65","68056473384187692692674921486353642328"],
+  ["0x90f79bf6eb2c4f870365e785982e1f101e93b906","68056473384187692692674921486353642286"],
+  ["0xf39fd6e51aad88f6f4ce6ab8827279cfffb92266","68056473384187692692674921486353642272"]
+]}
+```
+
+#### token_holder_deltas
+
+> [!NOTE]
+> Materialized view over `token_transfers`, kept in sync on reorg.
+
+Two rows per transfer (recipient `leg=+1`, sender `leg=-1`); skips zero-address legs. `ReplacingMergeTree` deduplicates by `(token, holder, block_num, tx_hash, log_idx, leg)` so retried inserts collapse on merge.
+
+| Column | Type | Description |
+|--------|------|-------------|
+| `block_num` | `Int64` | Block number |
+| `block_timestamp` | `DateTime64(3, 'UTC')` | Block timestamp |
+| `tx_hash` | `String` | Transaction hash |
+| `log_idx` | `Int32` | Log index |
+| `token` | `String` | Token contract |
+| `holder` | `String` | Holder address (sender or recipient) |
+| `leg` | `Int8` | `+1` for recipient credit, `-1` for sender debit |
+| `balance_delta` | `Int256` | Signed delta applied to `holder` for `token` at this block |
+
+```bash
+curl -G "https://tidx.example.com/query" \
+  --data-urlencode "chainId=42431" \
+  --data-urlencode "engine=clickhouse" \
+  --data-urlencode "sql=SELECT block_num, toString(balance_delta) AS delta, leg
+    FROM token_holder_deltas
+    WHERE token = '0x20c000000000000000000000e65cb5a40b7885ae'
+      AND holder = '0x70997970c51812dc3a010c7d01b50e0d17dc79c8'
+    ORDER BY block_num DESC, log_idx DESC
+    LIMIT 5"
+```
+
+```json
+{"ok":true,"columns":["block_num","delta","leg"],"rows":[
+  [1062,"-17431",-1],
+  [1059,"42",1],
+  [1051,"-180",-1],
+  [1043,"500",1],
+  [1027,"-23",-1]
+]}
+```
+
+To reconstruct a holder's balance at block `N`:
+
+```sql
+SELECT sum(balance_delta)
+FROM token_holder_deltas FINAL
+WHERE token = '0x…' AND holder = '0x…' AND block_num <= 1050
+```
+
+#### token_metadata
+
+> [!NOTE]
+> View over `token_transfers FINAL`, aggregated per `token`.
+
+Discovery / activity rollup per token contract. Every token that has ever emitted a `Transfer` shows up here with first/last seen block and timestamp plus a lifetime transfer count. Pair with a verified-tokens allowlist at query time to power `/tokens` listings.
+
+| Column | Type | Description |
+|--------|------|-------------|
+| `token` | `String` | Token contract |
+| `first_seen_block` | `Int64` | Block of the first observed `Transfer` |
+| `last_seen_block` | `Int64` | Block of the most recent `Transfer` |
+| `first_seen_timestamp` | `DateTime64(3, 'UTC')` | Timestamp of the first `Transfer` |
+| `last_seen_timestamp` | `DateTime64(3, 'UTC')` | Timestamp of the most recent `Transfer` |
+| `transfer_count` | `UInt64` | Total `Transfer` events ever emitted by this token |
+
+```bash
+curl -G "https://tidx.example.com/query" \
+  --data-urlencode "chainId=42431" \
+  --data-urlencode "engine=clickhouse" \
+  --data-urlencode "sql=SELECT token, transfer_count, first_seen_block, last_seen_block
+    FROM token_metadata
+    ORDER BY transfer_count DESC
+    LIMIT 5"
+```
+
+#### token_supply
+
+> [!NOTE]
+> View over `token_transfers FINAL`, computes net mints minus burns from zero-address legs.
+
+Outstanding supply per token, derived from `Transfer` events whose sender or recipient is `0x0`. Mints (`from = 0x0`) add to supply, burns (`to = 0x0`) subtract. Filtered to `supply > 0`.
+
+| Column | Type | Description |
+|--------|------|-------------|
+| `token` | `String` | Token contract |
+| `supply` | `Int256` | Cumulative mints − cumulative burns |
+
+```bash
+curl -G "https://tidx.example.com/query" \
+  --data-urlencode "chainId=42431" \
+  --data-urlencode "engine=clickhouse" \
+  --data-urlencode "sql=SELECT token, toString(supply) AS supply
+    FROM token_supply
+    ORDER BY supply DESC
+    LIMIT 5"
+```
+
+```json
+{"ok":true,"columns":["token","supply"],"rows":[
+  ["0x20c000000000000000000000e65cb5a40b7885ae","340282366920938463463374607431768211455"],
+  ["0x20c0000000000000000000003f9a1b2c4d5e6f70","100000000000000000000000"]
+]}
+```
+
+#### token_transfer_stats
+
+> [!NOTE]
+> View over `token_transfers FINAL`, aggregated per `(day, token)`.
+
+Per-day per-token rollups of transfer activity. Aggregated at query time so reorgs and retries are inherited from the underlying `token_transfers` table.
+
+| Column | Type | Description |
+|--------|------|-------------|
+| `day` | `Date` | Day (UTC) bucket from `block_timestamp` |
+| `token` | `String` | Token contract |
+| `transfer_count` | `UInt64` | Number of `Transfer` events on that day |
+| `volume` | `UInt256` | Sum of `amount` across all transfers on that day |
+| `unique_senders` | `UInt64` | Distinct `from` addresses on that day |
+| `unique_recipients` | `UInt64` | Distinct `to` addresses on that day |
+
+```bash
+curl -G "https://tidx.example.com/query" \
+  --data-urlencode "chainId=42431" \
+  --data-urlencode "engine=clickhouse" \
+  --data-urlencode "sql=SELECT day, transfer_count, toString(volume) AS volume, unique_senders, unique_recipients
+    FROM token_transfer_stats
+    WHERE token = '0x20c000000000000000000000e65cb5a40b7885ae'
+    ORDER BY day DESC
+    LIMIT 5"
+```
+
+```json
+{"ok":true,"columns":["day","transfer_count","volume","unique_senders","unique_recipients"],"rows":[
+  ["2026-05-27",18342,"984320012345678901234567",1024,987],
+  ["2026-05-26",17211,"872100012345678901234567",1011,973],
+  ["2026-05-25",16982,"851234012345678901234567",998,961]
+]}
+```
+
+#### token_transfers
+
+> [!NOTE]
+> Materialized view over `logs`, kept in sync on reorg.
+
+One row per canonical `Transfer(address,address,uint256)` log, decoded at insert time. `ReplacingMergeTree` keyed on `(token, block_num, log_idx, tx_hash)`.
+
+| Column | Type | Description |
+|--------|------|-------------|
+| `block_num` | `Int64` | Block number |
+| `block_timestamp` | `DateTime64(3, 'UTC')` | Block timestamp |
+| `tx_idx` | `Int32` | Transaction index |
+| `log_idx` | `Int32` | Log index |
+| `tx_hash` | `String` | Transaction hash |
+| `token` | `String` | Emitting token contract |
+| `from` | `String` | Sender address |
+| `to` | `String` | Recipient address |
+| `amount` | `UInt256` | Transfer amount |
+| `is_virtual_forward` | `UInt8` | 1 if this transfer was inserted via a virtual-forward path |
+
+```bash
+curl -G "https://tidx.example.com/query" \
+  --data-urlencode "chainId=42431" \
+  --data-urlencode "engine=clickhouse" \
+  --data-urlencode "sql=SELECT token, \`from\`, \`to\`, toString(amount) AS amount, tx_hash
+    FROM token_transfers
+    WHERE token = '0x20c000000000000000000000e65cb5a40b7885ae'
+    ORDER BY block_num DESC, log_idx DESC
+    LIMIT 3"
+```
+
+```json
+{"ok":true,"columns":["token","from","to","amount","tx_hash"],"rows":[
+  ["0x20c000000000000000000000e65cb5a40b7885ae","0x70997970c51812dc3a010c7d01b50e0d17dc79c8","0xfeec000000000000000000000000000000000000","17431","0x9d…ab"],
+  ["0x20c000000000000000000000e65cb5a40b7885ae","0x3c44cdddb6a900fa2b585dd299e03d12fa4293bc","0x70997970c51812dc3a010c7d01b50e0d17dc79c8","42","0x77…3c"],
+  ["0x20c000000000000000000000e65cb5a40b7885ae","0x90f79bf6eb2c4f870365e785982e1f101e93b906","0x3c44cdddb6a900fa2b585dd299e03d12fa4293bc","99","0x12…ef"]
+]}
+```
+
 
 ## Sync Architecture
 
