@@ -5,7 +5,7 @@ use tokio_postgres::NoTls;
 use url::Url;
 
 #[tokio::test]
-async fn test_pg_upgrade_adds_virtual_forward_column_before_indexes() {
+async fn test_pg_upgrade_adds_missing_postgres_ddl() {
     let Ok(url) = std::env::var("DATABASE_URL") else {
         eprintln!("DATABASE_URL not set, skipping migration upgrade test");
         return;
@@ -24,7 +24,21 @@ async fn test_pg_upgrade_adds_virtual_forward_column_before_indexes() {
 
         conn.batch_execute(
             r#"
+            DROP TABLE IF EXISTS blocks CASCADE;
             DROP TABLE IF EXISTS logs CASCADE;
+
+            CREATE TABLE blocks (
+                num             INT8 NOT NULL,
+                hash            BYTEA NOT NULL,
+                parent_hash     BYTEA NOT NULL,
+                timestamp       TIMESTAMPTZ NOT NULL,
+                timestamp_ms    INT8 NOT NULL,
+                gas_limit       INT8 NOT NULL,
+                gas_used        INT8 NOT NULL,
+                miner           BYTEA NOT NULL,
+                extra_data      BYTEA,
+                PRIMARY KEY (timestamp, num)
+            );
 
             CREATE TABLE logs (
                 block_num       INT8 NOT NULL,
@@ -52,14 +66,20 @@ async fn test_pg_upgrade_adds_virtual_forward_column_before_indexes() {
             "#,
         )
         .await
-        .expect("Failed to create old logs schema");
+        .expect("Failed to create old schema");
 
         run_migrations(&pool)
             .await
-            .expect("Failed to run migrations against old logs schema");
+            .expect("Failed to run migrations against old schema");
+        run_migrations(&pool)
+            .await
+            .expect("Failed to rerun migrations against upgraded schema");
         run_post_startup_migrations(&pool)
             .await
-            .expect("Failed to run post-startup migrations against old logs schema");
+            .expect("Failed to run post-startup migrations against old schema");
+        run_post_startup_migrations(&pool)
+            .await
+            .expect("Failed to rerun post-startup migrations against upgraded schema");
 
         let conn = pool.get().await.expect("Failed to get post-migration connection");
 
@@ -82,6 +102,48 @@ async fn test_pg_upgrade_adds_virtual_forward_column_before_indexes() {
         assert!(
             col_exists,
             "logs.is_virtual_forward column should exist after migration"
+        );
+
+        let consensus_proposer_exists: bool = conn
+            .query_one(
+                r#"
+                SELECT EXISTS (
+                    SELECT 1
+                    FROM information_schema.columns
+                    WHERE table_schema = 'public'
+                      AND table_name = 'blocks'
+                      AND column_name = 'consensus_proposer'
+                )
+                "#,
+                &[],
+            )
+            .await
+            .expect("Failed to query blocks columns")
+            .get(0);
+        assert!(
+            consensus_proposer_exists,
+            "blocks.consensus_proposer column should exist after migration"
+        );
+
+        let consensus_proposer_constraint_exists: bool = conn
+            .query_one(
+                r#"
+                SELECT EXISTS (
+                    SELECT 1
+                    FROM pg_constraint
+                    WHERE conrelid = 'blocks'::regclass
+                      AND contype = 'c'
+                      AND pg_get_constraintdef(oid) LIKE '%consensus_proposer%'
+                )
+                "#,
+                &[],
+            )
+            .await
+            .expect("Failed to query blocks constraints")
+            .get(0);
+        assert!(
+            consensus_proposer_constraint_exists,
+            "blocks.consensus_proposer length constraint should exist after migration"
         );
 
         let indexes: Vec<String> = conn

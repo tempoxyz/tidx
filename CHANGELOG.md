@@ -5,6 +5,7 @@
 ### Minor Changes
 
 - Added ClickHouse materialized views for token and address analytics: `token_transfers`, `token_balances`, `token_supply`, `token_approvals`, `token_transfer_stats`, `token_metadata`, `address_transfers`, `address_balances`, `address_txs`, and `contract_creations`. Available when running with `engine="clickhouse"`. (by @jxom, [#198](https://github.com/tempoxyz/tidx/pull/198))
+- Removed pgroll runtime support so PostgreSQL schema upgrades are handled by tidx's idempotent startup migrations.
 
 ## `tidx@0.5.6`
 
@@ -183,4 +184,3 @@
 ### Patch Changes
 
 - Initial release. (by @jxom, [9bba8d5](https://github.com/tempoxyz/tidx/commit/9bba8d5))
-

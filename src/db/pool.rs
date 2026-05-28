@@ -17,12 +17,12 @@ pub async fn create_pool_with_size(database_url: &str, max_size: usize) -> Resul
     // inside transactions, and Clean recycling clears leaked session state.
     let url_with_timeout = if database_url.contains('?') {
         format!(
-            "{}&options=-c%20idle_in_transaction_session_timeout%3D60000%20-c%20pgroll.no_inferred_migrations%3DTRUE",
+            "{}&options=-c%20idle_in_transaction_session_timeout%3D60000",
             database_url
         )
     } else {
         format!(
-            "{}?options=-c%20idle_in_transaction_session_timeout%3D60000%20-c%20pgroll.no_inferred_migrations%3DTRUE",
+            "{}?options=-c%20idle_in_transaction_session_timeout%3D60000",
             database_url
         )
     };

@@ -5,9 +5,8 @@ use super::Pool;
 
 const VIRTUAL_FORWARD_INDEX_SQL: &str =
     include_str!("../../db/migrations/20260417_add_logs_virtual_forward_indexes.sql");
-const VIRTUAL_FORWARD_TX_HASH_INDEX_SQL: &str = "CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_logs_tx_hash_virtual_forward \
-ON logs (tx_hash, log_idx) \
-WHERE is_virtual_forward = TRUE;";
+const VIRTUAL_FORWARD_TX_HASH_INDEX_SQL: &str =
+    include_str!("../../db/migrations/20260417_add_logs_tx_hash_virtual_forward_index.sql");
 
 pub async fn run_migrations(pool: &Pool) -> Result<()> {
     let conn = pool.get().await?;
@@ -53,10 +52,13 @@ pub async fn run_migrations(pool: &Pool) -> Result<()> {
         "../../db/migrations/20260416_add_is_virtual_forward.sql"
     ))
     .await?;
+    conn.batch_execute(include_str!(
+        "../../db/migrations/20260430_add_blocks_consensus_proposer.sql"
+    ))
+    .await?;
 
     // Heavyweight upgrades such as concurrent index creation run in a
-    // best-effort post-startup task so normal boot isn't blocked. Production
-    // should still apply them in a pre-deploy migration flow.
+    // best-effort post-startup task so normal boot isn't blocked.
 
     // Load any optional extensions
     conn.batch_execute(include_str!("../../db/extensions.sql"))

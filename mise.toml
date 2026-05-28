@@ -9,7 +9,6 @@ actionlint = "latest"
 "pipx:sqlfluff" = "latest"
 "github:foundry-rs/foundry" = "nightly"
 "github:tempoxyz/changelogs" = "latest"
-"github:xataio/pgroll" = { version = "latest", bin = "pgroll" }
 
 [shell_alias]
 psql = "usql"
