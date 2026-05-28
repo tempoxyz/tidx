@@ -80,9 +80,9 @@ impl ClickHouseObject {
 
 #[derive(Clone, Copy)]
 pub enum BackfillPolicy {
-    /// Run the select if the target table is empty. Caller MUST guarantee no
-    /// concurrent writers — the indexer enforces this by calling
-    /// `ensure_schema()` exclusively at startup, before any sink writes.
+    /// Run the select if the target table is empty. The indexer captures a
+    /// startup block cutoff and runs historical backfills through that cutoff;
+    /// materialized views cover rows written after the plan is created.
     IfEmpty { select_sql: &'static str },
 }
 

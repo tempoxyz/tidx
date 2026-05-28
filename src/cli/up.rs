@@ -351,23 +351,41 @@ fn spawn_sync_engine(
                         ch_config.user.as_deref(),
                         ch_password.as_deref(),
                     ) {
-                        Ok(ch_sink) => {
-                            if let Err(e) = ch_sink.ensure_schema().await {
+                        Ok(ch_sink) => match ch_sink.ensure_schema_and_plan_backfills().await {
+                            Ok(derived_backfills) => {
+                                info!(
+                                    chain = %chain.name,
+                                    database = %database,
+                                    derived_backfills = derived_backfills.len(),
+                                    "ClickHouse direct-write sink enabled"
+                                );
+                                if !derived_backfills.is_empty() {
+                                    let backfill_sink = ch_sink.clone();
+                                    let backfill_chain_name = chain.name.clone();
+                                    tokio::spawn(async move {
+                                        if let Err(e) = backfill_sink
+                                            .run_derived_backfill_plan(derived_backfills)
+                                            .await
+                                        {
+                                            error!(
+                                                error = %e,
+                                                chain = %backfill_chain_name,
+                                                "ClickHouse derived table backfill failed"
+                                            );
+                                        }
+                                    });
+                                }
+                                seed_metrics_from_clickhouse(&ch_sink).await;
+                                sinks = sinks.with_clickhouse(ch_sink);
+                            }
+                            Err(e) => {
                                 error!(
                                     error = %e,
                                     chain = %chain.name,
                                     "Failed to initialize ClickHouse schema (continuing without CH sink)"
                                 );
-                            } else {
-                                info!(
-                                    chain = %chain.name,
-                                    database = %database,
-                                    "ClickHouse direct-write sink enabled"
-                                );
-                                seed_metrics_from_clickhouse(&ch_sink).await;
-                                sinks = sinks.with_clickhouse(ch_sink);
                             }
-                        }
+                        },
                         Err(e) => {
                             error!(
                                 error = %e,

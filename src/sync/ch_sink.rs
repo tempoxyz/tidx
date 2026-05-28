@@ -52,6 +52,17 @@ pub struct ClickHouseSink {
     database: String,
 }
 
+/// A historical derived-table backfill planned from the schema state observed
+/// at startup. Materialized views handle rows written after `cutoff`, so these
+/// jobs can run in the background without holding up the sync engine.
+#[derive(Clone, Debug)]
+pub struct DerivedBackfillPlan {
+    target: &'static str,
+    select_sql: &'static str,
+    block_column: &'static str,
+    cutoff: i64,
+}
+
 impl ClickHouseSink {
     /// Create a new ClickHouse sink.
     ///
@@ -98,10 +109,22 @@ impl ClickHouseSink {
     /// 3. Reconcile derived views / materialized views: if a definition's
     ///    checksum has changed since the last `ensure_schema()`, drop and
     ///    recreate it so SELECT-body edits actually take effect.
-    /// 4. One-shot backfill any derived table whose target is empty. The
-    ///    caller MUST guarantee no concurrent writers — the indexer enforces
-    ///    this by running `ensure_schema()` at startup before any sink writes.
+    /// 4. One-shot backfill any derived table whose target is empty.
     pub async fn ensure_schema(&self) -> Result<()> {
+        self.ensure_schema_objects().await?;
+        self.backfill_derived_objects_if_empty().await
+    }
+
+    /// Reconcile schema objects and return any historical derived-table
+    /// backfills that should run after startup. This lets the indexer start
+    /// syncing immediately while large materialized tables catch up in the
+    /// background.
+    pub async fn ensure_schema_and_plan_backfills(&self) -> Result<Vec<DerivedBackfillPlan>> {
+        self.ensure_schema_objects().await?;
+        self.plan_derived_backfills_if_empty().await
+    }
+
+    async fn ensure_schema_objects(&self) -> Result<()> {
         self.base_client
             .query(&format!("CREATE DATABASE IF NOT EXISTS {}", self.database))
             .execute()
@@ -222,7 +245,7 @@ impl ClickHouseSink {
             debug!(object = object.name, database = %self.database, "ClickHouse object ready");
         }
 
-        self.backfill_derived_objects_if_empty().await
+        Ok(())
     }
 
     async fn record_applied(&self, name: &str, checksum: &str, kind: &str) -> Result<()> {
@@ -241,15 +264,58 @@ impl ClickHouseSink {
         Ok(())
     }
 
-    /// Snapshot-guarded one-shot backfill. The `IfEmpty` policy only runs the
-    /// backfill INSERT when the target is empty AND `logs` did not advance
-    /// during the operation (which would indicate a concurrent writer — the
-    /// race that `POPULATE` is famous for in ClickHouse).
+    /// One-shot backfill for empty derived tables. The plan captures a block
+    /// cutoff from dependency tables before writers start, then executes
+    /// backfills through that cutoff in dependency order. Materialized views
+    /// cover newer rows written while the plan is running.
     async fn backfill_derived_objects_if_empty(&self) -> Result<()> {
+        let plans = self.plan_derived_backfills_if_empty().await?;
+        self.run_derived_backfill_plan(plans).await
+    }
+
+    /// Execute a planned derived-table backfill.
+    pub async fn run_derived_backfill_plan(&self, plans: Vec<DerivedBackfillPlan>) -> Result<()> {
+        if plans.is_empty() {
+            return Ok(());
+        }
+
+        info!(
+            database = %self.database,
+            backfills = plans.len(),
+            "Starting ClickHouse derived table backfills"
+        );
+
+        for plan in plans {
+            info!(
+                database = %self.database,
+                table = plan.target,
+                cutoff = plan.cutoff,
+                "Backfilling ClickHouse derived table"
+            );
+
+            self.client
+                .query(&bounded_backfill_sql(&plan))
+                .execute()
+                .await
+                .map_err(|e| anyhow!("Failed to backfill ClickHouse table {}: {e}", plan.target))?;
+        }
+
+        info!(
+            database = %self.database,
+            "ClickHouse derived table backfills complete"
+        );
+        Ok(())
+    }
+
+    async fn plan_derived_backfills_if_empty(&self) -> Result<Vec<DerivedBackfillPlan>> {
+        let mut plans = Vec::new();
+        let mut cutoffs_by_table = HashMap::new();
+
         for object in derived_backfills() {
             let Some(BackfillPolicy::IfEmpty { select_sql }) = object.backfill else {
                 continue;
             };
+
             let count: u64 = self
                 .client
                 .query(&format!("SELECT count() FROM {}", object.name))
@@ -257,50 +323,49 @@ impl ClickHouseSink {
                 .await
                 .map_err(|e| anyhow!("Failed to count ClickHouse table {}: {e}", object.name))?;
             if count > 0 {
+                if let Some(max) = self.max_block_in_table(object.name).await? {
+                    cutoffs_by_table.insert(object.name, max);
+                }
                 continue;
             }
 
-            let before = self.logs_watermark().await?;
-
-            self.client
-                .query(&format!("INSERT INTO {} {}", object.name, select_sql))
-                .execute()
-                .await
-                .map_err(|e| anyhow!("Failed to backfill ClickHouse table {}: {e}", object.name))?;
-
-            let after = self.logs_watermark().await?;
-            if before != after {
+            let Some(block_column) = object.block_column else {
                 return Err(anyhow!(
-                    "ClickHouse backfill of {} raced with a concurrent writer: \
-                     logs watermark advanced from {:?} to {:?} during the backfill. \
-                     Rebuild the derived table with no other writers active.",
-                    object.name,
-                    before,
-                    after
+                    "ClickHouse derived backfill table {} has no block column",
+                    object.name
                 ));
-            }
+            };
+            let Some(cutoff) = self
+                .source_cutoff_for_backfill(object, &cutoffs_by_table)
+                .await?
+            else {
+                continue;
+            };
+
+            plans.push(DerivedBackfillPlan {
+                target: object.name,
+                select_sql,
+                block_column,
+                cutoff,
+            });
+            cutoffs_by_table.insert(object.name, cutoff);
         }
 
-        Ok(())
+        Ok(plans)
     }
 
-    async fn logs_watermark(&self) -> Result<Option<i64>> {
-        let count: u64 = self
-            .client
-            .query("SELECT count() FROM logs")
-            .fetch_one()
-            .await
-            .map_err(|e| anyhow!("ClickHouse query failed: {e}"))?;
-        if count == 0 {
+    async fn source_cutoff_for_backfill(
+        &self,
+        object: &ClickHouseObject,
+        cutoffs_by_table: &HashMap<&'static str, i64>,
+    ) -> Result<Option<i64>> {
+        let Some(source) = object.depends_on.first().copied() else {
             return Ok(None);
+        };
+        if let Some(cutoff) = cutoffs_by_table.get(source) {
+            return Ok(Some(*cutoff));
         }
-        let max: i64 = self
-            .client
-            .query("SELECT max(block_num) FROM logs")
-            .fetch_one()
-            .await
-            .map_err(|e| anyhow!("ClickHouse query failed: {e}"))?;
-        Ok(Some(max))
+        self.max_block_in_table(source).await
     }
 
     pub fn name(&self) -> &'static str {
@@ -727,6 +792,16 @@ fn checksum_of(ddl: &str) -> String {
     format!("{:016x}", hasher.finish())
 }
 
+fn bounded_backfill_sql(plan: &DerivedBackfillPlan) -> String {
+    format!(
+        "INSERT INTO {} SELECT * FROM ({}) WHERE {} <= {}",
+        plan.target,
+        plan.select_sql.trim(),
+        plan.block_column,
+        plan.cutoff
+    )
+}
+
 /// Validate that a table name is one of the known tables.
 /// Returns the validated name or an error for unknown tables.
 fn validate_table_name(table: &str) -> Result<&str> {
@@ -828,6 +903,21 @@ mod tests {
         );
         assert!(ClickHouseSink::new("http://localhost:8123", "123bad", None, None).is_err());
         assert!(ClickHouseSink::new("http://localhost:8123", "", None, None).is_err());
+    }
+
+    #[test]
+    fn test_bounded_backfill_sql_wraps_select_with_cutoff() {
+        let plan = DerivedBackfillPlan {
+            target: "address_txs",
+            select_sql: "SELECT block_num, tx_hash FROM txs\n",
+            block_column: "block_num",
+            cutoff: 123,
+        };
+
+        assert_eq!(
+            bounded_backfill_sql(&plan),
+            "INSERT INTO address_txs SELECT * FROM (SELECT block_num, tx_hash FROM txs) WHERE block_num <= 123"
+        );
     }
 
     #[test]
