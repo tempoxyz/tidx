@@ -869,7 +869,7 @@ WHERE token = '0x…' AND holder = '0x…' AND block_num <= 1050
 #### token_metadata
 
 > [!NOTE]
-> View over `token_transfers FINAL`, aggregated per `token`.
+> View over `token_metadata_blocks` (a `SummingMergeTree` materialized per `(token, block_num)`), aggregated per `token`. Reorg-safe via `block_num`.
 
 Discovery / activity rollup per token contract. Every token that has ever emitted a `Transfer` shows up here with first/last seen block and timestamp plus a lifetime transfer count. Pair with a verified-tokens allowlist at query time to power `/tokens` listings.
 
