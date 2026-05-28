@@ -1,7 +1,13 @@
+mod address_balances;
+mod address_transfers;
+mod address_txs;
 mod base;
 mod catalog;
+mod contract_creations;
 mod token_approvals;
+mod token_approvals_current;
 mod token_balances;
+mod token_metadata;
 mod token_supply;
 mod token_transfer_stats;
 mod token_transfers;
@@ -17,12 +23,21 @@ pub fn migrations() -> &'static [ClickHouseObject] {
 }
 
 pub fn derived_objects() -> impl DoubleEndedIterator<Item = &'static ClickHouseObject> {
+    // Order matters: each object's `depends_on` must reference an object that
+    // appears earlier in this iterator (validated by tests). `reorg_tables`
+    // reverses this order so dependents are pruned before their sources.
     token_transfers::OBJECTS
         .iter()
         .chain(token_balances::OBJECTS.iter())
         .chain(token_supply::OBJECTS.iter())
         .chain(token_approvals::OBJECTS.iter())
+        .chain(token_approvals_current::OBJECTS.iter())
+        .chain(token_metadata::OBJECTS.iter())
         .chain(token_transfer_stats::OBJECTS.iter())
+        .chain(address_transfers::OBJECTS.iter())
+        .chain(address_balances::OBJECTS.iter())
+        .chain(address_txs::OBJECTS.iter())
+        .chain(contract_creations::OBJECTS.iter())
 }
 
 /// Tables and views that the public `/query` HTTP surface may reference.
@@ -84,43 +99,77 @@ mod tests {
     }
 
     #[test]
-    fn new_aggregate_objects_are_registered_for_public_query() {
+    fn aggregate_objects_are_registered_for_public_query() {
         assert!(is_public_query_table("token_supply"));
         assert!(is_public_query_table("token_approvals"));
         assert_eq!(block_column("token_approvals"), Some("block_num"));
         assert!(is_public_query_table("token_transfer_stats"));
+        assert!(is_public_query_table("token_approvals_current"));
+        assert!(is_public_query_table("token_metadata"));
+    }
+
+    #[test]
+    fn address_keyed_objects_are_registered_for_public_query() {
+        assert!(is_public_query_table("address_transfers"));
+        assert_eq!(block_column("address_transfers"), Some("block_num"));
+        assert!(is_public_query_table("address_holder_deltas"));
+        assert_eq!(block_column("address_holder_deltas"), Some("block_num"));
+        assert!(is_public_query_table("address_balances"));
+        assert!(is_public_query_table("address_txs"));
+        assert_eq!(block_column("address_txs"), Some("block_num"));
+        assert!(is_public_query_table("contract_creations"));
+        assert_eq!(block_column("contract_creations"), Some("block_num"));
     }
 
     #[test]
     fn materialized_views_are_known_but_not_public_query_tables() {
-        assert!(!is_public_query_table("token_transfers_mv"));
-        assert!(is_known_table("token_transfers_mv"));
-        assert!(!is_public_query_table("token_holder_deltas_mv"));
-        assert!(is_known_table("token_holder_deltas_mv"));
-        assert!(!is_public_query_table("token_approvals_mv"));
-        assert!(is_known_table("token_approvals_mv"));
+        for mv in [
+            "token_transfers_mv",
+            "token_holder_deltas_mv",
+            "token_approvals_mv",
+            "address_transfers_mv",
+            "address_holder_deltas_mv",
+            "address_txs_mv",
+            "contract_creations_mv",
+        ] {
+            assert!(!is_public_query_table(mv), "{mv} should not be public");
+            assert!(is_known_table(mv), "{mv} should be known to the sink");
+        }
     }
 
     #[test]
     fn reorg_tables_delete_derived_tables_before_base_logs() {
         let tables: Vec<_> = reorg_tables().map(|table| table.name).collect();
-        let transfers = tables
-            .iter()
-            .position(|table| *table == "token_transfers")
-            .unwrap();
-        let deltas = tables
-            .iter()
-            .position(|table| *table == "token_holder_deltas")
-            .unwrap();
-        let approvals = tables
-            .iter()
-            .position(|table| *table == "token_approvals")
-            .unwrap();
-        let logs = tables.iter().position(|table| *table == "logs").unwrap();
-        assert!(deltas < transfers);
-        assert!(transfers < logs);
-        assert!(deltas < logs);
-        assert!(approvals < logs);
+        let position = |name: &str| {
+            tables
+                .iter()
+                .position(|t| *t == name)
+                .unwrap_or_else(|| panic!("{name} not in reorg list"))
+        };
+        // Derived tables that read from token_transfers must be pruned first.
+        let logs = position("logs");
+        let txs = position("txs");
+        let receipts = position("receipts");
+        let token_transfers = position("token_transfers");
+        let token_holder_deltas = position("token_holder_deltas");
+        let token_approvals = position("token_approvals");
+        let address_transfers = position("address_transfers");
+        let address_holder_deltas = position("address_holder_deltas");
+        let address_txs = position("address_txs");
+        let contract_creations = position("contract_creations");
+
+        // token_transfers consumers prune before it
+        assert!(token_holder_deltas < token_transfers);
+        assert!(address_transfers < token_transfers);
+        assert!(address_holder_deltas < token_transfers);
+
+        // token_transfers and token_approvals prune before their source `logs`
+        assert!(token_transfers < logs);
+        assert!(token_approvals < logs);
+
+        // Address-keyed tx feed prunes before `txs`; contract_creations before `receipts`.
+        assert!(address_txs < txs);
+        assert!(contract_creations < receipts);
     }
 
     #[test]
