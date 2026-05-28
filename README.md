@@ -573,21 +573,21 @@ For Transfer logs specifically, [`token_transfers`](#token_transfers) is pre-dec
 
 ClickHouse maintains these on insert and prunes them on reorg. Token-keyed tables answer "for this token, …"; address-keyed tables answer "for this account, …". Both families read from the same underlying Transfer/tx/receipt streams — the duplication exists so that either filter resolves via a sort-key seek instead of a full scan.
 
-| Name | Sort key | Source | Purpose |
-|------|----------|--------|---------|
-| [`token_transfers`](#token_transfers) | `(token, block_num, log_idx, tx_hash)` | `logs` (Transfer selector) | Decoded `Transfer` events. |
-| [`token_holder_deltas`](#token_holder_deltas) | `(token, holder, block_num, …)` | `token_transfers` | Per-event ± balance change, two rows per transfer. |
-| [`token_balances`](#token_balances) | inherited from `token_holder_deltas` | `token_holder_deltas FINAL` | Current positive balance per `(token, holder)`. |
-| [`token_supply`](#token_supply) | n/a (view) | `token_transfers FINAL` | Per-token mints − burns (zero-address legs). |
-| [`token_approvals`](#token_approvals) | `(token, block_num, log_idx, tx_hash)` | `logs` (Approval selector) | Decoded `Approval` events. |
-| [`token_approvals_current`](#token_approvals_current) | n/a (view) | `token_approvals FINAL` | Latest allowance per `(token, owner, spender)`. |
-| [`token_metadata`](#token_metadata) | n/a (view) | `token_transfers FINAL` | Per-token first/last seen + lifetime transfer count. |
-| [`token_transfer_stats`](#token_transfer_stats) | n/a (view) | `token_transfers FINAL` | Per-`(day, token)` count, volume, unique senders/recipients. |
-| [`address_transfers`](#address_transfers) | `(address, block_num, log_idx, tx_hash, direction)` | `token_transfers` | Transfer feed keyed by account; `'in'`/`'out'`. |
-| [`address_holder_deltas`](#address_holder_deltas) | `(holder, token, block_num, …)` | `token_transfers` | Holder-first mirror of `token_holder_deltas`. |
-| [`address_balances`](#address_balances) | inherited from `address_holder_deltas` | `address_holder_deltas FINAL` | Current positive balance per `(holder, token)`. |
-| [`address_txs`](#address_txs) | `(address, block_num, tx_idx, direction)` | `txs` | Tx feed keyed by account; `'from'`/`'to'`. |
-| [`contract_creations`](#contract_creations) | `(creator, block_num, tx_idx)` | `receipts` (where `contract_address IS NOT NULL`) | One row per contract deployment. |
+| Name | Purpose |
+|------|---------|
+| [`token_transfers`](#token_transfers) | Decoded `Transfer` events. |
+| [`token_holder_deltas`](#token_holder_deltas) | Per-event ± balance change, two rows per transfer. |
+| [`token_balances`](#token_balances) | Current positive balance per `(token, holder)`. |
+| [`token_supply`](#token_supply) | Per-token mints − burns (zero-address legs). |
+| [`token_approvals`](#token_approvals) | Decoded `Approval` events. |
+| [`token_approvals_current`](#token_approvals_current) | Latest allowance per `(token, owner, spender)`. |
+| [`token_metadata`](#token_metadata) | Per-token first/last seen + lifetime transfer count. |
+| [`token_transfer_stats`](#token_transfer_stats) | Per-`(day, token)` count, volume, unique senders/recipients. |
+| [`address_transfers`](#address_transfers) | Transfer feed keyed by account; `'in'`/`'out'`. |
+| [`address_holder_deltas`](#address_holder_deltas) | Holder-first mirror of `token_holder_deltas`. |
+| [`address_balances`](#address_balances) | Current positive balance per `(holder, token)`. |
+| [`address_txs`](#address_txs) | Tx feed keyed by account; `'from'`/`'to'`. |
+| [`contract_creations`](#contract_creations) | One row per contract deployment. |
 
 User-defined views registered through the [`/views` API](#views-api) live alongside these in `analytics_{chainId}` and are queryable the same way.
 
