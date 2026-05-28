@@ -455,9 +455,17 @@ curl "https://tidx.example.com/query?chainId=42431&engine=clickhouse&sql=SELECT 
 
 ## Tables
 
-The sync engine writes raw chain data to `blocks`, `txs`, `logs`, `receipts`, and `sync_state` in both PostgreSQL and ClickHouse. You can generate event tables at query time with `?signature=Event(...)`. ClickHouse additionally maintains built-in materialized views — token-keyed (`token_transfers`, `token_balances`, `token_supply`, `token_approvals`, `token_approvals_current`, `token_metadata`, `token_transfer_stats`), address-keyed (`address_transfers`, `address_balances`, `address_txs`, `contract_creations`), and the underlying delta tables — and you can register your own materialized views via the [`/views` API](#views-api).
+Three families of tables are queryable through `/query`:
 
-### blocks
+- **[Base Tables](#base-tables)** — raw chain data written by the sync engine, available in both PostgreSQL and ClickHouse.
+- **[Event Tables](#event-tables)** — virtual, decoded-at-query-time tables generated from `?signature=Event(...)`. Available in both engines.
+- **[Materialized Tables](#materialized-tables)** — precomputed, address- and token-keyed views maintained by ClickHouse on insert. Available only with `engine=clickhouse`. Includes built-ins (token transfers/balances/supply/approvals/metadata, address transfers/balances/txs, contract creations) plus any user-defined views registered through the [`/views` API](#views-api).
+
+### Base Tables
+
+Written by the sync engine to both PostgreSQL and ClickHouse. Schemas are identical across engines; the per-table column names below are the source of truth.
+
+#### blocks
 
 | Column | Type | Description |
 |--------|------|-------------|
@@ -472,7 +480,7 @@ The sync engine writes raw chain data to `blocks`, `txs`, `logs`, `receipts`, an
 | `extra_data` | `BYTEA` | Extra data field |
 | `consensus_proposer` | `BYTEA` | Ed25519 consensus proposer pubkey (TIP-1031, NULL pre-fork) |
 
-### txs
+#### txs
 
 | Column | Type | Description |
 |--------|------|-------------|
@@ -498,7 +506,7 @@ The sync engine writes raw chain data to `blocks`, `txs`, `logs`, `receipts`, an
 | `valid_after` | `INT8` | Validity window end |
 | `signature_type` | `INT2` | Signature type |
 
-### logs
+#### logs
 
 | Column | Type | Description |
 |--------|------|-------------|
@@ -512,7 +520,7 @@ The sync engine writes raw chain data to `blocks`, `txs`, `logs`, `receipts`, an
 | `topics` | `BYTEA[]` | All topics |
 | `data` | `BYTEA` | Event data |
 
-### receipts
+#### receipts
 
 | Column | Type | Description |
 |--------|------|-------------|
@@ -529,7 +537,7 @@ The sync engine writes raw chain data to `blocks`, `txs`, `logs`, `receipts`, an
 | `status` | `INT2` | Success (1) or failure (0) |
 | `fee_payer` | `BYTEA` | Tempo fee payer (if sponsored) |
 
-### sync_state
+#### sync_state
 
 | Column | Type | Description |
 |--------|------|-------------|
@@ -541,7 +549,7 @@ The sync engine writes raw chain data to `blocks`, `txs`, `logs`, `receipts`, an
 | `started_at` | `TIMESTAMPTZ` | Sync start time |
 | `updated_at` | `TIMESTAMPTZ` | Last update time |
 
-### Event tables
+### Event Tables
 
 Pass `?signature=Event(type1,type2,...)` to `/query` and tidx exposes a virtual table named after the event with one column per parameter. The table is generated as a CTE at query time, so no schema registration is needed and any event signature works on demand. Works against both `engine=postgres` and `engine=clickhouse`:
 
@@ -558,10 +566,35 @@ curl -G "https://tidx.example.com/query" \
 
 For Transfer logs specifically, [`token_transfers`](#token_transfers) is pre-decoded and cheaper.
 
-### token_transfers
+### Materialized Tables
 
 > [!NOTE]
-> ClickHouse only — query with `engine=clickhouse`. Materialized view over `logs`, kept in sync on reorg.
+> All tables in this section are ClickHouse-only. Query them with `engine=clickhouse`.
+
+ClickHouse maintains these on insert and prunes them on reorg. Token-keyed tables answer "for this token, …"; address-keyed tables answer "for this account, …". Both families read from the same underlying Transfer/tx/receipt streams — the duplication exists so that either filter resolves via a sort-key seek instead of a full scan.
+
+| Name | Sort key | Source | Purpose |
+|------|----------|--------|---------|
+| [`token_transfers`](#token_transfers) | `(token, block_num, log_idx, tx_hash)` | `logs` (Transfer selector) | Decoded `Transfer` events. |
+| [`token_holder_deltas`](#token_holder_deltas) | `(token, holder, block_num, …)` | `token_transfers` | Per-event ± balance change, two rows per transfer. |
+| [`token_balances`](#token_balances) | inherited from `token_holder_deltas` | `token_holder_deltas FINAL` | Current positive balance per `(token, holder)`. |
+| [`token_supply`](#token_supply) | n/a (view) | `token_transfers FINAL` | Per-token mints − burns (zero-address legs). |
+| [`token_approvals`](#token_approvals) | `(token, block_num, log_idx, tx_hash)` | `logs` (Approval selector) | Decoded `Approval` events. |
+| [`token_approvals_current`](#token_approvals_current) | n/a (view) | `token_approvals FINAL` | Latest allowance per `(token, owner, spender)`. |
+| [`token_metadata`](#token_metadata) | n/a (view) | `token_transfers FINAL` | Per-token first/last seen + lifetime transfer count. |
+| [`token_transfer_stats`](#token_transfer_stats) | n/a (view) | `token_transfers FINAL` | Per-`(day, token)` count, volume, unique senders/recipients. |
+| [`address_transfers`](#address_transfers) | `(address, block_num, log_idx, tx_hash, direction)` | `token_transfers` | Transfer feed keyed by account; `'in'`/`'out'`. |
+| [`address_holder_deltas`](#address_holder_deltas) | `(holder, token, block_num, …)` | `token_transfers` | Holder-first mirror of `token_holder_deltas`. |
+| [`address_balances`](#address_balances) | inherited from `address_holder_deltas` | `address_holder_deltas FINAL` | Current positive balance per `(holder, token)`. |
+| [`address_txs`](#address_txs) | `(address, block_num, tx_idx, direction)` | `txs` | Tx feed keyed by account; `'from'`/`'to'`. |
+| [`contract_creations`](#contract_creations) | `(creator, block_num, tx_idx)` | `receipts` (where `contract_address IS NOT NULL`) | One row per contract deployment. |
+
+User-defined views registered through the [`/views` API](#views-api) live alongside these in `analytics_{chainId}` and are queryable the same way.
+
+#### token_transfers
+
+> [!NOTE]
+> Materialized view over `logs`, kept in sync on reorg.
 
 One row per canonical `Transfer(address,address,uint256)` log, decoded at insert time. `ReplacingMergeTree` keyed on `(token, block_num, log_idx, tx_hash)`.
 
@@ -597,10 +630,10 @@ curl -G "https://tidx.example.com/query" \
 ]}
 ```
 
-### token_holder_deltas
+#### token_holder_deltas
 
 > [!NOTE]
-> ClickHouse only — query with `engine=clickhouse`. Materialized view over `token_transfers`, kept in sync on reorg.
+> Materialized view over `token_transfers`, kept in sync on reorg.
 
 Two rows per transfer (recipient `leg=+1`, sender `leg=-1`); skips zero-address legs. `ReplacingMergeTree` deduplicates by `(token, holder, block_num, tx_hash, log_idx, leg)` so retried inserts collapse on merge.
 
@@ -645,10 +678,10 @@ FROM token_holder_deltas FINAL
 WHERE token = '0x…' AND holder = '0x…' AND block_num <= 1050
 ```
 
-### token_balances
+#### token_balances
 
 > [!NOTE]
-> ClickHouse only — query with `engine=clickhouse`. View over `token_holder_deltas FINAL`, always reflects the post-merge state.
+> View over `token_holder_deltas FINAL`, always reflects the post-merge state.
 
 Current positive balance per `(token, holder)`, rolled up from `token_holder_deltas`. Filtered to `balance > 0`.
 
@@ -679,10 +712,10 @@ curl -G "https://tidx.example.com/query" \
 ]}
 ```
 
-### token_supply
+#### token_supply
 
 > [!NOTE]
-> ClickHouse only — query with `engine=clickhouse`. View over `token_transfers FINAL`, computes net mints minus burns from zero-address legs.
+> View over `token_transfers FINAL`, computes net mints minus burns from zero-address legs.
 
 Outstanding supply per token, derived from `Transfer` events whose sender or recipient is `0x0`. Mints (`from = 0x0`) add to supply, burns (`to = 0x0`) subtract. Filtered to `supply > 0`.
 
@@ -708,10 +741,10 @@ curl -G "https://tidx.example.com/query" \
 ]}
 ```
 
-### token_approvals
+#### token_approvals
 
 > [!NOTE]
-> ClickHouse only — query with `engine=clickhouse`. Materialized view over `logs`, kept in sync on reorg.
+> Materialized view over `logs`, kept in sync on reorg.
 
 One row per canonical `Approval(address,address,uint256)` log, decoded at insert time. `ReplacingMergeTree` keyed on `(token, block_num, log_idx, tx_hash)`. Stores raw approval events — to get the latest allowance per `(token, owner, spender)`, query with `ORDER BY block_num DESC, log_idx DESC LIMIT 1`.
 
@@ -746,10 +779,10 @@ curl -G "https://tidx.example.com/query" \
 ]}
 ```
 
-### token_transfer_stats
+#### token_transfer_stats
 
 > [!NOTE]
-> ClickHouse only — query with `engine=clickhouse`. View over `token_transfers FINAL`, aggregated per `(day, token)`.
+> View over `token_transfers FINAL`, aggregated per `(day, token)`.
 
 Per-day per-token rollups of transfer activity. Aggregated at query time so reorgs and retries are inherited from the underlying `token_transfers` table.
 
@@ -781,10 +814,10 @@ curl -G "https://tidx.example.com/query" \
 ]}
 ```
 
-### token_approvals_current
+#### token_approvals_current
 
 > [!NOTE]
-> ClickHouse only — query with `engine=clickhouse`. View over `token_approvals FINAL`, `argMax` per `(token, owner, spender)`.
+> View over `token_approvals FINAL`, `argMax` per `(token, owner, spender)`.
 
 Current allowance per `(token, owner, spender)` — collapses `token_approvals` history down to the last set value, filtered to `amount > 0`. Cheap lookup for "what can `spender` move on behalf of `owner`?"
 
@@ -809,10 +842,10 @@ curl -G "https://tidx.example.com/query" \
     ORDER BY amount DESC"
 ```
 
-### token_metadata
+#### token_metadata
 
 > [!NOTE]
-> ClickHouse only — query with `engine=clickhouse`. View over `token_transfers FINAL`, aggregated per `token`.
+> View over `token_transfers FINAL`, aggregated per `token`.
 
 Discovery / activity rollup per token contract. Every token that has ever emitted a `Transfer` shows up here with first/last seen block and timestamp plus a lifetime transfer count. Pair with a verified-tokens allowlist at query time to power `/tokens` listings.
 
@@ -835,10 +868,10 @@ curl -G "https://tidx.example.com/query" \
     LIMIT 5"
 ```
 
-### address_transfers
+#### address_transfers
 
 > [!NOTE]
-> ClickHouse only — query with `engine=clickhouse`. Materialized view over `token_transfers`, kept in sync on reorg.
+> Materialized view over `token_transfers`, kept in sync on reorg.
 
 Address-keyed Transfer feed. Each `Transfer` produces up to two rows (one per non-zero side): an `'in'` row for the recipient and an `'out'` row for the sender. `ReplacingMergeTree` ordered by `(address, block_num, log_idx, tx_hash, direction)` so per-address pagination is a sort-key seek instead of a full scan. Zero-address legs are dropped — mints show up only on the recipient's `'in'` side, burns only on the sender's `'out'` side.
 
@@ -866,10 +899,10 @@ curl -G "https://tidx.example.com/query" \
     LIMIT 5"
 ```
 
-### address_holder_deltas
+#### address_holder_deltas
 
 > [!NOTE]
-> ClickHouse only — query with `engine=clickhouse`. Materialized view over `token_transfers`, kept in sync on reorg.
+> Materialized view over `token_transfers`, kept in sync on reorg.
 
 Same deltas as `token_holder_deltas` but ordered `(holder, token, block_num, …)` so per-holder balance reconstructions are a sort-key seek. Two rows per transfer (recipient `leg=+1`, sender `leg=-1`); skips zero-address legs.
 
@@ -884,10 +917,10 @@ Same deltas as `token_holder_deltas` but ordered `(holder, token, block_num, …
 | `leg` | `Int8` | `+1` for credit, `-1` for debit |
 | `balance_delta` | `Int256` | Signed delta applied to `(holder, token)` |
 
-### address_balances
+#### address_balances
 
 > [!NOTE]
-> ClickHouse only — query with `engine=clickhouse`. View over `address_holder_deltas FINAL`, grouped by `(holder, token)`.
+> View over `address_holder_deltas FINAL`, grouped by `(holder, token)`.
 
 Current positive balances grouped by holder first — answers "what does this address hold?" in one sort-key range. `token_balances` answers the inverse "who holds this token?" — same underlying transfer events, two different sort orders.
 
@@ -907,10 +940,10 @@ curl -G "https://tidx.example.com/query" \
     ORDER BY balance DESC"
 ```
 
-### address_txs
+#### address_txs
 
 > [!NOTE]
-> ClickHouse only — query with `engine=clickhouse`. Materialized view over `txs`, kept in sync on reorg.
+> Materialized view over `txs`, kept in sync on reorg.
 
 Address-keyed transaction feed. Each tx produces one row per non-null side (sender always emits an `'from'` row; recipient emits a `'to'` row when `to` is non-null). `ReplacingMergeTree` ordered by `(address, block_num, tx_idx, direction)` so `/addresses/:address/transactions` and the `direction=from|to|both` filter resolve via a sort-key seek.
 
@@ -936,10 +969,10 @@ curl -G "https://tidx.example.com/query" \
     LIMIT 5"
 ```
 
-### contract_creations
+#### contract_creations
 
 > [!NOTE]
-> ClickHouse only — query with `engine=clickhouse`. Materialized view over `receipts`, kept in sync on reorg.
+> Materialized view over `receipts`, kept in sync on reorg.
 
 One row per contract deployment, derived from receipts where `contract_address` is set. Ordered by `(creator, block_num, tx_idx)` so "what contracts did this address deploy?" is a sort-key seek.
 
