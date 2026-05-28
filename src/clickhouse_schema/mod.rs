@@ -127,6 +127,8 @@ mod tests {
             "token_transfers_mv",
             "token_holder_deltas_mv",
             "token_approvals_mv",
+            "token_metadata_blocks",
+            "token_metadata_blocks_mv",
             "address_transfers_mv",
             "address_holder_deltas_mv",
             "address_txs_mv",

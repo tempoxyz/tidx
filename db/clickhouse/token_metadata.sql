@@ -5,6 +5,6 @@ SELECT
     max(block_num)                     AS last_seen_block,
     min(block_timestamp)               AS first_seen_timestamp,
     max(block_timestamp)               AS last_seen_timestamp,
-    count()                            AS transfer_count
-FROM token_transfers FINAL
+    sum(transfer_count)                AS transfer_count
+FROM token_metadata_blocks
 GROUP BY token
