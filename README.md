@@ -78,23 +78,23 @@ The sync engine writes to both PostgreSQL and ClickHouse in parallel. Use the `e
 
 ```bash
 # PostgreSQL (OLTP) - last 10 transfers from an address
-curl "https://tidx.example.com/query \
+curl "https://indexer.tempo.xyz/query \
   ?chainId=4217 \
   &signature=Transfer(address,address,uint256) \
   &sql=SELECT * FROM Transfer WHERE from = '0x...' ORDER BY block_num DESC LIMIT 10"
 
 # ClickHouse (OLAP) - same query, faster for large scans
-curl "https://tidx.example.com/query \
+curl "https://indexer.tempo.xyz/query \
   ?chainId=4217 \
   &engine=clickhouse \
   &signature=Transfer(address,address,uint256) \
   &sql=SELECT * FROM Transfer WHERE from = '0x...' ORDER BY block_num DESC LIMIT 10"
 
 # ClickHouse (OLAP) - query pre-computed views
-curl "https://tidx.example.com/views?chainId=4217"
+curl "https://indexer.tempo.xyz/views?chainId=4217"
 > {"ok":true,"views":[{"name":"top_holders","columns":[{"name":"token","type":"String"},{"name":"holder","type":"String"},{"name":"balance","type":"UInt256"}]}]}
 
-curl "https://tidx.example.com/query \
+curl "https://indexer.tempo.xyz/query \
   ?chainId=4217 \
   &engine=clickhouse \
   &sql=SELECT * FROM top_holders WHERE token = '0x...' LIMIT 10"
@@ -308,11 +308,11 @@ tidx query \
   --signature "Transfer(address indexed from, address indexed to, uint256 value)" \
   "SELECT * FROM Transfer LIMIT 10"
 
-# List views
-tidx views --url https://tidx.example.com list --chain-id 4217
+# List views on the hosted mainnet indexer
+tidx views --url https://indexer.tempo.xyz list --chain-id 4217
 
 # Create a view (must be run from trusted IP)
-tidx views --url https://tidx.example.com create \
+tidx views --url http://localhost:8080 create \
   --chain-id 4217 \
   --name top_holders \
   --sql "SELECT holder, SUM(balance) as total FROM balances GROUP BY holder" \
@@ -326,19 +326,24 @@ tidx upgrade
 
 tidx exposes a HTTP API for querying the indexer.
 
+Hosted endpoints:
+
+- Mainnet: `https://indexer.tempo.xyz` (`chainId=4217`)
+- Testnet: `https://indexer.testnet.tempo.xyz` (`chainId=42431`)
+
 ### Examples
 
 ```bash
 # Point lookup (auto-routed to PostgreSQL)
-curl "https://tidx.example.com/query?chainId=4217&sql=SELECT * FROM blocks WHERE num = 12345"
+curl "https://indexer.tempo.xyz/query?chainId=4217&sql=SELECT * FROM blocks WHERE num = 12345"
 > {"columns":["num","hash","timestamp"],"rows":[[12345,"0xabc...","2024-01-01T00:00:00Z"]],"row_count":1,"engine":"postgres","ok":true}
 
 # Aggregation (auto-routed to ClickHouse)
-curl "https://tidx.example.com/query?chainId=4217&sql=SELECT type, COUNT(*) FROM txs GROUP BY type"
+curl "https://indexer.tempo.xyz/query?chainId=4217&sql=SELECT type, COUNT(*) FROM txs GROUP BY type"
 > {"columns":["type","count"],"rows":[[0,50000],[2,120000]],"row_count":2,"engine":"clickhouse","ok":true}
 
 # Status
-curl https://tidx.example.com/status
+curl http://localhost:8080/status
 > {"ok":true,"chains":[{"chain_id":4217,"synced_num":567890,"head_num":567890,"lag":0}]}
 ```
 
@@ -369,7 +374,7 @@ Manage ClickHouse materialized views for pre-computed analytics. Views are store
 #### List Views
 
 ```bash
-curl "https://tidx.example.com/views?chainId=42431"
+curl "https://indexer.testnet.tempo.xyz/views?chainId=42431"
 ```
 
 ```json
@@ -393,7 +398,7 @@ curl "https://tidx.example.com/views?chainId=42431"
 #### Create View (trusted IP only)
 
 ```bash
-curl -X POST "https://tidx.example.com/views" \
+curl -X POST "http://localhost:8080/views" \
   -H "Content-Type: application/json" \
   -d '{
     "chainId": 42431,
@@ -419,7 +424,7 @@ This creates:
 #### Get View Details
 
 ```bash
-curl "https://tidx.example.com/views/whale_holders?chainId=42431"
+curl "https://indexer.testnet.tempo.xyz/views/whale_holders?chainId=42431"
 ```
 
 ```json
@@ -434,7 +439,7 @@ curl "https://tidx.example.com/views/whale_holders?chainId=42431"
 #### Delete View (trusted IP only)
 
 ```bash
-curl -X DELETE "https://tidx.example.com/views/whale_holders?chainId=42431"
+curl -X DELETE "http://localhost:8080/views/whale_holders?chainId=42431"
 ```
 
 ```json
@@ -450,7 +455,7 @@ Views are auto-prefixed with `analytics_{chainId}` when using `engine=clickhouse
 
 ```bash
 # Query the view (auto-prefixed)
-curl "https://tidx.example.com/query?chainId=42431&engine=clickhouse&sql=SELECT * FROM whale_holders WHERE token = '0x...' ORDER BY balance DESC LIMIT 10"
+curl "https://indexer.testnet.tempo.xyz/query?chainId=42431&engine=clickhouse&sql=SELECT * FROM whale_holders WHERE token = '0x...' ORDER BY balance DESC LIMIT 10"
 ```
 
 ## Tables
@@ -554,7 +559,7 @@ Written by the sync engine to both PostgreSQL and ClickHouse. Schemas are identi
 Pass `?signature=Event(type1,type2,...)` to `/query` and tidx exposes a virtual table named after the event with one column per parameter. The table is generated as a CTE at query time, so no schema registration is needed and any event signature works on demand. Works against both `engine=postgres` and `engine=clickhouse`:
 
 ```bash
-curl -G "https://tidx.example.com/query" \
+curl -G "https://indexer.tempo.xyz/query" \
   --data-urlencode "chainId=4217" \
   --data-urlencode "signature=Transfer(address,address,uint256)" \
   --data-urlencode "sql=SELECT \"from\", \"to\", value
@@ -605,7 +610,7 @@ Current positive balances grouped by holder first — answers "what does this ad
 | `balance` | `Int256` | Current balance (positive only) |
 
 ```bash
-curl -G "https://tidx.example.com/query" \
+curl -G "https://indexer.testnet.tempo.xyz/query" \
   --data-urlencode "chainId=42431" \
   --data-urlencode "engine=clickhouse" \
   --data-urlencode "sql=SELECT token, toString(balance) AS balance
@@ -653,7 +658,7 @@ Address-keyed Transfer feed. Each `Transfer` produces up to two rows (one per no
 | `amount` | `UInt256` | Transfer amount |
 
 ```bash
-curl -G "https://tidx.example.com/query" \
+curl -G "https://indexer.testnet.tempo.xyz/query" \
   --data-urlencode "chainId=42431" \
   --data-urlencode "engine=clickhouse" \
   --data-urlencode "sql=SELECT block_num, direction, counterparty, token, toString(amount) AS amount
@@ -681,7 +686,7 @@ Address-keyed transaction feed. Each tx produces one row per non-null side (send
 | `counterparty` | `Nullable(String)` | The other side, NULL when the source tx had no `to` (contract deploy) |
 
 ```bash
-curl -G "https://tidx.example.com/query" \
+curl -G "https://indexer.testnet.tempo.xyz/query" \
   --data-urlencode "chainId=42431" \
   --data-urlencode "engine=clickhouse" \
   --data-urlencode "sql=SELECT block_num, direction, tx_hash, counterparty
@@ -709,7 +714,7 @@ One row per contract deployment, derived from receipts where `contract_address` 
 | `contract` | `String` | Deployed contract address |
 
 ```bash
-curl -G "https://tidx.example.com/query" \
+curl -G "https://indexer.testnet.tempo.xyz/query" \
   --data-urlencode "chainId=42431" \
   --data-urlencode "engine=clickhouse" \
   --data-urlencode "sql=SELECT contract, block_num, tx_hash
@@ -738,7 +743,7 @@ One row per canonical `Approval(address,address,uint256)` log, decoded at insert
 | `amount` | `UInt256` | Allowance set on this event |
 
 ```bash
-curl -G "https://tidx.example.com/query" \
+curl -G "https://indexer.testnet.tempo.xyz/query" \
   --data-urlencode "chainId=42431" \
   --data-urlencode "engine=clickhouse" \
   --data-urlencode "sql=SELECT owner, spender, toString(amount) AS amount, block_num
@@ -774,7 +779,7 @@ Current allowance per `(token, owner, spender)` — collapses `token_approvals` 
 | `last_tx_hash` | `String` | Transaction hash of that event |
 
 ```bash
-curl -G "https://tidx.example.com/query" \
+curl -G "https://indexer.testnet.tempo.xyz/query" \
   --data-urlencode "chainId=42431" \
   --data-urlencode "engine=clickhouse" \
   --data-urlencode "sql=SELECT spender, toString(amount) AS amount, last_block_num
@@ -798,7 +803,7 @@ Current positive balance per `(token, holder)`, rolled up from `token_holder_del
 | `balance` | `Int256` | Current balance (positive only) |
 
 ```bash
-curl -G "https://tidx.example.com/query" \
+curl -G "https://indexer.testnet.tempo.xyz/query" \
   --data-urlencode "chainId=42431" \
   --data-urlencode "engine=clickhouse" \
   --data-urlencode "sql=SELECT holder, toString(balance) AS balance
@@ -837,7 +842,7 @@ Two rows per transfer (recipient `leg=+1`, sender `leg=-1`); skips zero-address 
 | `balance_delta` | `Int256` | Signed delta applied to `holder` for `token` at this block |
 
 ```bash
-curl -G "https://tidx.example.com/query" \
+curl -G "https://indexer.testnet.tempo.xyz/query" \
   --data-urlencode "chainId=42431" \
   --data-urlencode "engine=clickhouse" \
   --data-urlencode "sql=SELECT block_num, toString(balance_delta) AS delta, leg
@@ -883,7 +888,7 @@ Discovery / activity rollup per token contract. Every token that has ever emitte
 | `transfer_count` | `UInt64` | Total `Transfer` events ever emitted by this token |
 
 ```bash
-curl -G "https://tidx.example.com/query" \
+curl -G "https://indexer.testnet.tempo.xyz/query" \
   --data-urlencode "chainId=42431" \
   --data-urlencode "engine=clickhouse" \
   --data-urlencode "sql=SELECT token, transfer_count, first_seen_block, last_seen_block
@@ -905,7 +910,7 @@ Outstanding supply per token, derived from `Transfer` events whose sender or rec
 | `supply` | `Int256` | Cumulative mints − cumulative burns |
 
 ```bash
-curl -G "https://tidx.example.com/query" \
+curl -G "https://indexer.testnet.tempo.xyz/query" \
   --data-urlencode "chainId=42431" \
   --data-urlencode "engine=clickhouse" \
   --data-urlencode "sql=SELECT token, toString(supply) AS supply
@@ -938,7 +943,7 @@ Per-day per-token rollups of transfer activity. Aggregated at query time so reor
 | `unique_recipients` | `UInt64` | Distinct `to` addresses on that day |
 
 ```bash
-curl -G "https://tidx.example.com/query" \
+curl -G "https://indexer.testnet.tempo.xyz/query" \
   --data-urlencode "chainId=42431" \
   --data-urlencode "engine=clickhouse" \
   --data-urlencode "sql=SELECT day, transfer_count, toString(volume) AS volume, unique_senders, unique_recipients
@@ -977,7 +982,7 @@ One row per canonical `Transfer(address,address,uint256)` log, decoded at insert
 | `is_virtual_forward` | `UInt8` | 1 if this transfer was inserted via a virtual-forward path |
 
 ```bash
-curl -G "https://tidx.example.com/query" \
+curl -G "https://indexer.testnet.tempo.xyz/query" \
   --data-urlencode "chainId=42431" \
   --data-urlencode "engine=clickhouse" \
   --data-urlencode "sql=SELECT token, \`from\`, \`to\`, toString(amount) AS amount, tx_hash
