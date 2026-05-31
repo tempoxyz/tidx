@@ -295,6 +295,9 @@ fn validate_clickhouse_set_expr(
             if let Some(selection) = &select.selection {
                 validate_clickhouse_expr(selection, cte_names, depth)?;
             }
+            if let Some(prewhere) = &select.prewhere {
+                validate_clickhouse_expr(prewhere, cte_names, depth)?;
+            }
             if let sqlparser::ast::GroupByExpr::Expressions(exprs, _) = &select.group_by {
                 for expr in exprs {
                     validate_clickhouse_expr(expr, cte_names, depth)?;
@@ -1726,6 +1729,16 @@ mod tests {
         assert!(
             validate_clickhouse_query(
                 "SELECT count() FROM logs LIMIT 10 BY (SELECT url('http://169.254.169.254'))"
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn test_clickhouse_validates_prewhere_expressions() {
+        assert!(
+            validate_clickhouse_query(
+                "SELECT * FROM logs PREWHERE num IN (SELECT * FROM url('http://169.254.169.254'))"
             )
             .is_err()
         );
