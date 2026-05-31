@@ -223,6 +223,8 @@ const CLICKHOUSE_DANGEROUS_FUNCTIONS: &[&str] = &[
     "mongodb",
     "redis",
     "repeat",
+    "sleep",
+    "sleepeachrow",
 ];
 
 fn validate_clickhouse_query_ast(
@@ -1696,6 +1698,8 @@ mod tests {
             validate_clickhouse_query(r#"SELECT "default"."repeat"('x', 1000000) FROM logs"#)
                 .is_err()
         );
+        assert!(validate_clickhouse_query("SELECT sleep(2) FROM logs").is_err());
+        assert!(validate_clickhouse_query("SELECT sleepEachRow(1) FROM logs").is_err());
     }
 
     #[test]

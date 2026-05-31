@@ -198,8 +198,7 @@ impl ClickHouseEngine {
     ) -> Result<QueryResult> {
         let url = self.query_url(inst, timeout_ms);
 
-        let request_timeout = timeout_ms
-            .map(|timeout_ms| std::time::Duration::from_millis(timeout_ms.saturating_add(100)));
+        let request_timeout = timeout_ms.map(clickhouse_request_timeout);
         let mut req = inst.http_client.post(&url).body(sql.to_string());
         if let Some(timeout) = request_timeout {
             req = req.timeout(timeout);
@@ -214,7 +213,7 @@ impl ClickHouseEngine {
         let resp = if let Some(timeout) = request_timeout {
             tokio::time::timeout(timeout, send)
                 .await
-                .map_err(|_| anyhow!("ClickHouse query timed out"))?
+                .map_err(|_| anyhow!("ClickHouse query execution cancelled by client"))?
                 .map_err(|e| anyhow!("ClickHouse HTTP request failed: {e}"))?
         } else {
             send.await
@@ -289,6 +288,16 @@ impl ClickHouseEngine {
     }
 }
 
+fn clickhouse_request_timeout(timeout_ms: u64) -> std::time::Duration {
+    std::time::Duration::from_millis(
+        timeout_ms
+            .div_ceil(1000)
+            .max(1)
+            .saturating_mul(1000)
+            .saturating_add(100),
+    )
+}
+
 async fn read_limited_response(mut resp: reqwest::Response) -> Result<String> {
     let mut body = Vec::new();
 
@@ -345,6 +354,21 @@ mod tests {
         let query_err =
             anyhow!("ClickHouse query failed: Code: 60. DB::Exception: Table logs doesn't exist");
         assert!(!is_connection_error(&query_err));
+
+        let timeout_err = anyhow!("ClickHouse query execution cancelled by client");
+        assert!(!is_connection_error(&timeout_err));
+    }
+
+    #[test]
+    fn test_clickhouse_request_timeout_exceeds_server_timeout() {
+        assert_eq!(
+            clickhouse_request_timeout(1_001),
+            std::time::Duration::from_millis(2_100)
+        );
+        assert_eq!(
+            clickhouse_request_timeout(100),
+            std::time::Duration::from_millis(1_100)
+        );
     }
 
     #[test]
