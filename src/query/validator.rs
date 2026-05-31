@@ -308,6 +308,9 @@ fn validate_clickhouse_set_expr(
             if let Some(having) = &select.having {
                 validate_clickhouse_expr(having, cte_names, depth)?;
             }
+            for window in &select.named_window {
+                validate_clickhouse_named_window(window, cte_names, depth)?;
+            }
             Ok(())
         }
         SetExpr::Query(query) => validate_clickhouse_query_ast(query, cte_names, depth + 1),
@@ -581,15 +584,59 @@ fn validate_clickhouse_function(
         validate_clickhouse_expr(&order_expr.expr, cte_names, depth)?;
     }
     if let Some(sqlparser::ast::WindowType::WindowSpec(spec)) = &func.over {
-        for expr in &spec.partition_by {
-            validate_clickhouse_expr(expr, cte_names, depth)?;
-        }
-        for order_expr in &spec.order_by {
-            validate_clickhouse_expr(&order_expr.expr, cte_names, depth)?;
-        }
+        validate_clickhouse_window_spec(spec, cte_names, depth)?;
     }
 
     Ok(())
+}
+
+fn validate_clickhouse_named_window(
+    window: &sqlparser::ast::NamedWindowDefinition,
+    cte_names: &HashSet<String>,
+    depth: usize,
+) -> Result<()> {
+    match &window.1 {
+        sqlparser::ast::NamedWindowExpr::NamedWindow(_) => Ok(()),
+        sqlparser::ast::NamedWindowExpr::WindowSpec(spec) => {
+            validate_clickhouse_window_spec(spec, cte_names, depth)
+        }
+    }
+}
+
+fn validate_clickhouse_window_spec(
+    spec: &sqlparser::ast::WindowSpec,
+    cte_names: &HashSet<String>,
+    depth: usize,
+) -> Result<()> {
+    for expr in &spec.partition_by {
+        validate_clickhouse_expr(expr, cte_names, depth)?;
+    }
+    for order_expr in &spec.order_by {
+        validate_clickhouse_expr(&order_expr.expr, cte_names, depth)?;
+    }
+    if let Some(frame) = &spec.window_frame {
+        validate_clickhouse_window_frame_bound(&frame.start_bound, cte_names, depth)?;
+        if let Some(end_bound) = &frame.end_bound {
+            validate_clickhouse_window_frame_bound(end_bound, cte_names, depth)?;
+        }
+    }
+    Ok(())
+}
+
+fn validate_clickhouse_window_frame_bound(
+    bound: &sqlparser::ast::WindowFrameBound,
+    cte_names: &HashSet<String>,
+    depth: usize,
+) -> Result<()> {
+    match bound {
+        sqlparser::ast::WindowFrameBound::CurrentRow
+        | sqlparser::ast::WindowFrameBound::Preceding(None)
+        | sqlparser::ast::WindowFrameBound::Following(None) => Ok(()),
+        sqlparser::ast::WindowFrameBound::Preceding(Some(expr))
+        | sqlparser::ast::WindowFrameBound::Following(Some(expr)) => {
+            validate_clickhouse_expr(expr, cte_names, depth)
+        }
+    }
 }
 
 fn validate_set_expr(set_expr: &SetExpr, cte_names: &HashSet<String>, depth: usize) -> Result<()> {
@@ -1700,6 +1747,16 @@ mod tests {
         );
         assert!(validate_clickhouse_query("SELECT sleep(2) FROM logs").is_err());
         assert!(validate_clickhouse_query("SELECT sleepEachRow(1) FROM logs").is_err());
+    }
+
+    #[test]
+    fn test_clickhouse_rejects_dangerous_function_in_named_window() {
+        assert!(
+            validate_clickhouse_query(
+                "SELECT row_number() OVER w FROM logs WINDOW w AS (ORDER BY sleepEachRow(1))"
+            )
+            .is_err()
+        );
     }
 
     #[test]
