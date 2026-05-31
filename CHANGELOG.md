@@ -1,5 +1,11 @@
 # Changelog
 
+## `tidx@0.6.1`
+
+### Patch Changes
+
+- Added `token_balances_snapshot`, a refreshable ClickHouse materialized view that pre-aggregates holder balances from `token_holder_deltas` on a schedule so holder counts and listings hit the primary key instead of timing out on high-cardinality tokens. (by @jxom, [#208](https://github.com/tempoxyz/tidx/pull/208))
+
 ## `tidx@0.6.0`
 
 ### Minor Changes
