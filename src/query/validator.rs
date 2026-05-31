@@ -524,10 +524,19 @@ fn validate_clickhouse_function(
     cte_names: &HashSet<String>,
     depth: usize,
 ) -> Result<()> {
-    let func_name = func.name.to_string().to_lowercase();
-    let bare_name = func_name.rsplit('.').next().unwrap_or(&func_name);
+    let parts: Vec<String> = func
+        .name
+        .0
+        .iter()
+        .map(|part| {
+            part.as_ident()
+                .map(|ident| ident.value.to_lowercase())
+                .ok_or_else(|| anyhow!("Unsupported function identifier"))
+        })
+        .collect::<Result<_>>()?;
+    let bare_name = parts.last().map(String::as_str).unwrap_or_default();
     if CLICKHOUSE_DANGEROUS_FUNCTIONS.contains(&bare_name) {
-        return Err(anyhow!("Function '{}' is not allowed", func_name));
+        return Err(anyhow!("Function '{}' is not allowed", func.name));
     }
 
     if let FunctionArguments::List(arg_list) = &func.args {
@@ -1679,6 +1688,11 @@ mod tests {
             validate_clickhouse_query("SELECT remote('host', 'db', 'table') FROM logs").is_err()
         );
         assert!(validate_clickhouse_query("SELECT repeat('x', 1000000) FROM logs").is_err());
+        assert!(validate_clickhouse_query(r#"SELECT "repeat"('x', 1000000) FROM logs"#).is_err());
+        assert!(
+            validate_clickhouse_query(r#"SELECT "default"."repeat"('x', 1000000) FROM logs"#)
+                .is_err()
+        );
     }
 
     #[test]
