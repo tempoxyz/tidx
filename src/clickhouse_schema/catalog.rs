@@ -37,6 +37,18 @@ pub enum ClickHouseObjectKind {
         target_table: &'static str,
         select_sql: &'static str,
     },
+    /// `CREATE MATERIALIZED VIEW … REFRESH EVERY … ENGINE … AS select` — a
+    /// self-storing refreshable materialized view that periodically recomputes
+    /// its entire contents from source tables and atomically swaps the result
+    /// into its inner target table. Used for aggregates that are too expensive
+    /// to recompute on every read but don't need incremental freshness.
+    /// Dropped + recreated whenever the DDL checksum changes.
+    ///
+    /// The stored string is the full `CREATE MATERIALIZED VIEW …` statement.
+    /// Creating one requires the `allow_experimental_refreshable_materialized_view`
+    /// setting (still experimental as of ClickHouse 25.x), which the sink applies
+    /// when running the DDL.
+    RefreshableMaterializedView(&'static str),
 }
 
 impl ClickHouseObject {
@@ -44,7 +56,8 @@ impl ClickHouseObject {
         match self.kind {
             ClickHouseObjectKind::Table(sql)
             | ClickHouseObjectKind::Migration(sql)
-            | ClickHouseObjectKind::View(sql) => Cow::Borrowed(sql),
+            | ClickHouseObjectKind::View(sql)
+            | ClickHouseObjectKind::RefreshableMaterializedView(sql) => Cow::Borrowed(sql),
             ClickHouseObjectKind::MaterializedView {
                 target_table,
                 select_sql,
@@ -64,15 +77,29 @@ impl ClickHouseObject {
     }
 
     pub fn is_materialized_view(&self) -> bool {
-        matches!(self.kind, ClickHouseObjectKind::MaterializedView { .. })
+        matches!(
+            self.kind,
+            ClickHouseObjectKind::MaterializedView { .. }
+                | ClickHouseObjectKind::RefreshableMaterializedView(_)
+        )
+    }
+
+    /// True for refreshable materialized views, whose creation requires the
+    /// experimental `allow_experimental_refreshable_materialized_view` setting.
+    pub fn is_refreshable_materialized_view(&self) -> bool {
+        matches!(
+            self.kind,
+            ClickHouseObjectKind::RefreshableMaterializedView(_)
+        )
     }
 
     /// DROP statement to run before re-creating a definition-drifted view/MV.
+    /// Dropping a refreshable MV also drops its inner target table.
     pub fn drop_sql(&self) -> Option<String> {
         match self.kind {
-            ClickHouseObjectKind::MaterializedView { .. } | ClickHouseObjectKind::View(_) => {
-                Some(format!("DROP VIEW IF EXISTS {}", self.name))
-            }
+            ClickHouseObjectKind::MaterializedView { .. }
+            | ClickHouseObjectKind::RefreshableMaterializedView(_)
+            | ClickHouseObjectKind::View(_) => Some(format!("DROP VIEW IF EXISTS {}", self.name)),
             _ => None,
         }
     }

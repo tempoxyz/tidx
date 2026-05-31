@@ -227,8 +227,14 @@ impl ClickHouseSink {
                 }
             }
 
-            self.client
-                .query(&ddl)
+            let mut create = self.client.query(&ddl);
+            if object.is_refreshable_materialized_view() {
+                // Refreshable materialized views are still gated behind an
+                // experimental setting in ClickHouse 25.x. It must be set on the
+                // same statement that runs the CREATE.
+                create = create.with_option("allow_experimental_refreshable_materialized_view", "1");
+            }
+            create
                 .execute()
                 .await
                 .map_err(|e| anyhow!("Failed to create ClickHouse object {}: {e}", object.name))?;
@@ -237,6 +243,9 @@ impl ClickHouseSink {
                 ClickHouseObjectKind::Table(_) => "table",
                 ClickHouseObjectKind::View(_) => "view",
                 ClickHouseObjectKind::MaterializedView { .. } => "materialized_view",
+                ClickHouseObjectKind::RefreshableMaterializedView(_) => {
+                    "refreshable_materialized_view"
+                }
                 ClickHouseObjectKind::Migration(_) => "migration",
             };
             self.record_applied(object.name, &checksum, kind_label)

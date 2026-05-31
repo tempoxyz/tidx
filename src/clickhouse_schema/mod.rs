@@ -94,6 +94,10 @@ mod tests {
         assert!(is_known_table("token_transfers"));
         assert_eq!(block_column("token_transfers"), Some("block_num"));
         assert!(is_public_query_table("token_balances"));
+        // Pre-aggregated holder balances refreshed on a schedule — public so the
+        // /query surface and Cadent can read it instead of re-aggregating deltas.
+        assert!(is_public_query_table("token_balances_snapshot"));
+        assert!(is_known_table("token_balances_snapshot"));
         assert!(is_known_table("token_holder_deltas"));
         assert_eq!(block_column("token_holder_deltas"), Some("block_num"));
     }
