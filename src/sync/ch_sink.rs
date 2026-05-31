@@ -232,7 +232,8 @@ impl ClickHouseSink {
                 // Refreshable materialized views are still gated behind an
                 // experimental setting in ClickHouse 25.x. It must be set on the
                 // same statement that runs the CREATE.
-                create = create.with_option("allow_experimental_refreshable_materialized_view", "1");
+                create =
+                    create.with_option("allow_experimental_refreshable_materialized_view", "1");
             }
             create
                 .execute()
