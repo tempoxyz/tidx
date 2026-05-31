@@ -588,6 +588,7 @@ ClickHouse maintains these on insert and prunes them on reorg. Token-keyed table
 | [`token_approvals`](#token_approvals) | Decoded `Approval` events. |
 | [`token_approvals_current`](#token_approvals_current) | Latest allowance per `(token, owner, spender)`. |
 | [`token_balances`](#token_balances) | Current positive balance per `(token, holder)`. |
+| [`token_balances_snapshot`](#token_balances_snapshot) | Pre-aggregated `token_balances`, refreshed on a schedule. |
 | [`token_holder_deltas`](#token_holder_deltas) | Per-event ± balance change, two rows per transfer. |
 | [`token_metadata`](#token_metadata) | Per-token first/last seen + lifetime transfer count. |
 | [`token_supply`](#token_supply) | Per-token mints − burns (zero-address legs). |
@@ -821,6 +822,28 @@ curl -G "https://indexer.testnet.tempo.xyz/query" \
   ["0x90f79bf6eb2c4f870365e785982e1f101e93b906","68056473384187692692674921486353642286"],
   ["0xf39fd6e51aad88f6f4ce6ab8827279cfffb92266","68056473384187692692674921486353642272"]
 ]}
+```
+
+#### token_balances_snapshot
+
+> [!NOTE]
+> Refreshable materialized view over `token_holder_deltas FINAL`, recomputed on a schedule (every 15 minutes) rather than on insert.
+
+Same `(token, holder, balance)` rollup as [`token_balances`](#token_balances), but stored in its own `MergeTree` ordered by `(token, balance)` so holder counts and "top holders by balance" resolve via a sort-key seek instead of re-aggregating the full delta history on every read. Use this for high-cardinality tokens where the live `token_balances` view would time out; results are up to one refresh interval stale.
+
+| Column | Type | Description |
+|--------|------|-------------|
+| `token` | `String` | Token contract |
+| `holder` | `String` | Holder address |
+| `balance` | `Int256` | Current balance (positive only) |
+
+```bash
+curl -G "https://indexer.testnet.tempo.xyz/query" \
+  --data-urlencode "chainId=42431" \
+  --data-urlencode "engine=clickhouse" \
+  --data-urlencode "sql=SELECT count() AS holders
+    FROM token_balances_snapshot
+    WHERE token = '0x20c000000000000000000000e65cb5a40b7885ae'"
 ```
 
 #### token_holder_deltas
