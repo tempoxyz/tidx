@@ -30,7 +30,7 @@ pub struct EventInserter<'a> {
     tx_idx: i32,
 }
 
-impl<'a> EventInserter<'a> {
+impl EventInserter<'_> {
     pub fn starting_at(mut self, block_num: i64) -> Self {
         self.next_block_num = block_num;
         self
