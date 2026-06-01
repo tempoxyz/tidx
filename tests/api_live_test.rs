@@ -6,60 +6,17 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use alloy::primitives::address;
-use alloy::sol_types::SolEvent;
 use axum::Router;
 use axum::body::Body;
 use axum::extract::connect_info::IntoMakeServiceWithConnectInfo;
 use axum::http::{Request, StatusCode};
-use tower::Service;
 use tempo_contracts::precompiles::{ITIP403Registry, TIP403_REGISTRY_ADDRESS};
+use tower::Service;
 
 use common::testdb::TestDb;
 use serial_test::serial;
 use tidx::api::{self, inject_block_filter};
 use tidx::broadcast::Broadcaster;
-
-async fn insert_tip403_event<E: SolEvent>(
-    db: &TestDb,
-    event: &E,
-    block_num: i64,
-    log_idx: i32,
-) {
-    let conn = db.pool.get().await.expect("Failed to get connection");
-    let topics = event.encode_topics();
-    let topic_bytes: Vec<Vec<u8>> = topics
-        .iter()
-        .map(|topic| topic.0.as_slice().to_vec())
-        .collect();
-    let topic = |idx: usize| topic_bytes.get(idx).cloned();
-    let data = event.encode_data();
-    let tx_hash = [log_idx as u8; 32].to_vec();
-    let block_timestamp = chrono::DateTime::from_timestamp(1_700_000_000 + block_num, 0)
-        .expect("valid timestamp");
-
-    conn.execute(
-        r#"
-        INSERT INTO logs (
-            block_num, block_timestamp, log_idx, tx_idx, tx_hash, address,
-            selector, topic0, topic1, topic2, topic3, data, is_virtual_forward
-        ) VALUES ($1, $2, $3, 0, $4, $5, $6, $6, $7, $8, $9, $10, false)
-        "#,
-        &[
-            &block_num,
-            &block_timestamp,
-            &log_idx,
-            &tx_hash,
-            &TIP403_REGISTRY_ADDRESS.as_slice(),
-            &topic(0),
-            &topic(1),
-            &topic(2),
-            &topic(3),
-            &data,
-        ],
-    )
-    .await
-    .expect("Failed to insert TIP-403 event log");
-}
 
 fn make_pools(pool: tidx::db::Pool) -> (HashMap<u64, tidx::db::Pool>, u64) {
     let mut pools = HashMap::new();
@@ -154,64 +111,45 @@ async fn test_policy_data_whitelist_members() {
     let account_active = address!("0x2000000000000000000000000000000000000001");
     let account_removed = address!("0x2000000000000000000000000000000000000002");
 
-    insert_tip403_event(
-        &db,
-        &ITIP403Registry::PolicyCreated {
+    let mut events = db.event_inserter(TIP403_REGISTRY_ADDRESS).starting_at(10);
+    events
+        .insert(&ITIP403Registry::PolicyCreated {
             policyId: 7,
             updater: creator,
             policyType: ITIP403Registry::PolicyType::WHITELIST,
-        },
-        10,
-        0,
-    )
-    .await;
-    insert_tip403_event(
-        &db,
-        &ITIP403Registry::PolicyAdminUpdated {
+        })
+        .await;
+    events
+        .insert(&ITIP403Registry::PolicyAdminUpdated {
             policyId: 7,
             updater: creator,
             admin,
-        },
-        11,
-        0,
-    )
-    .await;
-    insert_tip403_event(
-        &db,
-        &ITIP403Registry::WhitelistUpdated {
+        })
+        .await;
+    events
+        .insert(&ITIP403Registry::WhitelistUpdated {
             policyId: 7,
             updater: admin,
             account: account_active,
             allowed: true,
-        },
-        12,
-        0,
-    )
-    .await;
-    insert_tip403_event(
-        &db,
-        &ITIP403Registry::WhitelistUpdated {
+        })
+        .await;
+    events
+        .insert(&ITIP403Registry::WhitelistUpdated {
             policyId: 7,
             updater: admin,
             account: account_removed,
             allowed: true,
-        },
-        13,
-        0,
-    )
-    .await;
-    insert_tip403_event(
-        &db,
-        &ITIP403Registry::WhitelistUpdated {
+        })
+        .await;
+    events
+        .insert(&ITIP403Registry::WhitelistUpdated {
             policyId: 7,
             updater: admin,
             account: account_removed,
             allowed: false,
-        },
-        14,
-        0,
-    )
-    .await;
+        })
+        .await;
 
     let broadcaster = Arc::new(Broadcaster::new());
     let (pools, chain_id) = make_pools(db.pool.clone());
@@ -245,7 +183,10 @@ async fn test_policy_data_whitelist_members() {
     assert_eq!(json["metadata"]["created_by"], creator.to_string());
     assert_eq!(json["metadata"]["created_at"], "2023-11-14T22:13:30Z");
     assert_eq!(json["metadata"]["last_updated_at"], "2023-11-14T22:13:34Z");
-    assert_eq!(json["members"], serde_json::json!([account_active.to_string()]));
+    assert_eq!(
+        json["members"],
+        serde_json::json!([account_active.to_string()])
+    );
 }
 
 #[tokio::test]
@@ -258,53 +199,38 @@ async fn test_policy_data_blacklist_members() {
     let restricted = address!("0x4000000000000000000000000000000000000001");
     let unrestricted = address!("0x4000000000000000000000000000000000000002");
 
-    insert_tip403_event(
-        &db,
-        &ITIP403Registry::PolicyCreated {
+    let mut events = db.event_inserter(TIP403_REGISTRY_ADDRESS).starting_at(20);
+    events
+        .insert(&ITIP403Registry::PolicyCreated {
             policyId: 8,
             updater: creator,
             policyType: ITIP403Registry::PolicyType::BLACKLIST,
-        },
-        20,
-        0,
-    )
-    .await;
-    insert_tip403_event(
-        &db,
-        &ITIP403Registry::BlacklistUpdated {
+        })
+        .await;
+    events
+        .insert(&ITIP403Registry::BlacklistUpdated {
             policyId: 8,
             updater: creator,
             account: restricted,
             restricted: true,
-        },
-        21,
-        0,
-    )
-    .await;
-    insert_tip403_event(
-        &db,
-        &ITIP403Registry::BlacklistUpdated {
+        })
+        .await;
+    events
+        .insert(&ITIP403Registry::BlacklistUpdated {
             policyId: 8,
             updater: creator,
             account: unrestricted,
             restricted: true,
-        },
-        22,
-        0,
-    )
-    .await;
-    insert_tip403_event(
-        &db,
-        &ITIP403Registry::BlacklistUpdated {
+        })
+        .await;
+    events
+        .insert(&ITIP403Registry::BlacklistUpdated {
             policyId: 8,
             updater: creator,
             account: unrestricted,
             restricted: false,
-        },
-        23,
-        0,
-    )
-    .await;
+        })
+        .await;
 
     let broadcaster = Arc::new(Broadcaster::new());
     let (pools, chain_id) = make_pools(db.pool.clone());

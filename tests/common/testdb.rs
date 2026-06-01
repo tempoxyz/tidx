@@ -1,3 +1,5 @@
+use alloy::primitives::Address;
+use alloy::sol_types::SolEvent;
 use tidx::db::{Pool, ThrottledPool, create_pool, run_migrations};
 use tidx::sync::engine::SyncEngine;
 use tidx::sync::sink::SinkSet;
@@ -14,6 +16,37 @@ static TEST_LOCK: OnceCell<Mutex<()>> = OnceCell::const_new();
 pub struct TestDb {
     pub pool: Pool,
     _guard: MutexGuard<'static, ()>,
+}
+
+/// Convenience inserter for synthetic event logs in tests.
+///
+/// By default each inserted event advances to the next block with `tx_idx = 0`
+/// and `log_idx = 0`, so tests can express event histories without manually
+/// threading block/log positions through every call.
+pub struct EventInserter<'a> {
+    db: &'a TestDb,
+    address: Address,
+    next_block_num: i64,
+    tx_idx: i32,
+}
+
+impl<'a> EventInserter<'a> {
+    pub fn starting_at(mut self, block_num: i64) -> Self {
+        self.next_block_num = block_num;
+        self
+    }
+
+    pub fn tx_idx(mut self, tx_idx: i32) -> Self {
+        self.tx_idx = tx_idx;
+        self
+    }
+
+    pub async fn insert<E: SolEvent>(&mut self, event: &E) {
+        self.db
+            .insert_event_at(self.address, event, self.next_block_num, self.tx_idx, 0)
+            .await;
+        self.next_block_num += 1;
+    }
 }
 
 impl TestDb {
@@ -102,6 +135,64 @@ and ensure DATABASE_URL points at the Postgres container (for example \
         conn.batch_execute("TRUNCATE blocks, txs, logs, receipts, sync_state CASCADE")
             .await
             .expect("Failed to truncate tables");
+    }
+
+    pub fn event_inserter(&self, address: Address) -> EventInserter<'_> {
+        EventInserter {
+            db: self,
+            address,
+            next_block_num: 1,
+            tx_idx: 0,
+        }
+    }
+
+    pub async fn insert_event_at<E: SolEvent>(
+        &self,
+        address: Address,
+        event: &E,
+        block_num: i64,
+        tx_idx: i32,
+        log_idx: i32,
+    ) {
+        let conn = self.pool.get().await.expect("Failed to get connection");
+        let topics = event.encode_topics();
+        let topic_bytes: Vec<Vec<u8>> = topics
+            .iter()
+            .map(|topic| topic.0.as_slice().to_vec())
+            .collect();
+        let topic = |idx: usize| topic_bytes.get(idx).cloned();
+        let data = event.encode_data();
+        let mut tx_hash = [0u8; 32];
+        tx_hash[16..24].copy_from_slice(&(block_num as u64).to_be_bytes());
+        tx_hash[24..28].copy_from_slice(&(tx_idx as u32).to_be_bytes());
+        tx_hash[28..32].copy_from_slice(&(log_idx as u32).to_be_bytes());
+        let tx_hash = tx_hash.to_vec();
+        let block_timestamp = chrono::DateTime::from_timestamp(1_700_000_000 + block_num, 0)
+            .expect("valid timestamp");
+
+        conn.execute(
+            r#"
+            INSERT INTO logs (
+                block_num, block_timestamp, log_idx, tx_idx, tx_hash, address,
+                selector, topic0, topic1, topic2, topic3, data, is_virtual_forward
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $7, $8, $9, $10, $11, false)
+            "#,
+            &[
+                &block_num,
+                &block_timestamp,
+                &log_idx,
+                &tx_idx,
+                &tx_hash,
+                &address.as_slice(),
+                &topic(0),
+                &topic(1),
+                &topic(2),
+                &topic(3),
+                &data,
+            ],
+        )
+        .await
+        .expect("Failed to insert event log");
     }
 
     pub async fn block_count(&self) -> i64 {
