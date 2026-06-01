@@ -12,17 +12,17 @@ pub async fn create_pool(database_url: &str) -> Result<Pool> {
 pub async fn create_pool_with_size(database_url: &str, max_size: usize) -> Result<Pool> {
     ensure_database_exists(database_url).await?;
 
-    // Kill idle-in-transaction connections after 60s to prevent lock contention on restart
-    // NOTE: statement_timeout is NOT set globally. API queries use SET LOCAL
-    // inside transactions, and Clean recycling clears leaked session state.
+    // Kill idle or active long-running statements in transactions after 60s to prevent
+    // lock contention. API queries still use stricter SET LOCAL timeouts when requested,
+    // and Clean recycling clears leaked session state.
     let url_with_timeout = if database_url.contains('?') {
         format!(
-            "{}&options=-c%20idle_in_transaction_session_timeout%3D60000",
+            "{}&options=-c%20idle_in_transaction_session_timeout%3D60000%20-c%20statement_timeout%3D60000",
             database_url
         )
     } else {
         format!(
-            "{}?options=-c%20idle_in_transaction_session_timeout%3D60000",
+            "{}?options=-c%20idle_in_transaction_session_timeout%3D60000%20-c%20statement_timeout%3D60000",
             database_url
         )
     };
