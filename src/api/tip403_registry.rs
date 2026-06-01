@@ -6,8 +6,6 @@ use serde::{Deserialize, Serialize};
 use alloy::{primitives::B256, sol_types::SolEvent};
 use tempo_contracts::precompiles::{ITIP403Registry, TIP403_REGISTRY_ADDRESS};
 
-use crate::db::Pool;
-
 use super::{ApiError, AppState};
 
 #[derive(Deserialize)]
@@ -59,7 +57,12 @@ pub async fn get_policy_data(
         .await
         .ok_or_else(|| ApiError::BadRequest(format!("Unknown chain_id: {}", params.chain_id)))?;
 
-    let metadata = load_tip403_policy_metadata(&pool, params.chain_id, params.policy_id)
+    let conn = pool
+        .get()
+        .await
+        .map_err(|e| ApiError::QueryError(e.to_string()))?;
+
+    let metadata = load_tip403_policy_metadata(&conn, params.chain_id, params.policy_id)
         .await
         .map_err(|e| ApiError::QueryError(e.to_string()))?
         .ok_or_else(|| {
@@ -67,7 +70,7 @@ pub async fn get_policy_data(
         })?;
 
     let members = if metadata.has_direct_members() {
-        load_tip403_policy_members(&pool, params.policy_id, &metadata.policy_type)
+        load_tip403_policy_members(&conn, params.policy_id, &metadata.policy_type)
             .await
             .map_err(|e| ApiError::QueryError(e.to_string()))?
     } else {
@@ -81,10 +84,10 @@ pub async fn get_policy_data(
     }))
 }
 
-fn decode_event<E: SolEvent>(topics: Vec<Vec<u8>>, data: &[u8]) -> AnyhowResult<E> {
+fn decode_event<E: SolEvent>(topics: &[&[u8]], data: &[u8]) -> AnyhowResult<E> {
     let topics = topics
         .iter()
-        .map(|topic| B256::try_from(topic.as_slice()))
+        .map(|topic| B256::try_from(*topic))
         .collect::<Result<Vec<_>, _>>()?;
     Ok(E::decode_raw_log_validate(topics, data)?)
 }
@@ -96,11 +99,10 @@ fn tip403_policy_topic(policy_id: u64) -> Vec<u8> {
 }
 
 async fn load_tip403_policy_metadata(
-    pool: &Pool,
+    conn: &deadpool_postgres::Object,
     chain_id: u64,
     policy_id: u64,
 ) -> AnyhowResult<Option<PolicyMetadata>> {
-    let conn = pool.get().await?;
     let selector = ITIP403Registry::PolicyCreated::SIGNATURE_HASH.as_slice();
     let policy_topic = tip403_policy_topic(policy_id);
     let registry = TIP403_REGISTRY_ADDRESS.as_slice();
@@ -124,7 +126,7 @@ async fn load_tip403_policy_metadata(
         .ok_or_else(|| anyhow!("PolicyCreated log missing updater topic"))?;
     let data: Vec<u8> = row.get(1);
     let event = decode_event::<ITIP403Registry::PolicyCreated>(
-        vec![selector.to_vec(), policy_topic, updater_topic],
+        &[selector, &policy_topic, &updater_topic],
         &data,
     )?;
     let created_by = event.updater.to_string();
@@ -134,12 +136,12 @@ async fn load_tip403_policy_metadata(
         policy_id,
         registry: TIP403_REGISTRY_ADDRESS.to_string(),
         policy_type: event.policyType,
-        admin: current_tip403_policy_admin(&conn, policy_id)
+        admin: current_tip403_policy_admin(conn, policy_id)
             .await?
             .or_else(|| Some(created_by.clone())),
         created_by: Some(created_by),
         created_at: Some(row.get(2)),
-        last_updated_at: latest_tip403_policy_update_at(&conn, policy_id).await?,
+        last_updated_at: latest_tip403_policy_update_at(conn, policy_id).await?,
     }))
 }
 
@@ -168,7 +170,7 @@ async fn current_tip403_policy_admin(
     let updater_topic: Vec<u8> = row.get(0);
     let admin_topic: Vec<u8> = row.get(1);
     let event = decode_event::<ITIP403Registry::PolicyAdminUpdated>(
-        vec![selector.to_vec(), policy_topic, updater_topic, admin_topic],
+        &[selector, &policy_topic, &updater_topic, &admin_topic],
         &[],
     )?;
     Ok(Some(event.admin.to_string()))
@@ -178,7 +180,7 @@ async fn latest_tip403_policy_update_at(
     conn: &deadpool_postgres::Object,
     policy_id: u64,
 ) -> AnyhowResult<Option<chrono::DateTime<Utc>>> {
-    let selectors = vec![
+    let selectors: [&[u8]; 4] = [
         ITIP403Registry::PolicyCreated::SIGNATURE_HASH.as_slice(),
         ITIP403Registry::PolicyAdminUpdated::SIGNATURE_HASH.as_slice(),
         ITIP403Registry::WhitelistUpdated::SIGNATURE_HASH.as_slice(),
@@ -196,7 +198,7 @@ async fn latest_tip403_policy_update_at(
             ORDER BY block_num DESC, tx_idx DESC, log_idx DESC
             LIMIT 1
             "#,
-            &[&registry, &selectors, &policy_topic],
+            &[&registry, &&selectors[..], &policy_topic],
         )
         .await?;
 
@@ -204,11 +206,10 @@ async fn latest_tip403_policy_update_at(
 }
 
 async fn load_tip403_policy_members(
-    pool: &Pool,
+    conn: &deadpool_postgres::Object,
     policy_id: u64,
     policy_type: &PolicyType,
 ) -> AnyhowResult<Vec<String>> {
-    let conn = pool.get().await?;
     let selector = match policy_type {
         PolicyType::WHITELIST => ITIP403Registry::WhitelistUpdated::SIGNATURE_HASH.as_slice(),
         PolicyType::BLACKLIST => ITIP403Registry::BlacklistUpdated::SIGNATURE_HASH.as_slice(),
@@ -239,24 +240,14 @@ async fn load_tip403_policy_members(
         let active_member = match policy_type {
             PolicyType::WHITELIST => {
                 let event = decode_event::<ITIP403Registry::WhitelistUpdated>(
-                    vec![
-                        selector.to_vec(),
-                        policy_topic.clone(),
-                        updater_topic,
-                        account_topic,
-                    ],
+                    &[selector, &policy_topic, &updater_topic, &account_topic],
                     &data,
                 )?;
                 event.allowed.then(|| event.account.to_string())
             }
             PolicyType::BLACKLIST => {
                 let event = decode_event::<ITIP403Registry::BlacklistUpdated>(
-                    vec![
-                        selector.to_vec(),
-                        policy_topic.clone(),
-                        updater_topic,
-                        account_topic,
-                    ],
+                    &[selector, &policy_topic, &updater_topic, &account_topic],
                     &data,
                 )?;
                 event.restricted.then(|| event.account.to_string())
@@ -269,6 +260,5 @@ async fn load_tip403_policy_members(
         }
     }
 
-    members.sort();
     Ok(members)
 }
