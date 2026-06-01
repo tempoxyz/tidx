@@ -1,4 +1,4 @@
-use anyhow::Result as AnyhowResult;
+use anyhow::{Result as AnyhowResult, anyhow};
 use axum::{Json, extract::Query, extract::State};
 use chrono::Utc;
 use serde::{Deserialize, Serialize, Serializer};
@@ -111,13 +111,9 @@ fn abi_u8_word(data: &[u8]) -> u8 {
     data.get(31).copied().unwrap_or_default()
 }
 
-fn policy_type_from_data(data: &[u8]) -> PolicyType {
-    match abi_u8_word(data) {
-        0 => PolicyType::WHITELIST,
-        1 => PolicyType::BLACKLIST,
-        2 => PolicyType::COMPOUND,
-        _ => PolicyType::WHITELIST,
-    }
+fn policy_type_from_data(data: &[u8]) -> AnyhowResult<PolicyType> {
+    let value = abi_u8_word(data);
+    PolicyType::try_from(value).map_err(|_| anyhow!("invalid TIP-403 policy type: {value}"))
 }
 
 fn serialize_policy_type<S>(policy_type: &PolicyType, serializer: S) -> Result<S::Ok, S::Error>
@@ -163,7 +159,7 @@ async fn load_tip403_policy_metadata(
         chain_id,
         policy_id,
         registry: TIP403_REGISTRY_ADDRESS.to_string(),
-        policy_type: policy_type_from_data(&data),
+        policy_type: policy_type_from_data(&data)?,
         admin: current_tip403_policy_admin(&conn, policy_id)
             .await?
             .or_else(|| updater_topic.as_deref().map(topic_address)),
