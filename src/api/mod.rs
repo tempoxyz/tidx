@@ -274,20 +274,10 @@ impl Tip403PolicyType {
 struct PolicyMetadata {
     policy_id: u64,
     policy_type: Tip403PolicyType,
+    admin: Option<String>,
     created_by: Option<String>,
-    created_block_num: Option<i64>,
-    created_tx_idx: Option<i32>,
-    created_log_idx: Option<i32>,
-}
-
-#[derive(Serialize)]
-struct PolicyMember {
-    account: String,
-    updated_by: String,
-    updated_block_num: i64,
-    updated_tx_idx: i32,
-    updated_log_idx: i32,
-    updated_tx_hash: String,
+    created_at: Option<chrono::DateTime<Utc>>,
+    last_updated_at: Option<chrono::DateTime<Utc>>,
 }
 
 #[derive(Serialize)]
@@ -297,7 +287,7 @@ struct PolicyDataResponse {
     policy_id: u64,
     registry: &'static str,
     metadata: PolicyMetadata,
-    members: Vec<PolicyMember>,
+    members: Vec<String>,
 }
 
 async fn handle_policy_data(
@@ -378,7 +368,7 @@ async fn load_tip403_policy_metadata(
     let row = conn
         .query_opt(
             r#"
-            SELECT topic2, data, block_num, tx_idx, log_idx
+            SELECT topic2, data, block_timestamp
             FROM logs
             WHERE address = $1 AND selector = $2 AND topic1 = $3
             ORDER BY block_num DESC, tx_idx DESC, log_idx DESC
@@ -395,18 +385,85 @@ async fn load_tip403_policy_metadata(
     Ok(Some(PolicyMetadata {
         policy_id,
         policy_type: Tip403PolicyType::from_u8(abi_u8_word(&data)),
+        admin: current_tip403_policy_admin(&conn, policy_id)
+            .await?
+            .or_else(|| updater_topic.as_deref().map(topic_address)),
         created_by: updater_topic.as_deref().map(topic_address),
-        created_block_num: Some(row.get(2)),
-        created_tx_idx: Some(row.get(3)),
-        created_log_idx: Some(row.get(4)),
+        created_at: Some(row.get(2)),
+        last_updated_at: latest_tip403_policy_update_at(&conn, policy_id).await?,
     }))
+}
+
+async fn current_tip403_policy_admin(
+    conn: &deadpool_postgres::Object,
+    policy_id: u64,
+) -> AnyhowResult<Option<String>> {
+    let selector = tip403_topic0(
+        "PolicyAdminUpdated(uint64 indexed policyId,address indexed updater,address indexed admin)",
+    )?;
+    let policy_topic = tip403_policy_topic(policy_id);
+    let registry = TIP403_REGISTRY_ADDRESS.to_vec();
+
+    let row = conn
+        .query_opt(
+            r#"
+            SELECT topic3
+            FROM logs
+            WHERE address = $1 AND selector = $2 AND topic1 = $3 AND topic3 IS NOT NULL
+            ORDER BY block_num DESC, tx_idx DESC, log_idx DESC
+            LIMIT 1
+            "#,
+            &[&registry, &selector, &policy_topic],
+        )
+        .await?;
+
+    let Some(row) = row else { return Ok(None) };
+    let admin_topic: Vec<u8> = row.get(0);
+    Ok(Some(topic_address(&admin_topic)))
+}
+
+async fn latest_tip403_policy_update_at(
+    conn: &deadpool_postgres::Object,
+    policy_id: u64,
+) -> AnyhowResult<Option<chrono::DateTime<Utc>>> {
+    let selectors = vec![
+        tip403_topic0(
+            "PolicyCreated(uint64 indexed policyId,address indexed updater,uint8 policyType)",
+        )?,
+        tip403_topic0(
+            "PolicyAdminUpdated(uint64 indexed policyId,address indexed updater,address indexed admin)",
+        )?,
+        tip403_topic0(
+            "WhitelistUpdated(uint64 indexed policyId,address indexed updater,address indexed account,bool allowed)",
+        )?,
+        tip403_topic0(
+            "BlacklistUpdated(uint64 indexed policyId,address indexed updater,address indexed account,bool restricted)",
+        )?,
+    ];
+    let policy_topic = tip403_policy_topic(policy_id);
+    let registry = TIP403_REGISTRY_ADDRESS.to_vec();
+
+    let row = conn
+        .query_opt(
+            r#"
+            SELECT block_timestamp
+            FROM logs
+            WHERE address = $1 AND selector = ANY($2) AND topic1 = $3
+            ORDER BY block_num DESC, tx_idx DESC, log_idx DESC
+            LIMIT 1
+            "#,
+            &[&registry, &selectors, &policy_topic],
+        )
+        .await?;
+
+    Ok(row.map(|row| row.get(0)))
 }
 
 async fn load_tip403_policy_members(
     pool: &Pool,
     policy_id: u64,
     signature: &str,
-) -> AnyhowResult<Vec<PolicyMember>> {
+) -> AnyhowResult<Vec<String>> {
     let conn = pool.get().await?;
     let selector = tip403_topic0(signature)?;
     let policy_topic = tip403_policy_topic(policy_id);
@@ -416,7 +473,7 @@ async fn load_tip403_policy_members(
         .query(
             r#"
             SELECT DISTINCT ON (topic3)
-                topic3, topic2, data, block_num, tx_idx, log_idx, tx_hash
+                topic3, data
             FROM logs
             WHERE address = $1 AND selector = $2 AND topic1 = $3 AND topic3 IS NOT NULL
             ORDER BY topic3, block_num DESC, tx_idx DESC, log_idx DESC
@@ -427,28 +484,16 @@ async fn load_tip403_policy_members(
 
     let mut members = Vec::new();
     for row in rows {
-        let data: Vec<u8> = row.get(2);
+        let data: Vec<u8> = row.get(1);
         if !abi_bool_word(&data) {
             continue;
         }
 
         let account_topic: Vec<u8> = row.get(0);
-        let updater_topic: Option<Vec<u8>> = row.get(1);
-        let tx_hash: Vec<u8> = row.get(6);
-        members.push(PolicyMember {
-            account: topic_address(&account_topic),
-            updated_by: updater_topic
-                .as_deref()
-                .map(topic_address)
-                .unwrap_or_else(|| "0x".to_string()),
-            updated_block_num: row.get(3),
-            updated_tx_idx: row.get(4),
-            updated_log_idx: row.get(5),
-            updated_tx_hash: hex_prefixed(&tx_hash),
-        });
+        members.push(topic_address(&account_topic));
     }
 
-    members.sort_by(|a, b| a.account.cmp(&b.account));
+    members.sort();
     Ok(members)
 }
 
