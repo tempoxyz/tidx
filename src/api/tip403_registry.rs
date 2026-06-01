@@ -1,7 +1,7 @@
 use anyhow::{Result as AnyhowResult, anyhow};
 use axum::{Json, extract::Query, extract::State};
 use chrono::Utc;
-use serde::{Deserialize, Serialize, Serializer};
+use serde::{Deserialize, Serialize};
 
 use alloy::{primitives::B256, sol_types::SolEvent};
 use tempo_contracts::precompiles::{ITIP403Registry, TIP403_REGISTRY_ADDRESS};
@@ -31,7 +31,6 @@ struct PolicyMetadata {
     chain_id: u64,
     policy_id: u64,
     registry: String,
-    #[serde(serialize_with = "serialize_policy_type")]
     policy_type: PolicyType,
     admin: Option<String>,
     created_by: Option<String>,
@@ -89,18 +88,6 @@ fn tip403_policy_topic(policy_id: u64) -> Vec<u8> {
     let mut topic = vec![0u8; 32];
     topic[24..32].copy_from_slice(&policy_id.to_be_bytes());
     topic
-}
-
-fn serialize_policy_type<S>(policy_type: &PolicyType, serializer: S) -> Result<S::Ok, S::Error>
-where
-    S: Serializer,
-{
-    serializer.serialize_str(match policy_type {
-        PolicyType::WHITELIST => "whitelist",
-        PolicyType::BLACKLIST => "blacklist",
-        PolicyType::COMPOUND => "compound",
-        _ => "unknown",
-    })
 }
 
 async fn load_tip403_policy_metadata(
