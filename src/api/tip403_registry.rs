@@ -22,10 +22,6 @@ pub struct PolicyDataParams {
 
 type PolicyType = ITIP403Registry::PolicyType;
 
-fn has_direct_members(policy: &PolicyType) -> bool {
-    matches!(policy, PolicyType::WHITELIST | PolicyType::BLACKLIST)
-}
-
 #[derive(Serialize)]
 struct PolicyMetadata {
     chain_id: u64,
@@ -36,6 +32,15 @@ struct PolicyMetadata {
     created_by: Option<String>,
     created_at: Option<chrono::DateTime<Utc>>,
     last_updated_at: Option<chrono::DateTime<Utc>>,
+}
+
+impl PolicyMetadata {
+    fn has_direct_members(&self) -> bool {
+        matches!(
+            self.policy_type,
+            PolicyType::WHITELIST | PolicyType::BLACKLIST
+        )
+    }
 }
 
 #[derive(Serialize)]
@@ -61,7 +66,7 @@ pub async fn get_policy_data(
             ApiError::NotFound(format!("TIP-403 policy not found: {}", params.policy_id))
         })?;
 
-    let members = if has_direct_members(&metadata.policy_type) {
+    let members = if metadata.has_direct_members() {
         load_tip403_policy_members(&pool, params.policy_id, &metadata.policy_type)
             .await
             .map_err(|e| ApiError::QueryError(e.to_string()))?
