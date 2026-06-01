@@ -28,6 +28,7 @@ use crate::broadcast::Broadcaster;
 use crate::clickhouse::ClickHouseEngine;
 use crate::config::HttpConfig;
 use crate::db::Pool;
+use crate::query::EventSignature;
 use crate::service::{QueryOptions, QueryResult, SyncStatus};
 
 pub type SharedPools = Arc<RwLock<HashMap<u64, Pool>>>;
@@ -207,6 +208,7 @@ fn build_router(state: AppState) -> Router<()> {
         .route("/health", get(handle_health))
         .route("/status", get(handle_status))
         .route("/query", get(handle_query))
+        .route("/policy-data", get(handle_policy_data))
         .route("/views", get(views::list_views).post(views::create_view))
         .route(
             "/views/{name}",
@@ -219,6 +221,235 @@ fn build_router(state: AppState) -> Router<()> {
 
 async fn handle_health() -> &'static str {
     "OK"
+}
+
+const TIP403_REGISTRY_ADDRESS: [u8; 20] = [
+    0x40, 0x3c, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00,
+];
+
+#[derive(Deserialize)]
+struct PolicyDataParams {
+    #[serde(alias = "chain_id")]
+    #[serde(rename = "chainId")]
+    chain_id: u64,
+    #[serde(alias = "policy_id")]
+    #[serde(rename = "policyId")]
+    policy_id: u64,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "lowercase")]
+enum Tip403PolicyType {
+    Whitelist,
+    Blacklist,
+    Compound,
+    Unknown,
+}
+
+impl Tip403PolicyType {
+    fn from_u8(value: u8) -> Self {
+        match value {
+            0 => Self::Whitelist,
+            1 => Self::Blacklist,
+            2 => Self::Compound,
+            _ => Self::Unknown,
+        }
+    }
+
+    fn member_event_signature(&self) -> Option<&'static str> {
+        match self {
+            Self::Whitelist => Some(
+                "WhitelistUpdated(uint64 indexed policyId,address indexed updater,address indexed account,bool allowed)",
+            ),
+            Self::Blacklist => Some(
+                "BlacklistUpdated(uint64 indexed policyId,address indexed updater,address indexed account,bool restricted)",
+            ),
+            Self::Compound | Self::Unknown => None,
+        }
+    }
+}
+
+#[derive(Serialize)]
+struct PolicyMetadata {
+    policy_id: u64,
+    policy_type: Tip403PolicyType,
+    created_by: Option<String>,
+    created_block_num: Option<i64>,
+    created_tx_idx: Option<i32>,
+    created_log_idx: Option<i32>,
+}
+
+#[derive(Serialize)]
+struct PolicyMember {
+    account: String,
+    updated_by: String,
+    updated_block_num: i64,
+    updated_tx_idx: i32,
+    updated_log_idx: i32,
+    updated_tx_hash: String,
+}
+
+#[derive(Serialize)]
+struct PolicyDataResponse {
+    ok: bool,
+    chain_id: u64,
+    policy_id: u64,
+    registry: &'static str,
+    metadata: PolicyMetadata,
+    members: Vec<PolicyMember>,
+}
+
+async fn handle_policy_data(
+    State(state): State<AppState>,
+    Query(params): Query<PolicyDataParams>,
+) -> Result<Json<PolicyDataResponse>, ApiError> {
+    let pool = state
+        .get_pool(Some(params.chain_id))
+        .await
+        .ok_or_else(|| ApiError::BadRequest(format!("Unknown chain_id: {}", params.chain_id)))?;
+
+    let metadata = load_tip403_policy_metadata(&pool, params.policy_id)
+        .await
+        .map_err(|e| ApiError::QueryError(e.to_string()))?
+        .ok_or_else(|| {
+            ApiError::NotFound(format!("TIP-403 policy not found: {}", params.policy_id))
+        })?;
+
+    let members = if let Some(signature) = metadata.policy_type.member_event_signature() {
+        load_tip403_policy_members(&pool, params.policy_id, signature)
+            .await
+            .map_err(|e| ApiError::QueryError(e.to_string()))?
+    } else {
+        Vec::new()
+    };
+
+    Ok(Json(PolicyDataResponse {
+        ok: true,
+        chain_id: params.chain_id,
+        policy_id: params.policy_id,
+        registry: "0x403c000000000000000000000000000000000000",
+        metadata,
+        members,
+    }))
+}
+
+fn tip403_topic0(signature: &str) -> AnyhowResult<Vec<u8>> {
+    Ok(EventSignature::parse(signature)?.topic0.to_vec())
+}
+
+fn tip403_policy_topic(policy_id: u64) -> Vec<u8> {
+    let mut topic = vec![0u8; 32];
+    topic[24..32].copy_from_slice(&policy_id.to_be_bytes());
+    topic
+}
+
+fn hex_prefixed(bytes: &[u8]) -> String {
+    format!("0x{}", hex::encode(bytes))
+}
+
+fn topic_address(topic: &[u8]) -> String {
+    if topic.len() >= 32 {
+        hex_prefixed(&topic[12..32])
+    } else {
+        hex_prefixed(topic)
+    }
+}
+
+fn abi_bool_word(data: &[u8]) -> bool {
+    data.get(31).copied().unwrap_or_default() != 0
+}
+
+fn abi_u8_word(data: &[u8]) -> u8 {
+    data.get(31).copied().unwrap_or_default()
+}
+
+async fn load_tip403_policy_metadata(
+    pool: &Pool,
+    policy_id: u64,
+) -> AnyhowResult<Option<PolicyMetadata>> {
+    let conn = pool.get().await?;
+    let selector = tip403_topic0(
+        "PolicyCreated(uint64 indexed policyId,address indexed updater,uint8 policyType)",
+    )?;
+    let policy_topic = tip403_policy_topic(policy_id);
+    let registry = TIP403_REGISTRY_ADDRESS.to_vec();
+
+    let row = conn
+        .query_opt(
+            r#"
+            SELECT topic2, data, block_num, tx_idx, log_idx
+            FROM logs
+            WHERE address = $1 AND selector = $2 AND topic1 = $3
+            ORDER BY block_num DESC, tx_idx DESC, log_idx DESC
+            LIMIT 1
+            "#,
+            &[&registry, &selector, &policy_topic],
+        )
+        .await?;
+
+    let Some(row) = row else { return Ok(None) };
+    let updater_topic: Option<Vec<u8>> = row.get(0);
+    let data: Vec<u8> = row.get(1);
+
+    Ok(Some(PolicyMetadata {
+        policy_id,
+        policy_type: Tip403PolicyType::from_u8(abi_u8_word(&data)),
+        created_by: updater_topic.as_deref().map(topic_address),
+        created_block_num: Some(row.get(2)),
+        created_tx_idx: Some(row.get(3)),
+        created_log_idx: Some(row.get(4)),
+    }))
+}
+
+async fn load_tip403_policy_members(
+    pool: &Pool,
+    policy_id: u64,
+    signature: &str,
+) -> AnyhowResult<Vec<PolicyMember>> {
+    let conn = pool.get().await?;
+    let selector = tip403_topic0(signature)?;
+    let policy_topic = tip403_policy_topic(policy_id);
+    let registry = TIP403_REGISTRY_ADDRESS.to_vec();
+
+    let rows = conn
+        .query(
+            r#"
+            SELECT DISTINCT ON (topic3)
+                topic3, topic2, data, block_num, tx_idx, log_idx, tx_hash
+            FROM logs
+            WHERE address = $1 AND selector = $2 AND topic1 = $3 AND topic3 IS NOT NULL
+            ORDER BY topic3, block_num DESC, tx_idx DESC, log_idx DESC
+            "#,
+            &[&registry, &selector, &policy_topic],
+        )
+        .await?;
+
+    let mut members = Vec::new();
+    for row in rows {
+        let data: Vec<u8> = row.get(2);
+        if !abi_bool_word(&data) {
+            continue;
+        }
+
+        let account_topic: Vec<u8> = row.get(0);
+        let updater_topic: Option<Vec<u8>> = row.get(1);
+        let tx_hash: Vec<u8> = row.get(6);
+        members.push(PolicyMember {
+            account: topic_address(&account_topic),
+            updated_by: updater_topic
+                .as_deref()
+                .map(topic_address)
+                .unwrap_or_else(|| "0x".to_string()),
+            updated_block_num: row.get(3),
+            updated_tx_idx: row.get(4),
+            updated_log_idx: row.get(5),
+            updated_tx_hash: hex_prefixed(&tx_hash),
+        });
+    }
+
+    members.sort_by(|a, b| a.account.cmp(&b.account));
+    Ok(members)
 }
 
 #[derive(Serialize)]
