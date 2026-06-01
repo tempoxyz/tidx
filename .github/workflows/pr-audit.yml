@@ -4,7 +4,6 @@ name: PR Audit
   pull_request:
     paths:
       - ".github/workflows/**"
-  merge_group:
 
 permissions: {}
 
@@ -15,12 +14,29 @@ jobs:
     permissions:
       contents: read
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
           persist-credentials: false
+          fetch-depth: 0
 
       - name: Install zizmor
         run: pipx install zizmor
 
+      - name: Find changed workflows
+        id: changed-workflows
+        env:
+          BASE_REF: ${{ github.base_ref }}
+        run: |
+          git fetch origin "$BASE_REF"
+          {
+            echo "files<<EOF"
+            git diff --name-only --diff-filter=ACMRT "origin/$BASE_REF"...HEAD -- .github/workflows/
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
       - name: Run zizmor
-        run: zizmor .github/workflows/
+        if: steps.changed-workflows.outputs.files != ''
+        env:
+          WORKFLOWS: ${{ steps.changed-workflows.outputs.files }}
+        run: |
+          zizmor $WORKFLOWS
