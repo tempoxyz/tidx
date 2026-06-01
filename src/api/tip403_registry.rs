@@ -105,18 +105,18 @@ async fn load_tip403_policy_metadata(
 ) -> AnyhowResult<Option<PolicyMetadata>> {
     let selector = ITIP403Registry::PolicyCreated::SIGNATURE_HASH.as_slice();
     let policy_topic = tip403_policy_topic(policy_id);
-    let registry = TIP403_REGISTRY_ADDRESS.as_slice();
 
     let row = conn
         .query_opt(
             r#"
             SELECT topic2, data, block_timestamp
             FROM logs
-            WHERE address = $1 AND selector = $2 AND topic1 = $3
+            WHERE address = '\x403c000000000000000000000000000000000000'::bytea
+              AND selector = $1 AND topic1 = $2
             ORDER BY block_num DESC, tx_idx DESC, log_idx DESC
             LIMIT 1
             "#,
-            &[&registry, &selector, &policy_topic],
+            &[&selector, &policy_topic],
         )
         .await?;
 
@@ -151,18 +151,18 @@ async fn current_tip403_policy_admin(
 ) -> AnyhowResult<Option<String>> {
     let selector = ITIP403Registry::PolicyAdminUpdated::SIGNATURE_HASH.as_slice();
     let policy_topic = tip403_policy_topic(policy_id);
-    let registry = TIP403_REGISTRY_ADDRESS.as_slice();
 
     let row = conn
         .query_opt(
             r#"
             SELECT topic2, topic3
             FROM logs
-            WHERE address = $1 AND selector = $2 AND topic1 = $3 AND topic3 IS NOT NULL
+            WHERE address = '\x403c000000000000000000000000000000000000'::bytea
+              AND selector = $1 AND topic1 = $2 AND topic3 IS NOT NULL
             ORDER BY block_num DESC, tx_idx DESC, log_idx DESC
             LIMIT 1
             "#,
-            &[&registry, &selector, &policy_topic],
+            &[&selector, &policy_topic],
         )
         .await?;
 
@@ -187,18 +187,18 @@ async fn latest_tip403_policy_update_at(
         ITIP403Registry::BlacklistUpdated::SIGNATURE_HASH.as_slice(),
     ];
     let policy_topic = tip403_policy_topic(policy_id);
-    let registry = TIP403_REGISTRY_ADDRESS.as_slice();
 
     let row = conn
         .query_opt(
             r#"
             SELECT block_timestamp
             FROM logs
-            WHERE address = $1 AND selector = ANY($2) AND topic1 = $3
+            WHERE address = '\x403c000000000000000000000000000000000000'::bytea
+              AND selector = ANY($1) AND topic1 = $2
             ORDER BY block_num DESC, tx_idx DESC, log_idx DESC
             LIMIT 1
             "#,
-            &[&registry, &&selectors[..], &policy_topic],
+            &[&&selectors[..], &policy_topic],
         )
         .await?;
 
@@ -216,7 +216,6 @@ async fn load_tip403_policy_members(
         _ => return Ok(Vec::new()),
     };
     let policy_topic = tip403_policy_topic(policy_id);
-    let registry = TIP403_REGISTRY_ADDRESS.as_slice();
 
     let rows = conn
         .query(
@@ -224,10 +223,11 @@ async fn load_tip403_policy_members(
             SELECT DISTINCT ON (topic3)
                 topic2, topic3, data
             FROM logs
-            WHERE address = $1 AND selector = $2 AND topic1 = $3 AND topic3 IS NOT NULL
+            WHERE address = '\x403c000000000000000000000000000000000000'::bytea
+              AND selector = $1 AND topic1 = $2 AND topic3 IS NOT NULL
             ORDER BY topic3, block_num DESC, tx_idx DESC, log_idx DESC
             "#,
-            &[&registry, &selector, &policy_topic],
+            &[&selector, &policy_topic],
         )
         .await?;
 

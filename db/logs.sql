@@ -24,3 +24,14 @@ CREATE INDEX IF NOT EXISTS idx_logs_address_topic1 ON logs (topic1, address, blo
 DROP INDEX IF EXISTS idx_logs_topic1;
 CREATE INDEX IF NOT EXISTS idx_logs_topic2 ON logs (topic2);
 CREATE INDEX IF NOT EXISTS idx_logs_topic3 ON logs (topic3);
+
+CREATE INDEX IF NOT EXISTS idx_logs_tip403_policy_event_latest
+ON logs (topic1, selector, block_num DESC, tx_idx DESC, log_idx DESC)
+INCLUDE (topic2, topic3, data, block_timestamp)
+WHERE address = '\x403c000000000000000000000000000000000000'::bytea;
+
+CREATE INDEX IF NOT EXISTS idx_logs_tip403_policy_member_latest
+ON logs (topic1, selector, topic3, block_num DESC, tx_idx DESC, log_idx DESC)
+INCLUDE (topic2, data)
+WHERE address = '\x403c000000000000000000000000000000000000'::bytea
+  AND topic3 IS NOT NULL;
