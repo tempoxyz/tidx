@@ -35,6 +35,7 @@ postgres-types = { version = "0.2", features = ["derive"] }
 # Ethereum/Tempo primitives
 alloy = { version = "2", features = ["full"] }
 tempo-alloy = { version = "1.8.0", default-features = false }
+tempo-contracts = { version = "1.8.0", default-features = false }
 tempo-primitives = { version = "1.8.0", default-features = false, features = ["serde"] }
 
 # URL parsing

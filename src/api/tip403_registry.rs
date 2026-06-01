@@ -1,18 +1,14 @@
 use anyhow::Result as AnyhowResult;
 use axum::{Json, extract::Query, extract::State};
 use chrono::Utc;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Serialize, Serializer};
+
+use alloy::sol_types::SolEvent;
+use tempo_contracts::precompiles::{ITIP403Registry, TIP403_REGISTRY_ADDRESS};
 
 use crate::db::Pool;
-use crate::query::EventSignature;
 
 use super::{ApiError, AppState};
-
-const TIP403_REGISTRY_ADDRESS: [u8; 20] = [
-    0x40, 0x3c, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-    0x00, 0x00, 0x00, 0x00,
-];
-const TIP403_REGISTRY_ADDRESS_HEX: &str = "0x403c000000000000000000000000000000000000";
 
 #[derive(Deserialize)]
 pub struct PolicyDataParams {
@@ -24,35 +20,13 @@ pub struct PolicyDataParams {
     policy_id: u64,
 }
 
-#[derive(Serialize)]
-#[serde(rename_all = "lowercase")]
-enum Tip403PolicyType {
-    Whitelist,
-    Blacklist,
-    Compound,
-    Unknown,
-}
+type PolicyType = ITIP403Registry::PolicyType;
 
-impl Tip403PolicyType {
-    fn from_u8(value: u8) -> Self {
-        match value {
-            0 => Self::Whitelist,
-            1 => Self::Blacklist,
-            2 => Self::Compound,
-            _ => Self::Unknown,
-        }
-    }
-
-    fn member_event_signature(&self) -> Option<&'static str> {
-        match self {
-            Self::Whitelist => Some(
-                "WhitelistUpdated(uint64 indexed policyId,address indexed updater,address indexed account,bool allowed)",
-            ),
-            Self::Blacklist => Some(
-                "BlacklistUpdated(uint64 indexed policyId,address indexed updater,address indexed account,bool restricted)",
-            ),
-            Self::Compound | Self::Unknown => None,
-        }
+fn member_event_selector(policy: &PolicyType) -> Option<Vec<u8>> {
+    match policy {
+        PolicyType::WHITELIST => Some(event_selector::<ITIP403Registry::WhitelistUpdated>()),
+        PolicyType::BLACKLIST => Some(event_selector::<ITIP403Registry::BlacklistUpdated>()),
+        _ => None,
     }
 }
 
@@ -60,8 +34,9 @@ impl Tip403PolicyType {
 struct PolicyMetadata {
     chain_id: u64,
     policy_id: u64,
-    registry: &'static str,
-    policy_type: Tip403PolicyType,
+    registry: String,
+    #[serde(serialize_with = "serialize_policy_type")]
+    policy_type: PolicyType,
     admin: Option<String>,
     created_by: Option<String>,
     created_at: Option<chrono::DateTime<Utc>>,
@@ -91,8 +66,8 @@ pub async fn get_policy_data(
             ApiError::NotFound(format!("TIP-403 policy not found: {}", params.policy_id))
         })?;
 
-    let members = if let Some(signature) = metadata.policy_type.member_event_signature() {
-        load_tip403_policy_members(&pool, params.policy_id, signature)
+    let members = if let Some(selector) = member_event_selector(&metadata.policy_type) {
+        load_tip403_policy_members(&pool, params.policy_id, &selector)
             .await
             .map_err(|e| ApiError::QueryError(e.to_string()))?
     } else {
@@ -106,8 +81,8 @@ pub async fn get_policy_data(
     }))
 }
 
-fn tip403_topic0(signature: &str) -> AnyhowResult<Vec<u8>> {
-    Ok(EventSignature::parse(signature)?.topic0.to_vec())
+fn event_selector<E: SolEvent>() -> Vec<u8> {
+    E::SIGNATURE_HASH.as_slice().to_vec()
 }
 
 fn tip403_policy_topic(policy_id: u64) -> Vec<u8> {
@@ -136,15 +111,34 @@ fn abi_u8_word(data: &[u8]) -> u8 {
     data.get(31).copied().unwrap_or_default()
 }
 
+fn policy_type_from_data(data: &[u8]) -> PolicyType {
+    match abi_u8_word(data) {
+        0 => PolicyType::WHITELIST,
+        1 => PolicyType::BLACKLIST,
+        2 => PolicyType::COMPOUND,
+        _ => PolicyType::WHITELIST,
+    }
+}
+
+fn serialize_policy_type<S>(policy_type: &PolicyType, serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: Serializer,
+{
+    serializer.serialize_str(match policy_type {
+        PolicyType::WHITELIST => "whitelist",
+        PolicyType::BLACKLIST => "blacklist",
+        PolicyType::COMPOUND => "compound",
+        _ => "unknown",
+    })
+}
+
 async fn load_tip403_policy_metadata(
     pool: &Pool,
     chain_id: u64,
     policy_id: u64,
 ) -> AnyhowResult<Option<PolicyMetadata>> {
     let conn = pool.get().await?;
-    let selector = tip403_topic0(
-        "PolicyCreated(uint64 indexed policyId,address indexed updater,uint8 policyType)",
-    )?;
+    let selector = event_selector::<ITIP403Registry::PolicyCreated>();
     let policy_topic = tip403_policy_topic(policy_id);
     let registry = TIP403_REGISTRY_ADDRESS.to_vec();
 
@@ -168,8 +162,8 @@ async fn load_tip403_policy_metadata(
     Ok(Some(PolicyMetadata {
         chain_id,
         policy_id,
-        registry: TIP403_REGISTRY_ADDRESS_HEX,
-        policy_type: Tip403PolicyType::from_u8(abi_u8_word(&data)),
+        registry: TIP403_REGISTRY_ADDRESS.to_string(),
+        policy_type: policy_type_from_data(&data),
         admin: current_tip403_policy_admin(&conn, policy_id)
             .await?
             .or_else(|| updater_topic.as_deref().map(topic_address)),
@@ -183,9 +177,7 @@ async fn current_tip403_policy_admin(
     conn: &deadpool_postgres::Object,
     policy_id: u64,
 ) -> AnyhowResult<Option<String>> {
-    let selector = tip403_topic0(
-        "PolicyAdminUpdated(uint64 indexed policyId,address indexed updater,address indexed admin)",
-    )?;
+    let selector = event_selector::<ITIP403Registry::PolicyAdminUpdated>();
     let policy_topic = tip403_policy_topic(policy_id);
     let registry = TIP403_REGISTRY_ADDRESS.to_vec();
 
@@ -212,18 +204,10 @@ async fn latest_tip403_policy_update_at(
     policy_id: u64,
 ) -> AnyhowResult<Option<chrono::DateTime<Utc>>> {
     let selectors = vec![
-        tip403_topic0(
-            "PolicyCreated(uint64 indexed policyId,address indexed updater,uint8 policyType)",
-        )?,
-        tip403_topic0(
-            "PolicyAdminUpdated(uint64 indexed policyId,address indexed updater,address indexed admin)",
-        )?,
-        tip403_topic0(
-            "WhitelistUpdated(uint64 indexed policyId,address indexed updater,address indexed account,bool allowed)",
-        )?,
-        tip403_topic0(
-            "BlacklistUpdated(uint64 indexed policyId,address indexed updater,address indexed account,bool restricted)",
-        )?,
+        event_selector::<ITIP403Registry::PolicyCreated>(),
+        event_selector::<ITIP403Registry::PolicyAdminUpdated>(),
+        event_selector::<ITIP403Registry::WhitelistUpdated>(),
+        event_selector::<ITIP403Registry::BlacklistUpdated>(),
     ];
     let policy_topic = tip403_policy_topic(policy_id);
     let registry = TIP403_REGISTRY_ADDRESS.to_vec();
@@ -247,10 +231,9 @@ async fn latest_tip403_policy_update_at(
 async fn load_tip403_policy_members(
     pool: &Pool,
     policy_id: u64,
-    signature: &str,
+    selector: &[u8],
 ) -> AnyhowResult<Vec<String>> {
     let conn = pool.get().await?;
-    let selector = tip403_topic0(signature)?;
     let policy_topic = tip403_policy_topic(policy_id);
     let registry = TIP403_REGISTRY_ADDRESS.to_vec();
 

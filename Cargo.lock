@@ -6646,6 +6646,7 @@ dependencies = [
  "sqlparser",
  "tempfile",
  "tempo-alloy",
+ "tempo-contracts",
  "tempo-primitives",
  "thiserror 2.0.18",
  "tokio",
