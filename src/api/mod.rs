@@ -272,7 +272,9 @@ impl Tip403PolicyType {
 
 #[derive(Serialize)]
 struct PolicyMetadata {
+    chain_id: u64,
     policy_id: u64,
+    registry: &'static str,
     policy_type: Tip403PolicyType,
     admin: Option<String>,
     created_by: Option<String>,
@@ -283,9 +285,6 @@ struct PolicyMetadata {
 #[derive(Serialize)]
 struct PolicyDataResponse {
     ok: bool,
-    chain_id: u64,
-    policy_id: u64,
-    registry: &'static str,
     metadata: PolicyMetadata,
     members: Vec<String>,
 }
@@ -299,7 +298,7 @@ async fn handle_policy_data(
         .await
         .ok_or_else(|| ApiError::BadRequest(format!("Unknown chain_id: {}", params.chain_id)))?;
 
-    let metadata = load_tip403_policy_metadata(&pool, params.policy_id)
+    let metadata = load_tip403_policy_metadata(&pool, params.chain_id, params.policy_id)
         .await
         .map_err(|e| ApiError::QueryError(e.to_string()))?
         .ok_or_else(|| {
@@ -316,9 +315,6 @@ async fn handle_policy_data(
 
     Ok(Json(PolicyDataResponse {
         ok: true,
-        chain_id: params.chain_id,
-        policy_id: params.policy_id,
-        registry: "0x403c000000000000000000000000000000000000",
         metadata,
         members,
     }))
@@ -356,6 +352,7 @@ fn abi_u8_word(data: &[u8]) -> u8 {
 
 async fn load_tip403_policy_metadata(
     pool: &Pool,
+    chain_id: u64,
     policy_id: u64,
 ) -> AnyhowResult<Option<PolicyMetadata>> {
     let conn = pool.get().await?;
@@ -383,7 +380,9 @@ async fn load_tip403_policy_metadata(
     let data: Vec<u8> = row.get(1);
 
     Ok(Some(PolicyMetadata {
+        chain_id,
         policy_id,
+        registry: "0x403c000000000000000000000000000000000000",
         policy_type: Tip403PolicyType::from_u8(abi_u8_word(&data)),
         admin: current_tip403_policy_admin(&conn, policy_id)
             .await?
