@@ -171,21 +171,22 @@ async fn test_policy_data_whitelist_members() {
         .unwrap();
     let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
 
-    assert_eq!(json["ok"], true);
-    assert_eq!(json["metadata"]["chain_id"], 1);
-    assert_eq!(json["metadata"]["policy_id"], 7);
     assert_eq!(
-        json["metadata"]["registry"],
-        "0x403c000000000000000000000000000000000000"
-    );
-    assert_eq!(json["metadata"]["policy_type"], "WHITELIST");
-    assert_eq!(json["metadata"]["admin"], admin.to_string());
-    assert_eq!(json["metadata"]["created_by"], creator.to_string());
-    assert_eq!(json["metadata"]["created_at"], "2023-11-14T22:13:30Z");
-    assert_eq!(json["metadata"]["last_updated_at"], "2023-11-14T22:13:34Z");
-    assert_eq!(
-        json["members"],
-        serde_json::json!([account_active.to_string()])
+        json,
+        serde_json::json!({
+            "ok": true,
+            "metadata": {
+                "chain_id": 1,
+                "policy_id": 7,
+                "registry": "0x403c000000000000000000000000000000000000",
+                "policy_type": "WHITELIST",
+                "admin": admin.to_string(),
+                "created_by": creator.to_string(),
+                "created_at": "2023-11-14T22:13:30Z",
+                "last_updated_at": "2023-11-14T22:13:34Z"
+            },
+            "members": [account_active.to_string()]
+        })
     );
 }
 
@@ -252,9 +253,23 @@ async fn test_policy_data_blacklist_members() {
         .unwrap();
     let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
 
-    assert_eq!(json["metadata"]["policy_type"], "BLACKLIST");
-    assert_eq!(json["metadata"]["admin"], creator.to_string());
-    assert_eq!(json["members"], serde_json::json!([restricted.to_string()]));
+    assert_eq!(
+        json,
+        serde_json::json!({
+            "ok": true,
+            "metadata": {
+                "chain_id": 1,
+                "policy_id": 8,
+                "registry": "0x403c000000000000000000000000000000000000",
+                "policy_type": "BLACKLIST",
+                "admin": creator.to_string(),
+                "created_by": creator.to_string(),
+                "created_at": "2023-11-14T22:13:40Z",
+                "last_updated_at": "2023-11-14T22:13:43Z"
+            },
+            "members": [restricted.to_string()]
+        })
+    );
 }
 
 #[tokio::test]
