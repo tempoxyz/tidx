@@ -1,0 +1,26 @@
+name: PR Audit
+
+"on":
+  pull_request:
+    paths:
+      - ".github/workflows/**"
+  merge_group:
+
+permissions: {}
+
+jobs:
+  zizmor:
+    name: zizmor
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Install zizmor
+        run: pipx install zizmor
+
+      - name: Run zizmor
+        run: zizmor .github/workflows/
