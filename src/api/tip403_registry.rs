@@ -8,6 +8,9 @@ use tempo_contracts::precompiles::{ITIP403Registry, TIP403_REGISTRY_ADDRESS};
 
 use super::{ApiError, AppState};
 
+const DEFAULT_MEMBER_LIMIT: i64 = 100;
+const MAX_MEMBER_LIMIT: i64 = 500;
+
 #[derive(Deserialize)]
 pub struct PolicyDataParams {
     #[serde(alias = "chain_id")]
@@ -16,6 +19,8 @@ pub struct PolicyDataParams {
     #[serde(alias = "policy_id")]
     #[serde(rename = "policyId")]
     policy_id: u64,
+    cursor: Option<String>,
+    limit: Option<i64>,
 }
 
 type PolicyType = ITIP403Registry::PolicyType;
@@ -32,6 +37,32 @@ struct PolicyMetadata {
     last_updated_at: Option<chrono::DateTime<Utc>>,
 }
 
+#[derive(Serialize)]
+struct CompoundPolicyRefs {
+    sender_policy_id: u64,
+    recipient_policy_id: u64,
+    mint_recipient_policy_id: u64,
+}
+
+#[derive(Serialize)]
+struct ChildPolicyData {
+    metadata: PolicyMetadata,
+    members: Vec<String>,
+    next_member_cursor: Option<String>,
+}
+
+#[derive(Serialize)]
+struct CompoundPolicyData {
+    sender_policy: ChildPolicyData,
+    recipient_policy: ChildPolicyData,
+    mint_recipient_policy: ChildPolicyData,
+}
+
+struct LoadedPolicyData {
+    metadata: PolicyMetadata,
+    compound_policy_refs: Option<CompoundPolicyRefs>,
+}
+
 impl PolicyMetadata {
     fn has_direct_members(&self) -> bool {
         matches!(
@@ -45,7 +76,10 @@ impl PolicyMetadata {
 pub struct PolicyDataResponse {
     ok: bool,
     metadata: PolicyMetadata,
+    compound_policy: Option<CompoundPolicyData>,
     members: Vec<String>,
+    member_limit: i64,
+    next_member_cursor: Option<String>,
 }
 
 pub async fn get_policy_data(
@@ -62,25 +96,55 @@ pub async fn get_policy_data(
         .await
         .map_err(|e| ApiError::QueryError(e.to_string()))?;
 
-    let metadata = load_tip403_policy_metadata(&conn, params.chain_id, params.policy_id)
+    let policy_data = load_tip403_policy_metadata(&conn, params.chain_id, params.policy_id)
         .await
         .map_err(|e| ApiError::QueryError(e.to_string()))?
         .ok_or_else(|| {
             ApiError::NotFound(format!("TIP-403 policy not found: {}", params.policy_id))
         })?;
 
-    let members = if metadata.has_direct_members() {
-        load_tip403_policy_members(&conn, params.policy_id, &metadata.policy_type)
-            .await
-            .map_err(|e| ApiError::QueryError(e.to_string()))?
+    let member_limit = params
+        .limit
+        .unwrap_or(DEFAULT_MEMBER_LIMIT)
+        .clamp(1, MAX_MEMBER_LIMIT);
+    let member_cursor = params
+        .cursor
+        .as_deref()
+        .map(tip403_member_cursor_topic)
+        .transpose()
+        .map_err(|e| ApiError::BadRequest(e.to_string()))?;
+
+    let (members, next_member_cursor) = if policy_data.metadata.has_direct_members() {
+        load_tip403_policy_members(
+            &conn,
+            params.policy_id,
+            &policy_data.metadata.policy_type,
+            member_limit,
+            member_cursor.as_deref(),
+        )
+        .await
+        .map_err(|e| ApiError::QueryError(e.to_string()))?
     } else {
-        Vec::new()
+        (Vec::new(), None)
+    };
+
+    let compound_policy = if let Some(refs) = policy_data.compound_policy_refs {
+        Some(
+            resolve_tip403_compound_policy(&conn, params.chain_id, refs, member_limit)
+                .await
+                .map_err(|e| ApiError::QueryError(e.to_string()))?,
+        )
+    } else {
+        None
     };
 
     Ok(Json(PolicyDataResponse {
         ok: true,
-        metadata,
+        metadata: policy_data.metadata,
+        compound_policy,
         members,
+        member_limit,
+        next_member_cursor,
     }))
 }
 
@@ -98,51 +162,156 @@ fn tip403_policy_topic(policy_id: u64) -> Vec<u8> {
     topic
 }
 
+fn tip403_registry_address() -> Vec<u8> {
+    TIP403_REGISTRY_ADDRESS.as_slice().to_vec()
+}
+
+fn tip403_member_cursor_topic(cursor: &str) -> AnyhowResult<Vec<u8>> {
+    let cursor = cursor.strip_prefix("0x").unwrap_or(cursor);
+    if cursor.len() != 40 {
+        return Err(anyhow!("cursor must be a 20-byte hex address"));
+    }
+
+    let mut topic = vec![0u8; 32];
+    hex::decode_to_slice(cursor, &mut topic[12..32])?;
+    Ok(topic)
+}
+
 async fn load_tip403_policy_metadata(
     conn: &deadpool_postgres::Object,
     chain_id: u64,
     policy_id: u64,
-) -> AnyhowResult<Option<PolicyMetadata>> {
-    let selector = ITIP403Registry::PolicyCreated::SIGNATURE_HASH.as_slice();
+) -> AnyhowResult<Option<LoadedPolicyData>> {
+    let policy_created_selector = ITIP403Registry::PolicyCreated::SIGNATURE_HASH.as_slice();
+    let compound_created_selector =
+        ITIP403Registry::CompoundPolicyCreated::SIGNATURE_HASH.as_slice();
+    let selectors: [&[u8]; 2] = [policy_created_selector, compound_created_selector];
+    let registry_address = tip403_registry_address();
     let policy_topic = tip403_policy_topic(policy_id);
 
     let row = conn
         .query_opt(
             r#"
-            SELECT topic2, data, block_timestamp
+            SELECT selector, topic2, data, block_timestamp
             FROM logs
-            WHERE address = '\x403c000000000000000000000000000000000000'::bytea
-              AND selector = $1 AND topic1 = $2
+            WHERE address = $1
+              AND selector = ANY($2) AND topic1 = $3
             ORDER BY block_num DESC, tx_idx DESC, log_idx DESC
             LIMIT 1
             "#,
-            &[&selector, &policy_topic],
+            &[&registry_address, &&selectors[..], &policy_topic],
         )
         .await?;
 
     let Some(row) = row else { return Ok(None) };
+    let selector: Vec<u8> = row.get(0);
     let updater_topic: Vec<u8> = row
-        .get::<_, Option<Vec<u8>>>(0)
-        .ok_or_else(|| anyhow!("PolicyCreated log missing updater topic"))?;
-    let data: Vec<u8> = row.get(1);
-    let event = decode_event::<ITIP403Registry::PolicyCreated>(
-        &[selector, &policy_topic, &updater_topic],
-        &data,
-    )?;
-    let created_by = event.updater.to_string();
+        .get::<_, Option<Vec<u8>>>(1)
+        .ok_or_else(|| anyhow!("TIP-403 creation log missing updater topic"))?;
+    let data: Vec<u8> = row.get(2);
+    let (policy_type, created_by, default_admin, compound_policy_refs) =
+        if selector == policy_created_selector {
+            let event = decode_event::<ITIP403Registry::PolicyCreated>(
+                &[policy_created_selector, &policy_topic, &updater_topic],
+                &data,
+            )?;
+            let created_by = event.updater.to_string();
+            (event.policyType, created_by.clone(), Some(created_by), None)
+        } else if selector == compound_created_selector {
+            let event = decode_event::<ITIP403Registry::CompoundPolicyCreated>(
+                &[compound_created_selector, &policy_topic, &updater_topic],
+                &data,
+            )?;
+            (
+                PolicyType::COMPOUND,
+                event.creator.to_string(),
+                None,
+                Some(CompoundPolicyRefs {
+                    sender_policy_id: event.senderPolicyId,
+                    recipient_policy_id: event.recipientPolicyId,
+                    mint_recipient_policy_id: event.mintRecipientPolicyId,
+                }),
+            )
+        } else {
+            return Err(anyhow!("unknown TIP-403 creation selector"));
+        };
 
-    Ok(Some(PolicyMetadata {
-        chain_id,
-        policy_id,
-        registry: TIP403_REGISTRY_ADDRESS.to_string(),
-        policy_type: event.policyType,
-        admin: current_tip403_policy_admin(conn, policy_id)
-            .await?
-            .or_else(|| Some(created_by.clone())),
-        created_by: Some(created_by),
-        created_at: Some(row.get(2)),
-        last_updated_at: latest_tip403_policy_update_at(conn, policy_id).await?,
+    Ok(Some(LoadedPolicyData {
+        metadata: PolicyMetadata {
+            chain_id,
+            policy_id,
+            registry: TIP403_REGISTRY_ADDRESS.to_string(),
+            policy_type,
+            admin: current_tip403_policy_admin(conn, policy_id)
+                .await?
+                .or(default_admin),
+            created_by: Some(created_by),
+            created_at: Some(row.get(3)),
+            last_updated_at: latest_tip403_policy_update_at(conn, policy_id).await?,
+        },
+        compound_policy_refs,
     }))
+}
+
+async fn resolve_tip403_compound_policy(
+    conn: &deadpool_postgres::Object,
+    chain_id: u64,
+    refs: CompoundPolicyRefs,
+    member_limit: i64,
+) -> AnyhowResult<CompoundPolicyData> {
+    Ok(CompoundPolicyData {
+        sender_policy: load_tip403_child_policy(
+            conn,
+            chain_id,
+            refs.sender_policy_id,
+            member_limit,
+        )
+        .await?,
+        recipient_policy: load_tip403_child_policy(
+            conn,
+            chain_id,
+            refs.recipient_policy_id,
+            member_limit,
+        )
+        .await?,
+        mint_recipient_policy: load_tip403_child_policy(
+            conn,
+            chain_id,
+            refs.mint_recipient_policy_id,
+            member_limit,
+        )
+        .await?,
+    })
+}
+
+async fn load_tip403_child_policy(
+    conn: &deadpool_postgres::Object,
+    chain_id: u64,
+    policy_id: u64,
+    member_limit: i64,
+) -> AnyhowResult<ChildPolicyData> {
+    let policy_data = load_tip403_policy_metadata(conn, chain_id, policy_id)
+        .await?
+        .ok_or_else(|| anyhow!("compound child policy not found: {policy_id}"))?;
+
+    let (members, next_member_cursor) = if policy_data.metadata.has_direct_members() {
+        load_tip403_policy_members(
+            conn,
+            policy_id,
+            &policy_data.metadata.policy_type,
+            member_limit,
+            None,
+        )
+        .await?
+    } else {
+        (Vec::new(), None)
+    };
+
+    Ok(ChildPolicyData {
+        metadata: policy_data.metadata,
+        members,
+        next_member_cursor,
+    })
 }
 
 async fn current_tip403_policy_admin(
@@ -150,6 +319,7 @@ async fn current_tip403_policy_admin(
     policy_id: u64,
 ) -> AnyhowResult<Option<String>> {
     let selector = ITIP403Registry::PolicyAdminUpdated::SIGNATURE_HASH.as_slice();
+    let registry_address = tip403_registry_address();
     let policy_topic = tip403_policy_topic(policy_id);
 
     let row = conn
@@ -157,12 +327,12 @@ async fn current_tip403_policy_admin(
             r#"
             SELECT topic2, topic3
             FROM logs
-            WHERE address = '\x403c000000000000000000000000000000000000'::bytea
-              AND selector = $1 AND topic1 = $2 AND topic3 IS NOT NULL
+            WHERE address = $1
+              AND selector = $2 AND topic1 = $3 AND topic3 IS NOT NULL
             ORDER BY block_num DESC, tx_idx DESC, log_idx DESC
             LIMIT 1
             "#,
-            &[&selector, &policy_topic],
+            &[&registry_address, &selector, &policy_topic],
         )
         .await?;
 
@@ -180,12 +350,14 @@ async fn latest_tip403_policy_update_at(
     conn: &deadpool_postgres::Object,
     policy_id: u64,
 ) -> AnyhowResult<Option<chrono::DateTime<Utc>>> {
-    let selectors: [&[u8]; 4] = [
+    let selectors: [&[u8]; 5] = [
         ITIP403Registry::PolicyCreated::SIGNATURE_HASH.as_slice(),
+        ITIP403Registry::CompoundPolicyCreated::SIGNATURE_HASH.as_slice(),
         ITIP403Registry::PolicyAdminUpdated::SIGNATURE_HASH.as_slice(),
         ITIP403Registry::WhitelistUpdated::SIGNATURE_HASH.as_slice(),
         ITIP403Registry::BlacklistUpdated::SIGNATURE_HASH.as_slice(),
     ];
+    let registry_address = tip403_registry_address();
     let policy_topic = tip403_policy_topic(policy_id);
 
     let row = conn
@@ -193,12 +365,12 @@ async fn latest_tip403_policy_update_at(
             r#"
             SELECT block_timestamp
             FROM logs
-            WHERE address = '\x403c000000000000000000000000000000000000'::bytea
-              AND selector = ANY($1) AND topic1 = $2
+            WHERE address = $1
+              AND selector = ANY($2) AND topic1 = $3
             ORDER BY block_num DESC, tx_idx DESC, log_idx DESC
             LIMIT 1
             "#,
-            &[&&selectors[..], &policy_topic],
+            &[&registry_address, &&selectors[..], &policy_topic],
         )
         .await?;
 
@@ -209,13 +381,19 @@ async fn load_tip403_policy_members(
     conn: &deadpool_postgres::Object,
     policy_id: u64,
     policy_type: &PolicyType,
-) -> AnyhowResult<Vec<String>> {
+    limit: i64,
+    cursor: Option<&[u8]>,
+) -> AnyhowResult<(Vec<String>, Option<String>)> {
     let selector = match policy_type {
         PolicyType::WHITELIST => ITIP403Registry::WhitelistUpdated::SIGNATURE_HASH.as_slice(),
         PolicyType::BLACKLIST => ITIP403Registry::BlacklistUpdated::SIGNATURE_HASH.as_slice(),
-        _ => return Ok(Vec::new()),
+        _ => return Ok((Vec::new(), None)),
     };
+    let registry_address = tip403_registry_address();
     let policy_topic = tip403_policy_topic(policy_id);
+    let empty_cursor = vec![0u8; 32];
+    let cursor = cursor.unwrap_or(&empty_cursor);
+    let query_limit = limit + 1;
 
     let rows = conn
         .query(
@@ -223,19 +401,28 @@ async fn load_tip403_policy_members(
             SELECT DISTINCT ON (topic3)
                 topic2, topic3, data
             FROM logs
-            WHERE address = '\x403c000000000000000000000000000000000000'::bytea
-              AND selector = $1 AND topic1 = $2 AND topic3 IS NOT NULL
+            WHERE address = $1
+              AND selector = $2 AND topic1 = $3 AND topic3 IS NOT NULL AND topic3 > $4
             ORDER BY topic3, block_num DESC, tx_idx DESC, log_idx DESC
+            LIMIT $5
             "#,
-            &[&selector, &policy_topic],
+            &[
+                &registry_address,
+                &selector,
+                &policy_topic,
+                &cursor,
+                &query_limit,
+            ],
         )
         .await?;
 
     let mut members = Vec::new();
-    for row in rows {
+    let mut next_member_cursor = None;
+    for row in rows.iter().take(limit as usize) {
         let updater_topic: Vec<u8> = row.get(0);
         let account_topic: Vec<u8> = row.get(1);
         let data: Vec<u8> = row.get(2);
+        next_member_cursor = Some(format!("0x{}", hex::encode(&account_topic[12..32])));
 
         let active_member = match policy_type {
             PolicyType::WHITELIST => {
@@ -260,5 +447,12 @@ async fn load_tip403_policy_members(
         }
     }
 
-    Ok(members)
+    Ok((
+        members,
+        if rows.len() as i64 > limit {
+            next_member_cursor
+        } else {
+            None
+        },
+    ))
 }
