@@ -62,7 +62,16 @@ jobs:
 
             const prAuthorAssociation = context.payload.issue.author_association;
             if (!allowed.has(prAuthorAssociation)) {
-              core.setFailed(`PR author @${context.payload.issue.user.login} is not allowed to trigger Cyclops audits (${prAuthorAssociation})`);
+              const { data: pr } = await github.rest.pulls.get({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                pull_number: context.issue.number,
+              });
+              const baseRepo = `${context.repo.owner}/${context.repo.repo}`;
+              const headRepo = pr.head.repo?.full_name;
+              if (headRepo !== baseRepo) {
+                core.setFailed(`PR author @${context.payload.issue.user.login} is not allowed to trigger Cyclops audits (${prAuthorAssociation})`);
+              }
             }
 
       - name: Parse arguments
