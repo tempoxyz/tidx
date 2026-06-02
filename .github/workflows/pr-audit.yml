@@ -60,13 +60,9 @@ jobs:
               return;
             }
 
-            const { data: pr } = await github.rest.pulls.get({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              pull_number: context.issue.number,
-            });
-            if (!allowed.has(pr.author_association)) {
-              core.setFailed(`PR author @${pr.user.login} is not allowed to trigger Cyclops audits (${pr.author_association})`);
+            const prAuthorAssociation = context.payload.issue.author_association;
+            if (!allowed.has(prAuthorAssociation)) {
+              core.setFailed(`PR author @${context.payload.issue.user.login} is not allowed to trigger Cyclops audits (${prAuthorAssociation})`);
             }
 
       - name: Parse arguments
