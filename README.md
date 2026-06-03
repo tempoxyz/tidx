@@ -148,9 +148,8 @@ batch_size = 100
 [chains.clickhouse]
 enabled = true
 url = "http://clickhouse:8123"
-# Optional maintenance repair for historical materialized-table gaps.
-# Leave disabled for normal sync pods.
-repair_derived_on_startup = false
+# Historical materialized-table repair runs after base ClickHouse backfill by default.
+repair_derived_on_startup = true
 
 [[chains]]
 name = "moderato"
@@ -185,7 +184,7 @@ pg_password_env = "TIDX_PG_PASSWORD"
 └── [clickhouse]                                     ClickHouse OLAP settings
     ├── enabled             bool      = false        Enable ClickHouse OLAP queries
     ├── url                 string    = "http://clickhouse:8123"  ClickHouse HTTP URL
-    └── repair_derived_on_startup bool = false       Repair historical derived-table gaps on startup
+    └── repair_derived_on_startup bool = true        Repair historical derived-table gaps on startup
 ```
 
 ## CLI
@@ -582,7 +581,7 @@ For Transfer logs specifically, [`token_transfers`](#token_transfers) is pre-dec
 
 ClickHouse maintains these on insert and prunes them on reorg. Token-keyed tables answer "for this token, …"; address-keyed tables answer "for this account, …". Both families read from the same underlying Transfer/tx/receipt streams — the duplication exists so that either filter resolves via a sort-key seek instead of a full scan.
 
-By default, tidx creates and maintains these tables for new inserts without running historical repair queries on startup. Set `repair_derived_on_startup = true` under `[chains.clickhouse]` for an explicit maintenance run that verifies built-in materialized tables against their source SELECTs in bounded block ranges, logs detected gaps, and replays only the missing ranges in chunks while realtime sync continues. Failed derived repairs are retried with backoff.
+On startup, tidx verifies built-in materialized tables after base ClickHouse backfill is caught up. It compares each table against its source SELECT in bounded block ranges, logs detected gaps, and replays only the missing ranges in chunks while realtime sync continues. Failed derived repairs are retried with backoff. Set `repair_derived_on_startup = false` under `[chains.clickhouse]` only if an operator needs to suppress historical repair work temporarily.
 
 | Name | Purpose |
 |------|---------|
