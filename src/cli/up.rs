@@ -19,6 +19,9 @@ use tidx::sync::ch_sink::ClickHouseSink;
 use tidx::sync::engine::SyncEngine;
 use tidx::sync::sink::SinkSet;
 
+const CLICKHOUSE_BACKFILL_RETRY_MAX_SECS: u64 = 10;
+const CLICKHOUSE_DERIVED_REPAIR_RETRY_MAX_SECS: u64 = 300;
+
 #[derive(ClapArgs)]
 pub struct Args {
     /// Path to config file
@@ -354,14 +357,16 @@ fn spawn_sync_engine(
                                             Ok(()) => break,
                                             Err(e) => {
                                                 attempt += 1;
-                                                let delay_secs =
-                                                    10u64.min(2u64.saturating_pow(attempt));
-                                                error!(
+                                                let delay_secs = retry_delay_secs(
+                                                    attempt,
+                                                    CLICKHOUSE_DERIVED_REPAIR_RETRY_MAX_SECS,
+                                                );
+                                                warn!(
                                                     error = %e,
                                                     chain = %backfill_chain_name,
                                                     attempt,
                                                     retry_in_secs = delay_secs,
-                                                    "ClickHouse derived table backfill failed, retrying"
+                                                    "ClickHouse derived table repair failed, backing off"
                                                 );
                                                 tokio::time::sleep(std::time::Duration::from_secs(
                                                     delay_secs,
@@ -408,7 +413,8 @@ fn spawn_sync_engine(
                         Ok(()) => break,
                         Err(e) => {
                             attempt += 1;
-                            let delay_secs = 10u64.min(2u64.saturating_pow(attempt));
+                            let delay_secs =
+                                retry_delay_secs(attempt, CLICKHOUSE_BACKFILL_RETRY_MAX_SECS);
                             error!(
                                 error = %e,
                                 chain = %backfill_chain_name,
@@ -445,6 +451,10 @@ fn spawn_sync_engine(
             error!(error = %e, chain = %chain.name, "Sync engine failed");
         }
     });
+}
+
+fn retry_delay_secs(attempt: u32, max_secs: u64) -> u64 {
+    2u64.saturating_pow(attempt).min(max_secs)
 }
 
 /// Seed in-memory ClickHouse watermarks and row counts from existing data.
@@ -491,5 +501,19 @@ async fn seed_metrics_from_db(pool: &tidx::db::Pool) {
                 tidx::metrics::increment_sink_row_count("postgres", &table, count as u64);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn retry_delay_backs_off_until_cap() {
+        assert_eq!(retry_delay_secs(1, 300), 2);
+        assert_eq!(retry_delay_secs(2, 300), 4);
+        assert_eq!(retry_delay_secs(8, 300), 256);
+        assert_eq!(retry_delay_secs(9, 300), 300);
+        assert_eq!(retry_delay_secs(127, 300), 300);
     }
 }
