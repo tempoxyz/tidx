@@ -1134,13 +1134,10 @@ mod tests {
     #[test]
     fn test_derived_query_retry_delay_caps() {
         assert_eq!(derived_query_retry_delay(1), Duration::from_millis(500));
-        assert_eq!(derived_query_retry_delay(2), Duration::from_millis(1_000));
-        assert_eq!(derived_query_retry_delay(5), Duration::from_millis(8_000));
-        assert_eq!(derived_query_retry_delay(6), Duration::from_millis(10_000));
-        assert_eq!(
-            derived_query_retry_delay(127),
-            Duration::from_millis(10_000)
-        );
+        assert_eq!(derived_query_retry_delay(2), Duration::from_secs(1));
+        assert_eq!(derived_query_retry_delay(5), Duration::from_secs(8));
+        assert_eq!(derived_query_retry_delay(6), Duration::from_secs(10));
+        assert_eq!(derived_query_retry_delay(127), Duration::from_secs(10));
     }
 
     #[test]
