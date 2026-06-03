@@ -4,7 +4,7 @@
 //! via the official `clickhouse` crate using RowBinary format with LZ4 compression.
 
 use anyhow::{Result, anyhow};
-use clickhouse::Row;
+use clickhouse::{Row, RowOwned, RowRead};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::hash::{DefaultHasher, Hash, Hasher};
@@ -43,6 +43,9 @@ const CH_SEND_TIMEOUT: Duration = Duration::from_secs(30);
 /// Timeout for waiting for ClickHouse to acknowledge the INSERT.
 const CH_END_TIMEOUT: Duration = Duration::from_secs(120);
 const DERIVED_BACKFILL_BLOCK_BATCH_SIZE: i64 = 100_000;
+const CH_DERIVED_QUERY_MAX_ATTEMPTS: u32 = 6;
+const CH_DERIVED_QUERY_RETRY_BASE_MS: u64 = 500;
+const CH_DERIVED_QUERY_RETRY_MAX_MS: u64 = 10_000;
 
 /// Direct-write ClickHouse sink using RowBinary format with LZ4 compression.
 #[derive(Clone)]
@@ -305,11 +308,11 @@ impl ClickHouseSink {
                 "Backfilling ClickHouse derived table"
             );
 
-            self.client
-                .query(&bounded_backfill_sql(&plan))
-                .execute()
-                .await
-                .map_err(|e| anyhow!("Failed to backfill ClickHouse table {}: {e}", plan.target))?;
+            self.execute_derived_query_with_retry(
+                &bounded_backfill_sql(&plan),
+                &format!("ClickHouse table {} backfill", plan.target),
+            )
+            .await?;
         }
 
         info!(
@@ -518,11 +521,8 @@ impl ClickHouseSink {
             select_sql.trim()
         );
         let (count, min, max): (u64, i64, i64) = self
-            .client
-            .query(&sql)
-            .fetch_one()
-            .await
-            .map_err(|e| anyhow!("ClickHouse source range query failed: {e}"))?;
+            .fetch_one_derived_query_with_retry(&sql, "ClickHouse source range query")
+            .await?;
         if count == 0 {
             Ok(None)
         } else {
@@ -537,11 +537,11 @@ impl ClickHouseSink {
         lo: i64,
         hi: i64,
     ) -> Result<u64> {
-        self.client
-            .query(&source_count_sql(select_sql, block_column, lo, hi))
-            .fetch_one()
-            .await
-            .map_err(|e| anyhow!("ClickHouse source count query failed: {e}"))
+        self.fetch_one_derived_query_with_retry(
+            &source_count_sql(select_sql, block_column, lo, hi),
+            "ClickHouse source count query",
+        )
+        .await
     }
 
     async fn count_target_rows(
@@ -552,11 +552,70 @@ impl ClickHouseSink {
         hi: i64,
     ) -> Result<u64> {
         let table = validate_table_name(table)?;
-        self.client
-            .query(&target_count_sql(table, block_column, lo, hi))
-            .fetch_one()
-            .await
-            .map_err(|e| anyhow!("ClickHouse target count query failed: {e}"))
+        self.fetch_one_derived_query_with_retry(
+            &target_count_sql(table, block_column, lo, hi),
+            "ClickHouse target count query",
+        )
+        .await
+    }
+
+    async fn fetch_one_derived_query_with_retry<T>(&self, sql: &str, operation: &str) -> Result<T>
+    where
+        T: RowOwned + RowRead,
+    {
+        let mut attempt = 0;
+        loop {
+            match self.client.query(sql).fetch_one::<T>().await {
+                Ok(row) => return Ok(row),
+                Err(e) => {
+                    attempt += 1;
+                    if attempt >= CH_DERIVED_QUERY_MAX_ATTEMPTS
+                        || !is_retryable_clickhouse_error(&e)
+                    {
+                        return Err(anyhow!("{operation} failed: {e}"));
+                    }
+
+                    let delay = derived_query_retry_delay(attempt);
+                    warn!(
+                        operation,
+                        attempt,
+                        max_attempts = CH_DERIVED_QUERY_MAX_ATTEMPTS,
+                        retry_in_ms = delay.as_millis() as u64,
+                        error = %e,
+                        "ClickHouse derived repair query retry"
+                    );
+                    tokio::time::sleep(delay).await;
+                }
+            }
+        }
+    }
+
+    async fn execute_derived_query_with_retry(&self, sql: &str, operation: &str) -> Result<()> {
+        let mut attempt = 0;
+        loop {
+            match self.client.query(sql).execute().await {
+                Ok(()) => return Ok(()),
+                Err(e) => {
+                    attempt += 1;
+                    if attempt >= CH_DERIVED_QUERY_MAX_ATTEMPTS
+                        || !is_retryable_clickhouse_error(&e)
+                    {
+                        return Err(anyhow!("{operation} failed: {e}"));
+                    }
+
+                    let delay = derived_query_retry_delay(attempt);
+                    warn!(
+                        operation,
+                        attempt,
+                        max_attempts = CH_DERIVED_QUERY_MAX_ATTEMPTS,
+                        retry_in_ms = delay.as_millis() as u64,
+                        error = %e,
+                        "ClickHouse derived repair query retry"
+                    );
+                    tokio::time::sleep(delay).await;
+                }
+            }
+        }
     }
 
     /// Delete all data from a given block number onwards (reorg support).
@@ -902,6 +961,24 @@ fn target_count_sql(
     )
 }
 
+fn is_retryable_clickhouse_error(error: &impl std::fmt::Display) -> bool {
+    let message = error.to_string().to_ascii_lowercase();
+    message.contains("network error")
+        || message.contains("connect")
+        || message.contains("connection")
+        || message.contains("timeout")
+        || message.contains("timed out")
+}
+
+fn derived_query_retry_delay(attempt: u32) -> Duration {
+    let exponent = attempt.saturating_sub(1);
+    let multiplier = 2u64.saturating_pow(exponent);
+    let millis = CH_DERIVED_QUERY_RETRY_BASE_MS
+        .saturating_mul(multiplier)
+        .min(CH_DERIVED_QUERY_RETRY_MAX_MS);
+    Duration::from_millis(millis)
+}
+
 /// Validate that a table name is one of the known tables.
 /// Returns the validated name or an error for unknown tables.
 fn validate_table_name(table: &str) -> Result<&str> {
@@ -1037,6 +1114,32 @@ mod tests {
         assert_eq!(
             target_count_sql("address_txs", "block_num", 100, 200),
             "SELECT count() FROM address_txs FINAL WHERE block_num >= 100 AND block_num < 200"
+        );
+    }
+
+    #[test]
+    fn test_derived_query_retry_classification() {
+        assert!(is_retryable_clickhouse_error(
+            &"network error: client error (Connect)"
+        ));
+        assert!(is_retryable_clickhouse_error(&"request timed out"));
+        assert!(is_retryable_clickhouse_error(&"connection closed"));
+
+        assert!(!is_retryable_clickhouse_error(
+            &"MEMORY_LIMIT_EXCEEDED: would use too much memory"
+        ));
+        assert!(!is_retryable_clickhouse_error(&"Syntax error near SELECT"));
+    }
+
+    #[test]
+    fn test_derived_query_retry_delay_caps() {
+        assert_eq!(derived_query_retry_delay(1), Duration::from_millis(500));
+        assert_eq!(derived_query_retry_delay(2), Duration::from_millis(1_000));
+        assert_eq!(derived_query_retry_delay(5), Duration::from_millis(8_000));
+        assert_eq!(derived_query_retry_delay(6), Duration::from_millis(10_000));
+        assert_eq!(
+            derived_query_retry_delay(127),
+            Duration::from_millis(10_000)
         );
     }
 
