@@ -14,7 +14,7 @@ use crate::types::{LogRow, ReceiptRow, SyncState};
 
 use super::decoder::{
     decode_block, decode_log, decode_receipt, decode_transaction, enrich_txs_from_receipts,
-    timestamp_from_secs,
+    timestamp_from_secs, validate_receipts,
 };
 use super::fetcher::RpcClient;
 use super::sink::SinkSet;
@@ -560,6 +560,9 @@ impl SyncEngine {
             self.realtime_rpc.get_receipts_batch_adaptive(from..=to)
         )?;
 
+        // Validate receipt membership against block transactions
+        validate_receipts(&blocks, &receipts)?;
+
         // Validate parent hash chain
         self.validate_parent_chain(&blocks).await?;
 
@@ -638,6 +641,9 @@ impl SyncEngine {
             self.realtime_rpc.get_block(num, true),
             self.realtime_rpc.get_block_receipts(num)
         )?;
+
+        // Validate receipt membership against block transactions
+        validate_receipts(&[block.clone()], &[receipts.clone()])?;
 
         let block_row = decode_block(&block);
         let block_ts = timestamp_from_secs(block.header.timestamp());
@@ -1348,7 +1354,7 @@ async fn is_fully_synced(pool: &Pool, tip_num: u64) -> Result<bool> {
 async fn sync_range_standalone(sinks: &SinkSet, rpc: &RpcClient, from: u64, to: u64) -> Result<()> {
     use super::decoder::{
         decode_block, decode_log, decode_receipt, decode_transaction, enrich_txs_from_receipts,
-        timestamp_from_secs,
+        timestamp_from_secs, validate_receipts,
     };
     use alloy::network::ReceiptResponse;
 
@@ -1356,6 +1362,9 @@ async fn sync_range_standalone(sinks: &SinkSet, rpc: &RpcClient, from: u64, to: 
         rpc.get_blocks_batch(from..=to),
         rpc.get_receipts_batch_adaptive(from..=to)
     )?;
+
+    // Validate receipt membership against block transactions
+    validate_receipts(&blocks, &receipts)?;
 
     let block_timestamps: HashMap<u64, _> = blocks
         .iter()
