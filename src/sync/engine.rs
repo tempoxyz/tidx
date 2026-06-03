@@ -3,14 +3,14 @@ use alloy::network::ReceiptResponse;
 use anyhow::Result;
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::sync::broadcast;
 use tracing::{debug, error, info};
 
 use crate::broadcast::{BlockUpdate, Broadcaster};
 use crate::db::{Pool, ThrottledPool};
 use crate::metrics::{self, SyncProgress};
-use crate::types::SyncState;
+use crate::types::{LogRow, ReceiptRow, SyncState};
 
 use super::decoder::{
     decode_block, decode_log, decode_receipt, decode_transaction, enrich_txs_from_receipts,
@@ -27,6 +27,9 @@ use crate::virtual_address::mark_virtual_forward_hops;
 /// RPC concurrency limits
 const REALTIME_RPC_CONCURRENCY: usize = 4;
 const BACKFILL_RPC_CONCURRENCY: usize = 8;
+const RECEIPT_BACKFILL_BLOCK_LIMIT: i64 = 100;
+const RECEIPT_BACKFILL_MAX_WRITE_ROWS: usize = 50_000;
+const RECEIPT_BACKFILL_INFO_ROWS: usize = 10_000;
 
 pub struct SyncEngine {
     /// Throttled pool - shared by all, but backfill is rate-limited
@@ -1454,11 +1457,10 @@ async fn tick_receipt_backfill(sinks: &SinkSet, rpc: &RpcClient, chain_id: u64) 
     use super::decoder::{decode_log, decode_receipt};
     use alloy::network::ReceiptResponse;
 
-    const BATCH_LIMIT: i64 = 100;
     let pool = sinks.pool();
 
     // Find blocks that have no receipts (most recent first)
-    let blocks_missing = detect_blocks_missing_receipts(pool, BATCH_LIMIT).await?;
+    let blocks_missing = detect_blocks_missing_receipts(pool, RECEIPT_BACKFILL_BLOCK_LIMIT).await?;
 
     if blocks_missing.is_empty() {
         // All caught up, sleep before checking again
@@ -1508,64 +1510,102 @@ async fn tick_receipt_backfill(sinks: &SinkSet, rpc: &RpcClient, chain_id: u64) 
             })
             .collect();
 
-        // Decode logs and receipts
-        let mut all_logs: Vec<_> = receipts
-            .iter()
-            .flatten()
-            .flat_map(|receipt| {
-                let block_num = receipt.block_number().unwrap_or(0);
-                block_timestamps
-                    .get(&block_num)
-                    .map(|&ts| {
-                        receipt
-                            .inner
-                            .logs()
-                            .iter()
-                            .map(move |log| decode_log(log, ts))
-                    })
-                    .into_iter()
-                    .flatten()
-            })
-            .collect();
+        let mut chunk_logs: Vec<LogRow> = Vec::new();
+        let mut chunk_receipts: Vec<ReceiptRow> = Vec::new();
+        let mut chunk_min_block: Option<u64> = None;
+        let mut chunk_max_block: Option<u64> = None;
 
-        let all_receipts: Vec<_> = receipts
-            .iter()
-            .flatten()
-            .filter_map(|receipt| {
-                let block_num = receipt.block_number().unwrap_or(0);
-                block_timestamps
-                    .get(&block_num)
-                    .map(|&ts| decode_receipt(receipt, ts))
-            })
-            .collect();
+        for block_receipts in receipts {
+            let mut block_logs: Vec<_> = block_receipts
+                .iter()
+                .flat_map(|receipt| {
+                    let block_num = receipt.block_number().unwrap_or(0);
+                    block_timestamps
+                        .get(&block_num)
+                        .map(|&ts| {
+                            receipt
+                                .inner
+                                .logs()
+                                .iter()
+                                .map(move |log| decode_log(log, ts))
+                        })
+                        .into_iter()
+                        .flatten()
+                })
+                .collect();
 
-        // TIP-1022: mark virtual address forwarding hops
-        let forward_marks = mark_virtual_forward_hops(&all_logs);
-        for (log, is_forward) in all_logs.iter_mut().zip(forward_marks) {
-            log.is_virtual_forward = is_forward;
+            // TIP-1022: mark virtual address forwarding hops. Matching is scoped to a
+            // transaction, so doing this one block at a time keeps chunking safe.
+            let forward_marks = mark_virtual_forward_hops(&block_logs);
+            for (log, is_forward) in block_logs.iter_mut().zip(forward_marks) {
+                log.is_virtual_forward = is_forward;
+            }
+
+            let block_receipt_rows: Vec<_> = block_receipts
+                .iter()
+                .filter_map(|receipt| {
+                    let block_num = receipt.block_number().unwrap_or(0);
+                    block_timestamps
+                        .get(&block_num)
+                        .map(|&ts| decode_receipt(receipt, ts))
+                })
+                .collect();
+
+            let block_rows = receipt_backfill_rows(block_logs.len(), block_receipt_rows.len());
+            if should_flush_receipt_backfill_chunk(
+                receipt_backfill_rows(chunk_logs.len(), chunk_receipts.len()),
+                block_rows,
+            ) {
+                flush_receipt_backfill_chunk(
+                    sinks,
+                    chain_id,
+                    chunk_min_block,
+                    chunk_max_block,
+                    &mut chunk_logs,
+                    &mut chunk_receipts,
+                )
+                .await?;
+                chunk_min_block = None;
+                chunk_max_block = None;
+            }
+
+            for block_num in block_logs.iter().map(|log| log.block_num as u64).chain(
+                block_receipt_rows
+                    .iter()
+                    .map(|receipt| receipt.block_num as u64),
+            ) {
+                chunk_min_block = Some(chunk_min_block.map_or(block_num, |m| m.min(block_num)));
+                chunk_max_block = Some(chunk_max_block.map_or(block_num, |m| m.max(block_num)));
+            }
+
+            if let Some(block_num) = block_receipt_rows
+                .iter()
+                .map(|receipt| receipt.block_num as u64)
+                .min()
+            {
+                min_block = Some(min_block.map_or(block_num, |m: u64| m.min(block_num)));
+            }
+            if let Some(block_num) = block_receipt_rows
+                .iter()
+                .map(|receipt| receipt.block_num as u64)
+                .max()
+            {
+                max_block = Some(max_block.map_or(block_num, |m: u64| m.max(block_num)));
+            }
+
+            chunk_logs.extend(block_logs);
+            chunk_receipts.extend(block_receipt_rows);
         }
 
-        let log_count = all_logs.len();
-        let receipt_count = all_receipts.len();
-
-        // Write logs + receipts atomically in a single transaction
-        sinks.write_all(&[], &[], &all_logs, &all_receipts).await?;
-
-        if receipt_count > 0 {
-            min_block = Some(min_block.map_or(from, |m: u64| m.min(from)));
-            max_block = Some(max_block.map_or(to, |m: u64| m.max(to)));
-        }
-
-        metrics::record_logs_indexed(chain_id, log_count as u64);
-
-        debug!(
+        flush_receipt_backfill_chunk(
+            sinks,
             chain_id,
-            from,
-            to,
-            receipts = receipt_count,
-            logs = log_count,
-            "Receipt backfill: wrote receipts+logs"
-        );
+            chunk_min_block,
+            chunk_max_block,
+            &mut chunk_logs,
+            &mut chunk_receipts,
+        )
+        .await?;
     }
 
     // Single UPDATE txs covering all processed ranges (instead of per-range)
@@ -1581,6 +1621,69 @@ async fn tick_receipt_backfill(sinks: &SinkSet, rpc: &RpcClient, chain_id: u64) 
         )
         .await?;
     }
+
+    Ok(())
+}
+
+fn receipt_backfill_rows(log_count: usize, receipt_count: usize) -> usize {
+    log_count + receipt_count
+}
+
+fn should_flush_receipt_backfill_chunk(current_rows: usize, next_rows: usize) -> bool {
+    current_rows > 0 && current_rows + next_rows > RECEIPT_BACKFILL_MAX_WRITE_ROWS
+}
+
+async fn flush_receipt_backfill_chunk(
+    sinks: &SinkSet,
+    chain_id: u64,
+    from: Option<u64>,
+    to: Option<u64>,
+    logs: &mut Vec<LogRow>,
+    receipts: &mut Vec<ReceiptRow>,
+) -> Result<()> {
+    if logs.is_empty() && receipts.is_empty() {
+        return Ok(());
+    }
+
+    let log_count = logs.len();
+    let receipt_count = receipts.len();
+    let row_count = receipt_backfill_rows(log_count, receipt_count);
+    let start = Instant::now();
+    let application_name = format!("tidx receipt_backfill {chain_id}");
+
+    sinks
+        .write_all_with_application_name(&[], &[], logs, receipts, &application_name)
+        .await?;
+
+    let elapsed = start.elapsed();
+    metrics::record_logs_indexed(chain_id, log_count as u64);
+
+    if elapsed >= Duration::from_secs(10) || row_count >= RECEIPT_BACKFILL_INFO_ROWS {
+        info!(
+            chain_id,
+            from,
+            to,
+            receipts = receipt_count,
+            logs = log_count,
+            rows = row_count,
+            elapsed_ms = elapsed.as_millis() as u64,
+            "Receipt backfill: wrote receipts+logs chunk"
+        );
+    } else {
+        debug!(
+            chain_id,
+            from,
+            to,
+            receipts = receipt_count,
+            logs = log_count,
+            rows = row_count,
+            elapsed_ms = elapsed.as_millis() as u64,
+            "Receipt backfill: wrote receipts+logs chunk"
+        );
+    }
+
+    logs.clear();
+    receipts.clear();
 
     Ok(())
 }
@@ -1666,5 +1769,25 @@ mod tests {
         let blocks: Vec<u64> = (1..=25).collect();
         let ranges = group_consecutive_blocks(&blocks);
         assert_eq!(ranges, vec![(1, 10), (11, 20), (21, 25)]);
+    }
+
+    #[test]
+    fn test_receipt_backfill_chunk_does_not_flush_empty_chunk() {
+        assert!(!should_flush_receipt_backfill_chunk(
+            0,
+            RECEIPT_BACKFILL_MAX_WRITE_ROWS + 1
+        ));
+    }
+
+    #[test]
+    fn test_receipt_backfill_chunk_flushes_before_row_limit() {
+        assert!(!should_flush_receipt_backfill_chunk(
+            RECEIPT_BACKFILL_MAX_WRITE_ROWS - 10,
+            10
+        ));
+        assert!(should_flush_receipt_backfill_chunk(
+            RECEIPT_BACKFILL_MAX_WRITE_ROWS - 10,
+            11
+        ));
     }
 }

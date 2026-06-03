@@ -87,14 +87,62 @@ impl SinkSet {
         logs: &[LogRow],
         receipts: &[ReceiptRow],
     ) -> Result<()> {
+        self.write_all_inner(blocks, txs, logs, receipts, None)
+            .await
+    }
+
+    pub async fn write_all_with_application_name(
+        &self,
+        blocks: &[BlockRow],
+        txs: &[TxRow],
+        logs: &[LogRow],
+        receipts: &[ReceiptRow],
+        application_name: &str,
+    ) -> Result<()> {
+        self.write_all_inner(blocks, txs, logs, receipts, Some(application_name))
+            .await
+    }
+
+    async fn write_all_inner(
+        &self,
+        blocks: &[BlockRow],
+        txs: &[TxRow],
+        logs: &[LogRow],
+        receipts: &[ReceiptRow],
+        application_name: Option<&str>,
+    ) -> Result<()> {
         if let Some(ch) = &self.ch {
             tokio::try_join!(
-                writer::write_batch(&self.pool, blocks, txs, logs, receipts),
+                async {
+                    if let Some(application_name) = application_name {
+                        writer::write_batch_with_application_name(
+                            &self.pool,
+                            blocks,
+                            txs,
+                            logs,
+                            receipts,
+                            application_name,
+                        )
+                        .await
+                    } else {
+                        writer::write_batch(&self.pool, blocks, txs, logs, receipts).await
+                    }
+                },
                 ch.write_blocks(blocks),
                 ch.write_txs(txs),
                 ch.write_logs(logs),
                 ch.write_receipts(receipts),
             )?;
+        } else if let Some(application_name) = application_name {
+            writer::write_batch_with_application_name(
+                &self.pool,
+                blocks,
+                txs,
+                logs,
+                receipts,
+                application_name,
+            )
+            .await?;
         } else {
             writer::write_batch(&self.pool, blocks, txs, logs, receipts).await?;
         }
