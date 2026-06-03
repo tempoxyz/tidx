@@ -573,6 +573,8 @@ For Transfer logs specifically, [`token_transfers`](#token_transfers) is pre-dec
 
 ClickHouse maintains these on insert and prunes them on reorg. Token-keyed tables answer "for this token, …"; address-keyed tables answer "for this account, …". Both families read from the same underlying Transfer/tx/receipt streams — the duplication exists so that either filter resolves via a sort-key seek instead of a full scan.
 
+On startup, tidx verifies built-in materialized tables against their source SELECTs in bounded block ranges. If a previous derived-table backfill failed or left a partial range, tidx logs the detected gap and replays only the missing ranges in chunks while realtime sync continues. Failed derived repairs are retried with backoff.
+
 | Name | Purpose |
 |------|---------|
 | [`address_balances`](#address_balances) | Current positive balance per `(holder, token)`. |

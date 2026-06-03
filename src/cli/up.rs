@@ -350,15 +350,32 @@ fn spawn_sync_engine(
                                     let backfill_sink = ch_sink.clone();
                                     let backfill_chain_name = chain.name.clone();
                                     tokio::spawn(async move {
-                                        if let Err(e) = backfill_sink
-                                            .run_derived_backfill_plan(derived_backfills)
-                                            .await
-                                        {
-                                            error!(
-                                                error = %e,
-                                                chain = %backfill_chain_name,
-                                                "ClickHouse derived table backfill failed"
-                                            );
+                                        let mut attempt: u32 = 0;
+                                        loop {
+                                            match backfill_sink
+                                                .run_derived_backfill_plan(
+                                                    derived_backfills.clone(),
+                                                )
+                                                .await
+                                            {
+                                                Ok(()) => break,
+                                                Err(e) => {
+                                                    attempt += 1;
+                                                    let delay_secs =
+                                                        10u64.min(2u64.saturating_pow(attempt));
+                                                    error!(
+                                                        error = %e,
+                                                        chain = %backfill_chain_name,
+                                                        attempt,
+                                                        retry_in_secs = delay_secs,
+                                                        "ClickHouse derived table backfill failed, retrying"
+                                                    );
+                                                    tokio::time::sleep(
+                                                        std::time::Duration::from_secs(delay_secs),
+                                                    )
+                                                    .await;
+                                                }
+                                            }
                                         }
                                     });
                                 }

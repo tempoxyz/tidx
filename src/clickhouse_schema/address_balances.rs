@@ -13,7 +13,7 @@ pub const OBJECTS: &[ClickHouseObject] = &[
         depends_on: &["token_transfers"],
         public_query: true,
         block_column: Some("block_num"),
-        backfill: Some(BackfillPolicy::IfEmpty {
+        backfill: Some(BackfillPolicy::Ranged {
             select_sql: ADDRESS_HOLDER_DELTAS_SELECT,
         }),
     },

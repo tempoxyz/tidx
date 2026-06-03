@@ -11,7 +11,7 @@ pub const OBJECTS: &[ClickHouseObject] = &[
         depends_on: &["receipts"],
         public_query: true,
         block_column: Some("block_num"),
-        backfill: Some(BackfillPolicy::IfEmpty {
+        backfill: Some(BackfillPolicy::Ranged {
             select_sql: CONTRACT_CREATIONS_SELECT,
         }),
     },
