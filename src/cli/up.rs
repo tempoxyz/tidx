@@ -348,34 +348,43 @@ fn spawn_sync_engine(
                                     database = %database,
                                     "ClickHouse direct-write sink enabled"
                                 );
-                                let backfill_sink = ch_sink.clone();
-                                let backfill_chain_name = chain.name.clone();
-                                tokio::spawn(async move {
-                                    let mut attempt: u32 = 0;
-                                    loop {
-                                        match backfill_sink.repair_derived_backfill_gaps().await {
-                                            Ok(()) => break,
-                                            Err(e) => {
-                                                attempt += 1;
-                                                let delay_secs = retry_delay_secs(
-                                                    attempt,
-                                                    CLICKHOUSE_DERIVED_REPAIR_RETRY_MAX_SECS,
-                                                );
-                                                warn!(
-                                                    error = %e,
-                                                    chain = %backfill_chain_name,
-                                                    attempt,
-                                                    retry_in_secs = delay_secs,
-                                                    "ClickHouse derived table repair failed, backing off"
-                                                );
-                                                tokio::time::sleep(std::time::Duration::from_secs(
-                                                    delay_secs,
-                                                ))
-                                                .await;
+                                if ch_config.repair_derived_on_startup {
+                                    let backfill_sink = ch_sink.clone();
+                                    let backfill_chain_name = chain.name.clone();
+                                    tokio::spawn(async move {
+                                        let mut attempt: u32 = 0;
+                                        loop {
+                                            match backfill_sink.repair_derived_backfill_gaps().await
+                                            {
+                                                Ok(()) => break,
+                                                Err(e) => {
+                                                    attempt += 1;
+                                                    let delay_secs = retry_delay_secs(
+                                                        attempt,
+                                                        CLICKHOUSE_DERIVED_REPAIR_RETRY_MAX_SECS,
+                                                    );
+                                                    warn!(
+                                                        error = %e,
+                                                        chain = %backfill_chain_name,
+                                                        attempt,
+                                                        retry_in_secs = delay_secs,
+                                                        "ClickHouse derived table repair failed, backing off"
+                                                    );
+                                                    tokio::time::sleep(
+                                                        std::time::Duration::from_secs(delay_secs),
+                                                    )
+                                                    .await;
+                                                }
                                             }
                                         }
-                                    }
-                                });
+                                    });
+                                } else {
+                                    info!(
+                                        chain = %chain.name,
+                                        database = %database,
+                                        "ClickHouse startup derived table repair disabled"
+                                    );
+                                }
                                 seed_metrics_from_clickhouse(&ch_sink).await;
                                 sinks = sinks.with_clickhouse(ch_sink);
                             }

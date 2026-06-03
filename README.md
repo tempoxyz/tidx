@@ -148,6 +148,9 @@ batch_size = 100
 [chains.clickhouse]
 enabled = true
 url = "http://clickhouse:8123"
+# Optional maintenance repair for historical materialized-table gaps.
+# Leave disabled for normal sync pods.
+repair_derived_on_startup = false
 
 [[chains]]
 name = "moderato"
@@ -181,7 +184,8 @@ pg_password_env = "TIDX_PG_PASSWORD"
 ├── batch_size              u64       = 100          Blocks per RPC batch request
 └── [clickhouse]                                     ClickHouse OLAP settings
     ├── enabled             bool      = false        Enable ClickHouse OLAP queries
-    └── url                 string    = "http://clickhouse:8123"  ClickHouse HTTP URL
+    ├── url                 string    = "http://clickhouse:8123"  ClickHouse HTTP URL
+    └── repair_derived_on_startup bool = false       Repair historical derived-table gaps on startup
 ```
 
 ## CLI
@@ -578,7 +582,7 @@ For Transfer logs specifically, [`token_transfers`](#token_transfers) is pre-dec
 
 ClickHouse maintains these on insert and prunes them on reorg. Token-keyed tables answer "for this token, …"; address-keyed tables answer "for this account, …". Both families read from the same underlying Transfer/tx/receipt streams — the duplication exists so that either filter resolves via a sort-key seek instead of a full scan.
 
-On startup, tidx verifies built-in materialized tables against their source SELECTs in bounded block ranges. If a previous derived-table backfill failed or left a partial range, tidx logs the detected gap and replays only the missing ranges in chunks while realtime sync continues. Failed derived repairs are retried with backoff.
+By default, tidx creates and maintains these tables for new inserts without running historical repair queries on startup. Set `repair_derived_on_startup = true` under `[chains.clickhouse]` for an explicit maintenance run that verifies built-in materialized tables against their source SELECTs in bounded block ranges, logs detected gaps, and replays only the missing ranges in chunks while realtime sync continues. Failed derived repairs are retried with backoff.
 
 | Name | Purpose |
 |------|---------|
