@@ -115,17 +115,21 @@ impl ClickHouseSink {
     ///    recreate it so SELECT-body edits actually take effect.
     /// 4. Backfill any detected gaps in derived tables.
     pub async fn ensure_schema(&self) -> Result<()> {
-        self.ensure_schema_objects().await?;
-        self.backfill_derived_objects().await
+        self.ensure_schema_only().await?;
+        self.repair_derived_backfill_gaps().await
     }
 
-    /// Reconcile schema objects and return any historical derived-table gaps
-    /// that should be repaired after startup. This lets the indexer start
-    /// syncing immediately while large materialized tables catch up in the
-    /// background.
-    pub async fn ensure_schema_and_plan_backfills(&self) -> Result<Vec<DerivedBackfillPlan>> {
-        self.ensure_schema_objects().await?;
-        self.plan_derived_backfills().await
+    /// Reconcile schema objects without scanning or repairing derived data.
+    /// The sync engine uses this path so regular writes can start before any
+    /// potentially large historical derived-table repair work.
+    pub async fn ensure_schema_only(&self) -> Result<()> {
+        self.ensure_schema_objects().await
+    }
+
+    /// Detect and repair historical gaps in managed derived tables.
+    pub async fn repair_derived_backfill_gaps(&self) -> Result<()> {
+        let plans = self.plan_derived_backfills().await?;
+        self.run_derived_backfill_plan(plans).await
     }
 
     async fn ensure_schema_objects(&self) -> Result<()> {
@@ -276,15 +280,6 @@ impl ClickHouseSink {
             .await
             .map_err(|e| anyhow!("Failed to record schema object {name}: {e}"))?;
         Ok(())
-    }
-
-    /// One-shot repair for derived tables. The plan captures bounded block
-    /// ranges from dependency tables before writers start, then executes
-    /// backfills in dependency order. Materialized views cover newer rows
-    /// written while the plan is running.
-    async fn backfill_derived_objects(&self) -> Result<()> {
-        let plans = self.plan_derived_backfills().await?;
-        self.run_derived_backfill_plan(plans).await
     }
 
     /// Execute a planned derived-table backfill.

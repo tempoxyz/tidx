@@ -338,47 +338,39 @@ fn spawn_sync_engine(
                         ch_config.user.as_deref(),
                         ch_password.as_deref(),
                     ) {
-                        Ok(ch_sink) => match ch_sink.ensure_schema_and_plan_backfills().await {
-                            Ok(derived_backfills) => {
+                        Ok(ch_sink) => match ch_sink.ensure_schema_only().await {
+                            Ok(()) => {
                                 info!(
                                     chain = %chain.name,
                                     database = %database,
-                                    derived_backfills = derived_backfills.len(),
                                     "ClickHouse direct-write sink enabled"
                                 );
-                                if !derived_backfills.is_empty() {
-                                    let backfill_sink = ch_sink.clone();
-                                    let backfill_chain_name = chain.name.clone();
-                                    tokio::spawn(async move {
-                                        let mut attempt: u32 = 0;
-                                        loop {
-                                            match backfill_sink
-                                                .run_derived_backfill_plan(
-                                                    derived_backfills.clone(),
-                                                )
-                                                .await
-                                            {
-                                                Ok(()) => break,
-                                                Err(e) => {
-                                                    attempt += 1;
-                                                    let delay_secs =
-                                                        10u64.min(2u64.saturating_pow(attempt));
-                                                    error!(
-                                                        error = %e,
-                                                        chain = %backfill_chain_name,
-                                                        attempt,
-                                                        retry_in_secs = delay_secs,
-                                                        "ClickHouse derived table backfill failed, retrying"
-                                                    );
-                                                    tokio::time::sleep(
-                                                        std::time::Duration::from_secs(delay_secs),
-                                                    )
-                                                    .await;
-                                                }
+                                let backfill_sink = ch_sink.clone();
+                                let backfill_chain_name = chain.name.clone();
+                                tokio::spawn(async move {
+                                    let mut attempt: u32 = 0;
+                                    loop {
+                                        match backfill_sink.repair_derived_backfill_gaps().await {
+                                            Ok(()) => break,
+                                            Err(e) => {
+                                                attempt += 1;
+                                                let delay_secs =
+                                                    10u64.min(2u64.saturating_pow(attempt));
+                                                error!(
+                                                    error = %e,
+                                                    chain = %backfill_chain_name,
+                                                    attempt,
+                                                    retry_in_secs = delay_secs,
+                                                    "ClickHouse derived table backfill failed, retrying"
+                                                );
+                                                tokio::time::sleep(std::time::Duration::from_secs(
+                                                    delay_secs,
+                                                ))
+                                                .await;
                                             }
                                         }
-                                    });
-                                }
+                                    }
+                                });
                                 seed_metrics_from_clickhouse(&ch_sink).await;
                                 sinks = sinks.with_clickhouse(ch_sink);
                             }
