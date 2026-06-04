@@ -591,6 +591,7 @@ On startup, tidx verifies built-in materialized tables after base ClickHouse bac
 | [`address_txs`](#address_txs) | Tx feed keyed by account; `'from'`/`'to'`. |
 | [`contract_creations`](#contract_creations) | One row per contract deployment. |
 | [`dex_fills`](#dex_fills) | Decoded stablecoin-DEX `OrderFilled` events. |
+| [`dex_ohlc_1m`](#dex_ohlc_1m) | 1-minute OHLC candles per pair, refreshed on a schedule. |
 | [`dex_orders`](#dex_orders) | Decoded stablecoin-DEX `OrderPlaced` events. |
 | [`dex_pairs`](#dex_pairs) | Decoded stablecoin-DEX `PairCreated` events. |
 | [`token_approvals`](#token_approvals) | Decoded `Approval` events. |
@@ -807,6 +808,38 @@ curl -G "https://indexer.testnet.tempo.xyz/query" \
     WHERE o.token = '0x20c000000000000000000000b9537d11c60e8b50'
     ORDER BY f.block_num DESC, f.log_idx DESC
     LIMIT 10"
+```
+
+#### dex_ohlc_1m
+
+> [!NOTE]
+> Refreshable materialized view over `dex_fills ⋈ dex_orders`, recomputed on a schedule (every minute) over a rolling 30-day retention window.
+
+1-minute OHLC (candlestick) buckets per trading pair, stored in a `MergeTree` ordered by `(token, bucket)`. Replaces scanning up to ~1000 raw fills and bucketing in memory on every chart request: a read becomes a primary-key range scan over candles, and long windows are no longer truncated. Coarser intervals (5m, 1h, …) re-bucket these 1m candles client-side (`high = max(high)`, `low = min(low)`, `open` = first bucket's open, `close` = last bucket's close, volumes summed); historical ranges beyond the retention window fall back to scanning `dex_fills`.
+
+Refreshable (full recompute + atomic swap) because candles are keyed by `(token, bucket)` with no `block_num`, so an incremental aggregate couldn't be reorg-pruned — same reasoning as `token_balances_snapshot`. Price math mirrors the API: `priceScale = 100000`, rate = `(priceScale + tick) / priceScale` for bids and its inverse for asks. Tune `REFRESH EVERY` and the retention window to fill volume.
+
+| Column | Type | Description |
+|--------|------|-------------|
+| `bucket` | `DateTime('UTC')` | Start of the 1-minute bucket |
+| `token` | `String` | Pair base token |
+| `open` | `Float64` | Rate of the first fill in the bucket |
+| `high` | `Float64` | Highest fill rate in the bucket |
+| `low` | `Float64` | Lowest fill rate in the bucket |
+| `close` | `Float64` | Rate of the last fill in the bucket |
+| `base_volume` | `UInt256` | Sum of base-token amounts filled |
+| `quote_volume` | `UInt256` | Sum of quote-token amounts |
+| `fill_count` | `UInt64` | Number of fills in the bucket |
+
+```bash
+curl -G "https://indexer.testnet.tempo.xyz/query" \
+  --data-urlencode "chainId=42431" \
+  --data-urlencode "engine=clickhouse" \
+  --data-urlencode "sql=SELECT bucket, open, high, low, close, base_volume
+    FROM dex_ohlc_1m
+    WHERE token = '0x20c000000000000000000000b9537d11c60e8b50'
+      AND bucket >= now() - INTERVAL 6 HOUR
+    ORDER BY bucket"
 ```
 
 #### token_approvals
