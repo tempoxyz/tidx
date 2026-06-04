@@ -589,6 +589,7 @@ On startup, tidx verifies built-in materialized tables after base ClickHouse bac
 | [`address_holder_deltas`](#address_holder_deltas) | Holder-first mirror of `token_holder_deltas`. |
 | [`address_transfers`](#address_transfers) | Transfer feed keyed by account; `'in'`/`'out'`. |
 | [`address_txs`](#address_txs) | Tx feed keyed by account; `'from'`/`'to'`. |
+| [`block_tx_counts`](#block_tx_counts) | Transaction count per block. |
 | [`contract_creations`](#contract_creations) | One row per contract deployment. |
 | [`token_approvals`](#token_approvals) | Decoded `Approval` events. |
 | [`token_approvals_current`](#token_approvals_current) | Latest allowance per `(token, owner, spender)`. |
@@ -701,6 +702,28 @@ curl -G "https://indexer.testnet.tempo.xyz/query" \
       AND direction = 'from'
     ORDER BY block_num DESC, tx_idx DESC
     LIMIT 5"
+```
+
+#### block_tx_counts
+
+> [!NOTE]
+> Materialized view over `txs`, kept in sync on reorg.
+
+Transaction count per block. `SummingMergeTree` ordered by `(block_num)`, so a block-list endpoint reads one summed row per block instead of `GROUP BY block_num`-ing the full `txs` table on every page. The insert-time `GROUP BY` plus `SummingMergeTree` merge means counts stay correct even when a block's transactions arrive across multiple insert batches.
+
+| Column | Type | Description |
+|--------|------|-------------|
+| `block_num` | `Int64` | Block number |
+| `block_timestamp` | `DateTime64(3, 'UTC')` | Block timestamp |
+| `tx_count` | `UInt64` | Number of transactions in the block |
+
+```bash
+curl -G "https://indexer.testnet.tempo.xyz/query" \
+  --data-urlencode "chainId=42431" \
+  --data-urlencode "engine=clickhouse" \
+  --data-urlencode "sql=SELECT block_num, tx_count
+    FROM block_tx_counts
+    WHERE block_num IN (12345, 12346, 12347)"
 ```
 
 #### contract_creations

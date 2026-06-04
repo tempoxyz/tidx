@@ -2,6 +2,7 @@ mod address_balances;
 mod address_transfers;
 mod address_txs;
 mod base;
+mod block_tx_counts;
 mod catalog;
 mod contract_creations;
 mod token_approvals;
@@ -38,6 +39,7 @@ pub fn derived_objects() -> impl DoubleEndedIterator<Item = &'static ClickHouseO
         .chain(address_balances::OBJECTS.iter())
         .chain(address_txs::OBJECTS.iter())
         .chain(contract_creations::OBJECTS.iter())
+        .chain(block_tx_counts::OBJECTS.iter())
 }
 
 /// Tables and views that the public `/query` HTTP surface may reference.
@@ -123,6 +125,16 @@ mod tests {
         assert_eq!(block_column("address_txs"), Some("block_num"));
         assert!(is_public_query_table("contract_creations"));
         assert_eq!(block_column("contract_creations"), Some("block_num"));
+    }
+
+    #[test]
+    fn block_tx_counts_is_registered_for_public_query() {
+        // Per-block transaction counts so block-list endpoints can read a single
+        // summed row instead of GROUP-BY-ing `txs` on every page.
+        assert!(is_public_query_table("block_tx_counts"));
+        assert_eq!(block_column("block_tx_counts"), Some("block_num"));
+        assert!(!is_public_query_table("block_tx_counts_mv"));
+        assert!(is_known_table("block_tx_counts_mv"));
     }
 
     #[test]
