@@ -135,6 +135,9 @@ mod tests {
             assert!(is_public_query_table(table), "{table} should be public");
             assert_eq!(block_column(table), Some("block_num"));
         }
+        // Pairs joined to their DEX-escrow base liquidity — public so the
+        // "pairs by liquidity" endpoint reads ranked pairs directly.
+        assert!(is_public_query_table("dex_pair_liquidity"));
     }
 
     #[test]

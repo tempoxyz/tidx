@@ -6,6 +6,7 @@ const DEX_ORDERS_SCHEMA: &str = include_str!("../../db/clickhouse/dex_orders.sql
 const DEX_ORDERS_SELECT: &str = include_str!("../../db/clickhouse/dex_orders_select.sql");
 const DEX_FILLS_SCHEMA: &str = include_str!("../../db/clickhouse/dex_fills.sql");
 const DEX_FILLS_SELECT: &str = include_str!("../../db/clickhouse/dex_fills_select.sql");
+const DEX_PAIR_LIQUIDITY: &str = include_str!("../../db/clickhouse/dex_pair_liquidity.sql");
 
 /// Decoded stablecoin-DEX event tables.
 ///
@@ -80,6 +81,14 @@ pub const OBJECTS: &[ClickHouseObject] = &[
         block_column: None,
         backfill: None,
     },
+    ClickHouseObject {
+        name: "dex_pair_liquidity",
+        kind: ClickHouseObjectKind::View(DEX_PAIR_LIQUIDITY),
+        depends_on: &["dex_pairs", "token_balances_snapshot"],
+        public_query: true,
+        block_column: None,
+        backfill: None,
+    },
 ];
 
 #[cfg(test)]
@@ -133,6 +142,28 @@ mod tests {
                 "{mv_name} should filter on {selector}"
             );
         }
+    }
+
+    #[test]
+    fn pair_liquidity_joins_pairs_to_dex_escrow_balances() {
+        let view = object("dex_pair_liquidity");
+        assert!(view.is_view());
+        // Public so Cadent reads ranked pairs with liquidity directly instead of
+        // over-fetching DEX balances and intersecting with pairs in memory.
+        assert!(view.public_query);
+        let ddl = view.ddl();
+        assert!(ddl.contains("CREATE VIEW IF NOT EXISTS dex_pair_liquidity"));
+        assert!(ddl.contains("FROM dex_pairs FINAL"));
+        assert!(ddl.contains("token_balances_snapshot"));
+        // Joins each pair's base to its DEX-escrow balance; the DEX precompile
+        // address is fixed across Tempo chains.
+        assert!(ddl.contains("b.token = p.base"));
+        assert!(ddl.contains("0xdec0000000000000000000000000000000000000"));
+        assert!(ddl.contains("b.balance > 0"));
+        assert_eq!(
+            view.drop_sql().as_deref(),
+            Some("DROP VIEW IF EXISTS dex_pair_liquidity")
+        );
     }
 
     #[test]
