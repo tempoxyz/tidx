@@ -4,6 +4,7 @@ mod address_txs;
 mod base;
 mod catalog;
 mod contract_creations;
+mod dex;
 mod token_approvals;
 mod token_approvals_current;
 mod token_balances;
@@ -38,6 +39,7 @@ pub fn derived_objects() -> impl DoubleEndedIterator<Item = &'static ClickHouseO
         .chain(address_balances::OBJECTS.iter())
         .chain(address_txs::OBJECTS.iter())
         .chain(contract_creations::OBJECTS.iter())
+        .chain(dex::OBJECTS.iter())
 }
 
 /// Tables and views that the public `/query` HTTP surface may reference.
@@ -126,6 +128,16 @@ mod tests {
     }
 
     #[test]
+    fn dex_decoded_tables_are_registered_for_public_query() {
+        // Pre-decoded stablecoin-DEX event tables so the exchange endpoints read
+        // sort-key seeks + a plain join instead of re-decoding `logs` per request.
+        for table in ["dex_pairs", "dex_orders", "dex_fills"] {
+            assert!(is_public_query_table(table), "{table} should be public");
+            assert_eq!(block_column(table), Some("block_num"));
+        }
+    }
+
+    #[test]
     fn materialized_views_are_known_but_not_public_query_tables() {
         for mv in [
             "token_transfers_mv",
@@ -135,6 +147,9 @@ mod tests {
             "address_holder_deltas_mv",
             "address_txs_mv",
             "contract_creations_mv",
+            "dex_pairs_mv",
+            "dex_orders_mv",
+            "dex_fills_mv",
         ] {
             assert!(!is_public_query_table(mv), "{mv} should not be public");
             assert!(is_known_table(mv), "{mv} should be known to the sink");

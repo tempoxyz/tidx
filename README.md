@@ -590,6 +590,9 @@ On startup, tidx verifies built-in materialized tables after base ClickHouse bac
 | [`address_transfers`](#address_transfers) | Transfer feed keyed by account; `'in'`/`'out'`. |
 | [`address_txs`](#address_txs) | Tx feed keyed by account; `'from'`/`'to'`. |
 | [`contract_creations`](#contract_creations) | One row per contract deployment. |
+| [`dex_fills`](#dex_fills) | Decoded stablecoin-DEX `OrderFilled` events. |
+| [`dex_orders`](#dex_orders) | Decoded stablecoin-DEX `OrderPlaced` events. |
+| [`dex_pairs`](#dex_pairs) | Decoded stablecoin-DEX `PairCreated` events. |
 | [`token_approvals`](#token_approvals) | Decoded `Approval` events. |
 | [`token_approvals_current`](#token_approvals_current) | Latest allowance per `(token, owner, spender)`. |
 | [`token_balances`](#token_balances) | Current positive balance per `(token, holder)`. |
@@ -729,6 +732,83 @@ curl -G "https://indexer.testnet.tempo.xyz/query" \
     ORDER BY block_num DESC, tx_idx DESC
     LIMIT 5"
 ```
+
+#### dex_pairs
+
+> [!NOTE]
+> Materialized view over `logs`, kept in sync on reorg.
+
+Decoded `PairCreated(bytes32 indexed key, address indexed base, address indexed quote)` events from the stablecoin DEX precompile. All three params are indexed, so the payload lives in topics. `ReplacingMergeTree` ordered by `(block_num, log_idx)` for the pair-creation feed, with bloom indexes on `base`/`quote`. Replaces the runtime `signature=PairCreated(...)` CTE.
+
+| Column | Type | Description |
+|--------|------|-------------|
+| `block_num` | `Int64` | Block number |
+| `block_timestamp` | `DateTime64(3, 'UTC')` | Block timestamp |
+| `tx_idx` | `Int32` | Transaction index |
+| `log_idx` | `Int32` | Log index |
+| `tx_hash` | `String` | Transaction hash |
+| `address` | `String` | Emitting contract (the DEX precompile) |
+| `key` | `String` | Pair key (`bytes32`) |
+| `base` | `String` | Base token address |
+| `quote` | `String` | Quote token address |
+
+#### dex_orders
+
+> [!NOTE]
+> Materialized view over `logs`, kept in sync on reorg.
+
+Decoded `OrderPlaced(uint128 indexed orderId, address indexed maker, address indexed token, uint128 amount, bool isBid, int16 tick, bool isFlipOrder, int16 flipTick)` events. `int16` ticks decode from their sign-extended ABI word (trailing 2 bytes, little-endian) so negatives are correct. `ReplacingMergeTree` ordered by `(token, orderId)` so pair-scoped filters (`WHERE token = base`) seek by sort key and joins by `orderId` use the bloom index.
+
+| Column | Type | Description |
+|--------|------|-------------|
+| `block_num` | `Int64` | Block number |
+| `block_timestamp` | `DateTime64(3, 'UTC')` | Block timestamp |
+| `tx_idx` | `Int32` | Transaction index |
+| `log_idx` | `Int32` | Log index |
+| `tx_hash` | `String` | Transaction hash |
+| `address` | `String` | Emitting contract (the DEX precompile) |
+| `orderId` | `UInt256` | Order id |
+| `maker` | `String` | Order maker |
+| `token` | `String` | Pair base token |
+| `amount` | `UInt256` | Order amount |
+| `isBid` | `UInt8` | 1 = bid, 0 = ask |
+| `tick` | `Int16` | Order price tick |
+| `isFlipOrder` | `UInt8` | 1 = flip order |
+| `flipTick` | `Int16` | Flip order price tick |
+
+#### dex_fills
+
+> [!NOTE]
+> Materialized view over `logs`, kept in sync on reorg.
+
+Decoded `OrderFilled(uint128 indexed orderId, address indexed maker, address indexed taker, uint128 amountFilled, bool partialFill)` events. The pair (`token`/`isBid`/`tick`) is not on this event — join `orderId` to [`dex_orders`](#dex_orders). `ReplacingMergeTree` ordered by `(orderId, block_num, log_idx)` so the join probes by sort key, with bloom indexes on `maker`/`taker`/`tx_hash`.
+
+| Column | Type | Description |
+|--------|------|-------------|
+| `block_num` | `Int64` | Block number |
+| `block_timestamp` | `DateTime64(3, 'UTC')` | Block timestamp |
+| `tx_idx` | `Int32` | Transaction index |
+| `log_idx` | `Int32` | Log index |
+| `tx_hash` | `String` | Transaction hash |
+| `address` | `String` | Emitting contract (the DEX precompile) |
+| `orderId` | `UInt256` | Order id (join key to `dex_orders`) |
+| `maker` | `String` | Fill maker |
+| `taker` | `String` | Fill taker |
+| `amountFilled` | `UInt256` | Amount filled |
+| `partialFill` | `UInt8` | 1 = partial fill |
+
+```bash
+curl -G "https://indexer.testnet.tempo.xyz/query" \
+  --data-urlencode "chainId=42431" \
+  --data-urlencode "engine=clickhouse" \
+  --data-urlencode "sql=SELECT f.block_num, f.amountFilled, o.token, o.isBid, o.tick
+    FROM dex_fills f
+    JOIN dex_orders o ON o.orderId = f.orderId
+    WHERE o.token = '0x20c000000000000000000000b9537d11c60e8b50'
+    ORDER BY f.block_num DESC, f.log_idx DESC
+    LIMIT 10"
+```
+
 #### token_approvals
 
 > [!NOTE]
