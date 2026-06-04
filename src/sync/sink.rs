@@ -225,8 +225,13 @@ impl SinkSet {
             Some((batch_end, data))
         };
 
-        while let Some((batch_end, (blocks, txs, logs, receipts))) = pending.take() {
+        while let Some((batch_end, (blocks, txs, logs, mut receipts))) = pending.take() {
             let block_count = blocks.len() as i64;
+
+            // Postgres receipts lack the denormalized tx-level type/fee_token;
+            // populate them from txs so the ClickHouse mirror matches the
+            // live-sync path before writing.
+            super::decoder::enrich_receipts_from_txs(&mut receipts, &txs);
 
             // Pipeline: fetch next batch from PG while writing current batch to CH
             let next_fetch = async {
@@ -490,6 +495,10 @@ async fn fetch_receipts(
             effective_gas_price: r.get(9),
             status: r.get(10),
             fee_payer: r.get(11),
+            // Postgres `receipts` has no type/fee_token; these are denormalized
+            // from txs by `enrich_receipts_from_txs` before the ClickHouse write.
+            tx_type: None,
+            fee_token: None,
         })
         .collect())
 }

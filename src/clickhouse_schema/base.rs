@@ -11,6 +11,8 @@ const LOGS_MIGRATION_20260417: &str =
     include_str!("../../db/clickhouse/migrations/20260417_add_logs_virtual_forward_index.sql");
 const BLOCKS_MIGRATION_20260430: &str =
     include_str!("../../db/clickhouse/migrations/20260430_add_blocks_consensus_proposer.sql");
+const RECEIPTS_MIGRATION_20260604: &str =
+    include_str!("../../db/clickhouse/migrations/20260604_add_receipts_type_fee_token.sql");
 
 pub const TABLES: &[ClickHouseObject] = &[
     ClickHouseObject {
@@ -68,6 +70,14 @@ pub const MIGRATIONS: &[ClickHouseObject] = &[
         name: "blocks_20260430_consensus_proposer",
         kind: ClickHouseObjectKind::Migration(BLOCKS_MIGRATION_20260430),
         depends_on: &["blocks"],
+        public_query: false,
+        block_column: None,
+        backfill: None,
+    },
+    ClickHouseObject {
+        name: "receipts_20260604_type_fee_token",
+        kind: ClickHouseObjectKind::Migration(RECEIPTS_MIGRATION_20260604),
+        depends_on: &["receipts"],
         public_query: false,
         block_column: None,
         backfill: None,

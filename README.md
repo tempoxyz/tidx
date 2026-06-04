@@ -545,6 +545,8 @@ Written by the sync engine to both PostgreSQL and ClickHouse. Schemas are identi
 | `status` | `INT2` | Success (1) or failure (0) |
 | `fee_payer` | `BYTEA` | Tempo fee payer (if sponsored) |
 
+> The ClickHouse mirror of `receipts` additionally carries `type` (`Nullable(Int16)`) and `fee_token` (`Nullable(String)`), denormalized from the matching tx at ingest so receipt queries don't have to join `txs`. Rows written before the `receipts_20260604_type_fee_token` migration stay `NULL` until re-synced.
+
 #### sync_state
 
 | Column | Type | Description |

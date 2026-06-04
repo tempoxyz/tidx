@@ -13,8 +13,8 @@ use crate::metrics::{self, SyncProgress};
 use crate::types::{LogRow, ReceiptRow, SyncState};
 
 use super::decoder::{
-    decode_block, decode_log, decode_receipt, decode_transaction, enrich_txs_from_receipts,
-    timestamp_from_secs,
+    decode_block, decode_log, decode_receipt, decode_transaction, enrich_receipts_from_txs,
+    enrich_txs_from_receipts, timestamp_from_secs,
 };
 use super::fetcher::RpcClient;
 use super::sink::SinkSet;
@@ -600,7 +600,7 @@ impl SyncEngine {
             })
             .collect();
 
-        let all_receipts: Vec<_> = receipts
+        let mut all_receipts: Vec<_> = receipts
             .iter()
             .flatten()
             .filter_map(|receipt| {
@@ -612,6 +612,7 @@ impl SyncEngine {
             .collect();
 
         enrich_txs_from_receipts(&mut all_txs, &all_receipts);
+        enrich_receipts_from_txs(&mut all_receipts, &all_txs);
 
         // TIP-1022: mark virtual address forwarding hops
         let forward_marks = mark_virtual_forward_hops(&all_logs);
@@ -653,12 +654,13 @@ impl SyncEngine {
             .flat_map(|r| r.inner.logs().iter().map(|log| decode_log(log, block_ts)))
             .collect();
 
-        let receipt_rows: Vec<_> = receipts
+        let mut receipt_rows: Vec<_> = receipts
             .iter()
             .map(|r| decode_receipt(r, block_ts))
             .collect();
 
         enrich_txs_from_receipts(&mut txs, &receipt_rows);
+        enrich_receipts_from_txs(&mut receipt_rows, &txs);
 
         // TIP-1022: mark virtual address forwarding hops
         let forward_marks = mark_virtual_forward_hops(&log_rows);
@@ -1347,8 +1349,8 @@ async fn is_fully_synced(pool: &Pool, tip_num: u64) -> Result<bool> {
 /// Standalone sync_range for gap-fill (doesn't need SyncEngine self)
 async fn sync_range_standalone(sinks: &SinkSet, rpc: &RpcClient, from: u64, to: u64) -> Result<()> {
     use super::decoder::{
-        decode_block, decode_log, decode_receipt, decode_transaction, enrich_txs_from_receipts,
-        timestamp_from_secs,
+        decode_block, decode_log, decode_receipt, decode_transaction, enrich_receipts_from_txs,
+        enrich_txs_from_receipts, timestamp_from_secs,
     };
     use alloy::network::ReceiptResponse;
 
@@ -1394,7 +1396,7 @@ async fn sync_range_standalone(sinks: &SinkSet, rpc: &RpcClient, from: u64, to: 
         })
         .collect();
 
-    let all_receipts: Vec<_> = receipts
+    let mut all_receipts: Vec<_> = receipts
         .iter()
         .flatten()
         .filter_map(|receipt| {
@@ -1406,6 +1408,7 @@ async fn sync_range_standalone(sinks: &SinkSet, rpc: &RpcClient, from: u64, to: 
         .collect();
 
     enrich_txs_from_receipts(&mut all_txs, &all_receipts);
+    enrich_receipts_from_txs(&mut all_receipts, &all_txs);
 
     // TIP-1022: mark virtual address forwarding hops
     let forward_marks = mark_virtual_forward_hops(&all_logs);
