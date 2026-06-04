@@ -240,7 +240,7 @@ pub async fn execute_query_postgres(
         Ok(Err(e)) => {
             return Err(anyhow!(
                 "Query error: {}",
-                sanitize_db_error(&e.to_string())
+                sanitize_db_error(&format_error_chain(&e))
             ));
         }
         Err(_) => return Err(anyhow!("Query timeout")),
@@ -384,6 +384,30 @@ pub fn format_column_string(row: &tokio_postgres::Row, idx: usize) -> String {
         serde_json::Value::Number(n) => n.to_string(),
         serde_json::Value::Bool(b) => b.to_string(),
         other => other.to_string(),
+    }
+}
+
+/// Render an `anyhow::Error` as `head: source: source` so the underlying cause
+/// (commonly a `tokio_postgres::error::DbError` with severity + message) is
+/// surfaced instead of the opaque `"db error"` head string.
+fn format_error_chain(err: &anyhow::Error) -> String {
+    // `anyhow::Error::chain()` yields the head as the first entry, then each
+    // `source()` in turn. Joining them mirrors what `anyhow`'s `{:#}` would
+    // print but keeps the output on one line so the existing sanitizer
+    // regexes still apply uniformly.
+    let mut parts: Vec<String> = Vec::new();
+    for cause in err.chain() {
+        let text = cause.to_string();
+        // Skip empty entries and adjacent duplicates: some lower causes
+        // restate their parent's message verbatim.
+        if !text.is_empty() && parts.last().map(|p| p != &text).unwrap_or(true) {
+            parts.push(text);
+        }
+    }
+    if parts.is_empty() {
+        err.to_string()
+    } else {
+        parts.join(": ")
     }
 }
 
@@ -608,5 +632,29 @@ mod tests {
         let sanitized = sanitize_db_error(&error);
         assert!(sanitized.len() < 510); // 500 + "..."
         assert!(sanitized.ends_with("..."));
+    }
+
+    // ========================================================================
+    // format_error_chain Tests
+    // ========================================================================
+
+    #[test]
+    fn test_format_error_chain_walks_sources() {
+        // tokio-postgres reports `Kind::Db` as the opaque head string
+        // "db error" with the actual `DbError` (severity + message) hanging
+        // off `source()`. Walking the chain restores the useful text.
+        let head = anyhow!("db error").context("Query error");
+        let chained = head.context("statement_timeout");
+        let rendered = format_error_chain(&chained);
+        assert!(rendered.contains("Query error"));
+        assert!(rendered.contains("db error"));
+        assert!(rendered.contains("statement_timeout"));
+    }
+
+    #[test]
+    fn test_format_error_chain_deduplicates_adjacent() {
+        let err = anyhow!("oops").context("oops");
+        let rendered = format_error_chain(&err);
+        assert_eq!(rendered, "oops");
     }
 }

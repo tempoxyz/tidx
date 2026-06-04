@@ -1,0 +1,6 @@
+---
+source: src/query/parser.rs
+assertion_line: 1924
+expression: sig.rewrite_filters_for_pushdown(sql)
+---
+SELECT * FROM Transfer WHERE topic1 IN ('0x000000000000000000000000dac17f958d2ee523a2206206994597c13d831ec7', '0x000000000000000000000000a726a1cd723409074df9108a2187cfa19899acf8')

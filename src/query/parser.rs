@@ -324,50 +324,23 @@ impl EventSignature {
 
     /// Rewrite a SQL query to push down filters on decoded columns to use indexed raw columns.
     /// E.g., WHERE "from" = '0xabc...' becomes WHERE topic1 = '\x000...abc...'
+    /// Also handles `IN (...)` lists and unquoted numeric values, both of which
+    /// otherwise force Postgres to compute `abi_uint(topic1)` for every row in
+    /// the underlying `logs` table — which routinely trips the per-query
+    /// `statement_timeout`.
     pub fn rewrite_filters_for_pushdown(&self, sql: &str) -> String {
         let mapping = self.column_mapping();
-        let filters = extract_equality_filters(sql);
 
         let mut result = sql.to_string();
-
-        for (col, value) in filters {
-            let col_lower = col.to_lowercase();
-            if let Some((raw_col, ty, is_indexed)) = mapping.get(&col_lower) {
-                // Only push down indexed columns (topics)
-                if !is_indexed {
-                    continue;
-                }
-
-                if let Some(encoded) = Self::encode_value_for_pushdown(ty, &value) {
-                    // Build the replacement patterns
-                    // Match: "col" = 'value' or "col" = '0xvalue'
-                    let patterns = [
-                        format!(r#""{}" = '{}'"#, col, value),
-                        format!(
-                            r#""{}" = '0x{}'"#,
-                            col,
-                            value.strip_prefix("0x").unwrap_or(&value)
-                        ),
-                        format!(r#""{}"='{}'"#, col, value),
-                        format!(
-                            r#""{}"='0x{}'"#,
-                            col,
-                            value.strip_prefix("0x").unwrap_or(&value)
-                        ),
-                    ];
-
-                    let replacement = format!("{} = '0x{}'", raw_col, encoded);
-
-                    for pattern in &patterns {
-                        if result.contains(pattern) {
-                            result = result.replace(pattern, &replacement);
-                            break;
-                        }
-                    }
-                }
+        for (col_lower, (raw_col, ty, is_indexed)) in &mapping {
+            // Only push down indexed columns (topics). Non-indexed params live
+            // in `data`, which has no comparable index to exploit.
+            if !is_indexed {
+                continue;
             }
+            result = rewrite_eq_for_pushdown(&result, col_lower, raw_col, ty);
+            result = rewrite_in_for_pushdown(&result, col_lower, raw_col, ty);
         }
-
         result
     }
 
@@ -404,6 +377,112 @@ impl EventSignature {
             _ => None, // Dynamic types not supported for pushdown
         }
     }
+}
+
+/// Rewrite `"col" = value` predicates on an indexed decoded column into
+/// `topicN = '\x...'` predicates so Postgres can use the index on `logs`.
+/// Handles both quoted (`'17486013'`, `'0xabc...'`) and unquoted numeric
+/// (`17486013`) literal forms, with optional whitespace around `=`.
+fn rewrite_eq_for_pushdown(sql: &str, col_lower: &str, raw_col: &str, ty: &AbiType) -> String {
+    // Match a literal: a single-quoted string OR an unquoted decimal (with
+    // optional leading sign). The trailing word-boundary on the unquoted form
+    // prevents the number from being glued to a following identifier.
+    let pattern = format!(
+        r#"(?i)"{col}"\s*=\s*(?:'([^']*)'|([+-]?\d+)\b)"#,
+        col = regex_lite::escape(col_lower),
+    );
+    let Ok(re) = regex_lite::Regex::new(&pattern) else {
+        return sql.to_string();
+    };
+    re.replace_all(sql, |caps: &regex_lite::Captures<'_>| {
+        let value = caps
+            .get(1)
+            .or_else(|| caps.get(2))
+            .map(|m| m.as_str().to_string())
+            .unwrap_or_default();
+        let Some(encoded) = EventSignature::encode_value_for_pushdown(ty, &value) else {
+            return caps[0].to_string();
+        };
+        format!("{raw_col} = '0x{encoded}'")
+    })
+    .into_owned()
+}
+
+/// Rewrite `"col" IN (v1, v2, ...)` predicates on an indexed decoded column
+/// into `topicN IN ('\x...', '\x...', ...)` so Postgres can use the index.
+/// Only literal value lists are rewritten; `IN (SELECT …)` subqueries are
+/// left alone (the inner-paren restriction in the regex skips them).
+fn rewrite_in_for_pushdown(sql: &str, col_lower: &str, raw_col: &str, ty: &AbiType) -> String {
+    // `[^()]+` rules out anything containing parentheses, which keeps
+    // subselects (`IN (SELECT …)`) and nested expressions out of this
+    // rewrite. The literal-list form we want to push down never contains
+    // parens.
+    let pattern = format!(
+        r#"(?i)"{col}"\s*IN\s*\(([^()]+)\)"#,
+        col = regex_lite::escape(col_lower),
+    );
+    let Ok(re) = regex_lite::Regex::new(&pattern) else {
+        return sql.to_string();
+    };
+    re.replace_all(sql, |caps: &regex_lite::Captures<'_>| {
+        let inner = caps.get(1).map(|m| m.as_str()).unwrap_or("");
+        let Some(encoded_values) = parse_literal_list(inner)
+            .into_iter()
+            .map(|value| {
+                EventSignature::encode_value_for_pushdown(ty, &value)
+                    .map(|encoded| format!("'0x{encoded}'"))
+            })
+            .collect::<Option<Vec<_>>>()
+        else {
+            return caps[0].to_string();
+        };
+        if encoded_values.is_empty() {
+            return caps[0].to_string();
+        }
+        format!("{raw_col} IN ({})", encoded_values.join(", "))
+    })
+    .into_owned()
+}
+
+/// Split a comma-separated list of SQL literals into raw value strings,
+/// stripping quotes from single-quoted literals and trimming whitespace. Used
+/// by [`rewrite_in_for_pushdown`] to extract the decoded values that need
+/// re-encoding before pushdown.
+fn parse_literal_list(input: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut current = String::new();
+    let mut in_quote = false;
+    let chars: Vec<char> = input.chars().collect();
+    let mut i = 0;
+    while i < chars.len() {
+        let c = chars[i];
+        if in_quote {
+            if c == '\'' {
+                // Escaped single quote (SQL standard `''`) stays in the value.
+                if chars.get(i + 1) == Some(&'\'') {
+                    current.push('\'');
+                    i += 2;
+                    continue;
+                }
+                in_quote = false;
+            } else {
+                current.push(c);
+            }
+        } else if c == '\'' {
+            in_quote = true;
+        } else if c == ',' {
+            out.push(current.trim().to_string());
+            current.clear();
+        } else {
+            current.push(c);
+        }
+        i += 1;
+    }
+    let last = current.trim().to_string();
+    if !last.is_empty() {
+        out.push(last);
+    }
+    out
 }
 
 /// Apply event-signature CTEs to a PostgreSQL user query.
@@ -1775,6 +1854,63 @@ mod tests {
         let sql = r#"SELECT * FROM Transfer WHERE "value" = '1000000'"#;
         let rewritten = sig.rewrite_filters_for_pushdown(sql);
         assert_eq!(sql, rewritten);
+    }
+
+    /// Without this rewrite the unquoted-numeric form falls through to
+    /// `WHERE abi_uint(topic1) = N`, which forces Postgres to compute
+    /// `abi_uint` over every selector-matching `logs` row and routinely trips
+    /// the per-query `statement_timeout`.
+    #[test]
+    fn test_rewrite_filters_unquoted_numeric_equality() {
+        let sig = EventSignature::parse(
+            "OrderPlaced(uint128 indexed orderId, address indexed maker, address indexed token, uint128 amount, bool isBid, int16 tick, bool isFlipOrder, int16 flipTick)",
+        )
+        .unwrap();
+
+        let sql = r#"SELECT * FROM OrderPlaced WHERE "orderId" = 17486013"#;
+        assert_snapshot!(sig.rewrite_filters_for_pushdown(sql));
+    }
+
+    /// `IN (...)` over a decoded indexed column is the multi-row lookup
+    /// `/exchanges` joins rely on. Pushing it down to `topic1 IN ('\x...')`
+    /// lets Postgres hit the index instead of full-scanning the CTE.
+    #[test]
+    fn test_rewrite_filters_in_list() {
+        let sig = EventSignature::parse(
+            "OrderPlaced(uint128 indexed orderId, address indexed maker, address indexed token, uint128 amount, bool isBid, int16 tick, bool isFlipOrder, int16 flipTick)",
+        )
+        .unwrap();
+
+        let sql = r#"SELECT * FROM OrderPlaced WHERE "orderId" IN (17486013, 17486014, 17486015)"#;
+        assert_snapshot!(sig.rewrite_filters_for_pushdown(sql));
+    }
+
+    /// `IN (SELECT ...)` subqueries must not be touched: encoding the
+    /// subselect as a literal list would be wrong, and the inner-paren
+    /// restriction in the regex is what keeps us out of them.
+    #[test]
+    fn test_rewrite_filters_in_subquery_unchanged() {
+        let sig = EventSignature::parse(
+            "Transfer(address indexed from, address indexed to, uint256 value)",
+        )
+        .unwrap();
+
+        let sql = r#"SELECT * FROM Transfer WHERE "from" IN (SELECT "to" FROM Transfer)"#;
+        let rewritten = sig.rewrite_filters_for_pushdown(sql);
+        assert_eq!(sql, rewritten);
+    }
+
+    /// IN over an address indexed param: encoding mirrors the equality case
+    /// (32-byte left-padded hex).
+    #[test]
+    fn test_rewrite_filters_in_addresses() {
+        let sig = EventSignature::parse(
+            "Transfer(address indexed from, address indexed to, uint256 value)",
+        )
+        .unwrap();
+
+        let sql = r#"SELECT * FROM Transfer WHERE "from" IN ('0xdAC17F958D2ee523a2206206994597C13D831ec7', '0xa726a1CD723409074DF9108A2187cfA19899aCF8')"#;
+        assert_snapshot!(sig.rewrite_filters_for_pushdown(sql));
     }
 
     // ========================================================================
