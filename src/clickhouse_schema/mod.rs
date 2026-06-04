@@ -110,6 +110,9 @@ mod tests {
         assert!(is_public_query_table("token_transfer_stats"));
         assert!(is_public_query_table("token_approvals_current"));
         assert!(is_public_query_table("token_metadata"));
+        // Per-token holder counts, refreshed on a schedule — public so Cadent
+        // reads one summed row per token instead of counting snapshot rows.
+        assert!(is_public_query_table("token_holder_counts"));
     }
 
     #[test]

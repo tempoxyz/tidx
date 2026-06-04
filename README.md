@@ -594,6 +594,7 @@ On startup, tidx verifies built-in materialized tables after base ClickHouse bac
 | [`token_approvals_current`](#token_approvals_current) | Latest allowance per `(token, owner, spender)`. |
 | [`token_balances`](#token_balances) | Current positive balance per `(token, holder)`. |
 | [`token_balances_snapshot`](#token_balances_snapshot) | Pre-aggregated `token_balances`, refreshed on a schedule. |
+| [`token_holder_counts`](#token_holder_counts) | Holder count per token, refreshed on a schedule. |
 | [`token_holder_deltas`](#token_holder_deltas) | Per-event ± balance change, two rows per transfer. |
 | [`token_metadata`](#token_metadata) | Per-token first/last seen + lifetime transfer count. |
 | [`token_supply`](#token_supply) | Per-token mints − burns (zero-address legs). |
@@ -848,6 +849,27 @@ curl -G "https://indexer.testnet.tempo.xyz/query" \
   --data-urlencode "engine=clickhouse" \
   --data-urlencode "sql=SELECT count() AS holders
     FROM token_balances_snapshot
+    WHERE token = '0x20c000000000000000000000e65cb5a40b7885ae'"
+```
+
+#### token_holder_counts
+
+> [!NOTE]
+> Refreshable materialized view over [`token_balances_snapshot`](#token_balances_snapshot), recomputed on a schedule (every 15 minutes) rather than on insert.
+
+Holder count per token, collapsed to a single row per token and stored in its own `MergeTree` ordered by `(token)`. `count() … FROM token_balances_snapshot WHERE token = X` is a primary-key range scan that still touches one row per holder (millions for tokens like PathUSD); this turns the token-detail "holder count" into a single-row primary-key lookup. Derived from the already-deduped snapshot rather than the raw deltas, so each refresh is cheap; counts are at most one refresh interval staler than the snapshot.
+
+| Column | Type | Description |
+|--------|------|-------------|
+| `token` | `String` | Token contract |
+| `holder_count` | `UInt64` | Number of holders with a positive balance |
+
+```bash
+curl -G "https://indexer.testnet.tempo.xyz/query" \
+  --data-urlencode "chainId=42431" \
+  --data-urlencode "engine=clickhouse" \
+  --data-urlencode "sql=SELECT holder_count
+    FROM token_holder_counts
     WHERE token = '0x20c000000000000000000000e65cb5a40b7885ae'"
 ```
 
