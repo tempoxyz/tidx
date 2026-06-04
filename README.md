@@ -592,6 +592,7 @@ On startup, tidx verifies built-in materialized tables after base ClickHouse bac
 | [`contract_creations`](#contract_creations) | One row per contract deployment. |
 | [`dex_fills`](#dex_fills) | Decoded stablecoin-DEX `OrderFilled` events. |
 | [`dex_orders`](#dex_orders) | Decoded stablecoin-DEX `OrderPlaced` events. |
+| [`dex_pair_liquidity`](#dex_pair_liquidity) | Pairs joined to their on-DEX base liquidity. |
 | [`dex_pairs`](#dex_pairs) | Decoded stablecoin-DEX `PairCreated` events. |
 | [`token_approvals`](#token_approvals) | Decoded `Approval` events. |
 | [`token_approvals_current`](#token_approvals_current) | Latest allowance per `(token, owner, spender)`. |
@@ -807,6 +808,34 @@ curl -G "https://indexer.testnet.tempo.xyz/query" \
     WHERE o.token = '0x20c000000000000000000000b9537d11c60e8b50'
     ORDER BY f.block_num DESC, f.log_idx DESC
     LIMIT 10"
+```
+
+#### dex_pair_liquidity
+
+> [!NOTE]
+> Plain view over `dex_pairs FINAL ⋈ token_balances_snapshot`.
+
+Trading pairs joined to their on-DEX base-token liquidity. The DEX precompile escrows both base and quote tokens, but only base addresses map to a pair; this view pushes that intersection into ClickHouse so the "pairs by liquidity" endpoint reads ranked pairs directly (`ORDER BY liquidity DESC, base ASC LIMIT …`) instead of over-fetching DEX balances and intersecting with the pair set in memory. The DEX precompile address (`0xdec0…0000`) is fixed across Tempo chains and inlined.
+
+| Column | Type | Description |
+|--------|------|-------------|
+| `key` | `String` | Pair key (`bytes32`) |
+| `base` | `String` | Base token address |
+| `quote` | `String` | Quote token address |
+| `block_num` | `Int64` | Pair creation block |
+| `log_idx` | `Int32` | Pair creation log index |
+| `block_timestamp` | `DateTime64(3, 'UTC')` | Pair creation timestamp |
+| `tx_hash` | `String` | Pair creation tx hash |
+| `liquidity` | `Int256` | Base-token balance escrowed on the DEX |
+
+```bash
+curl -G "https://indexer.testnet.tempo.xyz/query" \
+  --data-urlencode "chainId=42431" \
+  --data-urlencode "engine=clickhouse" \
+  --data-urlencode "sql=SELECT base, quote, liquidity
+    FROM dex_pair_liquidity
+    ORDER BY liquidity DESC, base ASC
+    LIMIT 20"
 ```
 
 #### token_approvals
