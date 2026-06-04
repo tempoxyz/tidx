@@ -880,6 +880,9 @@ struct ChReceiptWire {
     effective_gas_price: Option<String>,
     status: Option<i16>,
     fee_payer: Option<String>,
+    #[serde(rename = "type")]
+    tx_type: Option<i16>,
+    fee_token: Option<String>,
 }
 
 impl ChReceiptWire {
@@ -897,6 +900,8 @@ impl ChReceiptWire {
             effective_gas_price: r.effective_gas_price.clone(),
             status: r.status,
             fee_payer: r.fee_payer.as_ref().map(|v| hex_encode(v)),
+            tx_type: r.tx_type,
+            fee_token: r.fee_token.as_ref().map(|v| hex_encode(v)),
         }
     }
 }
