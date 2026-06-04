@@ -7,6 +7,7 @@ const TOKEN_HOLDER_DELTAS_SELECT: &str =
 const TOKEN_BALANCES_VIEW: &str = include_str!("../../db/clickhouse/token_balances.sql");
 const TOKEN_BALANCES_SNAPSHOT: &str =
     include_str!("../../db/clickhouse/token_balances_snapshot.sql");
+const TOKEN_HOLDER_COUNTS: &str = include_str!("../../db/clickhouse/token_holder_counts.sql");
 
 pub const OBJECTS: &[ClickHouseObject] = &[
     ClickHouseObject {
@@ -45,6 +46,16 @@ pub const OBJECTS: &[ClickHouseObject] = &[
         public_query: true,
         // Self-storing refreshable MV: it owns its rows and is fully replaced
         // each refresh, so it isn't block-scoped and reorg cleanup skips it.
+        block_column: None,
+        backfill: None,
+    },
+    ClickHouseObject {
+        name: "token_holder_counts",
+        kind: ClickHouseObjectKind::RefreshableMaterializedView(TOKEN_HOLDER_COUNTS),
+        depends_on: &["token_balances_snapshot"],
+        public_query: true,
+        // Self-storing refreshable MV: fully replaced each refresh, so it isn't
+        // block-scoped and reorg cleanup skips it.
         block_column: None,
         backfill: None,
     },
@@ -122,6 +133,32 @@ mod tests {
         assert_eq!(
             snapshot.drop_sql().as_deref(),
             Some("DROP VIEW IF EXISTS token_balances_snapshot")
+        );
+    }
+
+    #[test]
+    fn token_holder_counts_is_a_refreshable_materialized_view() {
+        let counts = OBJECTS
+            .iter()
+            .find(|object| object.name == "token_holder_counts")
+            .unwrap();
+        assert!(counts.is_refreshable_materialized_view());
+        // Publicly queryable so Cadent reads a single summed row per token
+        // instead of counting snapshot rows on every token-detail render.
+        assert!(counts.public_query);
+        assert!(counts.block_column.is_none());
+
+        let ddl = counts.ddl();
+        assert!(ddl.contains("CREATE MATERIALIZED VIEW IF NOT EXISTS token_holder_counts"));
+        assert!(ddl.contains("REFRESH EVERY"));
+        // Derives from the already-deduped snapshot, not the raw deltas, so each
+        // refresh is a cheap GROUP BY over one row per (token, holder).
+        assert!(ddl.contains("FROM token_balances_snapshot"));
+        assert!(ddl.contains("count() AS holder_count"));
+        assert!(ddl.contains("GROUP BY token"));
+        assert_eq!(
+            counts.drop_sql().as_deref(),
+            Some("DROP VIEW IF EXISTS token_holder_counts")
         );
     }
 }

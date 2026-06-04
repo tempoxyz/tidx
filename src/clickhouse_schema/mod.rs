@@ -112,6 +112,9 @@ mod tests {
         assert!(is_public_query_table("token_transfer_stats"));
         assert!(is_public_query_table("token_approvals_current"));
         assert!(is_public_query_table("token_metadata"));
+        // Per-token holder counts, refreshed on a schedule — public so Cadent
+        // reads one summed row per token instead of counting snapshot rows.
+        assert!(is_public_query_table("token_holder_counts"));
     }
 
     #[test]
@@ -138,6 +141,9 @@ mod tests {
         // Pre-bucketed 1m OHLC candles, refreshed on a schedule — public so the
         // exchange OHLC endpoint reads candles instead of scanning raw fills.
         assert!(is_public_query_table("dex_ohlc_1m"));
+        // Pairs joined to their DEX-escrow base liquidity — public so the
+        // "pairs by liquidity" endpoint reads ranked pairs directly.
+        assert!(is_public_query_table("dex_pair_liquidity"));
     }
 
     #[test]
