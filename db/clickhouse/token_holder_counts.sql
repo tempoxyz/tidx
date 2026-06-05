@@ -1,6 +1,6 @@
 -- Per-token holder counts, refreshed on a schedule.
 --
--- The explorer/API needs "how many holders does this token have?" on every
+-- The explorer/API needs "how many holders does this token have" on every
 -- token-detail render. Answering it from `token_balances_snapshot` means
 -- `count() … WHERE token = X AND balance > 0`, a primary-key range scan that
 -- still touches one row per holder — millions of rows for tokens like PathUSD.

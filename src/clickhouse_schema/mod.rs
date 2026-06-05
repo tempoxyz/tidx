@@ -232,4 +232,16 @@ mod tests {
             seen.push(object.name);
         }
     }
+
+    #[test]
+    fn managed_clickhouse_sql_has_no_client_bind_placeholders() {
+        for object in all_objects() {
+            let ddl = object.ddl();
+            assert!(
+                !ddl.contains('?'),
+                "{} DDL contains `?`, which the clickhouse crate treats as a bind placeholder even in comments",
+                object.name
+            );
+        }
+    }
 }
