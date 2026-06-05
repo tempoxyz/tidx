@@ -153,13 +153,14 @@ mod tests {
         assert!(view.public_query);
         let ddl = view.ddl();
         assert!(ddl.contains("CREATE VIEW IF NOT EXISTS dex_pair_liquidity"));
-        assert!(ddl.contains("FROM dex_pairs FINAL"));
+        assert!(ddl.contains("FROM dex_pairs FINAL\nINNER JOIN token_balances_snapshot"));
+        assert!(!ddl.contains("FINAL AS"));
         assert!(ddl.contains("token_balances_snapshot"));
         // Joins each pair's base to its DEX-escrow balance; the DEX precompile
         // address is fixed across Tempo chains.
-        assert!(ddl.contains("b.token = p.base"));
+        assert!(ddl.contains("token_balances_snapshot.token = dex_pairs.base"));
         assert!(ddl.contains("0xdec0000000000000000000000000000000000000"));
-        assert!(ddl.contains("b.balance > 0"));
+        assert!(ddl.contains("token_balances_snapshot.balance > 0"));
         assert_eq!(
             view.drop_sql().as_deref(),
             Some("DROP VIEW IF EXISTS dex_pair_liquidity")
