@@ -107,10 +107,10 @@ impl ClickHouseObject {
 
 #[derive(Clone, Copy)]
 pub enum BackfillPolicy {
-    /// Run the select if the target table is empty. The indexer captures a
-    /// startup block cutoff and runs historical backfills through that cutoff;
-    /// materialized views cover rows written after the plan is created.
-    IfEmpty { select_sql: &'static str },
+    /// Repair missing rows by replaying this SELECT over bounded block ranges.
+    /// The indexer compares source rows against the target table on startup;
+    /// materialized views cover rows written after the repair plan is created.
+    Ranged { select_sql: &'static str },
 }
 
 #[derive(Clone, Copy)]

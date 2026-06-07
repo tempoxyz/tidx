@@ -19,6 +19,9 @@ use tidx::sync::ch_sink::ClickHouseSink;
 use tidx::sync::engine::SyncEngine;
 use tidx::sync::sink::SinkSet;
 
+const CLICKHOUSE_BACKFILL_RETRY_MAX_SECS: u64 = 10;
+const CLICKHOUSE_DERIVED_REPAIR_RETRY_MAX_SECS: u64 = 300;
+
 #[derive(ClapArgs)]
 pub struct Args {
     /// Path to config file
@@ -310,6 +313,7 @@ fn spawn_sync_engine(
     tokio::spawn(async move {
         // Build SinkSet with PG (always) + optional ClickHouse direct-write sink
         let mut sinks = SinkSet::new(throttled_pool.inner().clone());
+        let mut derived_repair_sink = None;
 
         if let Some(ref ch_config) = chain.clickhouse {
             if ch_config.enabled {
@@ -338,29 +342,26 @@ fn spawn_sync_engine(
                         ch_config.user.as_deref(),
                         ch_password.as_deref(),
                     ) {
-                        Ok(ch_sink) => match ch_sink.ensure_schema_and_plan_backfills().await {
-                            Ok(derived_backfills) => {
+                        Ok(ch_sink) => match ch_sink.ensure_schema_only().await {
+                            Ok(()) => {
                                 info!(
                                     chain = %chain.name,
                                     database = %database,
-                                    derived_backfills = derived_backfills.len(),
                                     "ClickHouse direct-write sink enabled"
                                 );
-                                if !derived_backfills.is_empty() {
-                                    let backfill_sink = ch_sink.clone();
-                                    let backfill_chain_name = chain.name.clone();
-                                    tokio::spawn(async move {
-                                        if let Err(e) = backfill_sink
-                                            .run_derived_backfill_plan(derived_backfills)
-                                            .await
-                                        {
-                                            error!(
-                                                error = %e,
-                                                chain = %backfill_chain_name,
-                                                "ClickHouse derived table backfill failed"
-                                            );
-                                        }
-                                    });
+                                if ch_config.repair_derived_on_startup {
+                                    derived_repair_sink = Some(ch_sink.clone());
+                                    info!(
+                                        chain = %chain.name,
+                                        database = %database,
+                                        "ClickHouse derived table repair scheduled after base backfill"
+                                    );
+                                } else {
+                                    info!(
+                                        chain = %chain.name,
+                                        database = %database,
+                                        "ClickHouse startup derived table repair disabled"
+                                    );
                                 }
                                 seed_metrics_from_clickhouse(&ch_sink).await;
                                 sinks = sinks.with_clickhouse(ch_sink);
@@ -392,6 +393,7 @@ fn spawn_sync_engine(
             let backfill_sinks = sinks.clone();
             let backfill_chain_name = chain.name.clone();
             let backfill_chain_id = chain.chain_id;
+            let derived_repair_sink = derived_repair_sink.clone();
             tokio::spawn(async move {
                 let mut attempt: u32 = 0;
                 loop {
@@ -399,7 +401,8 @@ fn spawn_sync_engine(
                         Ok(()) => break,
                         Err(e) => {
                             attempt += 1;
-                            let delay_secs = 10u64.min(2u64.saturating_pow(attempt));
+                            let delay_secs =
+                                retry_delay_secs(attempt, CLICKHOUSE_BACKFILL_RETRY_MAX_SECS);
                             error!(
                                 error = %e,
                                 chain = %backfill_chain_name,
@@ -410,6 +413,11 @@ fn spawn_sync_engine(
                             tokio::time::sleep(std::time::Duration::from_secs(delay_secs)).await;
                         }
                     }
+                }
+
+                if let Some(derived_repair_sink) = derived_repair_sink {
+                    run_clickhouse_derived_repair_loop(derived_repair_sink, backfill_chain_name)
+                        .await;
                 }
             });
         }
@@ -436,6 +444,45 @@ fn spawn_sync_engine(
             error!(error = %e, chain = %chain.name, "Sync engine failed");
         }
     });
+}
+
+fn retry_delay_secs(attempt: u32, max_secs: u64) -> u64 {
+    2u64.saturating_pow(attempt).min(max_secs)
+}
+
+async fn run_clickhouse_derived_repair_loop(sink: ClickHouseSink, chain_name: String) {
+    info!(
+        chain = %chain_name,
+        database = %sink.database(),
+        "Starting ClickHouse derived table repair"
+    );
+
+    let mut attempt: u32 = 0;
+    loop {
+        match sink.repair_derived_backfill_gaps().await {
+            Ok(()) => {
+                info!(
+                    chain = %chain_name,
+                    database = %sink.database(),
+                    "ClickHouse derived table repair complete"
+                );
+                break;
+            }
+            Err(e) => {
+                attempt += 1;
+                let delay_secs =
+                    retry_delay_secs(attempt, CLICKHOUSE_DERIVED_REPAIR_RETRY_MAX_SECS);
+                warn!(
+                    error = %e,
+                    chain = %chain_name,
+                    attempt,
+                    retry_in_secs = delay_secs,
+                    "ClickHouse derived table repair failed, backing off"
+                );
+                tokio::time::sleep(std::time::Duration::from_secs(delay_secs)).await;
+            }
+        }
+    }
 }
 
 /// Seed in-memory ClickHouse watermarks and row counts from existing data.
@@ -482,5 +529,19 @@ async fn seed_metrics_from_db(pool: &tidx::db::Pool) {
                 tidx::metrics::increment_sink_row_count("postgres", &table, count as u64);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn retry_delay_backs_off_until_cap() {
+        assert_eq!(retry_delay_secs(1, 300), 2);
+        assert_eq!(retry_delay_secs(2, 300), 4);
+        assert_eq!(retry_delay_secs(8, 300), 256);
+        assert_eq!(retry_delay_secs(9, 300), 300);
+        assert_eq!(retry_delay_secs(127, 300), 300);
     }
 }

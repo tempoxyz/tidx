@@ -75,6 +75,11 @@ pub struct ReceiptRow {
     pub effective_gas_price: Option<String>,
     pub status: Option<i16>,
     pub fee_payer: Option<Vec<u8>>,
+    /// Tx-level transaction type, denormalized from the matching `TxRow` so
+    /// receipt queries don't have to join `txs`. None until enriched/backfilled.
+    pub tx_type: Option<i16>,
+    /// Tx-level fee token, denormalized from the matching `TxRow`.
+    pub fee_token: Option<Vec<u8>>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]

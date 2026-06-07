@@ -186,6 +186,10 @@ pub struct ClickHouseConfig {
     /// When set, the password is read from this env var at startup.
     #[serde(default)]
     pub password_env: Option<String>,
+
+    /// Scan and repair historical derived-table gaps on startup (default: true).
+    #[serde(default = "default_true")]
+    pub repair_derived_on_startup: bool,
 }
 
 impl ClickHouseConfig {
@@ -221,6 +225,7 @@ impl Default for ClickHouseConfig {
             database: None,
             user: None,
             password_env: None,
+            repair_derived_on_startup: true,
         }
     }
 }
@@ -418,6 +423,7 @@ mod tests {
         assert!(ch.enabled);
         assert_eq!(ch.url, "http://clickhouse-1:8123");
         assert_eq!(ch.failover_urls.len(), 2);
+        assert!(ch.repair_derived_on_startup);
         assert_eq!(
             ch.all_urls(),
             vec![
@@ -446,6 +452,26 @@ mod tests {
 
         assert!(ch.failover_urls.is_empty());
         assert_eq!(ch.all_urls(), vec!["http://clickhouse:8123"]);
+        assert!(ch.repair_derived_on_startup);
+    }
+
+    #[test]
+    fn test_clickhouse_config_can_disable_startup_derived_repair() {
+        let toml_str = r#"
+            name = "test"
+            chain_id = 1
+            rpc_url = "http://localhost:8545"
+            pg_url = "postgres://localhost/test"
+
+            [clickhouse]
+            enabled = true
+            repair_derived_on_startup = false
+        "#;
+
+        let config: ChainConfig = toml::from_str(toml_str).unwrap();
+        let ch = config.clickhouse.unwrap();
+
+        assert!(!ch.repair_derived_on_startup);
     }
 
     #[test]

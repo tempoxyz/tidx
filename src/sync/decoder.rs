@@ -130,6 +130,22 @@ pub fn enrich_txs_from_receipts(txs: &mut [TxRow], receipts: &[ReceiptRow]) {
     }
 }
 
+/// Enrich receipt rows with fields that come from txs (`type`, `fee_token`).
+/// Denormalizing these onto receipts lets the API serve receipt lists without
+/// joining `receipts` to `txs`. Must be called after both txs and receipts are
+/// decoded. Mirror of `enrich_txs_from_receipts`.
+pub fn enrich_receipts_from_txs(receipts: &mut [ReceiptRow], txs: &[TxRow]) {
+    use std::collections::HashMap;
+    let tx_map: HashMap<(i64, i32), &TxRow> =
+        txs.iter().map(|t| ((t.block_num, t.idx), t)).collect();
+    for receipt in receipts.iter_mut() {
+        if let Some(t) = tx_map.get(&(receipt.block_num, receipt.tx_idx)) {
+            receipt.tx_type = Some(t.tx_type);
+            receipt.fee_token.clone_from(&t.fee_token);
+        }
+    }
+}
+
 pub fn decode_receipt(receipt: &Receipt, block_timestamp: DateTime<Utc>) -> ReceiptRow {
     ReceiptRow {
         block_num: receipt.block_number().unwrap_or(0) as i64,
@@ -144,6 +160,9 @@ pub fn decode_receipt(receipt: &Receipt, block_timestamp: DateTime<Utc>) -> Rece
         effective_gas_price: Some(receipt.effective_gas_price().to_string()),
         status: if receipt.status() { Some(1) } else { Some(0) },
         fee_payer: Some(receipt.fee_payer.as_slice().to_vec()),
+        // Denormalized from the matching tx by `enrich_receipts_from_txs`.
+        tx_type: None,
+        fee_token: None,
     }
 }
 
@@ -234,5 +253,57 @@ mod tests {
         assert_eq!(txs[1].fee_payer, None);
         assert_eq!(txs[2].gas_used, Some(63000));
         assert_eq!(txs[2].fee_payer, Some(vec![0x02; 20]));
+    }
+
+    fn make_tx_full(block_num: i64, idx: i32, tx_type: i16, fee_token: Option<Vec<u8>>) -> TxRow {
+        TxRow {
+            block_num,
+            idx,
+            tx_type,
+            fee_token,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn enrich_receipts_sets_type_and_fee_token() {
+        let mut receipts = vec![
+            make_receipt(1, 0, 21000, None),
+            make_receipt(1, 1, 50000, None),
+        ];
+        let txs = vec![
+            make_tx_full(1, 0, 2, Some(vec![0xcc; 20])),
+            make_tx_full(1, 1, 4, None),
+        ];
+
+        enrich_receipts_from_txs(&mut receipts, &txs);
+
+        assert_eq!(receipts[0].tx_type, Some(2));
+        assert_eq!(receipts[0].fee_token, Some(vec![0xcc; 20]));
+        assert_eq!(receipts[1].tx_type, Some(4));
+        assert_eq!(receipts[1].fee_token, None);
+    }
+
+    #[test]
+    fn enrich_receipts_leaves_unmatched_as_none() {
+        let mut receipts = vec![
+            make_receipt(1, 0, 21000, None),
+            make_receipt(2, 0, 21000, None),
+        ];
+        let txs = vec![make_tx_full(1, 0, 2, Some(vec![0xcc; 20]))];
+
+        enrich_receipts_from_txs(&mut receipts, &txs);
+
+        assert_eq!(receipts[0].tx_type, Some(2));
+        assert_eq!(receipts[1].tx_type, None);
+        assert_eq!(receipts[1].fee_token, None);
+    }
+
+    #[test]
+    fn enrich_receipts_empty_txs_is_noop() {
+        let mut receipts = vec![make_receipt(1, 0, 21000, None)];
+        enrich_receipts_from_txs(&mut receipts, &[]);
+        assert_eq!(receipts[0].tx_type, None);
+        assert_eq!(receipts[0].fee_token, None);
     }
 }

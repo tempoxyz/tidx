@@ -28,6 +28,8 @@ url = "http://clickhouse:8123"
 # failover_urls = ["http://clickhouse-2:8123"]
 # user = "default"
 # password_env = "CH_PASSWORD"
+# Historical derived-table gap repair runs after base ClickHouse backfill by default.
+# repair_derived_on_startup = true
 
 [[chains]]
 name = "mainnet"
@@ -46,3 +48,5 @@ url = "http://clickhouse:8123"
 # failover_urls = ["http://clickhouse-2:8123"]
 # user = "default"
 # password_env = "CH_PASSWORD"
+# Historical derived-table gap repair runs after base ClickHouse backfill by default.
+# repair_derived_on_startup = true

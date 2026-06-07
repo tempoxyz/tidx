@@ -4,6 +4,7 @@ mod address_txs;
 mod base;
 mod catalog;
 mod contract_creations;
+mod dex;
 mod token_approvals;
 mod token_approvals_current;
 mod token_balances;
@@ -38,6 +39,7 @@ pub fn derived_objects() -> impl DoubleEndedIterator<Item = &'static ClickHouseO
         .chain(address_balances::OBJECTS.iter())
         .chain(address_txs::OBJECTS.iter())
         .chain(contract_creations::OBJECTS.iter())
+        .chain(dex::OBJECTS.iter())
 }
 
 /// Tables and views that the public `/query` HTTP surface may reference.
@@ -110,6 +112,9 @@ mod tests {
         assert!(is_public_query_table("token_transfer_stats"));
         assert!(is_public_query_table("token_approvals_current"));
         assert!(is_public_query_table("token_metadata"));
+        // Per-token holder counts, refreshed on a schedule — public so Cadent
+        // reads one summed row per token instead of counting snapshot rows.
+        assert!(is_public_query_table("token_holder_counts"));
     }
 
     #[test]
@@ -126,6 +131,19 @@ mod tests {
     }
 
     #[test]
+    fn dex_decoded_tables_are_registered_for_public_query() {
+        // Pre-decoded stablecoin-DEX event tables so the exchange endpoints read
+        // sort-key seeks + a plain join instead of re-decoding `logs` per request.
+        for table in ["dex_pairs", "dex_orders", "dex_fills"] {
+            assert!(is_public_query_table(table), "{table} should be public");
+            assert_eq!(block_column(table), Some("block_num"));
+        }
+        // Pairs joined to their DEX-escrow base liquidity — public so the
+        // "pairs by liquidity" endpoint reads ranked pairs directly.
+        assert!(is_public_query_table("dex_pair_liquidity"));
+    }
+
+    #[test]
     fn materialized_views_are_known_but_not_public_query_tables() {
         for mv in [
             "token_transfers_mv",
@@ -135,6 +153,9 @@ mod tests {
             "address_holder_deltas_mv",
             "address_txs_mv",
             "contract_creations_mv",
+            "dex_pairs_mv",
+            "dex_orders_mv",
+            "dex_fills_mv",
         ] {
             assert!(!is_public_query_table(mv), "{mv} should not be public");
             assert!(is_known_table(mv), "{mv} should be known to the sink");
@@ -209,6 +230,18 @@ mod tests {
                 );
             }
             seen.push(object.name);
+        }
+    }
+
+    #[test]
+    fn managed_clickhouse_sql_has_no_client_bind_placeholders() {
+        for object in all_objects() {
+            let ddl = object.ddl();
+            assert!(
+                !ddl.contains('?'),
+                "{} DDL contains `?`, which the clickhouse crate treats as a bind placeholder even in comments",
+                object.name
+            );
         }
     }
 }

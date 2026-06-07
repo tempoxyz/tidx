@@ -87,14 +87,62 @@ impl SinkSet {
         logs: &[LogRow],
         receipts: &[ReceiptRow],
     ) -> Result<()> {
+        self.write_all_inner(blocks, txs, logs, receipts, None)
+            .await
+    }
+
+    pub async fn write_all_with_application_name(
+        &self,
+        blocks: &[BlockRow],
+        txs: &[TxRow],
+        logs: &[LogRow],
+        receipts: &[ReceiptRow],
+        application_name: &str,
+    ) -> Result<()> {
+        self.write_all_inner(blocks, txs, logs, receipts, Some(application_name))
+            .await
+    }
+
+    async fn write_all_inner(
+        &self,
+        blocks: &[BlockRow],
+        txs: &[TxRow],
+        logs: &[LogRow],
+        receipts: &[ReceiptRow],
+        application_name: Option<&str>,
+    ) -> Result<()> {
         if let Some(ch) = &self.ch {
             tokio::try_join!(
-                writer::write_batch(&self.pool, blocks, txs, logs, receipts),
+                async {
+                    if let Some(application_name) = application_name {
+                        writer::write_batch_with_application_name(
+                            &self.pool,
+                            blocks,
+                            txs,
+                            logs,
+                            receipts,
+                            application_name,
+                        )
+                        .await
+                    } else {
+                        writer::write_batch(&self.pool, blocks, txs, logs, receipts).await
+                    }
+                },
                 ch.write_blocks(blocks),
                 ch.write_txs(txs),
                 ch.write_logs(logs),
                 ch.write_receipts(receipts),
             )?;
+        } else if let Some(application_name) = application_name {
+            writer::write_batch_with_application_name(
+                &self.pool,
+                blocks,
+                txs,
+                logs,
+                receipts,
+                application_name,
+            )
+            .await?;
         } else {
             writer::write_batch(&self.pool, blocks, txs, logs, receipts).await?;
         }
@@ -177,8 +225,13 @@ impl SinkSet {
             Some((batch_end, data))
         };
 
-        while let Some((batch_end, (blocks, txs, logs, receipts))) = pending.take() {
+        while let Some((batch_end, (blocks, txs, logs, mut receipts))) = pending.take() {
             let block_count = blocks.len() as i64;
+
+            // Postgres receipts lack the denormalized tx-level type/fee_token;
+            // populate them from txs so the ClickHouse mirror matches the
+            // live-sync path before writing.
+            super::decoder::enrich_receipts_from_txs(&mut receipts, &txs);
 
             // Pipeline: fetch next batch from PG while writing current batch to CH
             let next_fetch = async {
@@ -442,6 +495,10 @@ async fn fetch_receipts(
             effective_gas_price: r.get(9),
             status: r.get(10),
             fee_payer: r.get(11),
+            // Postgres `receipts` has no type/fee_token; these are denormalized
+            // from txs by `enrich_receipts_from_txs` before the ClickHouse write.
+            tx_type: None,
+            fee_token: None,
         })
         .collect())
 }

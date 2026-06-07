@@ -148,6 +148,8 @@ batch_size = 100
 [chains.clickhouse]
 enabled = true
 url = "http://clickhouse:8123"
+# Historical materialized-table repair runs after base ClickHouse backfill by default.
+repair_derived_on_startup = true
 
 [[chains]]
 name = "moderato"
@@ -181,7 +183,8 @@ pg_password_env = "TIDX_PG_PASSWORD"
 ├── batch_size              u64       = 100          Blocks per RPC batch request
 └── [clickhouse]                                     ClickHouse OLAP settings
     ├── enabled             bool      = false        Enable ClickHouse OLAP queries
-    └── url                 string    = "http://clickhouse:8123"  ClickHouse HTTP URL
+    ├── url                 string    = "http://clickhouse:8123"  ClickHouse HTTP URL
+    └── repair_derived_on_startup bool = true        Repair historical derived-table gaps on startup
 ```
 
 ## CLI
@@ -542,6 +545,8 @@ Written by the sync engine to both PostgreSQL and ClickHouse. Schemas are identi
 | `status` | `INT2` | Success (1) or failure (0) |
 | `fee_payer` | `BYTEA` | Tempo fee payer (if sponsored) |
 
+> The ClickHouse mirror of `receipts` additionally carries `type` (`Nullable(Int16)`) and `fee_token` (`Nullable(String)`), denormalized from the matching tx at ingest so receipt queries don't have to join `txs`. Rows written before the `receipts_20260604_type_fee_token` migration stay `NULL` until re-synced.
+
 #### sync_state
 
 | Column | Type | Description |
@@ -578,6 +583,8 @@ For Transfer logs specifically, [`token_transfers`](#token_transfers) is pre-dec
 
 ClickHouse maintains these on insert and prunes them on reorg. Token-keyed tables answer "for this token, …"; address-keyed tables answer "for this account, …". Both families read from the same underlying Transfer/tx/receipt streams — the duplication exists so that either filter resolves via a sort-key seek instead of a full scan.
 
+On startup, tidx verifies built-in materialized tables after base ClickHouse backfill is caught up. It compares each table against its source SELECT in bounded block ranges, logs detected gaps, and replays only the missing ranges in chunks while realtime sync continues. Failed derived repairs are retried with backoff. Set `repair_derived_on_startup = false` under `[chains.clickhouse]` only if an operator needs to suppress historical repair work temporarily.
+
 | Name | Purpose |
 |------|---------|
 | [`address_balances`](#address_balances) | Current positive balance per `(holder, token)`. |
@@ -585,10 +592,15 @@ ClickHouse maintains these on insert and prunes them on reorg. Token-keyed table
 | [`address_transfers`](#address_transfers) | Transfer feed keyed by account; `'in'`/`'out'`. |
 | [`address_txs`](#address_txs) | Tx feed keyed by account; `'from'`/`'to'`. |
 | [`contract_creations`](#contract_creations) | One row per contract deployment. |
+| [`dex_fills`](#dex_fills) | Decoded stablecoin-DEX `OrderFilled` events. |
+| [`dex_orders`](#dex_orders) | Decoded stablecoin-DEX `OrderPlaced` events. |
+| [`dex_pair_liquidity`](#dex_pair_liquidity) | Pairs joined to their on-DEX base liquidity. |
+| [`dex_pairs`](#dex_pairs) | Decoded stablecoin-DEX `PairCreated` events. |
 | [`token_approvals`](#token_approvals) | Decoded `Approval` events. |
 | [`token_approvals_current`](#token_approvals_current) | Latest allowance per `(token, owner, spender)`. |
 | [`token_balances`](#token_balances) | Current positive balance per `(token, holder)`. |
 | [`token_balances_snapshot`](#token_balances_snapshot) | Pre-aggregated `token_balances`, refreshed on a schedule. |
+| [`token_holder_counts`](#token_holder_counts) | Holder count per token, refreshed on a schedule. |
 | [`token_holder_deltas`](#token_holder_deltas) | Per-event ± balance change, two rows per transfer. |
 | [`token_metadata`](#token_metadata) | Per-token first/last seen + lifetime transfer count. |
 | [`token_supply`](#token_supply) | Per-token mints − burns (zero-address legs). |
@@ -724,6 +736,111 @@ curl -G "https://indexer.testnet.tempo.xyz/query" \
     ORDER BY block_num DESC, tx_idx DESC
     LIMIT 5"
 ```
+
+#### dex_pairs
+
+> [!NOTE]
+> Materialized view over `logs`, kept in sync on reorg.
+
+Decoded `PairCreated(bytes32 indexed key, address indexed base, address indexed quote)` events from the stablecoin DEX precompile. All three params are indexed, so the payload lives in topics. `ReplacingMergeTree` ordered by `(block_num, log_idx)` for the pair-creation feed, with bloom indexes on `base`/`quote`. Replaces the runtime `signature=PairCreated(...)` CTE.
+
+| Column | Type | Description |
+|--------|------|-------------|
+| `block_num` | `Int64` | Block number |
+| `block_timestamp` | `DateTime64(3, 'UTC')` | Block timestamp |
+| `tx_idx` | `Int32` | Transaction index |
+| `log_idx` | `Int32` | Log index |
+| `tx_hash` | `String` | Transaction hash |
+| `address` | `String` | Emitting contract (the DEX precompile) |
+| `key` | `String` | Pair key (`bytes32`) |
+| `base` | `String` | Base token address |
+| `quote` | `String` | Quote token address |
+
+#### dex_orders
+
+> [!NOTE]
+> Materialized view over `logs`, kept in sync on reorg.
+
+Decoded `OrderPlaced(uint128 indexed orderId, address indexed maker, address indexed token, uint128 amount, bool isBid, int16 tick, bool isFlipOrder, int16 flipTick)` events. `int16` ticks decode from their sign-extended ABI word (trailing 2 bytes, little-endian) so negatives are correct. `ReplacingMergeTree` ordered by `(token, orderId)` so pair-scoped filters (`WHERE token = base`) seek by sort key and joins by `orderId` use the bloom index.
+
+| Column | Type | Description |
+|--------|------|-------------|
+| `block_num` | `Int64` | Block number |
+| `block_timestamp` | `DateTime64(3, 'UTC')` | Block timestamp |
+| `tx_idx` | `Int32` | Transaction index |
+| `log_idx` | `Int32` | Log index |
+| `tx_hash` | `String` | Transaction hash |
+| `address` | `String` | Emitting contract (the DEX precompile) |
+| `orderId` | `UInt256` | Order id |
+| `maker` | `String` | Order maker |
+| `token` | `String` | Pair base token |
+| `amount` | `UInt256` | Order amount |
+| `isBid` | `UInt8` | 1 = bid, 0 = ask |
+| `tick` | `Int16` | Order price tick |
+| `isFlipOrder` | `UInt8` | 1 = flip order |
+| `flipTick` | `Int16` | Flip order price tick |
+
+#### dex_fills
+
+> [!NOTE]
+> Materialized view over `logs`, kept in sync on reorg.
+
+Decoded `OrderFilled(uint128 indexed orderId, address indexed maker, address indexed taker, uint128 amountFilled, bool partialFill)` events. The pair (`token`/`isBid`/`tick`) is not on this event — join `orderId` to [`dex_orders`](#dex_orders). `ReplacingMergeTree` ordered by `(orderId, block_num, log_idx)` so the join probes by sort key, with bloom indexes on `maker`/`taker`/`tx_hash`.
+
+| Column | Type | Description |
+|--------|------|-------------|
+| `block_num` | `Int64` | Block number |
+| `block_timestamp` | `DateTime64(3, 'UTC')` | Block timestamp |
+| `tx_idx` | `Int32` | Transaction index |
+| `log_idx` | `Int32` | Log index |
+| `tx_hash` | `String` | Transaction hash |
+| `address` | `String` | Emitting contract (the DEX precompile) |
+| `orderId` | `UInt256` | Order id (join key to `dex_orders`) |
+| `maker` | `String` | Fill maker |
+| `taker` | `String` | Fill taker |
+| `amountFilled` | `UInt256` | Amount filled |
+| `partialFill` | `UInt8` | 1 = partial fill |
+
+```bash
+curl -G "https://indexer.testnet.tempo.xyz/query" \
+  --data-urlencode "chainId=42431" \
+  --data-urlencode "engine=clickhouse" \
+  --data-urlencode "sql=SELECT f.block_num, f.amountFilled, o.token, o.isBid, o.tick
+    FROM dex_fills f
+    JOIN dex_orders o ON o.orderId = f.orderId
+    WHERE o.token = '0x20c000000000000000000000b9537d11c60e8b50'
+    ORDER BY f.block_num DESC, f.log_idx DESC
+    LIMIT 10"
+```
+
+#### dex_pair_liquidity
+
+> [!NOTE]
+> Plain view over `dex_pairs FINAL ⋈ token_balances_snapshot`.
+
+Trading pairs joined to their on-DEX base-token liquidity. The DEX precompile escrows both base and quote tokens, but only base addresses map to a pair; this view pushes that intersection into ClickHouse so the "pairs by liquidity" endpoint reads ranked pairs directly (`ORDER BY liquidity DESC, base ASC LIMIT …`) instead of over-fetching DEX balances and intersecting with the pair set in memory. The DEX precompile address (`0xdec0…0000`) is fixed across Tempo chains and inlined.
+
+| Column | Type | Description |
+|--------|------|-------------|
+| `key` | `String` | Pair key (`bytes32`) |
+| `base` | `String` | Base token address |
+| `quote` | `String` | Quote token address |
+| `block_num` | `Int64` | Pair creation block |
+| `log_idx` | `Int32` | Pair creation log index |
+| `block_timestamp` | `DateTime64(3, 'UTC')` | Pair creation timestamp |
+| `tx_hash` | `String` | Pair creation tx hash |
+| `liquidity` | `Int256` | Base-token balance escrowed on the DEX |
+
+```bash
+curl -G "https://indexer.testnet.tempo.xyz/query" \
+  --data-urlencode "chainId=42431" \
+  --data-urlencode "engine=clickhouse" \
+  --data-urlencode "sql=SELECT base, quote, liquidity
+    FROM dex_pair_liquidity
+    ORDER BY liquidity DESC, base ASC
+    LIMIT 20"
+```
+
 #### token_approvals
 
 > [!NOTE]
@@ -843,6 +960,27 @@ curl -G "https://indexer.testnet.tempo.xyz/query" \
   --data-urlencode "engine=clickhouse" \
   --data-urlencode "sql=SELECT count() AS holders
     FROM token_balances_snapshot
+    WHERE token = '0x20c000000000000000000000e65cb5a40b7885ae'"
+```
+
+#### token_holder_counts
+
+> [!NOTE]
+> Refreshable materialized view over [`token_balances_snapshot`](#token_balances_snapshot), recomputed on a schedule (every 15 minutes) rather than on insert.
+
+Holder count per token, collapsed to a single row per token and stored in its own `MergeTree` ordered by `(token)`. `count() … FROM token_balances_snapshot WHERE token = X` is a primary-key range scan that still touches one row per holder (millions for tokens like PathUSD); this turns the token-detail "holder count" into a single-row primary-key lookup. Derived from the already-deduped snapshot rather than the raw deltas, so each refresh is cheap; counts are at most one refresh interval staler than the snapshot.
+
+| Column | Type | Description |
+|--------|------|-------------|
+| `token` | `String` | Token contract |
+| `holder_count` | `UInt64` | Number of holders with a positive balance |
+
+```bash
+curl -G "https://indexer.testnet.tempo.xyz/query" \
+  --data-urlencode "chainId=42431" \
+  --data-urlencode "engine=clickhouse" \
+  --data-urlencode "sql=SELECT holder_count
+    FROM token_holder_counts
     WHERE token = '0x20c000000000000000000000e65cb5a40b7885ae'"
 ```
 

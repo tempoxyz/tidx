@@ -4,7 +4,7 @@
 //! via the official `clickhouse` crate using RowBinary format with LZ4 compression.
 
 use anyhow::{Result, anyhow};
-use clickhouse::Row;
+use clickhouse::{Row, RowOwned, RowRead};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::hash::{DefaultHasher, Hash, Hasher};
@@ -42,6 +42,10 @@ const CH_SEND_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Timeout for waiting for ClickHouse to acknowledge the INSERT.
 const CH_END_TIMEOUT: Duration = Duration::from_secs(120);
+const DERIVED_BACKFILL_BLOCK_BATCH_SIZE: i64 = 100_000;
+const CH_DERIVED_QUERY_MAX_ATTEMPTS: u32 = 6;
+const CH_DERIVED_QUERY_RETRY_BASE_MS: u64 = 500;
+const CH_DERIVED_QUERY_RETRY_MAX_MS: u64 = 10_000;
 
 /// Direct-write ClickHouse sink using RowBinary format with LZ4 compression.
 #[derive(Clone)]
@@ -52,15 +56,18 @@ pub struct ClickHouseSink {
     database: String,
 }
 
-/// A historical derived-table backfill planned from the schema state observed
-/// at startup. Materialized views handle rows written after `cutoff`, so these
-/// jobs can run in the background without holding up the sync engine.
+/// A historical derived-table repair planned from the schema state observed
+/// at startup. Materialized views handle rows written after the planned range,
+/// so these jobs can run in the background without holding up the sync engine.
 #[derive(Clone, Debug)]
 pub struct DerivedBackfillPlan {
     target: &'static str,
     select_sql: &'static str,
     block_column: &'static str,
-    cutoff: i64,
+    from_block: i64,
+    to_block_exclusive: i64,
+    source_rows: u64,
+    target_rows: u64,
 }
 
 impl ClickHouseSink {
@@ -109,19 +116,23 @@ impl ClickHouseSink {
     /// 3. Reconcile derived views / materialized views: if a definition's
     ///    checksum has changed since the last `ensure_schema()`, drop and
     ///    recreate it so SELECT-body edits actually take effect.
-    /// 4. One-shot backfill any derived table whose target is empty.
+    /// 4. Backfill any detected gaps in derived tables.
     pub async fn ensure_schema(&self) -> Result<()> {
-        self.ensure_schema_objects().await?;
-        self.backfill_derived_objects_if_empty().await
+        self.ensure_schema_only().await?;
+        self.repair_derived_backfill_gaps().await
     }
 
-    /// Reconcile schema objects and return any historical derived-table
-    /// backfills that should run after startup. This lets the indexer start
-    /// syncing immediately while large materialized tables catch up in the
-    /// background.
-    pub async fn ensure_schema_and_plan_backfills(&self) -> Result<Vec<DerivedBackfillPlan>> {
-        self.ensure_schema_objects().await?;
-        self.plan_derived_backfills_if_empty().await
+    /// Reconcile schema objects without scanning or repairing derived data.
+    /// The sync engine uses this path so regular writes can start before any
+    /// potentially large historical derived-table repair work.
+    pub async fn ensure_schema_only(&self) -> Result<()> {
+        self.ensure_schema_objects().await
+    }
+
+    /// Detect and repair historical gaps in managed derived tables.
+    pub async fn repair_derived_backfill_gaps(&self) -> Result<()> {
+        let plans = self.plan_derived_backfills().await?;
+        self.run_derived_backfill_plan(plans).await
     }
 
     async fn ensure_schema_objects(&self) -> Result<()> {
@@ -274,15 +285,6 @@ impl ClickHouseSink {
         Ok(())
     }
 
-    /// One-shot backfill for empty derived tables. The plan captures a block
-    /// cutoff from dependency tables before writers start, then executes
-    /// backfills through that cutoff in dependency order. Materialized views
-    /// cover newer rows written while the plan is running.
-    async fn backfill_derived_objects_if_empty(&self) -> Result<()> {
-        let plans = self.plan_derived_backfills_if_empty().await?;
-        self.run_derived_backfill_plan(plans).await
-    }
-
     /// Execute a planned derived-table backfill.
     pub async fn run_derived_backfill_plan(&self, plans: Vec<DerivedBackfillPlan>) -> Result<()> {
         if plans.is_empty() {
@@ -299,15 +301,18 @@ impl ClickHouseSink {
             info!(
                 database = %self.database,
                 table = plan.target,
-                cutoff = plan.cutoff,
+                from_block = plan.from_block,
+                to_block = plan.to_block_exclusive - 1,
+                source_rows = plan.source_rows,
+                target_rows = plan.target_rows,
                 "Backfilling ClickHouse derived table"
             );
 
-            self.client
-                .query(&bounded_backfill_sql(&plan))
-                .execute()
-                .await
-                .map_err(|e| anyhow!("Failed to backfill ClickHouse table {}: {e}", plan.target))?;
+            self.execute_derived_query_with_retry(
+                &bounded_backfill_sql(&plan),
+                &format!("ClickHouse table {} backfill", plan.target),
+            )
+            .await?;
         }
 
         info!(
@@ -317,65 +322,66 @@ impl ClickHouseSink {
         Ok(())
     }
 
-    async fn plan_derived_backfills_if_empty(&self) -> Result<Vec<DerivedBackfillPlan>> {
+    async fn plan_derived_backfills(&self) -> Result<Vec<DerivedBackfillPlan>> {
         let mut plans = Vec::new();
-        let mut cutoffs_by_table = HashMap::new();
 
         for object in derived_backfills() {
-            let Some(BackfillPolicy::IfEmpty { select_sql }) = object.backfill else {
+            let Some(BackfillPolicy::Ranged { select_sql }) = object.backfill else {
                 continue;
             };
-
-            let count: u64 = self
-                .client
-                .query(&format!("SELECT count() FROM {}", object.name))
-                .fetch_one()
-                .await
-                .map_err(|e| anyhow!("Failed to count ClickHouse table {}: {e}", object.name))?;
-            if count > 0 {
-                if let Some(max) = self.max_block_in_table(object.name).await? {
-                    cutoffs_by_table.insert(object.name, max);
-                }
-                continue;
-            }
-
             let Some(block_column) = object.block_column else {
                 return Err(anyhow!(
                     "ClickHouse derived backfill table {} has no block column",
                     object.name
                 ));
             };
-            let Some(cutoff) = self
-                .source_cutoff_for_backfill(object, &cutoffs_by_table)
+
+            let Some((source_min, source_max)) = self
+                .source_min_max_for_select(select_sql, block_column)
                 .await?
             else {
                 continue;
             };
 
-            plans.push(DerivedBackfillPlan {
-                target: object.name,
-                select_sql,
-                block_column,
-                cutoff,
-            });
-            cutoffs_by_table.insert(object.name, cutoff);
+            let mut lo = source_min;
+            let end_exclusive = source_max.saturating_add(1);
+            while lo < end_exclusive {
+                let hi = lo
+                    .saturating_add(DERIVED_BACKFILL_BLOCK_BATCH_SIZE)
+                    .min(end_exclusive);
+                let source_rows = self
+                    .count_source_rows(select_sql, block_column, lo, hi)
+                    .await?;
+                if source_rows > 0 {
+                    let target_rows = self
+                        .count_target_rows(object.name, block_column, lo, hi)
+                        .await?;
+                    if target_rows < source_rows {
+                        warn!(
+                            database = %self.database,
+                            table = object.name,
+                            from_block = lo,
+                            to_block = hi - 1,
+                            source_rows,
+                            target_rows,
+                            "Detected ClickHouse derived table backfill gap"
+                        );
+                        plans.push(DerivedBackfillPlan {
+                            target: object.name,
+                            select_sql,
+                            block_column,
+                            from_block: lo,
+                            to_block_exclusive: hi,
+                            source_rows,
+                            target_rows,
+                        });
+                    }
+                }
+                lo = hi;
+            }
         }
 
         Ok(plans)
-    }
-
-    async fn source_cutoff_for_backfill(
-        &self,
-        object: &ClickHouseObject,
-        cutoffs_by_table: &HashMap<&'static str, i64>,
-    ) -> Result<Option<i64>> {
-        let Some(source) = object.depends_on.first().copied() else {
-            return Ok(None);
-        };
-        if let Some(cutoff) = cutoffs_by_table.get(source) {
-            return Ok(Some(*cutoff));
-        }
-        self.max_block_in_table(source).await
     }
 
     pub fn name(&self) -> &'static str {
@@ -503,6 +509,113 @@ impl ClickHouseSink {
             .fetch_one()
             .await
             .map_err(|e| anyhow!("ClickHouse query failed: {e}"))
+    }
+
+    async fn source_min_max_for_select(
+        &self,
+        select_sql: &str,
+        block_column: &str,
+    ) -> Result<Option<(i64, i64)>> {
+        let sql = format!(
+            "SELECT count(), ifNull(minOrNull({block_column}), 0), ifNull(maxOrNull({block_column}), 0) FROM ({})",
+            select_sql.trim()
+        );
+        let (count, min, max): (u64, i64, i64) = self
+            .fetch_one_derived_query_with_retry(&sql, "ClickHouse source range query")
+            .await?;
+        if count == 0 {
+            Ok(None)
+        } else {
+            Ok(Some((min, max)))
+        }
+    }
+
+    async fn count_source_rows(
+        &self,
+        select_sql: &str,
+        block_column: &str,
+        lo: i64,
+        hi: i64,
+    ) -> Result<u64> {
+        self.fetch_one_derived_query_with_retry(
+            &source_count_sql(select_sql, block_column, lo, hi),
+            "ClickHouse source count query",
+        )
+        .await
+    }
+
+    async fn count_target_rows(
+        &self,
+        table: &str,
+        block_column: &str,
+        lo: i64,
+        hi: i64,
+    ) -> Result<u64> {
+        let table = validate_table_name(table)?;
+        self.fetch_one_derived_query_with_retry(
+            &target_count_sql(table, block_column, lo, hi),
+            "ClickHouse target count query",
+        )
+        .await
+    }
+
+    async fn fetch_one_derived_query_with_retry<T>(&self, sql: &str, operation: &str) -> Result<T>
+    where
+        T: RowOwned + RowRead,
+    {
+        let mut attempt = 0;
+        loop {
+            match self.client.query(sql).fetch_one::<T>().await {
+                Ok(row) => return Ok(row),
+                Err(e) => {
+                    attempt += 1;
+                    if attempt >= CH_DERIVED_QUERY_MAX_ATTEMPTS
+                        || !is_retryable_clickhouse_error(&e)
+                    {
+                        return Err(anyhow!("{operation} failed: {e}"));
+                    }
+
+                    let delay = derived_query_retry_delay(attempt);
+                    warn!(
+                        operation,
+                        attempt,
+                        max_attempts = CH_DERIVED_QUERY_MAX_ATTEMPTS,
+                        retry_in_ms = delay.as_millis() as u64,
+                        error = %e,
+                        "ClickHouse derived repair query retry"
+                    );
+                    tokio::time::sleep(delay).await;
+                }
+            }
+        }
+    }
+
+    async fn execute_derived_query_with_retry(&self, sql: &str, operation: &str) -> Result<()> {
+        let mut attempt = 0;
+        loop {
+            match self.client.query(sql).execute().await {
+                Ok(()) => return Ok(()),
+                Err(e) => {
+                    attempt += 1;
+                    if attempt >= CH_DERIVED_QUERY_MAX_ATTEMPTS
+                        || !is_retryable_clickhouse_error(&e)
+                    {
+                        return Err(anyhow!("{operation} failed: {e}"));
+                    }
+
+                    let delay = derived_query_retry_delay(attempt);
+                    warn!(
+                        operation,
+                        attempt,
+                        max_attempts = CH_DERIVED_QUERY_MAX_ATTEMPTS,
+                        retry_in_ms = delay.as_millis() as u64,
+                        error = %e,
+                        "ClickHouse derived repair query retry"
+                    );
+                    tokio::time::sleep(delay).await;
+                }
+            }
+        }
     }
 
     /// Delete all data from a given block number onwards (reorg support).
@@ -767,6 +880,9 @@ struct ChReceiptWire {
     effective_gas_price: Option<String>,
     status: Option<i16>,
     fee_payer: Option<String>,
+    #[serde(rename = "type")]
+    tx_type: Option<i16>,
+    fee_token: Option<String>,
 }
 
 impl ChReceiptWire {
@@ -784,6 +900,8 @@ impl ChReceiptWire {
             effective_gas_price: r.effective_gas_price.clone(),
             status: r.status,
             fee_payer: r.fee_payer.as_ref().map(|v| hex_encode(v)),
+            tx_type: r.tx_type,
+            fee_token: r.fee_token.as_ref().map(|v| hex_encode(v)),
         }
     }
 }
@@ -803,13 +921,67 @@ fn checksum_of(ddl: &str) -> String {
 }
 
 fn bounded_backfill_sql(plan: &DerivedBackfillPlan) -> String {
-    format!(
-        "INSERT INTO {} SELECT * FROM ({}) WHERE {} <= {}",
+    ranged_backfill_sql(
         plan.target,
-        plan.select_sql.trim(),
+        plan.select_sql,
         plan.block_column,
-        plan.cutoff
+        plan.from_block,
+        plan.to_block_exclusive,
     )
+}
+
+fn ranged_backfill_sql(
+    target: &str,
+    select_sql: &str,
+    block_column: &str,
+    from_block: i64,
+    to_block_exclusive: i64,
+) -> String {
+    format!(
+        "INSERT INTO {target} SELECT DISTINCT * FROM ({}) WHERE {block_column} >= {from_block} AND {block_column} < {to_block_exclusive}",
+        select_sql.trim()
+    )
+}
+
+fn source_count_sql(
+    select_sql: &str,
+    block_column: &str,
+    from_block: i64,
+    to_block_exclusive: i64,
+) -> String {
+    format!(
+        "SELECT count() FROM (SELECT DISTINCT * FROM ({}) WHERE {block_column} >= {from_block} AND {block_column} < {to_block_exclusive})",
+        select_sql.trim()
+    )
+}
+
+fn target_count_sql(
+    table: &str,
+    block_column: &str,
+    from_block: i64,
+    to_block_exclusive: i64,
+) -> String {
+    format!(
+        "SELECT count() FROM {table} FINAL WHERE {block_column} >= {from_block} AND {block_column} < {to_block_exclusive}"
+    )
+}
+
+fn is_retryable_clickhouse_error(error: &impl std::fmt::Display) -> bool {
+    let message = error.to_string().to_ascii_lowercase();
+    message.contains("network error")
+        || message.contains("connect")
+        || message.contains("connection")
+        || message.contains("timeout")
+        || message.contains("timed out")
+}
+
+fn derived_query_retry_delay(attempt: u32) -> Duration {
+    let exponent = attempt.saturating_sub(1);
+    let multiplier = 2u64.saturating_pow(exponent);
+    let millis = CH_DERIVED_QUERY_RETRY_BASE_MS
+        .saturating_mul(multiplier)
+        .min(CH_DERIVED_QUERY_RETRY_MAX_MS);
+    Duration::from_millis(millis)
 }
 
 /// Validate that a table name is one of the known tables.
@@ -916,18 +1088,61 @@ mod tests {
     }
 
     #[test]
-    fn test_bounded_backfill_sql_wraps_select_with_cutoff() {
+    fn test_bounded_backfill_sql_wraps_select_with_range() {
         let plan = DerivedBackfillPlan {
             target: "address_txs",
             select_sql: "SELECT block_num, tx_hash FROM txs\n",
             block_column: "block_num",
-            cutoff: 123,
+            from_block: 100,
+            to_block_exclusive: 200,
+            source_rows: 10,
+            target_rows: 5,
         };
 
         assert_eq!(
             bounded_backfill_sql(&plan),
-            "INSERT INTO address_txs SELECT * FROM (SELECT block_num, tx_hash FROM txs) WHERE block_num <= 123"
+            "INSERT INTO address_txs SELECT DISTINCT * FROM (SELECT block_num, tx_hash FROM txs) WHERE block_num >= 100 AND block_num < 200"
         );
+    }
+
+    #[test]
+    fn test_derived_backfill_count_sql_uses_distinct_source_and_final_target() {
+        assert_eq!(
+            source_count_sql(
+                "SELECT block_num, tx_hash FROM txs\n",
+                "block_num",
+                100,
+                200
+            ),
+            "SELECT count() FROM (SELECT DISTINCT * FROM (SELECT block_num, tx_hash FROM txs) WHERE block_num >= 100 AND block_num < 200)"
+        );
+        assert_eq!(
+            target_count_sql("address_txs", "block_num", 100, 200),
+            "SELECT count() FROM address_txs FINAL WHERE block_num >= 100 AND block_num < 200"
+        );
+    }
+
+    #[test]
+    fn test_derived_query_retry_classification() {
+        assert!(is_retryable_clickhouse_error(
+            &"network error: client error (Connect)"
+        ));
+        assert!(is_retryable_clickhouse_error(&"request timed out"));
+        assert!(is_retryable_clickhouse_error(&"connection closed"));
+
+        assert!(!is_retryable_clickhouse_error(
+            &"MEMORY_LIMIT_EXCEEDED: would use too much memory"
+        ));
+        assert!(!is_retryable_clickhouse_error(&"Syntax error near SELECT"));
+    }
+
+    #[test]
+    fn test_derived_query_retry_delay_caps() {
+        assert_eq!(derived_query_retry_delay(1), Duration::from_millis(500));
+        assert_eq!(derived_query_retry_delay(2), Duration::from_secs(1));
+        assert_eq!(derived_query_retry_delay(5), Duration::from_secs(8));
+        assert_eq!(derived_query_retry_delay(6), Duration::from_secs(10));
+        assert_eq!(derived_query_retry_delay(127), Duration::from_secs(10));
     }
 
     #[test]

@@ -414,9 +414,39 @@ pub async fn write_batch(
     logs: &[LogRow],
     receipts: &[ReceiptRow],
 ) -> Result<()> {
+    write_batch_inner(pool, blocks, txs, logs, receipts, None).await
+}
+
+pub async fn write_batch_with_application_name(
+    pool: &Pool,
+    blocks: &[BlockRow],
+    txs: &[TxRow],
+    logs: &[LogRow],
+    receipts: &[ReceiptRow],
+    application_name: &str,
+) -> Result<()> {
+    write_batch_inner(pool, blocks, txs, logs, receipts, Some(application_name)).await
+}
+
+async fn write_batch_inner(
+    pool: &Pool,
+    blocks: &[BlockRow],
+    txs: &[TxRow],
+    logs: &[LogRow],
+    receipts: &[ReceiptRow],
+    application_name: Option<&str>,
+) -> Result<()> {
     let start = Instant::now();
     let mut conn = pool.get().await?;
     let tx = conn.transaction().await?;
+
+    if let Some(application_name) = application_name {
+        tx.query(
+            "SELECT set_config('application_name', $1, true)",
+            &[&application_name],
+        )
+        .await?;
+    }
 
     // ── blocks ────────────────────────────────────────────────────────────
     if !blocks.is_empty() {

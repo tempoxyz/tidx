@@ -938,6 +938,8 @@ fn make_receipt(block_num: i64, tx_idx: i32) -> ReceiptRow {
         effective_gas_price: Some("100000000000".to_string()),
         status: Some(1),
         fee_payer: None,
+        tx_type: None,
+        fee_token: None,
     }
 }
 

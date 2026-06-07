@@ -10,7 +10,7 @@ pub const OBJECTS: &[ClickHouseObject] = &[
         depends_on: &["logs"],
         public_query: true,
         block_column: Some("block_num"),
-        backfill: Some(BackfillPolicy::IfEmpty {
+        backfill: Some(BackfillPolicy::Ranged {
             select_sql: TOKEN_TRANSFERS_SELECT,
         }),
     },
@@ -49,7 +49,7 @@ mod tests {
             .iter()
             .find(|object| object.name == "token_transfers")
             .unwrap();
-        let Some(BackfillPolicy::IfEmpty { select_sql }) = table.backfill else {
+        let Some(BackfillPolicy::Ranged { select_sql }) = table.backfill else {
             panic!("token transfers table should declare its backfill");
         };
         assert_eq!(select_sql, TOKEN_TRANSFERS_SELECT);

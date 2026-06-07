@@ -10,7 +10,7 @@ pub const OBJECTS: &[ClickHouseObject] = &[
         depends_on: &["txs"],
         public_query: true,
         block_column: Some("block_num"),
-        backfill: Some(BackfillPolicy::IfEmpty {
+        backfill: Some(BackfillPolicy::Ranged {
             select_sql: ADDRESS_TXS_SELECT,
         }),
     },
