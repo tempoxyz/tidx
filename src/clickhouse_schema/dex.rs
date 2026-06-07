@@ -141,6 +141,10 @@ mod tests {
                 ddl.contains(selector),
                 "{mv_name} should filter on {selector}"
             );
+            assert!(
+                ddl.contains("address = '0xdec0000000000000000000000000000000000000'"),
+                "{mv_name} should only decode DEX precompile logs"
+            );
         }
     }
 
