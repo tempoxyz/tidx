@@ -211,8 +211,10 @@ fn validate_limit_expr(expr: &Expr, context: &str) -> Result<()> {
 const CLICKHOUSE_BLOCKED_SCHEMAS: &[&str] = &["system", "information_schema"];
 const CLICKHOUSE_DANGEROUS_FUNCTIONS: &[&str] = &[
     "url",
+    "urlcluster",
     "file",
     "s3",
+    "s3cluster",
     "remote",
     "remotesecure",
     "mysql",
@@ -220,6 +222,7 @@ const CLICKHOUSE_DANGEROUS_FUNCTIONS: &[&str] = &[
     "jdbc",
     "odbc",
     "hdfs",
+    "hdfscluster",
     "mongodb",
     "redis",
     "repeat",
@@ -288,10 +291,20 @@ fn validate_clickhouse_set_expr(
                 validate_clickhouse_table_with_joins(table, cte_names, depth)?;
             }
             for item in &select.projection {
-                if let sqlparser::ast::SelectItem::UnnamedExpr(expr)
-                | sqlparser::ast::SelectItem::ExprWithAlias { expr, .. } = item
-                {
-                    validate_clickhouse_expr(expr, cte_names, depth)?;
+                match item {
+                    sqlparser::ast::SelectItem::UnnamedExpr(expr)
+                    | sqlparser::ast::SelectItem::ExprWithAlias { expr, .. } => {
+                        validate_clickhouse_expr(expr, cte_names, depth)?;
+                    }
+                    sqlparser::ast::SelectItem::Wildcard(options) => {
+                        validate_clickhouse_wildcard_options(options)?;
+                    }
+                    sqlparser::ast::SelectItem::QualifiedWildcard(kind, options) => {
+                        if let sqlparser::ast::SelectItemQualifiedWildcardKind::Expr(expr) = kind {
+                            validate_clickhouse_expr(expr, cte_names, depth)?;
+                        }
+                        validate_clickhouse_wildcard_options(options)?;
+                    }
                 }
             }
             if let Some(selection) = &select.selection {
@@ -328,6 +341,20 @@ fn validate_clickhouse_set_expr(
         }
         _ => Err(anyhow!("Only SELECT queries are allowed")),
     }
+}
+
+fn validate_clickhouse_wildcard_options(
+    options: &sqlparser::ast::WildcardAdditionalOptions,
+) -> Result<()> {
+    if options.opt_ilike.is_some()
+        || options.opt_exclude.is_some()
+        || options.opt_except.is_some()
+        || options.opt_replace.is_some()
+        || options.opt_rename.is_some()
+    {
+        return Err(anyhow!("Wildcard options are not allowed"));
+    }
+    Ok(())
 }
 
 fn validate_clickhouse_table_with_joins(
@@ -1737,6 +1764,24 @@ mod tests {
     fn test_clickhouse_rejects_dangerous_scalar_functions() {
         assert!(validate_clickhouse_query("SELECT url('http://example.com') FROM logs").is_err());
         assert!(
+            validate_clickhouse_query(
+                "SELECT 1 IN urlCluster('cluster', 'http://169.254.169.254/') FROM logs"
+            )
+            .is_err()
+        );
+        assert!(
+            validate_clickhouse_query(
+                "SELECT 1 IN s3Cluster('cluster', 's3://bucket/key') FROM logs"
+            )
+            .is_err()
+        );
+        assert!(
+            validate_clickhouse_query(
+                "SELECT 1 IN hdfsCluster('cluster', 'hdfs://host/path') FROM logs"
+            )
+            .is_err()
+        );
+        assert!(
             validate_clickhouse_query("SELECT remote('host', 'db', 'table') FROM logs").is_err()
         );
         assert!(validate_clickhouse_query("SELECT repeat('x', 1000000) FROM logs").is_err());
@@ -1747,6 +1792,17 @@ mod tests {
         );
         assert!(validate_clickhouse_query("SELECT sleep(2) FROM logs").is_err());
         assert!(validate_clickhouse_query("SELECT sleepEachRow(1) FROM logs").is_err());
+    }
+
+    #[test]
+    fn test_clickhouse_rejects_wildcard_projection_options() {
+        assert!(
+            validate_clickhouse_query(
+                "SELECT * REPLACE sleepEachRow(1) AS block_num FROM logs LIMIT 1"
+            )
+            .is_err()
+        );
+        assert!(validate_clickhouse_query("SELECT * EXCEPT tx_hash FROM logs LIMIT 1").is_err());
     }
 
     #[test]
