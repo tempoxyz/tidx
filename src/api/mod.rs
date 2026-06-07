@@ -468,7 +468,8 @@ async fn handle_query_live(
     params: QueryParams,
     signatures: Vec<String>,
 ) -> Sse<KeepAliveStream<SseStream>> {
-    if state.broadcaster.receiver_count() >= MAX_LIVE_CONNECTIONS {
+    let mut rx = state.broadcaster.subscribe();
+    if state.broadcaster.receiver_count() > MAX_LIVE_CONNECTIONS {
         let stream: SseStream = Box::pin(async_stream::stream! {
             yield Ok(SseEvent::default()
                 .event("error")
@@ -491,7 +492,6 @@ async fn handle_query_live(
         }
     };
 
-    let mut rx = state.broadcaster.subscribe();
     let sql = params.sql;
     let options = QueryOptions {
         timeout_ms: params.timeout_ms.clamp(100, 30000),
@@ -530,6 +530,10 @@ async fn handle_query_live(
         loop {
             match rx.recv().await {
                 Ok(update) => {
+                    if update.chain_id != params.chain_id {
+                        continue;
+                    }
+
                     if update.block_num <= last_block_num {
                         continue;
                     }
