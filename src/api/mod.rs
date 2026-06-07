@@ -21,6 +21,7 @@ use axum::{
 use chrono::Utc;
 use futures::Stream;
 use serde::{Deserialize, Serialize};
+use tower::limit::ConcurrencyLimitLayer;
 use tower_http::cors::CorsLayer;
 use tower_http::trace::TraceLayer;
 
@@ -43,6 +44,7 @@ pub struct ChainClickHouseConfig {
 
 pub type SharedClickHouseConfigs = Arc<RwLock<HashMap<u64, ChainClickHouseConfig>>>;
 pub type SharedTrustedCidrs = Arc<StdRwLock<Vec<(IpAddr, u8)>>>;
+const MAX_CONCURRENT_API_QUERIES: usize = 8;
 
 #[derive(Clone)]
 pub struct AppState {
@@ -206,7 +208,10 @@ fn build_router(state: AppState) -> Router<()> {
     Router::new()
         .route("/health", get(handle_health))
         .route("/status", get(handle_status))
-        .route("/query", get(handle_query))
+        .route(
+            "/query",
+            get(handle_query).layer(ConcurrencyLimitLayer::new(MAX_CONCURRENT_API_QUERIES)),
+        )
         .route("/views", get(views::list_views).post(views::create_view))
         .route(
             "/views/{name}",
