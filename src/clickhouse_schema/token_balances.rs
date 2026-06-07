@@ -92,9 +92,21 @@ mod tests {
         // trigger on the FIRST branch of a UNION ALL — using UNION ALL silently
         // drops the sender (-1) leg and corrupts holder balances.
         assert!(select_sql.contains("ARRAY JOIN"));
+        assert!(select_sql.contains("amount)"));
         assert!(select_sql.contains("CAST(1 AS Int8)"));
         assert!(select_sql.contains("CAST(-1 AS Int8)"));
+        assert!(!select_sql.contains("CAST(amount AS Int256)"));
         assert!(!select_sql.contains("UNION ALL"));
+    }
+
+    #[test]
+    fn token_holder_deltas_store_unsigned_amounts() {
+        let table = OBJECTS
+            .iter()
+            .find(|object| object.name == "token_holder_deltas")
+            .unwrap();
+        let ddl = table.ddl();
+        assert!(ddl.contains("balance_delta   UInt256"));
     }
 
     #[test]
@@ -106,6 +118,7 @@ mod tests {
         assert!(view.is_view());
         let ddl = view.ddl();
         assert!(ddl.contains("FROM token_holder_deltas FINAL"));
+        assert!(ddl.contains("sumIf(balance_delta, leg = 1) - sumIf(balance_delta, leg = -1)"));
         assert!(ddl.contains("HAVING balance > 0"));
     }
 
@@ -127,6 +140,7 @@ mod tests {
         assert!(ddl.contains("CREATE MATERIALIZED VIEW IF NOT EXISTS token_balances_snapshot"));
         assert!(ddl.contains("REFRESH EVERY"));
         assert!(ddl.contains("FROM token_holder_deltas FINAL"));
+        assert!(ddl.contains("sumIf(balance_delta, leg = 1) - sumIf(balance_delta, leg = -1)"));
         assert!(ddl.contains("HAVING balance > 0"));
 
         // Drops the view (and its inner target table) on definition drift.

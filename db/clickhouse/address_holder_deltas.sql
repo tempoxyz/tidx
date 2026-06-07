@@ -6,7 +6,7 @@ CREATE TABLE IF NOT EXISTS address_holder_deltas (
     holder          String,
     token           String,
     leg             Int8,
-    balance_delta   Int256,
+    balance_delta   UInt256,
 
     INDEX idx_token  token  TYPE bloom_filter GRANULARITY 1,
     INDEX idx_holder holder TYPE bloom_filter GRANULARITY 1

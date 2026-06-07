@@ -53,6 +53,8 @@ mod tests {
         assert!(ddl.contains("TO address_holder_deltas AS\nSELECT"));
         assert!(ddl.contains("FROM token_transfers"));
         assert!(ddl.contains("ARRAY JOIN"));
+        assert!(ddl.contains("amount)"));
+        assert!(!ddl.contains("CAST(amount AS Int256)"));
         assert!(!ddl.contains("UNION ALL"));
     }
 
@@ -65,6 +67,7 @@ mod tests {
         assert!(view.is_view());
         let ddl = view.ddl();
         assert!(ddl.contains("FROM address_holder_deltas FINAL"));
+        assert!(ddl.contains("sumIf(balance_delta, leg = 1) - sumIf(balance_delta, leg = -1)"));
         assert!(ddl.contains("GROUP BY holder, token"));
         assert!(ddl.contains("HAVING balance > 0"));
     }

@@ -2,7 +2,7 @@ CREATE VIEW IF NOT EXISTS token_balances AS
 SELECT
     token,
     holder,
-    sum(balance_delta) AS balance
+    sumIf(balance_delta, leg = 1) - sumIf(balance_delta, leg = -1) AS balance
 FROM token_holder_deltas FINAL
 GROUP BY token, holder
 HAVING balance > 0
