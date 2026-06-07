@@ -6,7 +6,7 @@ use axum::{
     http::HeaderMap,
 };
 use serde::{Deserialize, Serialize};
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 
 use super::{ApiError, AppState};
 use crate::query::{
@@ -20,7 +20,8 @@ fn require_admin_mutation(
     state: &AppState,
     addr: &SocketAddr,
 ) -> Result<(), ApiError> {
-    if !state.is_trusted_ip(addr) {
+    let client_ip = admin_client_ip(headers, state, addr);
+    if !state.is_trusted_ip(&client_ip) {
         return Err(ApiError::Forbidden(
             "Mutations only allowed from trusted IPs".to_string(),
         ));
@@ -37,6 +38,30 @@ fn require_admin_mutation(
     }
 
     Ok(())
+}
+
+fn admin_client_ip(headers: &HeaderMap, state: &AppState, addr: &SocketAddr) -> IpAddr {
+    let peer_ip = addr.ip();
+    if !state.is_trusted_ip(&peer_ip) {
+        return peer_ip;
+    }
+
+    forwarded_client_ip(headers).unwrap_or(peer_ip)
+}
+
+fn forwarded_client_ip(headers: &HeaderMap) -> Option<IpAddr> {
+    headers
+        .get("x-forwarded-for")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.split(',').next())
+        .map(str::trim)
+        .and_then(|value| value.parse().ok())
+        .or_else(|| {
+            headers
+                .get("x-real-ip")
+                .and_then(|value| value.to_str().ok())
+                .and_then(|value| value.trim().parse().ok())
+        })
 }
 
 /// Validate view name (alphanumeric + underscore only)
@@ -480,7 +505,10 @@ mod tests {
     }
 
     fn test_state_with_trusted_localhost() -> AppState {
-        let trusted_cidrs = vec![("127.0.0.1".parse::<IpAddr>().unwrap(), 32)];
+        test_state_with_trusted_cidrs(vec![("127.0.0.1".parse::<IpAddr>().unwrap(), 32)])
+    }
+
+    fn test_state_with_trusted_cidrs(trusted_cidrs: Vec<(IpAddr, u8)>) -> AppState {
         AppState {
             pools: Arc::new(RwLock::new(HashMap::new())),
             default_chain_id: 0,
@@ -506,6 +534,42 @@ mod tests {
         let mut headers = HeaderMap::new();
         headers.insert(ADMIN_MUTATION_HEADER, "1".parse().unwrap());
         assert!(require_admin_mutation(&headers, &state, &addr).is_ok());
+    }
+
+    #[test]
+    fn test_rejects_untrusted_forwarded_client_from_trusted_proxy() {
+        let state = test_state_with_trusted_localhost();
+        let addr: SocketAddr = "127.0.0.1:8080".parse().unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert(ADMIN_MUTATION_HEADER, "1".parse().unwrap());
+        headers.insert("x-forwarded-for", "203.0.113.10".parse().unwrap());
+        assert!(require_admin_mutation(&headers, &state, &addr).is_err());
+    }
+
+    #[test]
+    fn test_accepts_trusted_forwarded_client_from_trusted_proxy() {
+        let state = test_state_with_trusted_cidrs(vec![
+            ("127.0.0.1".parse::<IpAddr>().unwrap(), 32),
+            ("100.64.0.0".parse::<IpAddr>().unwrap(), 10),
+        ]);
+        let addr: SocketAddr = "127.0.0.1:8080".parse().unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert(ADMIN_MUTATION_HEADER, "1".parse().unwrap());
+        headers.insert(
+            "x-forwarded-for",
+            "100.64.12.34, 127.0.0.1".parse().unwrap(),
+        );
+        assert!(require_admin_mutation(&headers, &state, &addr).is_ok());
+    }
+
+    #[test]
+    fn test_ignores_forwarded_headers_from_untrusted_peer() {
+        let state = test_state_with_trusted_localhost();
+        let addr: SocketAddr = "203.0.113.10:8080".parse().unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert(ADMIN_MUTATION_HEADER, "1".parse().unwrap());
+        headers.insert("x-forwarded-for", "127.0.0.1".parse().unwrap());
+        assert!(require_admin_mutation(&headers, &state, &addr).is_err());
     }
 
     // ========================================================================

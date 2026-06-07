@@ -2,7 +2,7 @@ mod views;
 
 use std::collections::HashMap;
 use std::convert::Infallible;
-use std::net::{IpAddr, SocketAddr};
+use std::net::IpAddr;
 use std::sync::{Arc, RwLock as StdRwLock};
 
 use tokio::sync::RwLock;
@@ -71,14 +71,13 @@ impl AppState {
     }
 
     /// Check if an IP address is in the trusted CIDRs
-    pub fn is_trusted_ip(&self, addr: &SocketAddr) -> bool {
-        let ip = addr.ip();
+    pub fn is_trusted_ip(&self, ip: &IpAddr) -> bool {
         self.trusted_cidrs
             .read()
             .map(|cidrs| {
                 cidrs
                     .iter()
-                    .any(|(network, prefix)| ip_in_cidr(&ip, network, *prefix))
+                    .any(|(network, prefix)| ip_in_cidr(ip, network, *prefix))
             })
             .unwrap_or(false)
     }
@@ -784,8 +783,7 @@ mod tests {
             clickhouse_engines: Arc::new(RwLock::new(HashMap::new())),
             trusted_cidrs: Arc::new(std::sync::RwLock::new(Vec::new())),
         };
-        let addr: SocketAddr = "127.0.0.1:8080".parse().unwrap();
-        assert!(!state.is_trusted_ip(&addr));
+        assert!(!state.is_trusted_ip(&"127.0.0.1".parse().unwrap()));
     }
 
     #[test]
