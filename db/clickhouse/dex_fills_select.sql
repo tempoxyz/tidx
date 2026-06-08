@@ -24,6 +24,7 @@ SELECT
 FROM logs
 WHERE
     selector = '0x16c08f8f2c17b3c8879b3e3cf5efdbdcdfdbd0fcb3890f9d3086f470cd601ddd'
+    AND address = '0xdec0000000000000000000000000000000000000'
     AND topic1 IS NOT NULL
     AND topic2 IS NOT NULL
     AND topic3 IS NOT NULL

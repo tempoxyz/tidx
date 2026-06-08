@@ -3,7 +3,7 @@ mod views;
 
 use std::collections::HashMap;
 use std::convert::Infallible;
-use std::net::{IpAddr, SocketAddr};
+use std::net::IpAddr;
 use std::sync::{Arc, RwLock as StdRwLock};
 
 use tokio::sync::RwLock;
@@ -22,6 +22,7 @@ use axum::{
 use chrono::Utc;
 use futures::Stream;
 use serde::{Deserialize, Serialize};
+use tower::limit::ConcurrencyLimitLayer;
 use tower_http::cors::CorsLayer;
 use tower_http::trace::TraceLayer;
 
@@ -44,6 +45,7 @@ pub struct ChainClickHouseConfig {
 
 pub type SharedClickHouseConfigs = Arc<RwLock<HashMap<u64, ChainClickHouseConfig>>>;
 pub type SharedTrustedCidrs = Arc<StdRwLock<Vec<(IpAddr, u8)>>>;
+const MAX_CONCURRENT_API_QUERIES: usize = 8;
 
 #[derive(Clone)]
 pub struct AppState {
@@ -72,14 +74,13 @@ impl AppState {
     }
 
     /// Check if an IP address is in the trusted CIDRs
-    pub fn is_trusted_ip(&self, addr: &SocketAddr) -> bool {
-        let ip = addr.ip();
+    pub fn is_trusted_ip(&self, ip: &IpAddr) -> bool {
         self.trusted_cidrs
             .read()
             .map(|cidrs| {
                 cidrs
                     .iter()
-                    .any(|(network, prefix)| ip_in_cidr(&ip, network, *prefix))
+                    .any(|(network, prefix)| ip_in_cidr(ip, network, *prefix))
             })
             .unwrap_or(false)
     }
@@ -207,7 +208,10 @@ fn build_router(state: AppState) -> Router<()> {
     Router::new()
         .route("/health", get(handle_health))
         .route("/status", get(handle_status))
-        .route("/query", get(handle_query))
+        .route(
+            "/query",
+            get(handle_query).layer(ConcurrencyLimitLayer::new(MAX_CONCURRENT_API_QUERIES)),
+        )
         .route("/policy-data", get(tip403_registry::get_policy_data))
         .route("/views", get(views::list_views).post(views::create_view))
         .route(
@@ -470,7 +474,8 @@ async fn handle_query_live(
     params: QueryParams,
     signatures: Vec<String>,
 ) -> Sse<KeepAliveStream<SseStream>> {
-    if state.broadcaster.receiver_count() >= MAX_LIVE_CONNECTIONS {
+    let mut rx = state.broadcaster.subscribe();
+    if state.broadcaster.receiver_count() > MAX_LIVE_CONNECTIONS {
         let stream: SseStream = Box::pin(async_stream::stream! {
             yield Ok(SseEvent::default()
                 .event("error")
@@ -493,7 +498,6 @@ async fn handle_query_live(
         }
     };
 
-    let mut rx = state.broadcaster.subscribe();
     let sql = params.sql;
     let options = QueryOptions {
         timeout_ms: params.timeout_ms.clamp(100, 30000),
@@ -532,6 +536,10 @@ async fn handle_query_live(
         loop {
             match rx.recv().await {
                 Ok(update) => {
+                    if update.chain_id != params.chain_id {
+                        continue;
+                    }
+
                     if update.block_num <= last_block_num {
                         continue;
                     }
@@ -786,8 +794,7 @@ mod tests {
             clickhouse_engines: Arc::new(RwLock::new(HashMap::new())),
             trusted_cidrs: Arc::new(std::sync::RwLock::new(Vec::new())),
         };
-        let addr: SocketAddr = "127.0.0.1:8080".parse().unwrap();
-        assert!(!state.is_trusted_ip(&addr));
+        assert!(!state.is_trusted_ip(&"127.0.0.1".parse().unwrap()));
     }
 
     #[test]

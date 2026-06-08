@@ -17,6 +17,8 @@ const RAW_PUSHDOWN_COLUMNS: &[&str] = &[
     "tx_idx",
 ];
 
+const MAX_ABI_TYPE_DEPTH: usize = 10;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EventSignature {
     pub name: String,
@@ -1030,18 +1032,28 @@ pub enum AbiType {
 
 impl AbiType {
     pub fn parse(s: &str) -> Result<Self> {
+        Self::parse_with_depth(s, 0)
+    }
+
+    fn parse_with_depth(s: &str, depth: usize) -> Result<Self> {
+        if depth > MAX_ABI_TYPE_DEPTH {
+            return Err(anyhow!(
+                "ABI type nesting exceeds maximum depth of {MAX_ABI_TYPE_DEPTH}"
+            ));
+        }
+
         let s = s.trim();
 
         // Check array types first, before scalar parsing eats the suffix
         if let Some(inner_str) = s.strip_suffix("[]") {
-            let inner = AbiType::parse(inner_str)?;
+            let inner = Self::parse_with_depth(inner_str, depth + 1)?;
             return Ok(AbiType::DynamicArray(Box::new(inner)));
         }
 
         if let Some(bracket_pos) = s.rfind('[')
             && let Some(inner_with_bracket) = s.strip_suffix(']')
         {
-            let inner = AbiType::parse(&s[..bracket_pos])?;
+            let inner = Self::parse_with_depth(&s[..bracket_pos], depth + 1)?;
             let size_str = &inner_with_bracket[bracket_pos + 1..];
             let size: usize = size_str
                 .parse()
@@ -1255,6 +1267,20 @@ mod tests {
         assert!(!sig.params[2].indexed);
         assert_eq!(sig.params[2].name.as_deref(), Some("value"));
         assert!(sig.topic0_hex().starts_with("ddf252ad"));
+    }
+
+    #[test]
+    fn test_parse_signature_rejects_excessive_array_nesting() {
+        let ty = format!("uint256{}", "[]".repeat(MAX_ABI_TYPE_DEPTH + 1));
+        let err = EventSignature::parse(&format!("Nested({ty})")).unwrap_err();
+        assert!(err.to_string().contains("ABI type nesting exceeds"));
+    }
+
+    #[test]
+    fn test_parse_signature_allows_bounded_array_nesting() {
+        let ty = format!("uint256{}", "[]".repeat(MAX_ABI_TYPE_DEPTH));
+        let sig = EventSignature::parse(&format!("Nested({ty})")).unwrap();
+        assert_eq!(sig.params.len(), 1);
     }
 
     #[test]
