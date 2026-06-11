@@ -138,6 +138,9 @@ mod tests {
             assert!(is_public_query_table(table), "{table} should be public");
             assert_eq!(block_column(table), Some("block_num"));
         }
+        // Pre-bucketed 1m OHLC candles, refreshed on a schedule — public so the
+        // exchange OHLC endpoint reads candles instead of scanning raw fills.
+        assert!(is_public_query_table("dex_ohlc_1m"));
         // Pairs joined to their DEX-escrow base liquidity — public so the
         // "pairs by liquidity" endpoint reads ranked pairs directly.
         assert!(is_public_query_table("dex_pair_liquidity"));

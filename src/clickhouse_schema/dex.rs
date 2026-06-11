@@ -6,6 +6,7 @@ const DEX_ORDERS_SCHEMA: &str = include_str!("../../db/clickhouse/dex_orders.sql
 const DEX_ORDERS_SELECT: &str = include_str!("../../db/clickhouse/dex_orders_select.sql");
 const DEX_FILLS_SCHEMA: &str = include_str!("../../db/clickhouse/dex_fills.sql");
 const DEX_FILLS_SELECT: &str = include_str!("../../db/clickhouse/dex_fills_select.sql");
+const DEX_OHLC_1M: &str = include_str!("../../db/clickhouse/dex_ohlc_1m.sql");
 const DEX_PAIR_LIQUIDITY: &str = include_str!("../../db/clickhouse/dex_pair_liquidity.sql");
 
 /// Decoded stablecoin-DEX event tables.
@@ -89,6 +90,17 @@ pub const OBJECTS: &[ClickHouseObject] = &[
         block_column: None,
         backfill: None,
     },
+    ClickHouseObject {
+        name: "dex_ohlc_1m",
+        kind: ClickHouseObjectKind::RefreshableMaterializedView(DEX_OHLC_1M),
+        depends_on: &["dex_fills", "dex_orders"],
+        public_query: true,
+        // Self-storing refreshable MV keyed by (token, bucket): fully replaced
+        // each refresh, so it's reorg-correct by construction and reorg cleanup
+        // skips it.
+        block_column: None,
+        backfill: None,
+    },
 ];
 
 #[cfg(test)]
@@ -146,6 +158,33 @@ mod tests {
                 "{mv_name} should only decode DEX precompile logs"
             );
         }
+    }
+
+    #[test]
+    fn ohlc_is_a_reorg_safe_refreshable_view() {
+        let ohlc = object("dex_ohlc_1m");
+        assert!(ohlc.is_refreshable_materialized_view());
+        // Public so Cadent reads pre-bucketed candles instead of scanning raw
+        // fills; self-storing, so it carries no block_column.
+        assert!(ohlc.public_query);
+        assert!(ohlc.block_column.is_none());
+
+        let ddl = ohlc.ddl();
+        assert!(ddl.contains("CREATE MATERIALIZED VIEW IF NOT EXISTS dex_ohlc_1m"));
+        assert!(ddl.contains("REFRESH EVERY"));
+        assert!(ddl.contains("toStartOfInterval(block_timestamp, INTERVAL 1 MINUTE)"));
+        // OHLC built from the decoded join, with open/close anchored on the
+        // first/last fill in the bucket by (block_num, log_idx).
+        assert!(ddl.contains("FROM dex_fills"));
+        assert!(ddl.contains("dex_orders"));
+        assert!(ddl.contains("argMin(rate, (block_num, log_idx)) AS open"));
+        assert!(ddl.contains("argMax(rate, (block_num, log_idx)) AS close"));
+        // Price math mirrors the API's priceScale = 100000 rate/quote formulas.
+        assert!(ddl.contains("100000"));
+        assert_eq!(
+            ohlc.drop_sql().as_deref(),
+            Some("DROP VIEW IF EXISTS dex_ohlc_1m")
+        );
     }
 
     #[test]
