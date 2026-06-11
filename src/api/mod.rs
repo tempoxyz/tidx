@@ -1,3 +1,4 @@
+mod tip403_registry;
 mod views;
 
 use std::collections::HashMap;
@@ -211,6 +212,7 @@ fn build_router(state: AppState) -> Router<()> {
             "/query",
             get(handle_query).layer(ConcurrencyLimitLayer::new(MAX_CONCURRENT_API_QUERIES)),
         )
+        .route("/policy-data", get(tip403_registry::get_policy_data))
         .route("/views", get(views::list_views).post(views::create_view))
         .route(
             "/views/{name}",

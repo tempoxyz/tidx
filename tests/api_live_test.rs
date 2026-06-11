@@ -5,10 +5,12 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
+use alloy::primitives::address;
 use axum::Router;
 use axum::body::Body;
 use axum::extract::connect_info::IntoMakeServiceWithConnectInfo;
 use axum::http::{Request, StatusCode};
+use tempo_contracts::precompiles::{ITIP403Registry, TIP403_REGISTRY_ADDRESS};
 use tower::Service;
 
 use common::testdb::TestDb;
@@ -96,6 +98,439 @@ async fn test_status_endpoint() {
     assert!(json["rev"].is_string());
     assert!(!json["rev"].as_str().unwrap().is_empty());
     assert!(json["chains"].is_array());
+}
+
+#[tokio::test]
+#[serial(db)]
+async fn test_policy_data_whitelist_members() {
+    let db = TestDb::empty().await;
+    db.truncate_all().await;
+
+    let creator = address!("0x1000000000000000000000000000000000000001");
+    let admin = address!("0x1000000000000000000000000000000000000002");
+    let account_active = address!("0x2000000000000000000000000000000000000001");
+    let account_removed = address!("0x2000000000000000000000000000000000000002");
+
+    let mut events = db.event_inserter(TIP403_REGISTRY_ADDRESS).starting_at(10);
+    events
+        .insert(&ITIP403Registry::PolicyCreated {
+            policyId: 7,
+            updater: creator,
+            policyType: ITIP403Registry::PolicyType::WHITELIST,
+        })
+        .await;
+    events
+        .insert(&ITIP403Registry::PolicyAdminUpdated {
+            policyId: 7,
+            updater: creator,
+            admin,
+        })
+        .await;
+    events
+        .insert(&ITIP403Registry::WhitelistUpdated {
+            policyId: 7,
+            updater: admin,
+            account: account_active,
+            allowed: true,
+        })
+        .await;
+    events
+        .insert(&ITIP403Registry::WhitelistUpdated {
+            policyId: 7,
+            updater: admin,
+            account: account_removed,
+            allowed: true,
+        })
+        .await;
+    events
+        .insert(&ITIP403Registry::WhitelistUpdated {
+            policyId: 7,
+            updater: admin,
+            account: account_removed,
+            allowed: false,
+        })
+        .await;
+
+    let broadcaster = Arc::new(Broadcaster::new());
+    let (pools, chain_id) = make_pools(db.pool.clone());
+    let mut app = make_test_service(pools, chain_id, broadcaster).await;
+
+    let response = app
+        .call(
+            Request::builder()
+                .uri("/policy-data?chainId=1&policyId=7")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+    assert_eq!(
+        json,
+        serde_json::json!({
+            "ok": true,
+            "metadata": {
+                "chain_id": 1,
+                "policy_id": 7,
+                "registry": "0x403c000000000000000000000000000000000000",
+                "policy_type": "WHITELIST",
+                "admin": admin.to_string(),
+                "created_by": creator.to_string(),
+                "created_at": "2023-11-14T22:13:30Z",
+                "last_updated_at": "2023-11-14T22:13:34Z"
+            },
+            "compound_policy": null,
+            "members": [account_active.to_string()],
+            "member_limit": 100,
+            "next_member_cursor": null
+        })
+    );
+}
+
+#[tokio::test]
+#[serial(db)]
+async fn test_policy_data_blacklist_members() {
+    let db = TestDb::empty().await;
+    db.truncate_all().await;
+
+    let creator = address!("0x3000000000000000000000000000000000000001");
+    let restricted = address!("0x4000000000000000000000000000000000000001");
+    let unrestricted = address!("0x4000000000000000000000000000000000000002");
+
+    let mut events = db.event_inserter(TIP403_REGISTRY_ADDRESS).starting_at(20);
+    events
+        .insert(&ITIP403Registry::PolicyCreated {
+            policyId: 8,
+            updater: creator,
+            policyType: ITIP403Registry::PolicyType::BLACKLIST,
+        })
+        .await;
+    events
+        .insert(&ITIP403Registry::BlacklistUpdated {
+            policyId: 8,
+            updater: creator,
+            account: restricted,
+            restricted: true,
+        })
+        .await;
+    events
+        .insert(&ITIP403Registry::BlacklistUpdated {
+            policyId: 8,
+            updater: creator,
+            account: unrestricted,
+            restricted: true,
+        })
+        .await;
+    events
+        .insert(&ITIP403Registry::BlacklistUpdated {
+            policyId: 8,
+            updater: creator,
+            account: unrestricted,
+            restricted: false,
+        })
+        .await;
+
+    let broadcaster = Arc::new(Broadcaster::new());
+    let (pools, chain_id) = make_pools(db.pool.clone());
+    let mut app = make_test_service(pools, chain_id, broadcaster).await;
+
+    let response = app
+        .call(
+            Request::builder()
+                .uri("/policy-data?chainId=1&policyId=8")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+    assert_eq!(
+        json,
+        serde_json::json!({
+            "ok": true,
+            "metadata": {
+                "chain_id": 1,
+                "policy_id": 8,
+                "registry": "0x403c000000000000000000000000000000000000",
+                "policy_type": "BLACKLIST",
+                "admin": creator.to_string(),
+                "created_by": creator.to_string(),
+                "created_at": "2023-11-14T22:13:40Z",
+                "last_updated_at": "2023-11-14T22:13:43Z"
+            },
+            "compound_policy": null,
+            "members": [restricted.to_string()],
+            "member_limit": 100,
+            "next_member_cursor": null
+        })
+    );
+}
+
+#[tokio::test]
+#[serial(db)]
+async fn test_policy_data_members_are_paginated() {
+    let db = TestDb::empty().await;
+    db.truncate_all().await;
+
+    let creator = address!("0x5000000000000000000000000000000000000001");
+    let account_1 = address!("0x6000000000000000000000000000000000000001");
+    let account_2 = address!("0x6000000000000000000000000000000000000002");
+
+    let mut events = db.event_inserter(TIP403_REGISTRY_ADDRESS).starting_at(30);
+    events
+        .insert(&ITIP403Registry::PolicyCreated {
+            policyId: 9,
+            updater: creator,
+            policyType: ITIP403Registry::PolicyType::WHITELIST,
+        })
+        .await;
+    events
+        .insert(&ITIP403Registry::WhitelistUpdated {
+            policyId: 9,
+            updater: creator,
+            account: account_1,
+            allowed: true,
+        })
+        .await;
+    events
+        .insert(&ITIP403Registry::WhitelistUpdated {
+            policyId: 9,
+            updater: creator,
+            account: account_2,
+            allowed: true,
+        })
+        .await;
+
+    let broadcaster = Arc::new(Broadcaster::new());
+    let (pools, chain_id) = make_pools(db.pool.clone());
+    let mut app = make_test_service(pools, chain_id, broadcaster).await;
+
+    let response = app
+        .call(
+            Request::builder()
+                .uri("/policy-data?chainId=1&policyId=9&limit=1")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+    assert_eq!(json["members"], serde_json::json!([account_1.to_string()]));
+    assert_eq!(json["member_limit"], 1);
+    assert_eq!(json["next_member_cursor"], account_1.to_string());
+
+    let response = app
+        .call(
+            Request::builder()
+                .uri(format!(
+                    "/policy-data?chainId=1&policyId=9&limit=1&cursor={}",
+                    json["next_member_cursor"].as_str().unwrap()
+                ))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+    assert_eq!(json["members"], serde_json::json!([account_2.to_string()]));
+}
+
+#[tokio::test]
+#[serial(db)]
+async fn test_policy_data_compound_policy_metadata() {
+    let db = TestDb::empty().await;
+    db.truncate_all().await;
+
+    let creator = address!("0x7000000000000000000000000000000000000001");
+    let sender_account = address!("0x8000000000000000000000000000000000000001");
+    let recipient_account = address!("0x8000000000000000000000000000000000000002");
+    let mint_recipient_account = address!("0x8000000000000000000000000000000000000003");
+
+    let mut events = db.event_inserter(TIP403_REGISTRY_ADDRESS).starting_at(40);
+    events
+        .insert(&ITIP403Registry::PolicyCreated {
+            policyId: 1,
+            updater: creator,
+            policyType: ITIP403Registry::PolicyType::WHITELIST,
+        })
+        .await;
+    events
+        .insert(&ITIP403Registry::WhitelistUpdated {
+            policyId: 1,
+            updater: creator,
+            account: sender_account,
+            allowed: true,
+        })
+        .await;
+    events
+        .insert(&ITIP403Registry::PolicyCreated {
+            policyId: 2,
+            updater: creator,
+            policyType: ITIP403Registry::PolicyType::BLACKLIST,
+        })
+        .await;
+    events
+        .insert(&ITIP403Registry::BlacklistUpdated {
+            policyId: 2,
+            updater: creator,
+            account: recipient_account,
+            restricted: true,
+        })
+        .await;
+    events
+        .insert(&ITIP403Registry::PolicyCreated {
+            policyId: 3,
+            updater: creator,
+            policyType: ITIP403Registry::PolicyType::WHITELIST,
+        })
+        .await;
+    events
+        .insert(&ITIP403Registry::WhitelistUpdated {
+            policyId: 3,
+            updater: creator,
+            account: mint_recipient_account,
+            allowed: true,
+        })
+        .await;
+    events
+        .insert(&ITIP403Registry::CompoundPolicyCreated {
+            policyId: 10,
+            creator,
+            senderPolicyId: 1,
+            recipientPolicyId: 2,
+            mintRecipientPolicyId: 3,
+        })
+        .await;
+
+    let broadcaster = Arc::new(Broadcaster::new());
+    let (pools, chain_id) = make_pools(db.pool.clone());
+    let mut app = make_test_service(pools, chain_id, broadcaster).await;
+
+    let response = app
+        .call(
+            Request::builder()
+                .uri("/policy-data?chainId=1&policyId=10")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+    assert_eq!(
+        json,
+        serde_json::json!({
+            "ok": true,
+            "metadata": {
+                "chain_id": 1,
+                "policy_id": 10,
+                "registry": "0x403c000000000000000000000000000000000000",
+                "policy_type": "COMPOUND",
+                "admin": null,
+                "created_by": creator.to_string(),
+                "created_at": "2023-11-14T22:13:50Z",
+                "last_updated_at": "2023-11-14T22:13:56Z"
+            },
+            "compound_policy": {
+                "sender_policy": {
+                    "metadata": {
+                        "chain_id": 1,
+                        "policy_id": 1,
+                        "registry": "0x403c000000000000000000000000000000000000",
+                        "policy_type": "WHITELIST",
+                        "admin": creator.to_string(),
+                        "created_by": creator.to_string(),
+                        "created_at": "2023-11-14T22:13:50Z",
+                        "last_updated_at": "2023-11-14T22:13:51Z"
+                    },
+                    "members": [sender_account.to_string()],
+                    "next_member_cursor": null
+                },
+                "recipient_policy": {
+                    "metadata": {
+                        "chain_id": 1,
+                        "policy_id": 2,
+                        "registry": "0x403c000000000000000000000000000000000000",
+                        "policy_type": "BLACKLIST",
+                        "admin": creator.to_string(),
+                        "created_by": creator.to_string(),
+                        "created_at": "2023-11-14T22:13:52Z",
+                        "last_updated_at": "2023-11-14T22:13:53Z"
+                    },
+                    "members": [recipient_account.to_string()],
+                    "next_member_cursor": null
+                },
+                "mint_recipient_policy": {
+                    "metadata": {
+                        "chain_id": 1,
+                        "policy_id": 3,
+                        "registry": "0x403c000000000000000000000000000000000000",
+                        "policy_type": "WHITELIST",
+                        "admin": creator.to_string(),
+                        "created_by": creator.to_string(),
+                        "created_at": "2023-11-14T22:13:54Z",
+                        "last_updated_at": "2023-11-14T22:13:55Z"
+                    },
+                    "members": [mint_recipient_account.to_string()],
+                    "next_member_cursor": null
+                }
+            },
+            "members": [],
+            "member_limit": 100,
+            "next_member_cursor": null
+        })
+    );
+}
+
+#[tokio::test]
+#[serial(db)]
+async fn test_policy_data_not_found() {
+    let db = TestDb::empty().await;
+    db.truncate_all().await;
+    let broadcaster = Arc::new(Broadcaster::new());
+    let (pools, chain_id) = make_pools(db.pool.clone());
+    let mut app = make_test_service(pools, chain_id, broadcaster).await;
+
+    let response = app
+        .call(
+            Request::builder()
+                .uri("/policy-data?chainId=1&policyId=999")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
 }
 
 #[tokio::test]
