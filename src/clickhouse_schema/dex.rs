@@ -260,7 +260,7 @@ mod tests {
         // complete, reorg-corrected source state (no insert-time ordering hazard,
         // no refresh lag).
         assert!(enriched.is_view());
-        // Public so Cadent reads flip-correct, pre-oriented fills instead of
+        // Public so Cadent reads flip-correct, book-resolved fills instead of
         // replaying the raw order-state stream; stores nothing, so no block_column.
         assert!(enriched.public_query);
         assert!(enriched.block_column.is_none());
@@ -277,12 +277,18 @@ mod tests {
         assert!(ddl.contains("FROM dex_fills FINAL"));
         assert!(ddl.contains("dex_order_events FINAL"));
         assert!(ddl.contains("f.orderId = e.orderId AND f.pos > e.pos"));
-        // Quote side resolved from dex_pairs; genesis books fall back to ''.
+        // Quote token resolved from dex_pairs; genesis books fall back to ''.
         assert!(ddl.contains("LEFT JOIN dex_pairs AS p FINAL"));
-        // Materializes at-peg + price/quote so the filters become column reads.
+        // Book-native fill columns: base/quote tokens, side, at-peg, price and
+        // the quote-side amount become column reads. Taker source/destination is
+        // a swap-level (route) notion derived during assembly, not stored here.
+        assert!(ddl.contains("e.token AS token"));
+        assert!(ddl.contains("p.quote AS quote_token"));
+        assert!(ddl.contains("e.isBid AS isBid"));
         assert!(ddl.contains("toUInt8(e.tick = 0) AS at_peg"));
-        assert!(ddl.contains("AS source_token"));
-        assert!(ddl.contains("AS destination_token"));
+        assert!(ddl.contains("AS quote_amount"));
+        assert!(!ddl.contains("source_token"));
+        assert!(!ddl.contains("destination_token"));
         assert!(ddl.contains("100000"));
         assert_eq!(
             enriched.drop_sql().as_deref(),
