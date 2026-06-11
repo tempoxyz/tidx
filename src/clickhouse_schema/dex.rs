@@ -128,12 +128,13 @@ pub const OBJECTS: &[ClickHouseObject] = &[
     },
     ClickHouseObject {
         name: "dex_fills_enriched",
-        kind: ClickHouseObjectKind::RefreshableMaterializedView(DEX_FILLS_ENRICHED),
+        kind: ClickHouseObjectKind::View(DEX_FILLS_ENRICHED),
         depends_on: &["dex_fills", "dex_order_events", "dex_pairs"],
         public_query: true,
-        // Self-storing refreshable MV: ASOF-joins each fill to its point-in-time
-        // order state over a rolling window, so it's fully replaced each refresh
-        // — reorg-correct by construction, and reorg cleanup skips it.
+        // Plain view: ASOF-joins each fill to its point-in-time order state at
+        // query time over the already-decoded, sort-keyed source tables. Stores
+        // nothing, so it's realtime (no refresh lag), reorg-correct (reads live
+        // tables) and carries no block_column.
         block_column: None,
         backfill: None,
     },
@@ -252,17 +253,24 @@ mod tests {
     }
 
     #[test]
-    fn enriched_fills_are_reorg_safe_point_in_time_join() {
+    fn enriched_fills_are_realtime_point_in_time_join() {
         let enriched = object("dex_fills_enriched");
-        assert!(enriched.is_refreshable_materialized_view());
+        // Plain view, not a materialized view: the join runs at query time so a
+        // fill is filterable the instant it lands, and the join always sees the
+        // complete, reorg-corrected source state (no insert-time ordering hazard,
+        // no refresh lag).
+        assert!(enriched.is_view());
         // Public so Cadent reads flip-correct, pre-oriented fills instead of
-        // replaying the raw order-state stream; self-storing, so no block_column.
+        // replaying the raw order-state stream; stores nothing, so no block_column.
         assert!(enriched.public_query);
         assert!(enriched.block_column.is_none());
 
         let ddl = enriched.ddl();
-        assert!(ddl.contains("CREATE MATERIALIZED VIEW IF NOT EXISTS dex_fills_enriched"));
-        assert!(ddl.contains("REFRESH EVERY"));
+        assert!(ddl.contains("CREATE VIEW IF NOT EXISTS dex_fills_enriched"));
+        // A plain view stores nothing, so it must not carry materialization or
+        // refresh clauses.
+        assert!(!ddl.contains("MATERIALIZED VIEW"));
+        assert!(!ddl.contains("REFRESH"));
         // ASOF join resolves each fill's latest state strictly before its
         // position, against the placed+flipped events stream.
         assert!(ddl.contains("ASOF INNER JOIN"));
