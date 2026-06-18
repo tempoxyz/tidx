@@ -5,6 +5,7 @@ mod base;
 mod catalog;
 mod contract_creations;
 mod dex;
+mod receive_policy;
 mod token_approvals;
 mod token_approvals_current;
 mod token_balances;
@@ -21,6 +22,12 @@ pub fn base_objects() -> &'static [ClickHouseObject] {
 
 pub fn migrations() -> &'static [ClickHouseObject] {
     base::MIGRATIONS
+}
+
+/// One-shot migrations applied after `derived_objects()`, since they mutate
+/// derived tables.
+pub fn post_derived_migrations() -> &'static [ClickHouseObject] {
+    base::POST_DERIVED_MIGRATIONS
 }
 
 pub fn derived_objects() -> impl DoubleEndedIterator<Item = &'static ClickHouseObject> {
@@ -40,6 +47,7 @@ pub fn derived_objects() -> impl DoubleEndedIterator<Item = &'static ClickHouseO
         .chain(address_txs::OBJECTS.iter())
         .chain(contract_creations::OBJECTS.iter())
         .chain(dex::OBJECTS.iter())
+        .chain(receive_policy::OBJECTS.iter())
 }
 
 /// Tables and views that the public `/query` HTTP surface may reference.
@@ -56,6 +64,7 @@ pub fn all_objects() -> impl Iterator<Item = &'static ClickHouseObject> {
         .iter()
         .chain(migrations().iter())
         .chain(derived_objects())
+        .chain(post_derived_migrations().iter())
 }
 
 pub fn derived_backfills() -> impl Iterator<Item = &'static ClickHouseObject> {
@@ -233,6 +242,44 @@ mod tests {
                 );
             }
             seen.push(object.name);
+        }
+    }
+
+    #[test]
+    fn post_derived_migrations_run_after_their_target_tables() {
+        // all_objects() is the apply order; each migration must come after the
+        // table it mutates.
+        let order: Vec<&str> = all_objects().map(|object| object.name).collect();
+        let position = |name: &str| {
+            order
+                .iter()
+                .position(|n| *n == name)
+                .unwrap_or_else(|| panic!("{name} not in all_objects()"))
+        };
+
+        for (migration_name, target) in [
+            (
+                "token_holder_deltas_20260618_drop_guard_rows",
+                "token_holder_deltas",
+            ),
+            (
+                "address_holder_deltas_20260618_drop_guard_rows",
+                "address_holder_deltas",
+            ),
+        ] {
+            assert!(
+                position(migration_name) > position(target),
+                "{migration_name} must be applied after {target}"
+            );
+            let migration = all_objects()
+                .find(|object| object.name == migration_name)
+                .unwrap();
+            assert!(
+                matches!(migration.kind, ClickHouseObjectKind::Migration(_)),
+                "{migration_name} should be a one-shot migration"
+            );
+            assert!(!migration.public_query, "{migration_name} is internal");
+            assert!(!is_public_query_table(migration_name));
         }
     }
 
