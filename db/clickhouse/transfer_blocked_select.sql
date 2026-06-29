@@ -43,4 +43,27 @@ WHERE
     AND length(topic1) >= 66
     AND length(topic2) >= 66
     AND length(topic3) >= 66
+    -- Fixed head (amount + receiptVersion + receipt offset word) plus the
+    -- dynamic receipt length word must be present: '0x' (2) + 4 words * 64.
     AND length(data) >= 258
+    -- `receipt` is the only dynamic field after three static head words, so a
+    -- well-formed payload always encodes its ABI offset as 96 (0x60). Pin it:
+    -- this rejects corrupt offset words that would otherwise push the substring
+    -- reads below out of range, and lets us read the length word at its fixed
+    -- position (hex 195..258 = 3 + 96*2) instead of chasing a hostile offset.
+    -- The offset/length below are read as UInt64 (low 8 bytes of each 32-byte
+    -- ABI word), so require the high 24 bytes (48 hex chars) to be zero; that
+    -- makes the UInt64 read sound and rejects words whose high bits are set
+    -- (e.g. a length of 2^64 + n that would otherwise slip through as n).
+    AND substring(data, 131, 48) = repeat('0', 48)
+    AND reinterpretAsUInt64(reverse(unhex(substring(data, 131, 64)))) = 96
+    AND substring(data, 195, 48) = repeat('0', 48)
+    -- ...and the full declared receipt payload must fit. The length word only
+    -- proves how many bytes the receipt *claims*; without this a truncated row
+    -- with a nonzero length would pass the checks above and store a receipt
+    -- silently shortened by substring(). Required hex chars: '0x' (2) + head
+    -- (192) + length word (64) = 258, plus payload (receipt_length * 2).
+    -- UInt128 arithmetic so a large (but high-bits-zero) length can't overflow
+    -- the comparison and wrap to a small value that lets a truncated row through.
+    AND toUInt128(length(data)) >= 258
+        + toUInt128(reinterpretAsUInt64(reverse(unhex(substring(data, 195, 64))))) * 2

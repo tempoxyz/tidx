@@ -266,6 +266,22 @@ mod tests {
                 "address_holder_deltas_20260618_drop_guard_rows",
                 "address_holder_deltas",
             ),
+            (
+                "token_balances_snapshot_20260618_refresh_after_guard_delete",
+                "token_balances_snapshot",
+            ),
+            (
+                "token_balances_snapshot_20260618_wait_after_guard_delete",
+                "token_balances_snapshot",
+            ),
+            (
+                "token_holder_counts_20260618_refresh_after_guard_delete",
+                "token_holder_counts",
+            ),
+            (
+                "token_holder_counts_20260618_wait_after_guard_delete",
+                "token_holder_counts",
+            ),
         ] {
             assert!(
                 position(migration_name) > position(target),
