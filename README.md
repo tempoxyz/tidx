@@ -588,6 +588,7 @@ On startup, tidx verifies built-in materialized tables after base ClickHouse bac
 | Name | Purpose |
 |------|---------|
 | [`address_balances`](#address_balances) | Current positive balance per `(holder, token)`. |
+| [`address_balances_snapshot`](#address_balances_snapshot) | Pre-aggregated `address_balances`, refreshed on a schedule. |
 | [`address_holder_deltas`](#address_holder_deltas) | Holder-first mirror of `token_holder_deltas`. |
 | [`address_transfers`](#address_transfers) | Transfer feed keyed by account; `'in'`/`'out'`. |
 | [`address_txs`](#address_txs) | Tx feed keyed by account; `'from'`/`'to'`. |
@@ -631,6 +632,30 @@ curl -G "https://indexer.testnet.tempo.xyz/query" \
     FROM address_balances
     WHERE holder = '0x70997970c51812dc3a010c7d01b50e0d17dc79c8'
     ORDER BY balance DESC"
+```
+
+#### address_balances_snapshot
+
+> [!NOTE]
+> Refreshable materialized view over `address_holder_deltas FINAL`, recomputed on a schedule (every 15 minutes) rather than on insert.
+
+Same `(holder, token, balance)` rollup as [`address_balances`](#address_balances), but stored in its own `MergeTree` ordered by `(holder, balance, token)` so account balance pages and counts resolve via a holder-keyed range instead of re-aggregating the full delta history on every read. Use this for hot addresses where the live `address_balances` view would time out; results are up to one refresh interval stale.
+
+| Column | Type | Description |
+|--------|------|-------------|
+| `holder` | `String` | Holder address |
+| `token` | `String` | Token contract |
+| `balance` | `Int256` | Current balance (positive only) |
+
+```bash
+curl -G "https://indexer.testnet.tempo.xyz/query" \
+  --data-urlencode "chainId=42431" \
+  --data-urlencode "engine=clickhouse" \
+  --data-urlencode "sql=SELECT token, toString(balance) AS balance
+    FROM address_balances_snapshot
+    WHERE holder = '0x70997970c51812dc3a010c7d01b50e0d17dc79c8'
+    ORDER BY balance DESC
+    LIMIT 5"
 ```
 
 #### address_holder_deltas
