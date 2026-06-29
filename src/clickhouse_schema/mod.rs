@@ -124,6 +124,7 @@ mod tests {
         assert!(is_public_query_table("address_holder_deltas"));
         assert_eq!(block_column("address_holder_deltas"), Some("block_num"));
         assert!(is_public_query_table("address_balances"));
+        assert!(is_public_query_table("address_balances_snapshot"));
         assert!(is_public_query_table("address_txs"));
         assert_eq!(block_column("address_txs"), Some("block_num"));
         assert!(is_public_query_table("contract_creations"));

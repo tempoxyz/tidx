@@ -5,6 +5,8 @@ const ADDRESS_HOLDER_DELTAS_SCHEMA: &str =
 const ADDRESS_HOLDER_DELTAS_SELECT: &str =
     include_str!("../../db/clickhouse/address_holder_deltas_select.sql");
 const ADDRESS_BALANCES_VIEW: &str = include_str!("../../db/clickhouse/address_balances.sql");
+const ADDRESS_BALANCES_SNAPSHOT: &str =
+    include_str!("../../db/clickhouse/address_balances_snapshot.sql");
 
 pub const OBJECTS: &[ClickHouseObject] = &[
     ClickHouseObject {
@@ -33,6 +35,16 @@ pub const OBJECTS: &[ClickHouseObject] = &[
         kind: ClickHouseObjectKind::View(ADDRESS_BALANCES_VIEW),
         depends_on: &["address_holder_deltas"],
         public_query: true,
+        block_column: None,
+        backfill: None,
+    },
+    ClickHouseObject {
+        name: "address_balances_snapshot",
+        kind: ClickHouseObjectKind::RefreshableMaterializedView(ADDRESS_BALANCES_SNAPSHOT),
+        depends_on: &["address_holder_deltas"],
+        public_query: true,
+        // Self-storing refreshable MV: fully replaced each refresh, so it isn't
+        // block-scoped and reorg cleanup skips it.
         block_column: None,
         backfill: None,
     },
@@ -67,5 +79,32 @@ mod tests {
         assert!(ddl.contains("FROM address_holder_deltas FINAL"));
         assert!(ddl.contains("GROUP BY holder, token"));
         assert!(ddl.contains("HAVING balance > 0"));
+    }
+
+    #[test]
+    fn address_balances_snapshot_is_a_refreshable_materialized_view() {
+        let snapshot = OBJECTS
+            .iter()
+            .find(|object| object.name == "address_balances_snapshot")
+            .unwrap();
+        assert!(snapshot.is_materialized_view());
+        assert!(snapshot.is_refreshable_materialized_view());
+        // Publicly queryable so Cadent can read account balance pages without
+        // re-aggregating high-cardinality address_holder_deltas on every call.
+        assert!(snapshot.public_query);
+        // Self-storing and fully replaced each refresh, so reorg cleanup skips it.
+        assert!(snapshot.block_column.is_none());
+
+        let ddl = snapshot.ddl();
+        assert!(ddl.contains("CREATE MATERIALIZED VIEW IF NOT EXISTS address_balances_snapshot"));
+        assert!(ddl.contains("REFRESH EVERY"));
+        assert!(ddl.contains("ORDER BY (holder, balance, token)"));
+        assert!(ddl.contains("FROM address_holder_deltas FINAL"));
+        assert!(ddl.contains("GROUP BY holder, token"));
+        assert!(ddl.contains("HAVING balance > 0"));
+        assert_eq!(
+            snapshot.drop_sql().as_deref(),
+            Some("DROP VIEW IF EXISTS address_balances_snapshot")
+        );
     }
 }
