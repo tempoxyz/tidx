@@ -5,7 +5,6 @@ mod base;
 mod catalog;
 mod contract_creations;
 mod dex;
-mod receive_policy;
 mod token_approvals;
 mod token_approvals_current;
 mod token_balances;
@@ -47,7 +46,6 @@ pub fn derived_objects() -> impl DoubleEndedIterator<Item = &'static ClickHouseO
         .chain(address_txs::OBJECTS.iter())
         .chain(contract_creations::OBJECTS.iter())
         .chain(dex::OBJECTS.iter())
-        .chain(receive_policy::OBJECTS.iter())
 }
 
 /// Tables and views that the public `/query` HTTP surface may reference.
