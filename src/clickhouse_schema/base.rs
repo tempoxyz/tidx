@@ -13,6 +13,18 @@ const BLOCKS_MIGRATION_20260430: &str =
     include_str!("../../db/clickhouse/migrations/20260430_add_blocks_consensus_proposer.sql");
 const RECEIPTS_MIGRATION_20260604: &str =
     include_str!("../../db/clickhouse/migrations/20260604_add_receipts_type_fee_token.sql");
+const TOKEN_HOLDER_DELTAS_MIGRATION_20260618: &str =
+    include_str!("../../db/clickhouse/migrations/20260618_delete_guard_token_holder_deltas.sql");
+const ADDRESS_HOLDER_DELTAS_MIGRATION_20260618: &str =
+    include_str!("../../db/clickhouse/migrations/20260618_delete_guard_address_holder_deltas.sql");
+const REFRESH_TOKEN_BALANCES_SNAPSHOT_20260618: &str =
+    include_str!("../../db/clickhouse/migrations/20260618_refresh_token_balances_snapshot.sql");
+const WAIT_TOKEN_BALANCES_SNAPSHOT_20260618: &str =
+    include_str!("../../db/clickhouse/migrations/20260618_wait_token_balances_snapshot.sql");
+const REFRESH_TOKEN_HOLDER_COUNTS_20260618: &str =
+    include_str!("../../db/clickhouse/migrations/20260618_refresh_token_holder_counts.sql");
+const WAIT_TOKEN_HOLDER_COUNTS_20260618: &str =
+    include_str!("../../db/clickhouse/migrations/20260618_wait_token_holder_counts.sql");
 
 pub const TABLES: &[ClickHouseObject] = &[
     ClickHouseObject {
@@ -78,6 +90,63 @@ pub const MIGRATIONS: &[ClickHouseObject] = &[
         name: "receipts_20260604_type_fee_token",
         kind: ClickHouseObjectKind::Migration(RECEIPTS_MIGRATION_20260604),
         depends_on: &["receipts"],
+        public_query: false,
+        block_column: None,
+        backfill: None,
+    },
+];
+
+/// One-shot migrations that mutate derived tables, so they run after those
+/// tables are created. Tracked and replayed idempotently like `MIGRATIONS`.
+pub const POST_DERIVED_MIGRATIONS: &[ClickHouseObject] = &[
+    ClickHouseObject {
+        name: "token_holder_deltas_20260618_drop_guard_rows",
+        kind: ClickHouseObjectKind::Migration(TOKEN_HOLDER_DELTAS_MIGRATION_20260618),
+        depends_on: &["token_holder_deltas"],
+        public_query: false,
+        block_column: None,
+        backfill: None,
+    },
+    ClickHouseObject {
+        name: "address_holder_deltas_20260618_drop_guard_rows",
+        kind: ClickHouseObjectKind::Migration(ADDRESS_HOLDER_DELTAS_MIGRATION_20260618),
+        depends_on: &["address_holder_deltas"],
+        public_query: false,
+        block_column: None,
+        backfill: None,
+    },
+    // After deleting the guard rows above, force the refreshable holder-balance
+    // aggregates to rebuild so the public surface stops serving the stale guard
+    // holder before these migrations are recorded as applied. Order matters:
+    // refresh + wait the snapshot first, then the counts that read from it.
+    ClickHouseObject {
+        name: "token_balances_snapshot_20260618_refresh_after_guard_delete",
+        kind: ClickHouseObjectKind::Migration(REFRESH_TOKEN_BALANCES_SNAPSHOT_20260618),
+        depends_on: &["token_balances_snapshot"],
+        public_query: false,
+        block_column: None,
+        backfill: None,
+    },
+    ClickHouseObject {
+        name: "token_balances_snapshot_20260618_wait_after_guard_delete",
+        kind: ClickHouseObjectKind::Migration(WAIT_TOKEN_BALANCES_SNAPSHOT_20260618),
+        depends_on: &["token_balances_snapshot"],
+        public_query: false,
+        block_column: None,
+        backfill: None,
+    },
+    ClickHouseObject {
+        name: "token_holder_counts_20260618_refresh_after_guard_delete",
+        kind: ClickHouseObjectKind::Migration(REFRESH_TOKEN_HOLDER_COUNTS_20260618),
+        depends_on: &["token_holder_counts"],
+        public_query: false,
+        block_column: None,
+        backfill: None,
+    },
+    ClickHouseObject {
+        name: "token_holder_counts_20260618_wait_after_guard_delete",
+        kind: ClickHouseObjectKind::Migration(WAIT_TOKEN_HOLDER_COUNTS_20260618),
+        depends_on: &["token_holder_counts"],
         public_query: false,
         block_column: None,
         backfill: None,

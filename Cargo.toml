@@ -34,8 +34,8 @@ postgres-types = { version = "0.2", features = ["derive"] }
 
 # Ethereum/Tempo primitives
 alloy = { version = "2", features = ["full"] }
-tempo-alloy = { git = "https://github.com/tempoxyz/tempo", default-features = false }
-tempo-primitives = { git = "https://github.com/tempoxyz/tempo", package = "tempo-primitives", default-features = false, features = ["serde"] }
+tempo-alloy = { git = "https://github.com/tempoxyz/tempo", tag = "v1.9.0", default-features = false }
+tempo-primitives = { git = "https://github.com/tempoxyz/tempo", tag = "v1.9.0", package = "tempo-primitives", default-features = false, features = ["serde"] }
 
 # URL parsing
 form_urlencoded = "1"

@@ -13,7 +13,7 @@ use tracing::{debug, error, info, warn};
 
 use crate::clickhouse_schema::{
     BackfillPolicy, ClickHouseObject, ClickHouseObjectKind, base_objects, derived_backfills,
-    derived_objects, migrations, reorg_tables,
+    derived_objects, migrations, post_derived_migrations, reorg_tables,
 };
 use crate::metrics;
 use crate::types::{BlockRow, LogRow, ReceiptRow, TxRow};
@@ -160,6 +160,11 @@ impl ClickHouseSink {
         }
 
         self.ensure_derived_objects(&mut tracking).await?;
+
+        // Run after derived tables exist, since these migrations mutate them.
+        for migration in post_derived_migrations() {
+            self.apply_migration(migration, &mut tracking).await?;
+        }
 
         info!(database = %self.database, "ClickHouse schema ready");
         Ok(())
