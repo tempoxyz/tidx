@@ -17,6 +17,10 @@ const TOKEN_HOLDER_DELTAS_MIGRATION_20260618: &str =
     include_str!("../../db/clickhouse/migrations/20260618_delete_guard_token_holder_deltas.sql");
 const ADDRESS_HOLDER_DELTAS_MIGRATION_20260618: &str =
     include_str!("../../db/clickhouse/migrations/20260618_delete_guard_address_holder_deltas.sql");
+const REFRESH_ADDRESS_BALANCES_SNAPSHOT_20260618: &str =
+    include_str!("../../db/clickhouse/migrations/20260618_refresh_address_balances_snapshot.sql");
+const WAIT_ADDRESS_BALANCES_SNAPSHOT_20260618: &str =
+    include_str!("../../db/clickhouse/migrations/20260618_wait_address_balances_snapshot.sql");
 const REFRESH_TOKEN_BALANCES_SNAPSHOT_20260618: &str =
     include_str!("../../db/clickhouse/migrations/20260618_refresh_token_balances_snapshot.sql");
 const WAIT_TOKEN_BALANCES_SNAPSHOT_20260618: &str =
@@ -117,8 +121,23 @@ pub const POST_DERIVED_MIGRATIONS: &[ClickHouseObject] = &[
     },
     // After deleting the guard rows above, force the refreshable holder-balance
     // aggregates to rebuild so the public surface stops serving the stale guard
-    // holder before these migrations are recorded as applied. Order matters:
-    // refresh + wait the snapshot first, then the counts that read from it.
+    // holder before these migrations are recorded as applied.
+    ClickHouseObject {
+        name: "address_balances_snapshot_20260618_refresh_after_guard_delete",
+        kind: ClickHouseObjectKind::Migration(REFRESH_ADDRESS_BALANCES_SNAPSHOT_20260618),
+        depends_on: &["address_balances_snapshot"],
+        public_query: false,
+        block_column: None,
+        backfill: None,
+    },
+    ClickHouseObject {
+        name: "address_balances_snapshot_20260618_wait_after_guard_delete",
+        kind: ClickHouseObjectKind::Migration(WAIT_ADDRESS_BALANCES_SNAPSHOT_20260618),
+        depends_on: &["address_balances_snapshot"],
+        public_query: false,
+        block_column: None,
+        backfill: None,
+    },
     ClickHouseObject {
         name: "token_balances_snapshot_20260618_refresh_after_guard_delete",
         kind: ClickHouseObjectKind::Migration(REFRESH_TOKEN_BALANCES_SNAPSHOT_20260618),
