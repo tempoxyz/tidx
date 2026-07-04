@@ -25,6 +25,32 @@ const REFRESH_TOKEN_HOLDER_COUNTS_20260618: &str =
     include_str!("../../db/clickhouse/migrations/20260618_refresh_token_holder_counts.sql");
 const WAIT_TOKEN_HOLDER_COUNTS_20260618: &str =
     include_str!("../../db/clickhouse/migrations/20260618_wait_token_holder_counts.sql");
+const FIX_SIGNED_TOKEN_HOLDER_DELTAS_20260704: &str =
+    include_str!("../../db/clickhouse/migrations/20260704_fix_signed_token_holder_deltas.sql");
+const FIX_SIGNED_ADDRESS_HOLDER_DELTAS_20260704: &str =
+    include_str!("../../db/clickhouse/migrations/20260704_fix_signed_address_holder_deltas.sql");
+const WIDEN_TOKEN_HOLDER_DELTAS_20260704: &str =
+    include_str!("../../db/clickhouse/migrations/20260704_widen_token_holder_deltas.sql");
+const WIDEN_ADDRESS_HOLDER_DELTAS_20260704: &str =
+    include_str!("../../db/clickhouse/migrations/20260704_widen_address_holder_deltas.sql");
+const REINSERT_OVERFLOW_TOKEN_HOLDER_DELTAS_20260704: &str = include_str!(
+    "../../db/clickhouse/migrations/20260704_reinsert_overflow_token_holder_deltas.sql"
+);
+const REINSERT_OVERFLOW_ADDRESS_HOLDER_DELTAS_20260704: &str = include_str!(
+    "../../db/clickhouse/migrations/20260704_reinsert_overflow_address_holder_deltas.sql"
+);
+const REFRESH_TOKEN_BALANCES_SNAPSHOT_20260704: &str =
+    include_str!("../../db/clickhouse/migrations/20260704_refresh_token_balances_snapshot.sql");
+const WAIT_TOKEN_BALANCES_SNAPSHOT_20260704: &str =
+    include_str!("../../db/clickhouse/migrations/20260704_wait_token_balances_snapshot.sql");
+const REFRESH_TOKEN_HOLDER_COUNTS_20260704: &str =
+    include_str!("../../db/clickhouse/migrations/20260704_refresh_token_holder_counts.sql");
+const WAIT_TOKEN_HOLDER_COUNTS_20260704: &str =
+    include_str!("../../db/clickhouse/migrations/20260704_wait_token_holder_counts.sql");
+const REFRESH_ADDRESS_BALANCES_SNAPSHOT_20260704: &str =
+    include_str!("../../db/clickhouse/migrations/20260704_refresh_address_balances_snapshot.sql");
+const WAIT_ADDRESS_BALANCES_SNAPSHOT_20260704: &str =
+    include_str!("../../db/clickhouse/migrations/20260704_wait_address_balances_snapshot.sql");
 
 pub const TABLES: &[ClickHouseObject] = &[
     ClickHouseObject {
@@ -147,6 +173,102 @@ pub const POST_DERIVED_MIGRATIONS: &[ClickHouseObject] = &[
         name: "token_holder_counts_20260618_wait_after_guard_delete",
         kind: ClickHouseObjectKind::Migration(WAIT_TOKEN_HOLDER_COUNTS_20260618),
         depends_on: &["token_holder_counts"],
+        public_query: false,
+        block_column: None,
+        backfill: None,
+    },
+    ClickHouseObject {
+        name: "token_holder_deltas_20260704_fix_signed",
+        kind: ClickHouseObjectKind::Migration(FIX_SIGNED_TOKEN_HOLDER_DELTAS_20260704),
+        depends_on: &["token_holder_deltas"],
+        public_query: false,
+        block_column: None,
+        backfill: None,
+    },
+    ClickHouseObject {
+        name: "token_holder_deltas_20260704_widen_uint256",
+        kind: ClickHouseObjectKind::Migration(WIDEN_TOKEN_HOLDER_DELTAS_20260704),
+        depends_on: &["token_holder_deltas"],
+        public_query: false,
+        block_column: None,
+        backfill: None,
+    },
+    ClickHouseObject {
+        name: "token_holder_deltas_20260704_reinsert_overflow",
+        kind: ClickHouseObjectKind::Migration(REINSERT_OVERFLOW_TOKEN_HOLDER_DELTAS_20260704),
+        depends_on: &["token_holder_deltas", "token_transfers"],
+        public_query: false,
+        block_column: None,
+        backfill: None,
+    },
+    ClickHouseObject {
+        name: "address_holder_deltas_20260704_fix_signed",
+        kind: ClickHouseObjectKind::Migration(FIX_SIGNED_ADDRESS_HOLDER_DELTAS_20260704),
+        depends_on: &["address_holder_deltas"],
+        public_query: false,
+        block_column: None,
+        backfill: None,
+    },
+    ClickHouseObject {
+        name: "address_holder_deltas_20260704_widen_uint256",
+        kind: ClickHouseObjectKind::Migration(WIDEN_ADDRESS_HOLDER_DELTAS_20260704),
+        depends_on: &["address_holder_deltas"],
+        public_query: false,
+        block_column: None,
+        backfill: None,
+    },
+    ClickHouseObject {
+        name: "address_holder_deltas_20260704_reinsert_overflow",
+        kind: ClickHouseObjectKind::Migration(REINSERT_OVERFLOW_ADDRESS_HOLDER_DELTAS_20260704),
+        depends_on: &["address_holder_deltas", "token_transfers"],
+        public_query: false,
+        block_column: None,
+        backfill: None,
+    },
+    ClickHouseObject {
+        name: "token_balances_snapshot_20260704_refresh_after_sign_fix",
+        kind: ClickHouseObjectKind::Migration(REFRESH_TOKEN_BALANCES_SNAPSHOT_20260704),
+        depends_on: &["token_balances_snapshot"],
+        public_query: false,
+        block_column: None,
+        backfill: None,
+    },
+    ClickHouseObject {
+        name: "token_balances_snapshot_20260704_wait_after_sign_fix",
+        kind: ClickHouseObjectKind::Migration(WAIT_TOKEN_BALANCES_SNAPSHOT_20260704),
+        depends_on: &["token_balances_snapshot"],
+        public_query: false,
+        block_column: None,
+        backfill: None,
+    },
+    ClickHouseObject {
+        name: "token_holder_counts_20260704_refresh_after_sign_fix",
+        kind: ClickHouseObjectKind::Migration(REFRESH_TOKEN_HOLDER_COUNTS_20260704),
+        depends_on: &["token_holder_counts"],
+        public_query: false,
+        block_column: None,
+        backfill: None,
+    },
+    ClickHouseObject {
+        name: "token_holder_counts_20260704_wait_after_sign_fix",
+        kind: ClickHouseObjectKind::Migration(WAIT_TOKEN_HOLDER_COUNTS_20260704),
+        depends_on: &["token_holder_counts"],
+        public_query: false,
+        block_column: None,
+        backfill: None,
+    },
+    ClickHouseObject {
+        name: "address_balances_snapshot_20260704_refresh_after_sign_fix",
+        kind: ClickHouseObjectKind::Migration(REFRESH_ADDRESS_BALANCES_SNAPSHOT_20260704),
+        depends_on: &["address_balances_snapshot"],
+        public_query: false,
+        block_column: None,
+        backfill: None,
+    },
+    ClickHouseObject {
+        name: "address_balances_snapshot_20260704_wait_after_sign_fix",
+        kind: ClickHouseObjectKind::Migration(WAIT_ADDRESS_BALANCES_SNAPSHOT_20260704),
+        depends_on: &["address_balances_snapshot"],
         public_query: false,
         block_column: None,
         backfill: None,

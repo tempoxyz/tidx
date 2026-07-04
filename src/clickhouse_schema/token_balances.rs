@@ -95,6 +95,23 @@ mod tests {
         assert!(select_sql.contains("CAST(1 AS Int8)"));
         assert!(select_sql.contains("CAST(-1 AS Int8)"));
         assert!(!select_sql.contains("UNION ALL"));
+        assert!(!select_sql.contains("CAST(amount AS Int256)"));
+        assert!(select_sql.contains("CAST(1 AS Int8),  amount)"));
+        assert!(select_sql.contains("CAST(-1 AS Int8), amount)"));
+    }
+
+    #[test]
+    fn token_holder_deltas_store_unsigned_magnitude() {
+        assert!(TOKEN_HOLDER_DELTAS_SCHEMA.contains("balance_delta   UInt256"));
+        let view_ddl = OBJECTS
+            .iter()
+            .find(|object| object.name == "token_balances")
+            .unwrap()
+            .ddl();
+        assert!(
+            view_ddl.contains("sumIf(balance_delta, leg = 1) - sumIf(balance_delta, leg = -1)")
+        );
+        assert!(!view_ddl.contains("sum(balance_delta)"));
     }
 
     #[test]

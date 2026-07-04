@@ -1,0 +1,1 @@
+SYSTEM WAIT VIEW address_balances_snapshot

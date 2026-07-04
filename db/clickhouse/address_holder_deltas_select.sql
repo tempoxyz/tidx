@@ -10,8 +10,8 @@ SELECT
 FROM token_transfers
 ARRAY JOIN
     [
-        (`to`,   CAST(1 AS Int8),  CAST(amount AS Int256)),
-        (`from`, CAST(-1 AS Int8), -CAST(amount AS Int256))
+        (`to`,   CAST(1 AS Int8),  amount),
+        (`from`, CAST(-1 AS Int8), amount)
     ] AS leg_tuple
 WHERE tupleElement(leg_tuple, 1) NOT IN (
     '0x0000000000000000000000000000000000000000',

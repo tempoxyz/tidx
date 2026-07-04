@@ -69,6 +69,23 @@ mod tests {
     }
 
     #[test]
+    fn address_holder_deltas_store_unsigned_magnitude() {
+        assert!(ADDRESS_HOLDER_DELTAS_SCHEMA.contains("balance_delta   UInt256"));
+        assert!(!ADDRESS_HOLDER_DELTAS_SELECT.contains("CAST(amount AS Int256)"));
+        assert!(ADDRESS_HOLDER_DELTAS_SELECT.contains("CAST(1 AS Int8),  amount)"));
+        assert!(ADDRESS_HOLDER_DELTAS_SELECT.contains("CAST(-1 AS Int8), amount)"));
+        let view_ddl = OBJECTS
+            .iter()
+            .find(|object| object.name == "address_balances")
+            .unwrap()
+            .ddl();
+        assert!(
+            view_ddl.contains("sumIf(balance_delta, leg = 1) - sumIf(balance_delta, leg = -1)")
+        );
+        assert!(!view_ddl.contains("sum(balance_delta)"));
+    }
+
+    #[test]
     fn address_balances_view_groups_by_holder_first() {
         let view = OBJECTS
             .iter()

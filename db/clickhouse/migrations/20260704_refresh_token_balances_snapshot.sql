@@ -1,0 +1,1 @@
+SYSTEM REFRESH VIEW token_balances_snapshot
