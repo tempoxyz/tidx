@@ -1,0 +1,1 @@
+SYSTEM WAIT VIEW token_balances_snapshot

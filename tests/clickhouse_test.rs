@@ -10,7 +10,7 @@ mod common;
 
 use common::clickhouse::TestClickHouse;
 use serial_test::serial;
-use tidx::clickhouse_schema::{base_objects, migrations};
+use tidx::clickhouse_schema::{base_objects, migrations, post_derived_migrations};
 use tidx::query::EventSignature;
 use tidx::sync::ch_sink::ClickHouseSink;
 use tidx::sync::sink::SinkSet;
@@ -1221,6 +1221,179 @@ async fn token_transfers(ch: &TestClickHouse) -> Vec<TokenTransferEvent> {
             is_virtual_forward: row["is_virtual_forward"].as_u64().unwrap(),
         })
         .collect()
+}
+
+fn make_transfer_log_u256(
+    block_num: i64,
+    log_idx: i32,
+    from: &str,
+    to: &str,
+    value_hex: &str,
+) -> LogRow {
+    use chrono::TimeZone;
+    let ts = chrono::Utc.with_ymd_and_hms(2025, 1, 15, 12, 0, 0).unwrap()
+        + chrono::Duration::seconds(block_num);
+    let topic0 =
+        hex::decode("ddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef").unwrap();
+    let data = hex::decode(value_hex).expect("value_hex must be valid hex");
+    assert_eq!(data.len(), 32, "value_hex must encode 32 bytes");
+
+    LogRow {
+        block_num,
+        block_timestamp: ts,
+        log_idx,
+        tx_idx: 0,
+        tx_hash: vec![block_num as u8; 32],
+        address: vec![0xda; 20],
+        selector: Some(topic0.clone()),
+        topic0: Some(topic0),
+        topic1: Some(padded_topic_address(from)),
+        topic2: Some(padded_topic_address(to)),
+        topic3: None,
+        data,
+        is_virtual_forward: false,
+    }
+}
+
+#[tokio::test]
+#[serial(clickhouse)]
+async fn test_sink_token_balances_handles_amount_above_int256_max() {
+    let Some((sink, ch)) = setup_sink().await else {
+        return;
+    };
+
+    let zero = "0x0000000000000000000000000000000000000000";
+    let alice = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    let bob = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+
+    let a_hex = "8000000000000000000000000000000000000000000000000000000000000064";
+    let c_hex = "8000000000000000000000000000000000000000000000000000000000000028";
+
+    let logs = vec![
+        make_transfer_log_u256(1, 0, zero, alice, a_hex),
+        make_transfer_log_u256(2, 0, alice, bob, c_hex),
+    ];
+    sink.write_logs(&logs).await.expect("write_logs failed");
+
+    let delta_type = ch
+        .query(&format!(
+            "SELECT type FROM system.columns WHERE database = '{SINK_DB}' \
+             AND table = 'token_holder_deltas' AND name = 'balance_delta'"
+        ))
+        .await
+        .expect("column type query failed");
+    assert_eq!(delta_type.trim(), "UInt256");
+
+    let balances = token_holder_balances(&ch).await;
+    assert_eq!(balances.get(alice).map(String::as_str), Some("60"));
+    assert_eq!(
+        balances.get(bob).map(String::as_str),
+        Some("57896044618658097711785492504343953926634992332820282019728792003956564820008")
+    );
+    assert!(!balances.contains_key(zero));
+}
+
+#[tokio::test]
+#[serial(clickhouse)]
+async fn test_post_derived_migrations_repair_legacy_signed_holder_deltas() {
+    let ch = TestClickHouse::new(SINK_DB)
+        .await
+        .expect("Failed to create CH client");
+    if ch.wait_for_ready().await.is_err() {
+        println!("ClickHouse not available, skipping test");
+        return;
+    }
+    ch.reset_database().await.expect("Failed to reset database");
+
+    let zero = "0x0000000000000000000000000000000000000000";
+    let alice = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    let bob = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    let token = "0xdadadadadadadadadadadadadadadadadadadada";
+    let a = "57896044618658097711785492504343953926634992332820282019728792003956564820068";
+    let c = "57896044618658097711785492504343953926634992332820282019728792003956564820008";
+
+    ch.query(include_str!("../db/clickhouse/token_transfers.sql"))
+        .await
+        .expect("create token_transfers");
+    ch.query(&format!(
+        "INSERT INTO token_transfers \
+         (block_num, block_timestamp, tx_idx, log_idx, tx_hash, token, `from`, `to`, amount, is_virtual_forward) VALUES \
+         (1, '2025-01-15 12:00:01', 0, 0, 'a1', '{token}', '{zero}',  '{alice}', {a}, 0), \
+         (2, '2025-01-15 12:00:02', 0, 0, 'a2', '{token}', '{alice}', '{bob}',   {c}, 0)"
+    ))
+    .await
+    .expect("seed token_transfers");
+
+    ch.query(
+        "CREATE TABLE token_holder_deltas (
+            block_num Int64, block_timestamp DateTime64(3, 'UTC'), tx_hash String, log_idx Int32,
+            token String, holder String, leg Int8, balance_delta Int256
+        ) ENGINE = ReplacingMergeTree()
+        PARTITION BY toYYYYMM(block_timestamp)
+        ORDER BY (token, holder, block_num, tx_hash, log_idx, leg)",
+    )
+    .await
+    .expect("create legacy token_holder_deltas");
+
+    ch.query(
+        "INSERT INTO token_holder_deltas
+         SELECT block_num, block_timestamp, tx_hash, log_idx, token,
+             tupleElement(leg_tuple, 1) AS holder,
+             tupleElement(leg_tuple, 2) AS leg,
+             tupleElement(leg_tuple, 3) AS balance_delta
+         FROM token_transfers
+         ARRAY JOIN [
+             (`to`,   CAST(1 AS Int8),  CAST(amount AS Int256)),
+             (`from`, CAST(-1 AS Int8), -CAST(amount AS Int256))
+         ] AS leg_tuple
+         WHERE tupleElement(leg_tuple, 1) != '0x0000000000000000000000000000000000000000'",
+    )
+    .await
+    .expect("seed legacy deltas");
+
+    let legacy_bob = ch
+        .query(&format!(
+            "SELECT toString(sum(balance_delta)) FROM token_holder_deltas FINAL WHERE holder = '{bob}'"
+        ))
+        .await
+        .expect("legacy balance query");
+    assert!(
+        legacy_bob.trim().starts_with('-'),
+        "legacy signed delta for bob should wrap negative, got {}",
+        legacy_bob.trim()
+    );
+
+    for name in [
+        "token_holder_deltas_20260704_fix_signed",
+        "token_holder_deltas_20260704_widen_uint256",
+        "token_holder_deltas_20260704_reinsert_overflow",
+    ] {
+        let migration = post_derived_migrations()
+            .iter()
+            .find(|object| object.name == name)
+            .unwrap_or_else(|| panic!("migration {name} should exist"));
+        ch.query(&migration.ddl())
+            .await
+            .unwrap_or_else(|e| panic!("migration {name} failed: {e}"));
+    }
+
+    let delta_type = ch
+        .query(&format!(
+            "SELECT type FROM system.columns WHERE database = '{SINK_DB}' \
+             AND table = 'token_holder_deltas' AND name = 'balance_delta'"
+        ))
+        .await
+        .expect("column type query failed");
+    assert_eq!(delta_type.trim(), "UInt256");
+
+    ch.query(include_str!("../db/clickhouse/token_balances.sql"))
+        .await
+        .expect("create token_balances view");
+
+    let balances = token_holder_balances(&ch).await;
+    assert_eq!(balances.get(alice).map(String::as_str), Some("60"));
+    assert_eq!(balances.get(bob).map(String::as_str), Some(c));
+    assert!(!balances.contains_key(zero));
 }
 
 async fn token_holder_balances(ch: &TestClickHouse) -> std::collections::HashMap<String, String> {
