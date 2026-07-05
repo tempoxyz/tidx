@@ -8,7 +8,7 @@ CREATE TABLE IF NOT EXISTS receipts (
     contract_address        BYTEA,
     gas_used                INT8 NOT NULL,
     cumulative_gas_used     INT8 NOT NULL,
-    effective_gas_price     TEXT,
+    effective_gas_price     TEXT COLLATE "C",
     status                  INT2,
     fee_payer               BYTEA,
     PRIMARY KEY (block_timestamp, block_num, tx_idx)

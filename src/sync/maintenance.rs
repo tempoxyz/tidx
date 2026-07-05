@@ -179,37 +179,59 @@ async fn seal_candidates(
     Ok(candidates)
 }
 
-/// Seal one partition: CLUSTER by its primary-key index, ANALYZE, FREEZE,
-/// and record it in partition_state. CLUSTER takes an exclusive lock on the
-/// (cold, no-longer-written) partition for the duration of the rewrite.
+/// Seal one partition and record it in partition_state.
+///
+/// Heap partitions get the full physical optimization: CLUSTER by the
+/// primary-key index (exclusive lock on the cold, no-longer-written
+/// partition for the duration of the rewrite), ANALYZE, VACUUM (FREEZE).
+///
+/// orioledb partitions only need ANALYZE: the access method is
+/// index-organized (rows are always physically ordered by primary key) and
+/// uses undo-log MVCC (no freeze debt), and it does not support CLUSTER or
+/// VACUUM FULL at all.
 async fn seal_partition(pool: &Pool, table: &str, partition_idx: i64) -> Result<()> {
     let partition = format!("{table}_p{partition_idx}");
     let conn = pool.get().await?;
 
-    let pk_index: String = conn
+    let am: String = conn
         .query_one(
-            "SELECT ci.relname FROM pg_index i
-             JOIN pg_class ci ON ci.oid = i.indexrelid
-             WHERE i.indrelid = to_regclass($1::text) AND i.indisprimary",
+            "SELECT am.amname FROM pg_class c
+             JOIN pg_am am ON am.oid = c.relam
+             WHERE c.oid = to_regclass($1::text)",
             &[&partition],
         )
         .await
-        .with_context(|| format!("no primary-key index on {partition}"))?
+        .with_context(|| format!("no access method for {partition}"))?
         .get(0);
 
     let start = Instant::now();
     // CLUSTER / ANALYZE / VACUUM can't run inside a transaction block; each
-    // executes standalone. Record the seal only after all three succeeded so
-    // a failed seal is retried on the next pass.
-    conn.batch_execute(&format!("CLUSTER \"{partition}\" USING \"{pk_index}\""))
-        .await
-        .with_context(|| format!("CLUSTER {partition} failed"))?;
+    // executes standalone. Record the seal only after everything succeeded
+    // so a failed seal is retried on the next pass.
+    if am != "orioledb" {
+        let pk_index: String = conn
+            .query_one(
+                "SELECT ci.relname FROM pg_index i
+                 JOIN pg_class ci ON ci.oid = i.indexrelid
+                 WHERE i.indrelid = to_regclass($1::text) AND i.indisprimary",
+                &[&partition],
+            )
+            .await
+            .with_context(|| format!("no primary-key index on {partition}"))?
+            .get(0);
+
+        conn.batch_execute(&format!("CLUSTER \"{partition}\" USING \"{pk_index}\""))
+            .await
+            .with_context(|| format!("CLUSTER {partition} failed"))?;
+    }
     conn.batch_execute(&format!("ANALYZE \"{partition}\""))
         .await
         .with_context(|| format!("ANALYZE {partition} failed"))?;
-    conn.batch_execute(&format!("VACUUM (FREEZE) \"{partition}\""))
-        .await
-        .with_context(|| format!("VACUUM (FREEZE) {partition} failed"))?;
+    if am != "orioledb" {
+        conn.batch_execute(&format!("VACUUM (FREEZE) \"{partition}\""))
+            .await
+            .with_context(|| format!("VACUUM (FREEZE) {partition} failed"))?;
+    }
 
     conn.execute(
         "INSERT INTO partition_state (table_name, partition_idx) VALUES ($1, $2)
@@ -220,8 +242,9 @@ async fn seal_partition(pool: &Pool, table: &str, partition_idx: i64) -> Result<
 
     info!(
         partition = %partition,
+        am = %am,
         elapsed_ms = start.elapsed().as_millis() as u64,
-        "Sealed partition (clustered + frozen)"
+        "Sealed partition"
     );
 
     Ok(())

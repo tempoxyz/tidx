@@ -6,4 +6,4 @@
 CREATE TABLE IF NOT EXISTS storage_config (
     single_row       BOOLEAN PRIMARY KEY DEFAULT TRUE CHECK (single_row),
     partition_blocks INT8 NOT NULL CHECK (partition_blocks > 0)
-);
+) USING heap;

@@ -6,11 +6,11 @@ CREATE TABLE IF NOT EXISTS txs (
     type                    INT2 NOT NULL,
     "from"                  BYTEA NOT NULL,
     "to"                    BYTEA,
-    value                   TEXT NOT NULL,
+    value                   TEXT COLLATE "C" NOT NULL,
     input                   BYTEA NOT NULL,
     gas_limit               INT8 NOT NULL,
-    max_fee_per_gas         TEXT NOT NULL,
-    max_priority_fee_per_gas TEXT NOT NULL,
+    max_fee_per_gas         TEXT COLLATE "C" NOT NULL,
+    max_priority_fee_per_gas TEXT COLLATE "C" NOT NULL,
     gas_used                INT8,
     nonce_key               BYTEA NOT NULL,
     nonce                   INT8 NOT NULL,
@@ -34,6 +34,13 @@ DROP INDEX IF EXISTS idx_txs_selector;
 -- are migrated into the `tx_calls` table by
 -- db/migrations/20260705_normalize_tx_calls.sql.
 
--- LZ4 TOAST compression for wide values (PG14+). Metadata-only; applies to
--- newly written rows. Existing rows keep their current compression.
-ALTER TABLE txs ALTER COLUMN input SET COMPRESSION lz4;
+-- LZ4 TOAST compression for wide values on heap layouts (PG14+;
+-- metadata-only, applies to newly written rows). Skipped when orioledb is
+-- installed: orioledb tables use their own zstd compression and reject
+-- SET COMPRESSION.
+DO $$
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM pg_extension WHERE extname = 'orioledb') THEN
+        ALTER TABLE txs ALTER COLUMN input SET COMPRESSION lz4;
+    END IF;
+END $$;

@@ -7,7 +7,7 @@ CREATE TABLE IF NOT EXISTS sync_state (
     sync_rate       FLOAT8,
     started_at      TIMESTAMPTZ,
     updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
-);
+) USING heap;
 
 -- ClickHouse backfill cursor: highest block successfully written to all CH tables.
 -- Persisted in PG so it survives restarts and isn't fooled by realtime sync writing ahead.

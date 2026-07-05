@@ -40,6 +40,11 @@ pub async fn run_migrations(pool: &Pool, partition_blocks: u64) -> Result<()> {
 
     info!("Running schema migrations");
 
+    // Extensions first: table and partition DDL below branches on whether
+    // the orioledb access method is available.
+    conn.batch_execute(include_str!("../../db/extensions.sql"))
+        .await?;
+
     // Storage layout settings + partition machinery first: the partition
     // width is locked at first boot (existing boundaries are fixed; a
     // different width would overlap them), and ensure_block_partitions is
@@ -93,10 +98,6 @@ pub async fn run_migrations(pool: &Pool, partition_blocks: u64) -> Result<()> {
 
     // Heavyweight upgrades such as concurrent index creation run in a
     // best-effort post-startup task so normal boot isn't blocked.
-
-    // Load any optional extensions
-    conn.batch_execute(include_str!("../../db/extensions.sql"))
-        .await?;
 
     Ok(())
 }

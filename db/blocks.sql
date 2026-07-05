@@ -20,6 +20,13 @@ DROP INDEX IF EXISTS idx_blocks_num_asc;
 CREATE INDEX IF NOT EXISTS idx_blocks_hash ON blocks (hash);
 CREATE INDEX IF NOT EXISTS idx_blocks_timestamp ON blocks (timestamp);
 
--- LZ4 TOAST compression for wide values (PG14+). Metadata-only; applies to
--- newly written rows. Existing rows keep their current compression.
-ALTER TABLE blocks ALTER COLUMN extra_data SET COMPRESSION lz4;
+-- LZ4 TOAST compression for wide values on heap layouts (PG14+;
+-- metadata-only, applies to newly written rows). Skipped when orioledb is
+-- installed: orioledb tables use their own zstd compression and reject
+-- SET COMPRESSION.
+DO $$
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM pg_extension WHERE extname = 'orioledb') THEN
+        ALTER TABLE blocks ALTER COLUMN extra_data SET COMPRESSION lz4;
+    END IF;
+END $$;

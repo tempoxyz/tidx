@@ -163,13 +163,12 @@ async fn test_legacy_jsonb_migration_backfills_tx_calls() {
     let conn = db.pool.get().await.unwrap();
 
     // Restore the legacy schema.
-    conn.batch_execute(
-        "ALTER TABLE txs ADD COLUMN calls JSONB;
-         CREATE INDEX idx_txs_calls_partial ON txs USING GIN (calls)
-             WHERE calls IS NOT NULL AND call_count > 1;",
-    )
-    .await
-    .unwrap();
+    // (The legacy GIN index is not recreated: on orioledb partitions GIN
+    // would go through the experimental bridge index, and the migration's
+    // DROP INDEX IF EXISTS is trivially covered either way.)
+    conn.batch_execute("ALTER TABLE txs ADD COLUMN calls JSONB")
+        .await
+        .unwrap();
 
     // Legacy rows, JSON exactly as old tidx wrote it (serde of tempo Call:
     // hex-quantity value, data:null). The multicall exercises odd-length

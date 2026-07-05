@@ -38,7 +38,7 @@ async fn test_pg_upgrade_adds_missing_postgres_ddl() {
                 miner           BYTEA NOT NULL,
                 extra_data      BYTEA,
                 PRIMARY KEY (timestamp, num)
-            );
+            ) USING heap;
 
             CREATE TABLE logs (
                 block_num       INT8 NOT NULL,
@@ -54,7 +54,7 @@ async fn test_pg_upgrade_adds_missing_postgres_ddl() {
                 topic3          BYTEA,
                 data            BYTEA NOT NULL,
                 PRIMARY KEY (block_timestamp, block_num, log_idx)
-            );
+            ) USING heap;
 
             CREATE INDEX IF NOT EXISTS idx_logs_block_num ON logs (block_num DESC);
             CREATE INDEX IF NOT EXISTS idx_logs_tx_hash ON logs (tx_hash);

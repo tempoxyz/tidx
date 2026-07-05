@@ -10,7 +10,7 @@ CREATE TABLE IF NOT EXISTS tx_calls (
     tx_idx          INT4 NOT NULL,
     call_idx        INT2 NOT NULL,
     "to"            BYTEA,              -- NULL = contract creation
-    value           TEXT NOT NULL,      -- decimal string, same format as txs.value
+    value           TEXT COLLATE "C" NOT NULL, -- decimal string, same format as txs.value
     input           BYTEA NOT NULL,
     PRIMARY KEY (block_timestamp, block_num, tx_idx, call_idx)
 ) PARTITION BY RANGE (block_num);
@@ -21,6 +21,13 @@ CREATE INDEX IF NOT EXISTS idx_tx_calls_to ON tx_calls ("to", block_timestamp DE
 -- Reorg deletes and block-range scans.
 CREATE INDEX IF NOT EXISTS idx_tx_calls_block_num ON tx_calls (block_num DESC);
 
--- LZ4 TOAST compression for wide values (PG14+). Metadata-only; applies to
--- newly written rows.
-ALTER TABLE tx_calls ALTER COLUMN input SET COMPRESSION lz4;
+-- LZ4 TOAST compression for wide values on heap layouts (PG14+;
+-- metadata-only, applies to newly written rows). Skipped when orioledb is
+-- installed: orioledb tables use their own zstd compression and reject
+-- SET COMPRESSION.
+DO $$
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM pg_extension WHERE extname = 'orioledb') THEN
+        ALTER TABLE tx_calls ALTER COLUMN input SET COMPRESSION lz4;
+    END IF;
+END $$;

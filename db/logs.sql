@@ -25,6 +25,13 @@ DROP INDEX IF EXISTS idx_logs_topic1;
 CREATE INDEX IF NOT EXISTS idx_logs_topic2 ON logs (topic2);
 CREATE INDEX IF NOT EXISTS idx_logs_topic3 ON logs (topic3);
 
--- LZ4 TOAST compression for wide values (PG14+). Metadata-only; applies to
--- newly written rows. Existing rows keep their current compression.
-ALTER TABLE logs ALTER COLUMN data SET COMPRESSION lz4;
+-- LZ4 TOAST compression for wide values on heap layouts (PG14+;
+-- metadata-only, applies to newly written rows). Skipped when orioledb is
+-- installed: orioledb tables use their own zstd compression and reject
+-- SET COMPRESSION.
+DO $$
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM pg_extension WHERE extname = 'orioledb') THEN
+        ALTER TABLE logs ALTER COLUMN data SET COMPRESSION lz4;
+    END IF;
+END $$;
