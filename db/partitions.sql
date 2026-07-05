@@ -1,3 +1,15 @@
+-- Partition lifecycle state. A partition is "sealed" once it has fully left
+-- the hot window: physically reordered by its primary key (CLUSTER), frozen,
+-- and recorded here so maintenance never re-seals it. Sealing is advisory —
+-- stray writes into a sealed partition (e.g. deferred receipt backfill) are
+-- still allowed and merely reduce its clustering slightly.
+CREATE TABLE IF NOT EXISTS partition_state (
+    table_name    TEXT NOT NULL,
+    partition_idx INT8 NOT NULL,
+    sealed_at     TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (table_name, partition_idx)
+);
+
 -- Create any missing RANGE partitions of `parent` covering blocks
 -- [from_block, to_block]. Partition k of width `partition_blocks` (from
 -- storage_config) covers [k * width, (k + 1) * width).

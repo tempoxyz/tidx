@@ -105,9 +105,11 @@ and ensure DATABASE_URL points at the Postgres container (for example \
 
     pub async fn truncate_all(&self) {
         let conn = self.pool.get().await.expect("Failed to get connection");
-        conn.batch_execute("TRUNCATE blocks, txs, tx_calls, logs, receipts, sync_state CASCADE")
-            .await
-            .expect("Failed to truncate tables");
+        conn.batch_execute(
+            "TRUNCATE blocks, txs, tx_calls, logs, receipts, sync_state, partition_state CASCADE",
+        )
+        .await
+        .expect("Failed to truncate tables");
     }
 
     pub async fn block_count(&self) -> i64 {

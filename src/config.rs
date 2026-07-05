@@ -134,6 +134,18 @@ pub struct ChainConfig {
     #[serde(default = "default_partition_blocks")]
     pub partition_blocks: u64,
 
+    /// Seal partitions once they leave the hot window: CLUSTER by primary
+    /// key, ANALYZE, VACUUM FREEZE (default: true). No effect on
+    /// pre-partitioning deployments.
+    #[serde(default = "default_true")]
+    pub seal_partitions: bool,
+
+    /// Number of recent blocks whose partitions stay hot — unsealed and
+    /// fully write-optimized (default: 2,000,000). Partitions entirely below
+    /// both this window and the contiguous-sync watermark get sealed.
+    #[serde(default = "default_hot_window_blocks")]
+    pub hot_window_blocks: u64,
+
     /// Complete backfill before starting realtime sync (default: false)
     /// When true, syncs all gaps to genesis before following chain head.
     /// When false (default), runs realtime and backfill concurrently.
@@ -344,6 +356,10 @@ fn default_partition_blocks() -> u64 {
     crate::db::DEFAULT_PARTITION_BLOCKS
 }
 
+fn default_hot_window_blocks() -> u64 {
+    2_000_000
+}
+
 fn default_concurrency() -> usize {
     4
 }
@@ -497,6 +513,8 @@ mod tests {
             batch_size: 100,
             concurrency: 4,
             partition_blocks: 1_000_000,
+            seal_partitions: true,
+            hot_window_blocks: 2_000_000,
             backfill_first: false,
             trust_rpc: false,
             api_pg_url: None,
@@ -524,6 +542,8 @@ mod tests {
             batch_size: 100,
             concurrency: 4,
             partition_blocks: 1_000_000,
+            seal_partitions: true,
+            hot_window_blocks: 2_000_000,
             backfill_first: false,
             trust_rpc: false,
             api_pg_url: None,
@@ -550,6 +570,8 @@ mod tests {
             batch_size: 100,
             concurrency: 4,
             partition_blocks: 1_000_000,
+            seal_partitions: true,
+            hot_window_blocks: 2_000_000,
             backfill_first: false,
             trust_rpc: false,
             api_pg_url: None,
@@ -573,6 +595,8 @@ mod tests {
             batch_size: 100,
             concurrency: 4,
             partition_blocks: 1_000_000,
+            seal_partitions: true,
+            hot_window_blocks: 2_000_000,
             backfill_first: false,
             trust_rpc: false,
             api_pg_url: None,

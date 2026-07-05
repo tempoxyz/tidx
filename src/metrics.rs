@@ -20,6 +20,14 @@ pub fn record_logs_indexed(chain_id: u64, count: u64) {
     counter!("tidx_logs_indexed_total", &labels).increment(count);
 }
 
+pub fn record_partition_sealed(chain_id: u64, table: &str) {
+    let labels = [
+        ("chain_id", chain_id.to_string()),
+        ("table", table.to_string()),
+    ];
+    counter!("tidx_partitions_sealed_total", &labels).increment(1);
+}
+
 pub fn set_sync_head(chain_id: u64, block_num: u64) {
     let labels = [("chain_id", chain_id.to_string())];
     gauge!("tidx_sync_head_block", &labels).set(block_num as f64);

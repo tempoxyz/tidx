@@ -259,6 +259,17 @@ async fn initialize_chain(
         });
     }
 
+    if chain.seal_partitions {
+        let pool = throttled_pool.pool.clone();
+        let chain_id = chain.chain_id;
+        let hot_window_blocks = chain.hot_window_blocks;
+        tokio::spawn(async move {
+            // Pre-creates partitions ahead of the head and seals partitions
+            // leaving the hot window; no-op on pre-partitioning deployments.
+            tidx::sync::maintenance::run_maintenance_loop(pool, chain_id, hot_window_blocks).await;
+        });
+    }
+
     // Seed in-memory watermarks and row counts from existing DB data
     // so that status display is accurate immediately after restart.
     seed_metrics_from_db(&throttled_pool.pool).await;
