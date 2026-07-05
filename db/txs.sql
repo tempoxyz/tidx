@@ -32,3 +32,7 @@ CREATE INDEX IF NOT EXISTS idx_txs_to ON txs ("to", block_timestamp DESC);
 DROP INDEX IF EXISTS idx_txs_calls;
 CREATE INDEX IF NOT EXISTS idx_txs_calls_partial ON txs USING GIN (calls) WHERE calls IS NOT NULL AND call_count > 1;
 DROP INDEX IF EXISTS idx_txs_selector;
+
+-- LZ4 TOAST compression for wide values (PG14+). Metadata-only; applies to
+-- newly written rows. Existing rows keep their current compression.
+ALTER TABLE txs ALTER COLUMN input SET COMPRESSION lz4;

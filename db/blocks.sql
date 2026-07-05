@@ -16,3 +16,7 @@ CREATE INDEX IF NOT EXISTS idx_blocks_num ON blocks (num DESC);
 DROP INDEX IF EXISTS idx_blocks_num_asc;
 CREATE INDEX IF NOT EXISTS idx_blocks_hash ON blocks (hash);
 CREATE INDEX IF NOT EXISTS idx_blocks_timestamp ON blocks (timestamp);
+
+-- LZ4 TOAST compression for wide values (PG14+). Metadata-only; applies to
+-- newly written rows. Existing rows keep their current compression.
+ALTER TABLE blocks ALTER COLUMN extra_data SET COMPRESSION lz4;
