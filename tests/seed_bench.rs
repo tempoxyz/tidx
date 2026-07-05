@@ -25,7 +25,7 @@ async fn seed_benchmark_data() -> Result<()> {
         .unwrap_or(100);
 
     let pool = tidx::db::create_pool(&db_url).await?;
-    tidx::db::run_migrations(&pool).await?;
+    tidx::db::run_migrations(&pool, tidx::db::DEFAULT_PARTITION_BLOCKS).await?;
 
     let config = common::seed::SeedConfig::new(txs, txs_per_block);
     common::seed::seed(&pool, &config).await?;

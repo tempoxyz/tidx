@@ -30,9 +30,37 @@ fn exact_block_nums(nums: impl Iterator<Item = i64>) -> Vec<i64> {
     nums.collect::<BTreeSet<_>>().into_iter().collect()
 }
 
+/// Create any missing block-range partitions of `table` covering `nums`
+/// before writing rows for them. Delegates to the ensure_block_partitions
+/// SQL function (db/partitions.sql), which is a no-op on pre-partitioning
+/// deployments where `table` is still a regular table.
+async fn ensure_partitions(
+    tx: &tokio_postgres::Transaction<'_>,
+    table: &str,
+    nums: impl Iterator<Item = i64>,
+) -> Result<()> {
+    let mut min = i64::MAX;
+    let mut max = i64::MIN;
+    for num in nums {
+        min = min.min(num);
+        max = max.max(num);
+    }
+    if min > max {
+        return Ok(());
+    }
+    tx.execute(
+        "SELECT ensure_block_partitions($1, $2, $3)",
+        &[&table, &min, &max],
+    )
+    .await?;
+    Ok(())
+}
+
 /// Insert blocks via COPY BINARY into a staging temp table within `tx`
 /// (conflict-ignore).
 async fn insert_blocks(tx: &tokio_postgres::Transaction<'_>, blocks: &[BlockRow]) -> Result<()> {
+    ensure_partitions(tx, "blocks", blocks.iter().map(|b| b.num)).await?;
+
     tx.execute(
         "CREATE TEMP TABLE _staging_blocks (
             num INT8, hash BYTEA, parent_hash BYTEA, timestamp TIMESTAMPTZ,
@@ -101,6 +129,8 @@ async fn insert_blocks(tx: &tokio_postgres::Transaction<'_>, blocks: &[BlockRow]
 /// Multicall AA txs additionally have their inner calls replaced in the
 /// `tx_calls` table.
 async fn replace_txs(tx: &tokio_postgres::Transaction<'_>, txs: &[TxRow]) -> Result<()> {
+    ensure_partitions(tx, "txs", txs.iter().map(|t| t.block_num)).await?;
+
     let block_nums = exact_block_nums(txs.iter().map(|tx| tx.block_num));
     delete_blocks_exact(tx, "txs", &block_nums).await?;
     delete_blocks_exact(tx, "tx_calls", &block_nums).await?;
@@ -214,6 +244,15 @@ async fn insert_tx_calls(tx: &tokio_postgres::Transaction<'_>, txs: &[TxRow]) ->
         return Ok(());
     }
 
+    ensure_partitions(
+        tx,
+        "tx_calls",
+        txs.iter()
+            .filter(|t| t.calls.len() > 1)
+            .map(|t| t.block_num),
+    )
+    .await?;
+
     tx.execute(
         "CREATE TEMP TABLE _staging_tx_calls (
             block_num INT8, block_timestamp TIMESTAMPTZ, tx_idx INT4, call_idx INT2,
@@ -284,6 +323,8 @@ async fn insert_tx_calls(tx: &tokio_postgres::Transaction<'_>, txs: &[TxRow]) ->
 /// Replace logs for the touched blocks within `tx`: delete stale rows for
 /// those block numbers, then insert via COPY BINARY staging (conflict-ignore).
 async fn replace_logs(tx: &tokio_postgres::Transaction<'_>, logs: &[LogRow]) -> Result<()> {
+    ensure_partitions(tx, "logs", logs.iter().map(|l| l.block_num)).await?;
+
     let block_nums = exact_block_nums(logs.iter().map(|log| log.block_num));
     delete_blocks_exact(tx, "logs", &block_nums).await?;
 
@@ -363,6 +404,8 @@ async fn replace_receipts(
     tx: &tokio_postgres::Transaction<'_>,
     receipts: &[ReceiptRow],
 ) -> Result<()> {
+    ensure_partitions(tx, "receipts", receipts.iter().map(|r| r.block_num)).await?;
+
     let block_nums = exact_block_nums(receipts.iter().map(|receipt| receipt.block_num));
     delete_blocks_exact(tx, "receipts", &block_nums).await?;
 

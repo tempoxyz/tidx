@@ -10,7 +10,10 @@ CREATE TABLE IF NOT EXISTS blocks (
     extra_data      BYTEA,
     consensus_proposer BYTEA CHECK (consensus_proposer IS NULL OR octet_length(consensus_proposer) = 32),
     PRIMARY KEY (timestamp, num)
-);
+) PARTITION BY RANGE (num);
+-- Fresh installs get the partitioned layout; pre-partitioning deployments
+-- keep their regular table (IF NOT EXISTS skips) until the offline rewrite.
+-- Partitions are created on demand by ensure_block_partitions (db/partitions.sql).
 
 CREATE INDEX IF NOT EXISTS idx_blocks_num ON blocks (num DESC);
 DROP INDEX IF EXISTS idx_blocks_num_asc;

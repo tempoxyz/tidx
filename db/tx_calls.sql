@@ -13,7 +13,7 @@ CREATE TABLE IF NOT EXISTS tx_calls (
     value           TEXT NOT NULL,      -- decimal string, same format as txs.value
     input           BYTEA NOT NULL,
     PRIMARY KEY (block_timestamp, block_num, tx_idx, call_idx)
-);
+) PARTITION BY RANGE (block_num);
 
 -- Serves the AA inner-call recipient filter (tempo-api2 `includeCallRecipients`):
 -- ("to" = X OR EXISTS (SELECT 1 FROM tx_calls c WHERE ... AND c."to" = X))

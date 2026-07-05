@@ -68,10 +68,10 @@ async fn test_pg_upgrade_adds_missing_postgres_ddl() {
         .await
         .expect("Failed to create old schema");
 
-        run_migrations(&pool)
+        run_migrations(&pool, tidx::db::DEFAULT_PARTITION_BLOCKS)
             .await
             .expect("Failed to run migrations against old schema");
-        run_migrations(&pool)
+        run_migrations(&pool, tidx::db::DEFAULT_PARTITION_BLOCKS)
             .await
             .expect("Failed to rerun migrations against upgraded schema");
         run_post_startup_migrations(&pool)

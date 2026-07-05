@@ -81,7 +81,7 @@ fn bench_batch_writes(c: &mut Criterion) {
 
     let pool = rt.block_on(async {
         let pool = create_pool(&db_url).await.expect("Failed to create pool");
-        run_migrations(&pool)
+        run_migrations(&pool, tidx::db::DEFAULT_PARTITION_BLOCKS)
             .await
             .expect("Failed to run migrations");
         pool
@@ -160,7 +160,7 @@ fn bench_mixed_workload(c: &mut Criterion) {
 
     let pool = rt.block_on(async {
         let pool = create_pool(&db_url).await.expect("Failed to create pool");
-        run_migrations(&pool)
+        run_migrations(&pool, tidx::db::DEFAULT_PARTITION_BLOCKS)
             .await
             .expect("Failed to run migrations");
         pool
@@ -226,7 +226,7 @@ fn bench_copy_throughput(c: &mut Criterion) {
 
     let pool = rt.block_on(async {
         let pool = create_pool(&db_url).await.expect("Failed to create pool");
-        run_migrations(&pool)
+        run_migrations(&pool, tidx::db::DEFAULT_PARTITION_BLOCKS)
             .await
             .expect("Failed to run migrations");
         pool

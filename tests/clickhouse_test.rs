@@ -1884,7 +1884,7 @@ async fn setup_backfill() -> Option<(tidx::db::Pool, SinkSet, TestClickHouse)> {
     let pool = tidx::db::create_pool(&pg_url)
         .await
         .expect("Failed to create PG pool");
-    tidx::db::run_migrations(&pool)
+    tidx::db::run_migrations(&pool, tidx::db::DEFAULT_PARTITION_BLOCKS)
         .await
         .expect("Failed to run PG migrations");
 

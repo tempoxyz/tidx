@@ -1,4 +1,7 @@
-use tidx::db::{Pool, ThrottledPool, create_pool, run_migrations, run_post_startup_migrations};
+use tidx::db::{
+    DEFAULT_PARTITION_BLOCKS, Pool, ThrottledPool, create_pool, run_migrations,
+    run_post_startup_migrations,
+};
 use tidx::sync::engine::SyncEngine;
 use tidx::sync::sink::SinkSet;
 use tokio::sync::{Mutex, MutexGuard, OnceCell};
@@ -39,7 +42,7 @@ impl TestDb {
 
         MIGRATIONS_DONE
             .get_or_init(|| async {
-                run_migrations(&pool)
+                run_migrations(&pool, DEFAULT_PARTITION_BLOCKS)
                     .await
                     .expect("Failed to run migrations");
                 run_post_startup_migrations(&pool)

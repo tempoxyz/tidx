@@ -174,8 +174,11 @@ async fn test_legacy_jsonb_migration_backfills_tx_calls() {
     // Legacy rows, JSON exactly as old tidx wrote it (serde of tempo Call:
     // hex-quantity value, data:null). The multicall exercises odd-length
     // quantity hex ("0x5"), zero ("0x0"), and a contract-creation call.
+    // (A real legacy txs table is regular; on the partitioned test layout the
+    // raw INSERT needs its partition first — a no-op on regular tables.)
     conn.batch_execute(
         r#"
+        SELECT ensure_block_partitions('txs', 30000000, 30000000);
         INSERT INTO txs (block_num, block_timestamp, idx, hash, type, "from", "to", value, input,
                          gas_limit, max_fee_per_gas, max_priority_fee_per_gas,
                          nonce_key, nonce, calls, call_count)

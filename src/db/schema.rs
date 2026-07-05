@@ -10,7 +10,10 @@ const VIRTUAL_FORWARD_TX_HASH_INDEX_SQL: &str =
 const NORMALIZE_TX_CALLS_SQL: &str =
     include_str!("../../db/migrations/20260705_normalize_tx_calls.sql");
 
-pub async fn run_migrations(pool: &Pool) -> Result<()> {
+/// Default number of blocks per partition of the chain tables.
+pub const DEFAULT_PARTITION_BLOCKS: u64 = 1_000_000;
+
+pub async fn run_migrations(pool: &Pool, partition_blocks: u64) -> Result<()> {
     let conn = pool.get().await?;
 
     // Kill ALL other connections to this database before running migrations.
@@ -36,6 +39,33 @@ pub async fn run_migrations(pool: &Pool) -> Result<()> {
     }
 
     info!("Running schema migrations");
+
+    // Storage layout settings + partition machinery first: the partition
+    // width is locked at first boot (existing boundaries are fixed; a
+    // different width would overlap them), and ensure_block_partitions is
+    // called by the writer before every batch.
+    conn.batch_execute(include_str!("../../db/storage.sql"))
+        .await?;
+    conn.execute(
+        "INSERT INTO storage_config (partition_blocks) VALUES ($1)
+         ON CONFLICT (single_row) DO NOTHING",
+        &[&(partition_blocks as i64)],
+    )
+    .await?;
+    let locked: i64 = conn
+        .query_one("SELECT partition_blocks FROM storage_config", &[])
+        .await?
+        .get(0);
+    if locked != partition_blocks as i64 {
+        warn!(
+            configured = partition_blocks,
+            locked,
+            "partition_blocks differs from the value locked at first boot; using the locked value"
+        );
+    }
+    conn.batch_execute(include_str!("../../db/partitions.sql"))
+        .await?;
+
     conn.batch_execute(include_str!("../../db/blocks.sql"))
         .await?;
     conn.batch_execute(include_str!("../../db/txs.sql")).await?;
@@ -74,9 +104,34 @@ pub async fn run_migrations(pool: &Pool) -> Result<()> {
 pub async fn run_post_startup_migrations(pool: &Pool) -> Result<()> {
     let conn = pool.get().await?;
 
-    conn.batch_execute(VIRTUAL_FORWARD_INDEX_SQL).await?;
-    conn.batch_execute(VIRTUAL_FORWARD_TX_HASH_INDEX_SQL)
-        .await?;
+    // CREATE INDEX CONCURRENTLY is not supported on partitioned tables, so
+    // on the partitioned layout create the same indexes non-concurrently
+    // (no-op once they exist; partitioned deployments start empty, so the
+    // first creation is cheap).
+    let logs_partitioned: bool = conn
+        .query_one(
+            "SELECT EXISTS (
+                 SELECT 1 FROM pg_partitioned_table pt
+                 JOIN pg_class c ON c.oid = pt.partrelid
+                 JOIN pg_namespace n ON n.oid = c.relnamespace
+                 WHERE c.relname = 'logs' AND n.nspname = current_schema()
+             )",
+            &[],
+        )
+        .await?
+        .get(0);
+
+    if logs_partitioned {
+        conn.batch_execute(&VIRTUAL_FORWARD_INDEX_SQL.replace("CONCURRENTLY ", ""))
+            .await?;
+        conn.batch_execute(&VIRTUAL_FORWARD_TX_HASH_INDEX_SQL.replace("CONCURRENTLY ", ""))
+            .await?;
+    } else {
+        conn.batch_execute(VIRTUAL_FORWARD_INDEX_SQL).await?;
+        conn.batch_execute(VIRTUAL_FORWARD_TX_HASH_INDEX_SQL)
+            .await?;
+    }
+
     // Legacy upgrade: backfill tx_calls from the old txs.calls JSONB column,
     // then drop it. Potentially long-running on large deployments, hence
     // post-startup. No-op once the column is gone.

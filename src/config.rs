@@ -128,6 +128,12 @@ pub struct ChainConfig {
     #[serde(default = "default_concurrency")]
     pub concurrency: usize,
 
+    /// Blocks per Postgres partition of the chain tables (default: 1,000,000).
+    /// Locked into the database at first boot; changing it afterwards has no
+    /// effect because existing partition boundaries are fixed.
+    #[serde(default = "default_partition_blocks")]
+    pub partition_blocks: u64,
+
     /// Complete backfill before starting realtime sync (default: false)
     /// When true, syncs all gaps to genesis before following chain head.
     /// When false (default), runs realtime and backfill concurrently.
@@ -334,6 +340,10 @@ fn default_batch_size() -> u64 {
     100
 }
 
+fn default_partition_blocks() -> u64 {
+    crate::db::DEFAULT_PARTITION_BLOCKS
+}
+
 fn default_concurrency() -> usize {
     4
 }
@@ -486,6 +496,7 @@ mod tests {
             backfill: true,
             batch_size: 100,
             concurrency: 4,
+            partition_blocks: 1_000_000,
             backfill_first: false,
             trust_rpc: false,
             api_pg_url: None,
@@ -512,6 +523,7 @@ mod tests {
             backfill: true,
             batch_size: 100,
             concurrency: 4,
+            partition_blocks: 1_000_000,
             backfill_first: false,
             trust_rpc: false,
             api_pg_url: None,
@@ -537,6 +549,7 @@ mod tests {
             backfill: true,
             batch_size: 100,
             concurrency: 4,
+            partition_blocks: 1_000_000,
             backfill_first: false,
             trust_rpc: false,
             api_pg_url: None,
@@ -559,6 +572,7 @@ mod tests {
             backfill: true,
             batch_size: 100,
             concurrency: 4,
+            partition_blocks: 1_000_000,
             backfill_first: false,
             trust_rpc: false,
             api_pg_url: None,

@@ -15,6 +15,9 @@
 -- (db/functions.sql) converts the bytes to NUMERIC, stored as decimal TEXT
 -- to match the txs.value format.
 DO $$
+DECLARE
+    min_block INT8;
+    max_block INT8;
 BEGIN
     IF EXISTS (
         SELECT 1 FROM information_schema.columns
@@ -22,6 +25,14 @@ BEGIN
           AND table_name = 'txs'
           AND column_name = 'calls'
     ) THEN
+        -- tx_calls may be a (fresh) partitioned parent even though txs is a
+        -- legacy regular table; create the partitions the backfill will hit.
+        SELECT MIN(block_num), MAX(block_num) INTO min_block, max_block
+        FROM txs WHERE calls IS NOT NULL AND call_count > 1;
+        IF min_block IS NOT NULL THEN
+            PERFORM ensure_block_partitions('tx_calls', min_block, max_block);
+        END IF;
+
         INSERT INTO tx_calls (block_num, block_timestamp, tx_idx, call_idx, "to", value, input)
         SELECT t.block_num,
                t.block_timestamp,
