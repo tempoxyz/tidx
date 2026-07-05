@@ -3,6 +3,7 @@ use tracing::info;
 
 use crate::db::Pool;
 use crate::metrics;
+use crate::tempo::{Call, TEMPO_TX_TYPE_ID};
 use crate::types::{BlockRow, LogRow, ReceiptRow, TxRow};
 
 use super::ch_sink::ClickHouseSink;
@@ -399,14 +400,14 @@ async fn fetch_txs(conn: &deadpool_postgres::Object, from: i64, to: i64) -> Resu
         .query(
             "SELECT block_num, block_timestamp, idx, hash, type, \"from\", \"to\", value, input, \
              gas_limit, max_fee_per_gas, max_priority_fee_per_gas, gas_used, \
-             nonce_key, nonce, fee_token, fee_payer, calls, call_count, \
+             nonce_key, nonce, fee_token, fee_payer, call_count, \
              valid_before, valid_after, signature_type \
              FROM txs WHERE block_num >= $1 AND block_num <= $2 ORDER BY block_num, idx",
             &[&from, &to],
         )
         .await?;
 
-    Ok(rows
+    let mut txs: Vec<TxRow> = rows
         .iter()
         .map(|r| TxRow {
             block_num: r.get(0),
@@ -426,13 +427,86 @@ async fn fetch_txs(conn: &deadpool_postgres::Object, from: i64, to: i64) -> Resu
             nonce: r.get(14),
             fee_token: r.get(15),
             fee_payer: r.get(16),
-            calls: r.get(17),
-            call_count: r.get(18),
-            valid_before: r.get(19),
-            valid_after: r.get(20),
-            signature_type: r.get(21),
+            calls: Vec::new(),
+            call_count: r.get(17),
+            valid_before: r.get(18),
+            valid_after: r.get(19),
+            signature_type: r.get(20),
         })
-        .collect())
+        .collect();
+
+    rebuild_aa_calls(conn, from, to, &mut txs).await?;
+
+    Ok(txs)
+}
+
+/// Rebuild the typed inner-call array of AA txs so the ClickHouse `calls`
+/// JSON column matches what live sync writes.
+///
+/// Multicall txs read their calls from `tx_calls`; single-call txs rebuild
+/// the one call from the tx row itself, whose `to`/`value`/`input` mirror
+/// calls[0] (the AA envelope derives them from the first call, and `value`
+/// is the sum of a single call's value).
+async fn rebuild_aa_calls(
+    conn: &deadpool_postgres::Object,
+    from: i64,
+    to: i64,
+    txs: &mut [TxRow],
+) -> Result<()> {
+    use std::collections::HashMap;
+
+    let mut multicalls: HashMap<(i64, i32), Vec<Call>> = HashMap::new();
+    let call_rows = conn
+        .query(
+            "SELECT block_num, tx_idx, \"to\", value, input FROM tx_calls \
+             WHERE block_num >= $1 AND block_num <= $2 ORDER BY block_num, tx_idx, call_idx",
+            &[&from, &to],
+        )
+        .await?;
+    for r in &call_rows {
+        multicalls
+            .entry((r.get(0), r.get(1)))
+            .or_default()
+            .push(call_from_parts(r.get(2), r.get(3), r.get(4))?);
+    }
+
+    for tx in txs.iter_mut() {
+        if tx.tx_type != TEMPO_TX_TYPE_ID as i16 {
+            continue;
+        }
+        tx.calls = match tx.call_count {
+            n if n > 1 => multicalls
+                .remove(&(tx.block_num, tx.idx))
+                .unwrap_or_default(),
+            1 => vec![call_from_parts(
+                tx.to.clone(),
+                tx.value.clone(),
+                tx.input.clone(),
+            )?],
+            _ => Vec::new(),
+        };
+    }
+
+    Ok(())
+}
+
+/// Build a typed AA inner call from its stored parts (`to` bytes or NULL for
+/// create, decimal-string value, raw input bytes).
+fn call_from_parts(to: Option<Vec<u8>>, value: String, input: Vec<u8>) -> Result<Call> {
+    use alloy::primitives::{Address, TxKind, U256};
+
+    Ok(Call {
+        to: match to {
+            Some(bytes) => TxKind::Call(
+                Address::try_from(bytes.as_slice())
+                    .map_err(|e| anyhow::anyhow!("invalid tx_calls.to address: {e}"))?,
+            ),
+            None => TxKind::Create,
+        },
+        value: U256::from_str_radix(&value, 10)
+            .map_err(|e| anyhow::anyhow!("invalid tx_calls.value {value:?}: {e}"))?,
+        input: input.into(),
+    })
 }
 
 async fn fetch_logs(conn: &deadpool_postgres::Object, from: i64, to: i64) -> Result<Vec<LogRow>> {
@@ -501,4 +575,87 @@ async fn fetch_receipts(
             fee_token: None,
         })
         .collect())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use alloy::primitives::{Address, TxKind, U256};
+
+    fn call_json(calls: &[Call]) -> String {
+        serde_json::to_value(calls).unwrap().to_string()
+    }
+
+    /// Mirror of the writer's `insert_tx_calls` column derivation.
+    fn to_parts(call: &Call) -> (Option<Vec<u8>>, String, Vec<u8>) {
+        (
+            match call.to {
+                TxKind::Call(address) => Some(address.as_slice().to_vec()),
+                TxKind::Create => None,
+            },
+            call.value.to_string(),
+            call.input.to_vec(),
+        )
+    }
+
+    #[test]
+    fn call_round_trips_through_stored_parts() {
+        let original = Call {
+            to: TxKind::Call(Address::repeat_byte(0xab)),
+            value: U256::from(123456789u64),
+            input: vec![0xde, 0xad, 0xbe, 0xef].into(),
+        };
+
+        let (to, value, input) = to_parts(&original);
+        let rebuilt = call_from_parts(to, value, input).unwrap();
+
+        assert_eq!(rebuilt, original);
+        assert_eq!(call_json(&[rebuilt]), call_json(&[original]));
+    }
+
+    #[test]
+    fn create_call_round_trips_as_null_to() {
+        let original = Call {
+            to: TxKind::Create,
+            value: U256::ZERO,
+            input: vec![0x60, 0x80].into(),
+        };
+
+        let (to, value, input) = to_parts(&original);
+        assert!(to.is_none());
+        let rebuilt = call_from_parts(to, value, input).unwrap();
+
+        assert_eq!(rebuilt, original);
+    }
+
+    #[test]
+    fn rebuilt_json_matches_pre_normalization_format() {
+        // Pin the exact JSON the ClickHouse `calls` column has always stored
+        // (serde of tempo-alloy Call via serde_json::Value, declaration-order
+        // keys — serde_json is built with preserve_order here).
+        let call = Call {
+            to: TxKind::Call(Address::repeat_byte(0x11)),
+            value: U256::from(5u64),
+            input: vec![0x01, 0x02].into(),
+        };
+
+        assert_eq!(
+            call_json(&[call]),
+            r#"[{"to":"0x1111111111111111111111111111111111111111","value":"0x5","input":"0x0102","data":null}]"#
+        );
+    }
+
+    #[test]
+    fn max_value_round_trips_via_decimal_string() {
+        let original = Call {
+            to: TxKind::Call(Address::ZERO),
+            value: U256::MAX,
+            input: Vec::new().into(),
+        };
+
+        let (to, value, input) = to_parts(&original);
+        let rebuilt = call_from_parts(to, value, input).unwrap();
+
+        assert_eq!(rebuilt, original);
+    }
 }

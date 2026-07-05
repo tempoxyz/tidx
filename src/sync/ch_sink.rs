@@ -16,6 +16,7 @@ use crate::clickhouse_schema::{
     derived_objects, migrations, post_derived_migrations, reorg_tables,
 };
 use crate::metrics;
+use crate::tempo::TEMPO_TX_TYPE_ID;
 use crate::types::{BlockRow, LogRow, ReceiptRow, TxRow};
 
 /// DDL for the catalog state table that records the checksum of every
@@ -819,7 +820,13 @@ impl ChTxWire {
             nonce: tx.nonce,
             fee_token: tx.fee_token.as_ref().map(|v| hex_encode(v)),
             fee_payer: tx.fee_payer.as_ref().map(|v| hex_encode(v)),
-            calls: tx.calls.as_ref().map(|v| v.to_string()),
+            // AA txs serialize their full inner-call array (matching the
+            // pre-normalization JSONB format); other types carry no calls.
+            calls: if tx.tx_type == TEMPO_TX_TYPE_ID as i16 {
+                serde_json::to_value(&tx.calls).ok().map(|v| v.to_string())
+            } else {
+                None
+            },
             call_count: tx.call_count,
             valid_before: tx.valid_before,
             valid_after: tx.valid_after,

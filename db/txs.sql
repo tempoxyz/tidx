@@ -16,7 +16,6 @@ CREATE TABLE IF NOT EXISTS txs (
     nonce                   INT8 NOT NULL,
     fee_token               BYTEA,
     fee_payer               BYTEA,
-    calls                   JSONB,
     call_count              INT2 NOT NULL DEFAULT 1,
     valid_before            INT8,
     valid_after             INT8,
@@ -30,8 +29,10 @@ DROP INDEX IF EXISTS idx_txs_block_num_asc;
 CREATE INDEX IF NOT EXISTS idx_txs_from ON txs ("from", block_timestamp DESC);
 CREATE INDEX IF NOT EXISTS idx_txs_to ON txs ("to", block_timestamp DESC);
 DROP INDEX IF EXISTS idx_txs_calls;
-CREATE INDEX IF NOT EXISTS idx_txs_calls_partial ON txs USING GIN (calls) WHERE calls IS NOT NULL AND call_count > 1;
 DROP INDEX IF EXISTS idx_txs_selector;
+-- The former `calls` JSONB column and its GIN index (idx_txs_calls_partial)
+-- are migrated into the `tx_calls` table by
+-- db/migrations/20260705_normalize_tx_calls.sql.
 
 -- LZ4 TOAST compression for wide values (PG14+). Metadata-only; applies to
 -- newly written rows. Existing rows keep their current compression.

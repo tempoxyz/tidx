@@ -45,7 +45,7 @@ fn generate_txs(count: usize, block_num: i64) -> Vec<TxRow> {
             nonce: i as i64,
             fee_token: None,
             fee_payer: None,
-            calls: None,
+            calls: Vec::new(),
             call_count: 1,
             valid_before: None,
             valid_after: None,

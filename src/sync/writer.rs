@@ -1,3 +1,4 @@
+use alloy::primitives::TxKind;
 use anyhow::Result;
 use std::collections::BTreeSet;
 use std::pin::Pin;
@@ -97,9 +98,12 @@ async fn insert_blocks(tx: &tokio_postgres::Transaction<'_>, blocks: &[BlockRow]
 
 /// Replace txs for the touched blocks within `tx`: delete stale rows for
 /// those block numbers, then insert via COPY BINARY staging (conflict-ignore).
+/// Multicall AA txs additionally have their inner calls replaced in the
+/// `tx_calls` table.
 async fn replace_txs(tx: &tokio_postgres::Transaction<'_>, txs: &[TxRow]) -> Result<()> {
     let block_nums = exact_block_nums(txs.iter().map(|tx| tx.block_num));
     delete_blocks_exact(tx, "txs", &block_nums).await?;
+    delete_blocks_exact(tx, "tx_calls", &block_nums).await?;
 
     tx.execute(
         "CREATE TEMP TABLE _staging_txs (
@@ -107,7 +111,7 @@ async fn replace_txs(tx: &tokio_postgres::Transaction<'_>, txs: &[TxRow]) -> Res
             type INT2, \"from\" BYTEA, \"to\" BYTEA, value TEXT, input BYTEA,
             gas_limit INT8, max_fee_per_gas TEXT, max_priority_fee_per_gas TEXT,
             gas_used INT8, nonce_key BYTEA, nonce INT8, fee_token BYTEA,
-            fee_payer BYTEA, calls JSONB, call_count INT2, valid_before INT8,
+            fee_payer BYTEA, call_count INT2, valid_before INT8,
             valid_after INT8, signature_type INT2
         ) ON COMMIT DROP",
         &[],
@@ -132,7 +136,6 @@ async fn replace_txs(tx: &tokio_postgres::Transaction<'_>, txs: &[TxRow]) -> Res
         Type::INT8,        // nonce
         Type::BYTEA,       // fee_token
         Type::BYTEA,       // fee_payer
-        Type::JSONB,       // calls
         Type::INT2,        // call_count
         Type::INT8,        // valid_before
         Type::INT8,        // valid_after
@@ -143,7 +146,7 @@ async fn replace_txs(tx: &tokio_postgres::Transaction<'_>, txs: &[TxRow]) -> Res
         .copy_in(
             r#"COPY _staging_txs (block_num, block_timestamp, idx, hash, type, "from", "to", value, input,
                 gas_limit, max_fee_per_gas, max_priority_fee_per_gas, gas_used,
-                nonce_key, nonce, fee_token, fee_payer, calls, call_count,
+                nonce_key, nonce, fee_token, fee_payer, call_count,
                 valid_before, valid_after, signature_type) FROM STDIN BINARY"#,
         )
         .await?;
@@ -172,7 +175,6 @@ async fn replace_txs(tx: &tokio_postgres::Transaction<'_>, txs: &[TxRow]) -> Res
                 &tx_row.nonce,
                 &tx_row.fee_token,
                 &tx_row.fee_payer,
-                &tx_row.calls,
                 &tx_row.call_count,
                 &tx_row.valid_before,
                 &tx_row.valid_after,
@@ -186,13 +188,92 @@ async fn replace_txs(tx: &tokio_postgres::Transaction<'_>, txs: &[TxRow]) -> Res
     tx.execute(
         r#"INSERT INTO txs (block_num, block_timestamp, idx, hash, type, "from", "to", value, input,
             gas_limit, max_fee_per_gas, max_priority_fee_per_gas, gas_used,
-            nonce_key, nonce, fee_token, fee_payer, calls, call_count,
+            nonce_key, nonce, fee_token, fee_payer, call_count,
             valid_before, valid_after, signature_type)
          SELECT block_num, block_timestamp, idx, hash, type, "from", "to", value, input,
             gas_limit, max_fee_per_gas, max_priority_fee_per_gas, gas_used,
-            nonce_key, nonce, fee_token, fee_payer, calls, call_count,
+            nonce_key, nonce, fee_token, fee_payer, call_count,
             valid_before, valid_after, signature_type
          FROM _staging_txs ON CONFLICT DO NOTHING"#,
+        &[],
+    )
+    .await?;
+
+    insert_tx_calls(tx, txs).await?;
+
+    Ok(())
+}
+
+/// Insert the inner calls of multicall AA txs into `tx_calls` via COPY BINARY
+/// staging (conflict-ignore). Single-call AA txs are skipped: the AA envelope
+/// mirrors calls[0] in the tx row's own `to`/`value`/`input` columns, so
+/// persisting them would duplicate data. Stale rows for the touched blocks
+/// are deleted by `replace_txs` before this runs.
+async fn insert_tx_calls(tx: &tokio_postgres::Transaction<'_>, txs: &[TxRow]) -> Result<()> {
+    if !txs.iter().any(|tx| tx.calls.len() > 1) {
+        return Ok(());
+    }
+
+    tx.execute(
+        "CREATE TEMP TABLE _staging_tx_calls (
+            block_num INT8, block_timestamp TIMESTAMPTZ, tx_idx INT4, call_idx INT2,
+            \"to\" BYTEA, value TEXT, input BYTEA
+        ) ON COMMIT DROP",
+        &[],
+    )
+    .await?;
+
+    let types = &[
+        Type::INT8,        // block_num
+        Type::TIMESTAMPTZ, // block_timestamp
+        Type::INT4,        // tx_idx
+        Type::INT2,        // call_idx
+        Type::BYTEA,       // to
+        Type::TEXT,        // value
+        Type::BYTEA,       // input
+    ];
+
+    let sink = tx
+        .copy_in(
+            "COPY _staging_tx_calls (block_num, block_timestamp, tx_idx, call_idx, \"to\", value, input) FROM STDIN BINARY",
+        )
+        .await?;
+
+    let writer = BinaryCopyInWriter::new(sink, types);
+    let mut pinned_writer: Pin<Box<BinaryCopyInWriter>> = Box::pin(writer);
+
+    for tx_row in txs {
+        if tx_row.calls.len() <= 1 {
+            continue;
+        }
+        for (call_idx, call) in tx_row.calls.iter().enumerate() {
+            let to = match call.to {
+                TxKind::Call(address) => Some(address.as_slice().to_vec()),
+                TxKind::Create => None,
+            };
+            let value = call.value.to_string();
+            let input = call.input.as_ref();
+            pinned_writer
+                .as_mut()
+                .write(&[
+                    &tx_row.block_num,
+                    &tx_row.block_timestamp,
+                    &tx_row.idx,
+                    &(call_idx as i16),
+                    &to,
+                    &value,
+                    &input,
+                ])
+                .await?;
+        }
+    }
+
+    pinned_writer.as_mut().finish().await?;
+
+    tx.execute(
+        "INSERT INTO tx_calls (block_num, block_timestamp, tx_idx, call_idx, \"to\", value, input)
+         SELECT block_num, block_timestamp, tx_idx, call_idx, \"to\", value, input
+         FROM _staging_tx_calls ON CONFLICT DO NOTHING",
         &[],
     )
     .await?;
@@ -817,11 +898,16 @@ pub async fn delete_blocks_from(pool: &Pool, from_block: u64) -> Result<u64> {
     let conn = pool.get().await?;
     let from_block_i64 = from_block as i64;
 
-    // Delete in order: logs, receipts, txs, blocks (foreign key order)
+    // Delete in order: logs, receipts, tx_calls, txs, blocks (foreign key order)
     conn.execute("DELETE FROM logs WHERE block_num >= $1", &[&from_block_i64])
         .await?;
     conn.execute(
         "DELETE FROM receipts WHERE block_num >= $1",
+        &[&from_block_i64],
+    )
+    .await?;
+    conn.execute(
+        "DELETE FROM tx_calls WHERE block_num >= $1",
         &[&from_block_i64],
     )
     .await?;

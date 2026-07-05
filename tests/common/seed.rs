@@ -112,7 +112,7 @@ pub async fn seed(pool: &Pool, config: &SeedConfig) -> Result<(u64, i64, u64)> {
                     nonce: i64::from(rng.random_range(0..10000)),
                     fee_token: None,
                     fee_payer: None,
-                    calls: None,
+                    calls: Vec::new(),
                     call_count: 1,
                     valid_before: None,
                     valid_after: None,

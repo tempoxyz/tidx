@@ -246,6 +246,21 @@ async fn test_seeded_tx_variance() {
 
     println!("Multicall txs: {multicalls}");
 
+    // Every multicall tx must have its inner calls normalized into tx_calls.
+    let tx_calls_txs: i64 = conn
+        .query_one(
+            "SELECT COUNT(DISTINCT (block_num, tx_idx)) FROM tx_calls",
+            &[],
+        )
+        .await
+        .expect("Failed to count tx_calls txs")
+        .get(0);
+
+    assert_eq!(
+        tx_calls_txs, multicalls,
+        "tx_calls should contain exactly the multicall txs"
+    );
+
     // Check address diversity
     let unique_froms: i64 = conn
         .query_one("SELECT COUNT(DISTINCT \"from\") FROM txs", &[])

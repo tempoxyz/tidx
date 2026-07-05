@@ -7,6 +7,8 @@ const VIRTUAL_FORWARD_INDEX_SQL: &str =
     include_str!("../../db/migrations/20260417_add_logs_virtual_forward_indexes.sql");
 const VIRTUAL_FORWARD_TX_HASH_INDEX_SQL: &str =
     include_str!("../../db/migrations/20260417_add_logs_tx_hash_virtual_forward_index.sql");
+const NORMALIZE_TX_CALLS_SQL: &str =
+    include_str!("../../db/migrations/20260705_normalize_tx_calls.sql");
 
 pub async fn run_migrations(pool: &Pool) -> Result<()> {
     let conn = pool.get().await?;
@@ -37,6 +39,8 @@ pub async fn run_migrations(pool: &Pool) -> Result<()> {
     conn.batch_execute(include_str!("../../db/blocks.sql"))
         .await?;
     conn.batch_execute(include_str!("../../db/txs.sql")).await?;
+    conn.batch_execute(include_str!("../../db/tx_calls.sql"))
+        .await?;
     conn.batch_execute(include_str!("../../db/logs.sql"))
         .await?;
     conn.batch_execute(include_str!("../../db/receipts.sql"))
@@ -73,6 +77,10 @@ pub async fn run_post_startup_migrations(pool: &Pool) -> Result<()> {
     conn.batch_execute(VIRTUAL_FORWARD_INDEX_SQL).await?;
     conn.batch_execute(VIRTUAL_FORWARD_TX_HASH_INDEX_SQL)
         .await?;
+    // Legacy upgrade: backfill tx_calls from the old txs.calls JSONB column,
+    // then drop it. Potentially long-running on large deployments, hence
+    // post-startup. No-op once the column is gone.
+    conn.batch_execute(NORMALIZE_TX_CALLS_SQL).await?;
 
     Ok(())
 }

@@ -8,6 +8,7 @@ use alloy::network::Network;
 use tempo_alloy::TempoNetwork;
 
 pub use tempo_alloy::primitives::TempoTxEnvelope;
+pub use tempo_alloy::primitives::transaction::{Call, TEMPO_TX_TYPE_ID};
 pub use tempo_alloy::rpc::TempoTransactionReceipt;
 
 pub type Block = <TempoNetwork as Network>::BlockResponse;

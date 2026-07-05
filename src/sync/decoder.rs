@@ -42,13 +42,13 @@ pub fn decode_transaction(tx: &Transaction, block: &Block, idx: u32) -> TxRow {
     let inner: &Recovered<TempoTxEnvelope> = &tx.inner;
 
     // Extract Tempo-specific fields if this is a 0x76 transaction
-    let (nonce_key, fee_token, calls_json, call_count, valid_before, valid_after, signature_type) =
+    let (nonce_key, fee_token, calls, call_count, valid_before, valid_after, signature_type) =
         if let TempoTxEnvelope::AA(aa_signed) = inner.as_ref() {
             let tempo_tx = aa_signed.tx();
             (
                 tempo_tx.nonce_key.to_be_bytes_vec(),
                 tempo_tx.fee_token.map(|a| a.as_slice().to_vec()),
-                serde_json::to_value(&tempo_tx.calls).ok(),
+                tempo_tx.calls.clone(),
                 tempo_tx.calls.len() as i16,
                 tempo_tx.valid_before.map(|v| v.get() as i64),
                 tempo_tx.valid_after.map(|v| v.get() as i64),
@@ -59,7 +59,7 @@ pub fn decode_transaction(tx: &Transaction, block: &Block, idx: u32) -> TxRow {
                 }),
             )
         } else {
-            (vec![0u8; 32], None, None, 1, None, None, Some(0))
+            (vec![0u8; 32], None, Vec::new(), 1, None, None, Some(0))
         };
 
     TxRow {
@@ -82,7 +82,7 @@ pub fn decode_transaction(tx: &Transaction, block: &Block, idx: u32) -> TxRow {
         nonce: inner.nonce() as i64,
         fee_token,
         fee_payer: None, // Recovered from receipt
-        calls: calls_json,
+        calls,
         call_count,
         valid_before,
         valid_after,

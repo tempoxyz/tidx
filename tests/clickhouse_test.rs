@@ -858,7 +858,7 @@ fn make_tx(block_num: i64, idx: i32) -> TxRow {
         nonce: block_num,
         fee_token: None,
         fee_payer: None,
-        calls: None,
+        calls: Vec::new(),
         call_count: 1,
         valid_before: None,
         valid_after: None,

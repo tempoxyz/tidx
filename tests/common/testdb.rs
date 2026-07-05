@@ -1,4 +1,4 @@
-use tidx::db::{Pool, ThrottledPool, create_pool, run_migrations};
+use tidx::db::{Pool, ThrottledPool, create_pool, run_migrations, run_post_startup_migrations};
 use tidx::sync::engine::SyncEngine;
 use tidx::sync::sink::SinkSet;
 use tokio::sync::{Mutex, MutexGuard, OnceCell};
@@ -42,6 +42,9 @@ impl TestDb {
                 run_migrations(&pool)
                     .await
                     .expect("Failed to run migrations");
+                run_post_startup_migrations(&pool)
+                    .await
+                    .expect("Failed to run post-startup migrations");
             })
             .await;
 
@@ -99,7 +102,7 @@ and ensure DATABASE_URL points at the Postgres container (for example \
 
     pub async fn truncate_all(&self) {
         let conn = self.pool.get().await.expect("Failed to get connection");
-        conn.batch_execute("TRUNCATE blocks, txs, logs, receipts, sync_state CASCADE")
+        conn.batch_execute("TRUNCATE blocks, txs, tx_calls, logs, receipts, sync_state CASCADE")
             .await
             .expect("Failed to truncate tables");
     }
