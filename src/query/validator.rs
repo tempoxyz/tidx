@@ -8,7 +8,7 @@ use sqlparser::ast::{
 use sqlparser::dialect::GenericDialect;
 use sqlparser::parser::Parser;
 
-const POSTGRES_ALLOWED_TABLES: &[&str] = &["blocks", "txs", "logs", "receipts"];
+const POSTGRES_ALLOWED_TABLES: &[&str] = &["blocks", "txs", "tx_calls", "logs", "receipts"];
 
 const MAX_QUERY_LENGTH: usize = 65_536;
 const MAX_SUBQUERY_DEPTH: usize = 4;
@@ -1350,6 +1350,25 @@ mod tests {
     fn test_allows_subquery() {
         assert!(
             validate_query("SELECT * FROM blocks WHERE num IN (SELECT block_num FROM txs)").is_ok()
+        );
+    }
+
+    #[test]
+    fn test_allows_tx_calls_recipient_exists() {
+        // The AA inner-call recipient filter shape consumers use after the
+        // txs.calls JSONB → tx_calls normalization.
+        assert!(
+            validate_query(
+                "SELECT hash FROM txs \
+                 WHERE (\"to\" = '\\xaa' OR EXISTS ( \
+                     SELECT 1 FROM tx_calls c \
+                     WHERE c.block_timestamp = txs.block_timestamp \
+                       AND c.block_num = txs.block_num \
+                       AND c.tx_idx = txs.idx \
+                       AND c.\"to\" = '\\xaa')) \
+                 ORDER BY block_num DESC LIMIT 10"
+            )
+            .is_ok()
         );
     }
 
