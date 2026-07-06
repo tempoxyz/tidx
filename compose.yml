@@ -24,12 +24,17 @@ x-tidx-command: &tidx-command
     [chains.clickhouse]
     enabled = $${TIDX_CLICKHOUSE_ENABLED:-true}
     url = "$${TIDX_CLICKHOUSE_URL:-http://clickhouse:8123}"
+
+    [chains.timescale]
+    enabled = $${TIDX_TIMESCALE_ENABLED:-true}
     EOF
     exec tidx up --config /tmp/config.toml
 
 services:
   postgres:
-    image: postgres:16
+    # TimescaleDB image: the columnstore cold tier is enabled by default
+    # (opt out with TIDX_TIMESCALE_ENABLED=false).
+    image: timescale/timescaledb:2.28.0-pg17
     environment:
       POSTGRES_DB: tidx
       POSTGRES_USER: tidx
@@ -41,6 +46,8 @@ services:
       - postgres_data:/var/lib/postgresql/data
     command:
       - postgres
+      - -c
+      - shared_preload_libraries=timescaledb
       - -c
       - max_wal_size=4GB
       - -c
@@ -162,6 +169,9 @@ services:
       TIDX_CHAIN_NAME: devnet
       TIDX_CHAIN_ID: "31318"
       TIDX_RPC_URL: ${TIDX_DEVNET_RPC_URL:?set TIDX_DEVNET_RPC_URL}
+      # The migration e2e exercises the legacy heap-schema upgrade path,
+      # which the cold tier would refuse to convert.
+      TIDX_TIMESCALE_ENABLED: "false"
     depends_on:
       postgres:
         condition: service_healthy

@@ -1,6 +1,8 @@
 services:
   postgres:
-    image: postgres:16
+    # TimescaleDB image: the columnstore cold tier ([chains.timescale] in
+    # config.toml) is enabled by default. Requires a fresh data volume.
+    image: timescale/timescaledb:2.28.0-pg17
     environment:
       POSTGRES_USER: tidx
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-tidx}
@@ -11,6 +13,8 @@ services:
       - postgres_data:/var/lib/postgresql/data
     command:
       - postgres
+      - -c
+      - shared_preload_libraries=timescaledb
       - -c
       - max_wal_size=16GB
       - -c

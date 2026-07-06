@@ -216,14 +216,11 @@ Run PostgreSQL on [TimescaleDB](https://github.com/timescale/timescaledb) and ti
 
 ### Setup
 
-1. **Run Postgres with the timescaledb extension.** With the prod compose stack, the overlay swaps the image and preloads the extension:
+The shipped compose stacks (`docker/prod`, the quickstart `compose.yml`, `docker/local`) run `timescale/timescaledb` with the cold tier **enabled by default** — nothing to configure. Opt out with `TIDX_TIMESCALE_ENABLED=false` (quickstart) or `enabled = false` under `[chains.timescale]`.
 
-   ```bash
-   cd docker/prod
-   docker compose -f docker-compose.yml -f docker-compose.timescale.yml up -d
-   ```
+Self-managed deployments:
 
-   Self-managed: use a `timescale/timescaledb` image (2.28+, PG 16/17) or add the extension to your server, with `shared_preload_libraries=timescaledb`.
+1. **Run Postgres with the timescaledb extension** — a `timescale/timescaledb` image (2.28+, PG 16/17) or the extension on your own server, with `shared_preload_libraries=timescaledb`.
 
 2. **Enable the cold tier per chain** in `config.toml`:
 

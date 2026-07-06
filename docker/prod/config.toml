@@ -23,6 +23,11 @@ batch_size = 100
 enabled = true
 url = "http://clickhouse:8123"
 
+# TimescaleDB columnstore cold tier: compresses fully-synced chunks
+# behind the hot window (requires the timescaledb postgres image).
+[chains.timescale]
+enabled = true
+
 [[chains]]
 name = "mainnet"
 chain_id = 4217
@@ -36,3 +41,8 @@ batch_size = 100
 [chains.clickhouse]
 enabled = true
 url = "http://clickhouse:8123"
+
+# TimescaleDB columnstore cold tier: compresses fully-synced chunks
+# behind the hot window (requires the timescaledb postgres image).
+[chains.timescale]
+enabled = true

@@ -13,7 +13,7 @@ port = 9090
 name = "dev"
 chain_id = 1337
 rpc_url = "http://tempo:8545"
-pg_url = "postgres://tidx:tidx@postgres:5432/tidx"
+pg_url = "postgres://tidx:tidx@timescaledb:5432/tidx"
 backfill = true
 batch_size = 100
 
@@ -21,3 +21,11 @@ batch_size = 100
 [chains.clickhouse]
 enabled = true
 url = "http://clickhouse:8123"
+
+# TimescaleDB columnstore cold tier (dev-scale windows so chunk
+# compression actually triggers while the local stack runs).
+[chains.timescale]
+enabled = true
+chunk_blocks = 10000
+hot_window_blocks = 20000
+interval_secs = 60

@@ -96,7 +96,7 @@ services:
     volumes:
       - ./config.toml:/config.toml:ro
     depends_on:
-      postgres:
+      timescaledb:
         condition: service_healthy
       tempo:
         condition: service_started
