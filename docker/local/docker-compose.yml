@@ -89,7 +89,6 @@ services:
       - "5"
       - --target-urls
       - "http://tempo:8545"
-      - --disable-2d-nonces
       - --mnemonic
       - "test test test test test test test test test test test junk"
       - --tip20-weight
