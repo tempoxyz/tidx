@@ -48,7 +48,7 @@ pub async fn write_blocks(pool: &Pool, blocks: &[BlockRow]) -> Result<()> {
             num INT8, hash BYTEA, parent_hash BYTEA, timestamp TIMESTAMPTZ,
             timestamp_ms INT8, gas_limit INT8, gas_used INT8, miner BYTEA, extra_data BYTEA,
             consensus_proposer BYTEA
-        ) ON COMMIT DROP",
+        ) USING heap ON COMMIT DROP",
         &[],
     )
     .await?;
@@ -134,7 +134,7 @@ pub async fn write_txs(pool: &Pool, txs: &[TxRow]) -> Result<()> {
             gas_used INT8, nonce_key BYTEA, nonce INT8, fee_token BYTEA,
             fee_payer BYTEA, calls JSONB, call_count INT2, valid_before INT8,
             valid_after INT8, signature_type INT2
-        ) ON COMMIT DROP",
+        ) USING heap ON COMMIT DROP",
         &[],
     )
     .await?;
@@ -244,7 +244,7 @@ pub async fn write_logs(pool: &Pool, logs: &[LogRow]) -> Result<()> {
             tx_hash BYTEA, address BYTEA, selector BYTEA, topic0 BYTEA,
             topic1 BYTEA, topic2 BYTEA, topic3 BYTEA, data BYTEA,
             is_virtual_forward BOOLEAN
-        ) ON COMMIT DROP",
+        ) USING heap ON COMMIT DROP",
         &[],
     )
     .await?;
@@ -333,7 +333,7 @@ pub async fn write_receipts(pool: &Pool, receipts: &[ReceiptRow]) -> Result<()> 
             \"from\" BYTEA, \"to\" BYTEA, contract_address BYTEA, gas_used INT8,
             cumulative_gas_used INT8, effective_gas_price TEXT, status INT2,
             fee_payer BYTEA
-        ) ON COMMIT DROP",
+        ) USING heap ON COMMIT DROP",
         &[],
     )
     .await?;
@@ -455,7 +455,7 @@ async fn write_batch_inner(
                 num INT8, hash BYTEA, parent_hash BYTEA, timestamp TIMESTAMPTZ,
                 timestamp_ms INT8, gas_limit INT8, gas_used INT8, miner BYTEA, extra_data BYTEA,
                 consensus_proposer BYTEA
-            ) ON COMMIT DROP",
+            ) USING heap ON COMMIT DROP",
             &[],
         )
         .await?;
@@ -522,7 +522,7 @@ async fn write_batch_inner(
                 gas_used INT8, nonce_key BYTEA, nonce INT8, fee_token BYTEA,
                 fee_payer BYTEA, calls JSONB, call_count INT2, valid_before INT8,
                 valid_after INT8, signature_type INT2
-            ) ON COMMIT DROP",
+            ) USING heap ON COMMIT DROP",
             &[],
         )
         .await?;
@@ -614,7 +614,7 @@ async fn write_batch_inner(
                 tx_hash BYTEA, address BYTEA, selector BYTEA, topic0 BYTEA,
                 topic1 BYTEA, topic2 BYTEA, topic3 BYTEA, data BYTEA,
                 is_virtual_forward BOOLEAN
-            ) ON COMMIT DROP",
+            ) USING heap ON COMMIT DROP",
             &[],
         )
         .await?;
@@ -685,7 +685,7 @@ async fn write_batch_inner(
                 \"from\" BYTEA, \"to\" BYTEA, contract_address BYTEA, gas_used INT8,
                 cumulative_gas_used INT8, effective_gas_price TEXT, status INT2,
                 fee_payer BYTEA
-            ) ON COMMIT DROP",
+            ) USING heap ON COMMIT DROP",
             &[],
         )
         .await?;

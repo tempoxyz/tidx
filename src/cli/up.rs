@@ -240,7 +240,11 @@ async fn initialize_chain(
     let throttled_pool = ThrottledPool::new(&pg_url).await?;
 
     info!(chain = %chain.name, "Running migrations...");
-    db::run_migrations(&throttled_pool.pool).await?;
+    let storage = db::StorageOptions {
+        table_am: chain.pg_table_am.clone(),
+        compress: chain.pg_compress,
+    };
+    db::run_migrations_with_storage(&throttled_pool.pool, &storage).await?;
 
     {
         let pool = throttled_pool.pool.clone();

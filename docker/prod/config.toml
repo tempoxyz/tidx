@@ -15,6 +15,8 @@ chain_id = 42431
 rpc_url = "https://rpc.testnet.tempo.xyz"
 rpc_auth_env = "TEMPO_RPC_AUTH_MODERATO"
 pg_url = "postgres://tidx:tidx@postgres:5432/tidx_moderato"
+pg_table_am = "orioledb"
+pg_compress = 3
 backfill = true
 batch_size = 100
 
@@ -29,6 +31,8 @@ chain_id = 4217
 rpc_url = "https://rpc.tempo.xyz"
 rpc_auth_env = "TEMPO_RPC_AUTH_MAINNET"
 pg_url = "postgres://tidx:tidx@postgres:5432/tidx_mainnet"
+pg_table_am = "orioledb"
+pg_compress = 3
 backfill = true
 batch_size = 100
 

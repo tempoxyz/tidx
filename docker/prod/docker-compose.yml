@@ -1,6 +1,6 @@
 services:
   postgres:
-    image: postgres:16
+    image: orioledb/orioledb:latest-pg17
     environment:
       POSTGRES_USER: tidx
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-tidx}
@@ -10,7 +10,15 @@ services:
     volumes:
       - postgres_data:/var/lib/postgresql/data
     command:
+      # -D /etc/postgresql: image ships shared_preload_libraries=orioledb there
       - postgres
+      - -D
+      - /etc/postgresql
+      # main_buffers must cover the hot working set; ingest degrades sharply past it
+      - -c
+      - orioledb.main_buffers=${ORIOLE_MAIN_BUFFERS:-4GB}
+      - -c
+      - orioledb.undo_buffers=${ORIOLE_UNDO_BUFFERS:-1GB}
       - -c
       - max_wal_size=16GB
       - -c

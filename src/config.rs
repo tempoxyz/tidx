@@ -116,6 +116,19 @@ pub struct ChainConfig {
     #[serde(default)]
     pub pg_password_env: Option<String>,
 
+    /// Postgres table access method for chain tables (e.g. "orioledb").
+    /// Applied when tables are first created; existing tables keep their
+    /// access method. The server must have the AM available (for OrioleDB:
+    /// an orioledb-patched Postgres with shared_preload_libraries set).
+    #[serde(default)]
+    pub pg_table_am: Option<String>,
+
+    /// OrioleDB zstd compression level (0-22, or -1 for none) used as the
+    /// default for tables created during schema setup.
+    /// Only valid with pg_table_am = "orioledb".
+    #[serde(default)]
+    pub pg_compress: Option<i32>,
+
     /// Enable backfill to genesis (default: true)
     #[serde(default = "default_backfill")]
     pub backfill: bool,
@@ -483,6 +496,8 @@ mod tests {
             rpc_auth_env: None,
             pg_url: "postgres://user:pass@localhost/db".to_string(),
             pg_password_env: None,
+            pg_table_am: None,
+            pg_compress: None,
             backfill: true,
             batch_size: 100,
             concurrency: 4,
@@ -509,6 +524,8 @@ mod tests {
             rpc_auth_env: None,
             pg_url: "postgres://user:placeholder@localhost/db".to_string(),
             pg_password_env: Some("PATH".to_string()),
+            pg_table_am: None,
+            pg_compress: None,
             backfill: true,
             batch_size: 100,
             concurrency: 4,
@@ -534,6 +551,8 @@ mod tests {
             rpc_auth_env: None,
             pg_url: "postgres://user:placeholder@localhost/db".to_string(),
             pg_password_env: Some("NONEXISTENT_VAR_XYZ_999".to_string()),
+            pg_table_am: None,
+            pg_compress: None,
             backfill: true,
             batch_size: 100,
             concurrency: 4,
@@ -556,6 +575,8 @@ mod tests {
             rpc_auth_env: Some("PATH".to_string()),
             pg_url: "postgres://user:pass@localhost/db".to_string(),
             pg_password_env: None,
+            pg_table_am: None,
+            pg_compress: None,
             backfill: true,
             batch_size: 100,
             concurrency: 4,
