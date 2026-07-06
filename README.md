@@ -117,6 +117,27 @@ cd tidx
 cargo build --release
 ```
 
+### Postgres on ZFS (optional)
+
+Self-hosted deployments can run Postgres on ZFS datasets with transparent
+lz4 compression for a **~2.4x smaller on-disk footprint** at near-parity
+read and ingest speed (measured on Moderato: 23.2 → 9.7 GB per 1M blocks;
+32k/zstd-3 reaches 3.8x for archive boxes at reduced ingest — details in
+[tasks/zfs-zstd-plan.md](tasks/zfs-zstd-plan.md)).
+
+```bash
+sudo scripts/zfs/provision.sh pool /dev/nvme1n1p3   # or: pool --file <path> <size>
+sudo scripts/zfs/provision.sh datasets              # 16k/lz4; prints TIDX_* exports
+export TIDX_PGDATA=/tidx/pgdata TIDX_PGWAL=/tidx/pgwal
+cd docker/prod
+docker compose -f docker-compose.yml -f docker-compose.zfs.yml up -d
+```
+
+The override sets `full_page_writes=off`, which is safe **only** while
+PGDATA lives on ZFS (copy-on-write prevents torn pages) — never reuse those
+Postgres flags on ext4/xfs. Don't put the ClickHouse volume on a compressed
+dataset; it compresses its own data.
+
 ## Configuration
 
 tidx uses a `config.toml` file to configure the indexer.

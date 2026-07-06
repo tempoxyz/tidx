@@ -1,0 +1,45 @@
+# Optional override: run Postgres on ZFS datasets with transparent lz4
+# compression (~2.4x smaller on-disk at near-parity read and ingest speed
+# with a production-sized shared_buffers; measured numbers in
+# tasks/zfs-zstd-plan.md).
+#
+# Usage:
+#   sudo scripts/zfs/provision.sh pool /dev/nvme1n1p3
+#   sudo scripts/zfs/provision.sh datasets          # prints the TIDX_* exports
+#   export TIDX_PGDATA=... TIDX_PGWAL=...
+#   docker compose -f docker-compose.yml -f docker-compose.zfs.yml up -d
+#
+# !!! This file sets full_page_writes=off, which is ONLY safe because ZFS is
+# !!! copy-on-write (torn pages cannot happen). If you ever move the data
+# !!! directory back to ext4/xfs, you MUST NOT reuse these settings.
+
+services:
+  postgres:
+    environment:
+      POSTGRES_INITDB_WALDIR: /var/lib/postgresql/wal
+    volumes: !override
+      - ${TIDX_PGDATA:?set TIDX_PGDATA to the ZFS pgdata dataset mountpoint}:/var/lib/postgresql/data
+      - ${TIDX_PGWAL:?set TIDX_PGWAL to the ZFS WAL dataset mountpoint}:/var/lib/postgresql/wal
+    command:
+      - postgres
+      - -c
+      - max_wal_size=16GB
+      - -c
+      - checkpoint_timeout=30min
+      - -c
+      - synchronous_commit=off
+      - -c
+      - shared_buffers=${PG_SHARED_BUFFERS:-4GB}
+      - -c
+      - work_mem=64MB
+      - -c
+      - wal_level=minimal
+      - -c
+      - max_wal_senders=0
+      # ZFS-only settings (see warning above):
+      - -c
+      - full_page_writes=off
+      - -c
+      - wal_init_zero=off
+      - -c
+      - wal_recycle=off

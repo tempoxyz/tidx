@@ -1,7 +1,73 @@
 # ZFS zstd Under Stock Postgres — Experiment Plan
 
-> Status: **planning only — no tidx code changes expected.**
+> Status: **executed 2026-07-06 — results below; lz4 adopted as optional
+> deployment guidance** (`docker/prod/docker-compose.zfs.yml`).
 > Branch: `jxom/zfs-zstd-experiment` off main `2f37b44`.
+
+## Results (2026-07-06, Hetzner 16c/30GB, Moderato ~1M blocks/lane, authed RPC)
+
+Pool: 150G file-backed vdev on the local root disk (ratios exact; ingest
+numbers carry some file-vdev overhead). Each lane synced ~1.0M blocks
+(~9M txs, ~20M logs) backward from the moving tip; block ranges differ
+slightly between lanes, ratios are per-lane exact.
+
+### Storage
+
+| lane | config | physical | zfs compressratio | GB per 1M blocks |
+|---|---|---:|---:|---:|
+| l0 | ext4 baseline | 23.4 GB | — | 23.2 |
+| l1 | ZFS 16k zstd-3 | 8.2 GB | **2.88x** | **8.1** |
+| l2 | ZFS 32k zstd-3 | 6.9 GB | **3.78x** | **6.9** |
+| l3 | ZFS 16k lz4 | 9.9 GB | 2.42x | 9.7 |
+
+Better than the 1.6–2.6x estimate; l2 live-syncs to the same footprint as
+OrioleDB's best *bulk-loaded* lane (6.1 GB/M). WAL side effect: with
+`full_page_writes=off` + `wal_recycle=off` the WAL dir holds ~4 MB residual
+vs 17 GB of recycled segments on the ext4 baseline.
+
+### Performance (shared_buffers=256MB — see caveat)
+
+| lane | ingest blk/s | vs l0 | point lookups | keyset pages |
+|---|---:|---:|---|---|
+| l0 | 1512 | — | 0.10–0.26 ms | 0.24–0.26 ms |
+| l1 | 493 | 33% | parity to +14% | 1.0–1.8 ms (4–7x) |
+| l2 | 272 | 18% | +35–58% | 1.5–2.6 ms (6–10x) |
+| l3 | 985 | **65%** | parity | 0.37–0.43 ms |
+
+Caveat: with `shared_buffers=256MB` nearly every page read goes through the
+compressed ARC and pays decompression; a production-sized buffer pool pulls
+hot-path reads back toward parity (validation run with 4GB below). The
+keyset regression is a read-amplification artifact of that config, worst for
+zstd-32k, minor for lz4.
+
+### Verdict vs gate
+
+- **Ratio gate (≥1.7x): pass** on every ZFS lane.
+- **Ingest gate (≥90%): fail** — zstd pays 3–5x, lz4 ~1.5x.
+- **OLTP gate (≤15%): pass for lz4 point lookups; fail for zstd keysets**
+  under the small-buffer config.
+
+**Decision:** not a default, and not a competitor to the tiered
+(partitioned PG + pg_clickhouse) design — that remains the production
+recommendation (capped ~7 GB with full-speed serving). ZFS **lz4** is
+adopted as *optional deployment guidance* for self-hosted monolithic
+deployments (no ClickHouse) and archive/replica boxes: 2.4x smaller at
+near-parity reads and ~⅔ ingest. zstd-3/16k is the documented alternative
+when storage cost dominates and sync speed only needs to beat the chain's
+real-time block rate. Deliverables: `docker/prod/docker-compose.zfs.yml`,
+`scripts/zfs/provision.sh`, and the "Postgres on ZFS" section in the README.
+
+Follow-up validation (same box): rerunning the lz4 lane with
+`shared_buffers=4GB` lifted ingest to ~1,606 blk/s — at or above the ext4
+baseline (1,512 blk/s, measured with 256MB buffers) — and pulled keyset
+pages back to 0.28–0.30 ms (from 0.37–0.43) with point lookups at parity
+(0.10–0.20 ms). The ingest/read penalties were dominated by the undersized
+buffer pool, not compression. The production override therefore defaults to
+`shared_buffers=4GB`.
+
+The experiment tooling (lane runner, measurement, OLTP suite) lived at
+`docker/zfs/` + `scripts/zfs/` through commit `a58efd2` and was removed
+after the experiment concluded; only the minimal production setup remains.
 
 ## Goal
 

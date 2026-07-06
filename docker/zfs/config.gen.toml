@@ -1,0 +1,17 @@
+[http]
+enabled = true
+port = 8080
+bind = "0.0.0.0"
+
+[prometheus]
+enabled = true
+port = 9090
+
+[[chains]]
+name = "local"
+chain_id = 1337
+rpc_url = "http://192.168.5.2:18545"
+pg_url = "postgres://tidx:tidx@postgres:5432/tidx"
+backfill = true
+batch_size = 500
+concurrency = 8
