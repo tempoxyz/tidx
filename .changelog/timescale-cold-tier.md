@@ -2,4 +2,4 @@
 tidx: minor
 ---
 
-Added an optional TimescaleDB columnstore cold tier (`[chains.timescale]`): fully-synced chunks behind the hot window are compressed in place, keeping cold data queryable in Postgres without an FDW.
+Added tiered storage on TimescaleDB (`[chains.timescale]`): chain tables partition into hot rowstore segments and highly compressed cold segments, keeping full history queryable in Postgres.
