@@ -22,6 +22,7 @@
 ## Features
 
 - **Dual Storage** — PostgreSQL (OLTP) + ClickHouse (OLAP), written in parallel
+- **TimescaleDB Cold Tier** — optional columnstore compression for historical chunks (4–7× smaller Postgres) with bloom-indexed point lookups; hot data stays plain rowstore
 - **Event/Function Decoding** — Query decoded events or function calldata by ABI signature (no pre-registration)
 - **HTTP API + CLI** — Query data via REST, SQL, or command line
 
@@ -31,6 +32,7 @@
 - [Overview](#overview)
 - [Installation](#installation)
 - [Configuration](#configuration)
+- [TimescaleDB Cold Tier](#timescaledb-cold-tier)
 - [CLI](#cli)
 - [HTTP API](#http-api)
 - [Tables](#tables)
@@ -56,25 +58,34 @@ The sync engine writes to both PostgreSQL and ClickHouse in parallel. Use the `e
                                               │  ?engine=...        │     (no pre-registration)
                                               └──────────┬──────────┘
                                                          │
-              ┌──────────────────────────────────────────┼──────────────────────────────────────────┐
-              │                                          │                                          │
-              ▼                                          ▼                                          ▼
-┌─────────────────────┐                    ┌─────────────────────┐                    ┌─────────────────────┐
-│    PostgreSQL       │                    │     ClickHouse      │                    │  Materialized Views │
-│    (OLTP)           │                    │      (OLAP)         │ ─────────────────► │  (auto-updated)     │
-│                     │                    │                     │                    │                     │
-└─────────┬───────────┘                    └─────────┬───────────┘                    └─────────────────────┘
-          │                                          │
-          └──────────────────┬───────────────────────┘
-                             │
-                     ┌───────┴───────┐
-                     │  Dual Sink    │
-                     └───────┬───────┘
-                             │
-                     ┌───────┴───────┐
-                     │  Sync Engine  │
-                     └───────────────┘
+                       ┌─────────────────────────────────┴─────────────────┐
+                       ▼                                                   ▼
+┌──────────────────────────────────────────────┐   ┌─────────────────────┐   ┌─────────────────────┐
+│     PostgreSQL · TimescaleDB (OLTP)          │   │     ClickHouse      │   │  Materialized Views │
+│                                              │   │      (OLAP)         │──►│  (auto-updated)     │
+│  blocks/txs/logs/receipts = hypertables      │   │                     │   │                     │
+│  chunked by block number                     │   └─────────┬───────────┘   └─────────────────────┘
+│                                              │             │
+│  block_num →                          tip    │             │
+│  ┌────────┐┌────────┐     ┌────────┐┌──────┐ │             │
+│  │ COLUMN ││ COLUMN │  …  │  ROW   ││ ROW  │ │             │
+│  │ STORE  ││ STORE  │     │ STORE  ││STORE │ │             │
+│  └────────┘└────────┘     └────────┘└──────┘ │             │
+│  cold: compressed 4–7×    hot: plain heap    │             │
+└──────────────────────┬───────────────────────┘             │
+                       │                                     │
+                       └──────────────────┬──────────────────┘
+                                          │
+                                  ┌───────┴───────┐
+                                  │  Dual Sink    │
+                                  └───────┬───────┘
+                                          │
+                                  ┌───────┴───────┐
+                                  │  Sync Engine  │
+                                  └───────────────┘
 ```
+
+With the [TimescaleDB cold tier](#timescaledb-cold-tier) disabled (the default), the PostgreSQL side is a plain heap database — same tables, same queries, no chunking.
 
 ```bash
 # PostgreSQL (OLTP) - last 10 transfers from an address
@@ -151,6 +162,13 @@ url = "http://clickhouse:8123"
 # Historical materialized-table repair runs after base ClickHouse backfill by default.
 repair_derived_on_startup = true
 
+# Optional: TimescaleDB columnstore cold tier (requires a timescaledb Postgres image)
+[chains.timescale]
+enabled = true
+chunk_blocks = 1000000        # blocks per hypertable chunk (locked at first boot)
+hot_window_blocks = 5000000   # trailing blocks kept uncompressed (full B-trees)
+interval_secs = 300           # maintenance pass interval
+
 [[chains]]
 name = "moderato"
 chain_id = 42431
@@ -181,10 +199,64 @@ pg_password_env = "TIDX_PG_PASSWORD"
 ├── api_pg_url              string    (optional)     Separate PostgreSQL URL for API (e.g., read replica)
 ├── api_pg_password_env     string    (optional)     Env var name for API PostgreSQL password
 ├── batch_size              u64       = 100          Blocks per RPC batch request
-└── [clickhouse]                                     ClickHouse OLAP settings
-    ├── enabled             bool      = false        Enable ClickHouse OLAP queries
-    ├── url                 string    = "http://clickhouse:8123"  ClickHouse HTTP URL
-    └── repair_derived_on_startup bool = true        Repair historical derived-table gaps on startup
+├── [clickhouse]                                     ClickHouse OLAP settings
+│   ├── enabled             bool      = false        Enable ClickHouse OLAP queries
+│   ├── url                 string    = "http://clickhouse:8123"  ClickHouse HTTP URL
+│   └── repair_derived_on_startup bool = true        Repair historical derived-table gaps on startup
+└── [timescale]                                      TimescaleDB columnstore cold tier
+    ├── enabled             bool      = false        Enable the cold tier (needs timescaledb extension)
+    ├── chunk_blocks        u64       = 1000000      Blocks per hypertable chunk (locked at first boot)
+    ├── hot_window_blocks   u64       = 5000000      Trailing blocks kept in uncompressed rowstore
+    └── interval_secs       u64       = 300          Seconds between compression maintenance passes
+```
+
+## TimescaleDB Cold Tier
+
+Run PostgreSQL on [TimescaleDB](https://github.com/timescale/timescaledb) and tidx compresses historical data in place. Tables become hypertables chunked by block number; a maintenance loop converts fully-synced chunks behind `tip − hot_window_blocks` to compressed columnstore (4–7× smaller, bloom sparse indexes on hashes/addresses/topics for point lookups). Hot chunks stay plain rowstore with the full B-tree set, the write path is unchanged, and everything remains one Postgres query surface — no FDW, no view layer. ClickHouse stays an independent OLAP option.
+
+### Setup
+
+1. **Run Postgres with the timescaledb extension.** With the prod compose stack, the overlay swaps the image and preloads the extension:
+
+   ```bash
+   cd docker/prod
+   docker compose -f docker-compose.yml -f docker-compose.timescale.yml up -d
+   ```
+
+   Self-managed: use a `timescale/timescaledb` image (2.28+, PG 16/17) or add the extension to your server, with `shared_preload_libraries=timescaledb`.
+
+2. **Enable the cold tier per chain** in `config.toml`:
+
+   ```toml
+   [chains.timescale]
+   enabled = true
+   chunk_blocks = 1000000        # locked at first boot
+   hot_window_blocks = 5000000
+   interval_secs = 300
+   ```
+
+3. **Start from a fresh database.** tidx converts tables to hypertables at first boot and refuses tables that already contain data — migrate existing deployments by re-syncing blue/green. On a stock Postgres server the flag degrades to a warning and tidx runs without the cold tier.
+
+Compression progress is visible in the logs (`Converted chunk to columnstore`, per-table sizes) and Prometheus (`tidx_timescale_chunks_compressed_total`, `tidx_timescale_cold_ceiling_block`).
+
+### Serving notes
+
+- Point lookups bounded to a block range, and everything in the hot window, perform as on stock Postgres. Unbounded lookups (e.g. tx by hash with no block filter) scan compressed-batch metadata across all chunks — milliseconds on moderate history, growing linearly. Prefer bounding lookups, probing the hot window first, or both.
+- For keyset pagination use a range bound plus row comparison — fast on both rowstore and columnstore:
+
+  ```sql
+  WHERE block_num <= $1 AND (block_num, log_idx) < ($1, $2)
+  ORDER BY block_num DESC, log_idx DESC LIMIT 25
+  ```
+
+- Reorg deletes and idempotent re-writes remain valid against compressed chunks (slower; reorgs only touch the rowstore window in practice).
+- Columnstore compression is a [TSL-licensed](https://github.com/timescale/timescaledb/blob/main/tsl/LICENSE-TIMESCALE) TimescaleDB feature: free to self-host, not resellable as a managed database.
+
+### Local testing
+
+```bash
+docker compose -f docker/local/docker-compose.yml up -d timescaledb
+cargo test --test timescale_test
 ```
 
 ## CLI
