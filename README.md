@@ -58,8 +58,8 @@ The sync engine writes to both PostgreSQL and ClickHouse in parallel. Use the `e
                                               │  ?engine=...        │
                                               └──────────┬──────────┘
                                                          │
-                       ┌─────────────────────────────────┴─────────────────┐
-                       ▼                                                   ▼
+                       ┌─────────────────────────────────┴────┐
+                       ▼                                      ▼
 ┌──────────────────────────────────────────────┐   ┌─────────────────────┐
 │     PostgreSQL · TimescaleDB (OLTP)          │   │     ClickHouse      │
 │                                              │   │      (OLAP)         │
