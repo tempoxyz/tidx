@@ -122,8 +122,7 @@ cargo build --release
 Self-hosted deployments can run Postgres on ZFS datasets with transparent
 lz4 compression for a **~2.4x smaller on-disk footprint** at near-parity
 read and ingest speed (measured on Moderato: 23.2 → 9.7 GB per 1M blocks;
-32k/zstd-3 reaches 3.8x for archive boxes at reduced ingest — details in
-[tasks/zfs-zstd-plan.md](tasks/zfs-zstd-plan.md)).
+32k/zstd-3 reaches 3.8x for archive boxes at reduced ingest).
 
 ```bash
 sudo scripts/zfs/provision.sh pool /dev/nvme1n1p3   # or: pool --file <path> <size>

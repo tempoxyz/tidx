@@ -11,8 +11,8 @@
 # Environment:
 #   POOL   pool name (default: tidx)
 #
-# Measured on Moderato (see tasks/zfs-zstd-plan.md): 16k/lz4 = 2.4x smaller
-# at near-parity reads; 32k/zstd-3 = 3.8x smaller for archive boxes.
+# Measured on Moderato: 16k/lz4 = 2.4x smaller at near-parity reads;
+# 32k/zstd-3 = 3.8x smaller for archive boxes.
 
 set -euo pipefail
 

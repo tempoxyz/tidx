@@ -1,7 +1,7 @@
 # Optional override: run Postgres on ZFS datasets with transparent lz4
 # compression (~2.4x smaller on-disk at near-parity read and ingest speed
-# with a production-sized shared_buffers; measured numbers in
-# tasks/zfs-zstd-plan.md).
+# with a production-sized shared_buffers; measured numbers in the README's
+# "Postgres on ZFS" section).
 #
 # Usage:
 #   sudo scripts/zfs/provision.sh pool /dev/nvme1n1p3

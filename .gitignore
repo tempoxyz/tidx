@@ -27,3 +27,6 @@ _
 
 out
 cache
+
+# Local planning docs
+/tasks/
