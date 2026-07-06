@@ -31,7 +31,13 @@ psql_ta() {
 }
 
 echo "building bench sample tables..."
-pg psql -U tidx -d tidx -v ON_ERROR_STOP=1 -f /oltp/00-samples.sql >/dev/null
+TX_COUNT=$(psql_ta "SELECT count(*) FROM txs")
+LOG_COUNT=$(psql_ta "SELECT count(*) FROM logs")
+TX_FRAC=$(awk -v n="$TX_COUNT" 'BEGIN{f=(n>0)?40000/n:1; print (f>1)?1:f}')
+LOG_FRAC=$(awk -v n="$LOG_COUNT" 'BEGIN{f=(n>0)?40000/n:1; print (f>1)?1:f}')
+pg psql -U tidx -d tidx -v ON_ERROR_STOP=1 \
+  -v tx_frac="$TX_FRAC" -v log_frac="$LOG_FRAC" \
+  -f /oltp/00-samples.sql >/dev/null
 
 MIN_BLOCK=$(psql_ta "SELECT min(num) FROM blocks")
 MAX_BLOCK=$(psql_ta "SELECT max(num) FROM blocks")
@@ -56,13 +62,13 @@ DARGS=(-D "min_block=$MIN_BLOCK" -D "max_block=$MAX_BLOCK" -D "n_txh=$N_TXH" -D 
 echo -e "shape\tlatency_avg_ms\ttps" >"$OUT/oltp.tsv"
 for shape in "${SHAPES[@]}"; do
   echo "shape: $shape (warmup + ${BENCH_SECS}s x ${BENCH_CLIENTS} clients)"
-  # warmup
-  pg pgbench -U tidx -d tidx -n -c 1 -t 20 "${DARGS[@]}" -f "/oltp/$shape.sql" >/dev/null 2>&1 || {
+  # warmup (NB: pgbench's -d is "debug", not dbname — dbname is positional)
+  pg pgbench -U tidx -n -c 1 -t 20 "${DARGS[@]}" -f "/oltp/$shape.sql" tidx >/dev/null 2>&1 || {
     echo "error: shape $shape failed; running once verbosely:" >&2
-    pg pgbench -U tidx -d tidx -n -c 1 -t 1 "${DARGS[@]}" -f "/oltp/$shape.sql" >&2 || true
+    pg pgbench -U tidx -n -c 1 -t 1 "${DARGS[@]}" -f "/oltp/$shape.sql" tidx >&2 || true
     exit 1
   }
-  out=$(pg pgbench -U tidx -d tidx -n -c "$BENCH_CLIENTS" -j "$BENCH_CLIENTS" -T "$BENCH_SECS" "${DARGS[@]}" -f "/oltp/$shape.sql")
+  out=$(pg pgbench -U tidx -n -c "$BENCH_CLIENTS" -j "$BENCH_CLIENTS" -T "$BENCH_SECS" "${DARGS[@]}" -f "/oltp/$shape.sql" tidx)
   lat=$(echo "$out" | awk '/latency average/ {print $(NF-1)}')
   tps=$(echo "$out" | awk '/^tps/ {print $3; exit}')
   echo -e "$shape\t${lat:-?}\t${tps:-?}" >>"$OUT/oltp.tsv"

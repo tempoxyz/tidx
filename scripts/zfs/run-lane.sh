@@ -152,14 +152,15 @@ done
 T1=$(date +%s)
 WALL=$((T1 - T0))
 
-echo "target reached: $LAST_COUNT+ blocks in ${WALL}s — stopping tidx"
+echo "target reached: $COUNT blocks in ${WALL}s — stopping tidx"
 compose stop tidx
 psql_ta "CHECKPOINT" >/dev/null || true
 sleep 10 # let the final ZFS txg commit settle before du
 
 {
   echo "SYNC_WALL_SECS=$WALL"
-  echo "SYNC_AVG_BLOCKS_PER_SEC=$(awk -v c="$TARGET_BLOCKS" -v t="$WALL" 'BEGIN{printf "%.1f", c/t}')"
+  echo "SYNC_BLOCKS=$COUNT"
+  echo "SYNC_AVG_BLOCKS_PER_SEC=$(awk -v c="$COUNT" -v t="$WALL" 'BEGIN{printf "%.1f", c/t}')"
 } >"$OUT/sync.env"
 
 # --- measure + bench ---------------------------------------------------------
