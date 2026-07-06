@@ -27,3 +27,7 @@ _
 
 out
 cache
+
+# ZFS storage experiment artifacts
+/results/
+docker/zfs/config.gen.toml
