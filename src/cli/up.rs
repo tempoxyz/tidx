@@ -242,6 +242,23 @@ async fn initialize_chain(
     info!(chain = %chain.name, "Running migrations...");
     db::run_migrations(&throttled_pool.pool).await?;
 
+    // TimescaleDB columnstore cold tier: convert chain tables to
+    // hypertables and start the chunk-compression maintenance loop.
+    if let Some(ts_config) = chain.timescale.as_ref().filter(|t| t.enabled) {
+        if tidx::sync::timescale::setup(&throttled_pool.pool, ts_config).await? {
+            info!(
+                chain = %chain.name,
+                hot_window_blocks = ts_config.hot_window_blocks,
+                "TimescaleDB columnstore cold tier enabled"
+            );
+            tokio::spawn(tidx::sync::timescale::run_maintenance_loop(
+                throttled_pool.pool.clone(),
+                chain.chain_id,
+                ts_config.clone(),
+            ));
+        }
+    }
+
     {
         let pool = throttled_pool.pool.clone();
         let chain_name = chain.name.clone();

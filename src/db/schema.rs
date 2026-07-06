@@ -70,9 +70,36 @@ pub async fn run_migrations(pool: &Pool) -> Result<()> {
 pub async fn run_post_startup_migrations(pool: &Pool) -> Result<()> {
     let conn = pool.get().await?;
 
-    conn.batch_execute(VIRTUAL_FORWARD_INDEX_SQL).await?;
-    conn.batch_execute(VIRTUAL_FORWARD_TX_HASH_INDEX_SQL)
-        .await?;
+    // TimescaleDB hypertables reject CREATE INDEX CONCURRENTLY; fall back
+    // to a plain CREATE INDEX there (fresh cold-tier deployments start
+    // empty, so the non-concurrent build is cheap).
+    let timescale = conn
+        .query_opt(
+            "SELECT 1 FROM pg_extension WHERE extname = 'timescaledb'",
+            &[],
+        )
+        .await?
+        .is_some();
+    let logs_is_hypertable = timescale
+        && conn
+            .query_opt(
+                "SELECT 1 FROM timescaledb_information.hypertables \
+                 WHERE hypertable_schema = 'public' AND hypertable_name = 'logs'",
+                &[],
+            )
+            .await?
+            .is_some();
+
+    if logs_is_hypertable {
+        conn.batch_execute(&VIRTUAL_FORWARD_INDEX_SQL.replace("CONCURRENTLY ", ""))
+            .await?;
+        conn.batch_execute(&VIRTUAL_FORWARD_TX_HASH_INDEX_SQL.replace("CONCURRENTLY ", ""))
+            .await?;
+    } else {
+        conn.batch_execute(VIRTUAL_FORWARD_INDEX_SQL).await?;
+        conn.batch_execute(VIRTUAL_FORWARD_TX_HASH_INDEX_SQL)
+            .await?;
+    }
 
     Ok(())
 }

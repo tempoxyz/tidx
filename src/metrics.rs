@@ -291,6 +291,21 @@ pub fn record_sink_error(sink: &str) {
     counter!("tidx_sink_errors_total", &labels).increment(1);
 }
 
+// Timescale columnstore cold-tier metrics
+
+pub fn record_timescale_chunk_compressed(chain_id: u64, table: &str) {
+    let labels = [
+        ("chain_id", chain_id.to_string()),
+        ("table", table.to_string()),
+    ];
+    counter!("tidx_timescale_chunks_compressed_total", &labels).increment(1);
+}
+
+pub fn set_timescale_cold_ceiling(chain_id: u64, block: u64) {
+    let labels = [("chain_id", chain_id.to_string())];
+    gauge!("tidx_timescale_cold_ceiling_block", &labels).set(block as f64);
+}
+
 // ClickHouse OLAP metrics
 
 pub fn record_clickhouse_query(duration: std::time::Duration, success: bool) {

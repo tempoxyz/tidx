@@ -19,6 +19,18 @@ backfill = true
 batch_size = 500
 concurrency = 8
 
+# TimescaleDB columnstore cold tier (optional)
+# Chain tables become hypertables chunked by block number; fully-populated
+# chunks behind the hot window are compressed to columnstore (bloom sparse
+# indexes keep point lookups fast on cold data). Requires a Postgres
+# server running the timescaledb extension (e.g. timescale/timescaledb
+# image) and a fresh database at first enable.
+# [chains.timescale]
+# enabled = true
+# chunk_blocks = 1000000        # blocks per chunk (locked at first boot)
+# hot_window_blocks = 5000000   # trailing blocks kept uncompressed
+# interval_secs = 300           # maintenance pass interval
+
 # ClickHouse OLAP engine (optional)
 # Data is written directly via HTTP batch inserts (JSONEachRow).
 # Queries go to the primary; failover instances are tried on connection failure.

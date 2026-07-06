@@ -155,6 +155,63 @@ pub struct ChainConfig {
     /// ClickHouse OLAP settings (for analytical queries)
     #[serde(default)]
     pub clickhouse: Option<ClickHouseConfig>,
+
+    /// TimescaleDB columnstore cold-tier settings.
+    /// Requires the Postgres server to run the timescaledb extension
+    /// (e.g. the `timescale/timescaledb` image).
+    #[serde(default)]
+    pub timescale: Option<TimescaleConfig>,
+}
+
+/// Configuration for the TimescaleDB columnstore cold tier.
+///
+/// Chain tables become hypertables chunked by block number. Chunks that
+/// fall fully behind the hot window are converted to columnstore
+/// (compressed, bloom/minmax sparse indexes) so cold data stays local in
+/// Postgres — point lookups, joins and pagination need no FDW or contract.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TimescaleConfig {
+    /// Enable the columnstore cold tier (default: false)
+    #[serde(default)]
+    pub enabled: bool,
+
+    /// Blocks per hypertable chunk (default: 1,000,000).
+    /// Locked in at first boot — changing it later only affects new chunks.
+    #[serde(default = "default_chunk_blocks")]
+    pub chunk_blocks: u64,
+
+    /// Trailing blocks kept in uncompressed rowstore chunks with full
+    /// B-tree indexes (default: 5,000,000). Fully-populated chunks
+    /// entirely behind `tip - hot_window_blocks` become columnstore.
+    #[serde(default = "default_hot_window_blocks")]
+    pub hot_window_blocks: u64,
+
+    /// Seconds between cold-tier maintenance passes (default: 300)
+    #[serde(default = "default_timescale_interval_secs")]
+    pub interval_secs: u64,
+}
+
+impl Default for TimescaleConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            chunk_blocks: default_chunk_blocks(),
+            hot_window_blocks: default_hot_window_blocks(),
+            interval_secs: default_timescale_interval_secs(),
+        }
+    }
+}
+
+fn default_chunk_blocks() -> u64 {
+    1_000_000
+}
+
+fn default_hot_window_blocks() -> u64 {
+    5_000_000
+}
+
+fn default_timescale_interval_secs() -> u64 {
+    300
 }
 
 /// Configuration for ClickHouse OLAP engine
@@ -475,6 +532,41 @@ mod tests {
     }
 
     #[test]
+    fn test_timescale_config_defaults() {
+        let toml_str = r#"
+            name = "test"
+            chain_id = 1
+            rpc_url = "http://localhost:8545"
+            pg_url = "postgres://localhost/test"
+
+            [timescale]
+            enabled = true
+            chunk_blocks = 100000
+        "#;
+
+        let config: ChainConfig = toml::from_str(toml_str).unwrap();
+        let ts = config.timescale.unwrap();
+
+        assert!(ts.enabled);
+        assert_eq!(ts.chunk_blocks, 100_000);
+        assert_eq!(ts.hot_window_blocks, 5_000_000);
+        assert_eq!(ts.interval_secs, 300);
+    }
+
+    #[test]
+    fn test_timescale_config_absent_by_default() {
+        let toml_str = r#"
+            name = "test"
+            chain_id = 1
+            rpc_url = "http://localhost:8545"
+            pg_url = "postgres://localhost/test"
+        "#;
+
+        let config: ChainConfig = toml::from_str(toml_str).unwrap();
+        assert!(config.timescale.is_none());
+    }
+
+    #[test]
     fn test_resolved_pg_url_without_env() {
         let config = ChainConfig {
             name: "test".to_string(),
@@ -491,6 +583,7 @@ mod tests {
             api_pg_url: None,
             api_pg_password_env: None,
             clickhouse: None,
+            timescale: None,
         };
 
         assert_eq!(
@@ -517,6 +610,7 @@ mod tests {
             api_pg_url: None,
             api_pg_password_env: None,
             clickhouse: None,
+            timescale: None,
         };
 
         let resolved = config.resolved_pg_url().unwrap();
@@ -542,6 +636,7 @@ mod tests {
             api_pg_url: None,
             api_pg_password_env: None,
             clickhouse: None,
+            timescale: None,
         };
 
         assert!(config.resolved_pg_url().is_err());
@@ -564,6 +659,7 @@ mod tests {
             api_pg_url: None,
             api_pg_password_env: None,
             clickhouse: None,
+            timescale: None,
         };
 
         let resolved = config.resolved_rpc_url().unwrap();
