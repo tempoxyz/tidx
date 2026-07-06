@@ -54,8 +54,9 @@ WAL_BYTES=$(psql_ta "SELECT pg_wal_lsn_diff(pg_current_wal_lsn(), '0/0')::int8")
 
 # --- physical sizes (what the disk actually holds) ---
 du_bytes() {
-  # GNU du has -b; BSD (macOS smoke runs) only has -k.
-  du -sb "$1" 2>/dev/null | cut -f1 && return
+  # Allocated bytes, NOT apparent size (du -b would report uncompressed bytes
+  # on ZFS). GNU: --block-size=1 counts allocation; BSD (macOS): -k * 1024.
+  du -s --block-size=1 "$1" 2>/dev/null | cut -f1 && return
   du -sk "$1" 2>/dev/null | awk '{print $1 * 1024}'
 }
 DATA_PHYS=$(du_bytes "$TIDX_PGDATA" || echo 0)
@@ -95,14 +96,21 @@ fi
 } >"$OUT/raw.env"
 
 # --- human summary ---
+# Prefer the authoritative ZFS accounting (used/logicalused/compressratio)
+# when the data dir is a ZFS dataset; fall back to du + pg_database_size.
+if [ -n "$ZFS_DATA_LINE" ]; then
+  DATA_PHYS=$(echo "$ZFS_DATA_LINE" | awk '{print $2}')
+  RATIO=$(echo "$ZFS_DATA_LINE" | awk '{print $4 "x (zfs compressratio)"}')
+else
+  RATIO="n/a"
+  if [ "$DATA_PHYS" -gt 0 ]; then
+    RATIO=$(awk -v l="$DB_LOGICAL" -v p="$DATA_PHYS" 'BEGIN{printf "%.2fx (db-logical/du)", l/p}')
+  fi
+fi
 gb() { awk -v b="$1" 'BEGIN{printf "%.2f", b/1e9}'; }
 PER_M="n/a"
 if [ "$BLOCKS" -gt 0 ]; then
   PER_M=$(awk -v b="$DATA_PHYS" -v n="$BLOCKS" 'BEGIN{printf "%.2f", b/n*1e6/1e9}')
-fi
-RATIO="n/a"
-if [ "$DATA_PHYS" -gt 0 ]; then
-  RATIO=$(awk -v l="$DB_LOGICAL" -v p="$DATA_PHYS" 'BEGIN{printf "%.2f", l/p}')
 fi
 
 {
@@ -116,7 +124,7 @@ fi
   echo "| physical data dir | $(gb "$DATA_PHYS") GB |"
   echo "| physical WAL dir | $(gb "$WAL_PHYS") GB |"
   echo "| WAL written (lsn) | $(gb "$WAL_BYTES") GB |"
-  echo "| **compression ratio (logical/physical)** | **${RATIO}x** |"
+  echo "| **compression ratio** | **${RATIO}** |"
   echo "| **physical GB per 1M blocks** | **$PER_M** |"
   echo "| zfs data dataset | ${ZFS_DATA_LINE:-n/a} |"
   echo "| zfs wal dataset | ${ZFS_WAL_LINE:-n/a} |"

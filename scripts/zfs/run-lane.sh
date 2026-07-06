@@ -72,7 +72,12 @@ else
   [ "$(id -u)" = "0" ] || { echo "error: ZFS lanes need root (sudo -E)" >&2; exit 1; }
   export PG_FULL_PAGE_WRITES=off PG_WAL_INIT_ZERO=off PG_WAL_RECYCLE=off
   # provision.sh prints "export TIDX_PGDATA=..." lines; adopt them.
-  eval "$(POOL="$POOL" "$SCRIPT_DIR/provision.sh" dataset "$LANE" "$RS" "$COMP" | grep '^export ')"
+  PROV_OUT="$(POOL="$POOL" "$SCRIPT_DIR/provision.sh" dataset "$LANE" "$RS" "$COMP")" || {
+    echo "error: dataset provisioning failed (rerun after: sudo $SCRIPT_DIR/provision.sh destroy $LANE)" >&2
+    exit 1
+  }
+  eval "$(printf '%s\n' "$PROV_OUT" | grep '^export ')"
+  [ -n "${TIDX_PGDATA:-}" ] || { echo "error: provision.sh did not report mountpoints" >&2; exit 1; }
 fi
 
 [ -n "$(ls -A "$TIDX_PGDATA" 2>/dev/null)" ] && {
