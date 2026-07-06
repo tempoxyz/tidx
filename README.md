@@ -54,17 +54,17 @@ The sync engine writes to both PostgreSQL and ClickHouse in parallel. Use the `e
                                               ┌─────────────────────┐
                                               │      /query         │
                                               │                     │
-                                              │  ?signature=...     │◄─── Lazy event decoding
-                                              │  ?engine=...        │     (no pre-registration)
+                                              │  ?signature=...     │
+                                              │  ?engine=...        │
                                               └──────────┬──────────┘
                                                          │
                        ┌─────────────────────────────────┴─────────────────┐
                        ▼                                                   ▼
-┌──────────────────────────────────────────────┐   ┌─────────────────────┐   ┌─────────────────────┐
-│     PostgreSQL · TimescaleDB (OLTP)          │   │     ClickHouse      │   │  Materialized Views │
-│                                              │   │      (OLAP)         │──►│  (auto-updated)     │
-│  blocks/txs/logs/receipts = hypertables      │   │                     │   │                     │
-│  chunked by block number                     │   └─────────┬───────────┘   └─────────────────────┘
+┌──────────────────────────────────────────────┐   ┌─────────────────────┐
+│     PostgreSQL · TimescaleDB (OLTP)          │   │     ClickHouse      │
+│                                              │   │      (OLAP)         │
+│  blocks/txs/logs/receipts = hypertables      │   │                     │
+│  chunked by block number                     │   └─────────┬───────────┘
 │                                              │             │
 │  block_num →                          tip    │             │
 │  ┌────────┐┌────────┐     ┌────────┐┌──────┐ │             │
