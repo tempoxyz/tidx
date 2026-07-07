@@ -185,20 +185,40 @@ async fn ensure_database_exists(database_url: &str) -> Result<()> {
         }
     });
 
-    // Check if database exists
-    let exists: bool = client
+    // Check if database exists. Some managed Postgres services restrict
+    // catalog access or database creation; in that case, let the target
+    // connection below decide whether the configured database is usable.
+    let exists: bool = match client
         .query_one(
             "SELECT EXISTS(SELECT 1 FROM pg_database WHERE datname = $1)",
             &[&db_name],
         )
-        .await?
-        .get(0);
+        .await
+    {
+        Ok(row) => row.get(0),
+        Err(e) => {
+            tracing::warn!(
+                database = %db_name,
+                error = %e,
+                "Could not check whether database exists; continuing with configured database URL"
+            );
+            return Ok(());
+        }
+    };
 
     if !exists {
         // Use format! because CREATE DATABASE doesn't support parameterized queries
         let create_sql = format!("CREATE DATABASE \"{}\"", db_name.replace('"', "\"\""));
-        client.execute(&create_sql, &[]).await?;
-        tracing::info!(database = %db_name, "Created database");
+        match client.execute(&create_sql, &[]).await {
+            Ok(_) => tracing::info!(database = %db_name, "Created database"),
+            Err(e) => {
+                tracing::warn!(
+                    database = %db_name,
+                    error = %e,
+                    "Could not create database; continuing with configured database URL"
+                );
+            }
+        }
     }
 
     Ok(())

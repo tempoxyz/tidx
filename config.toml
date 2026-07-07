@@ -24,7 +24,8 @@ concurrency = 8
 # chunks behind the hot window are compressed to columnstore (bloom sparse
 # indexes keep point lookups fast on cold data). Requires a Postgres
 # server running the timescaledb extension (e.g. timescale/timescaledb
-# image) and a fresh database at first enable.
+# image) and a fresh database at first enable. On Tiger Cloud, use the
+# database name from the service connection string and one service per chain.
 # [chains.timescale]
 # enabled = true
 # chunk_blocks = 1000000        # blocks per chunk (locked at first boot)

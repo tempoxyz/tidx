@@ -154,7 +154,7 @@ pub async fn setup(pool: &Pool, cfg: &TimescaleConfig) -> Result<bool> {
                  timescaledb.enable_columnstore, \
                  timescaledb.orderby = '{orderby}', \
                  timescaledb.segmentby = '', \
-                 timescaledb.index = '{index}')"
+                 timescaledb.sparse_index = '{index}')"
         ))
         .await
         .with_context(|| format!("configuring columnstore settings on {table}"))?;

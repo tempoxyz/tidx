@@ -234,6 +234,14 @@ Self-managed deployments:
 
 3. **Start from a fresh database.** tidx converts tables to hypertables at first boot and refuses tables that already contain data — migrate existing deployments by re-syncing blue/green. On a stock Postgres server the flag degrades to a warning and tidx runs without the cold tier.
 
+Tiger Cloud deployments:
+
+1. **Use the service database from the Tiger Cloud connection string.** Tiger Cloud does not allow arbitrary `CREATE DATABASE` names such as `tidx_mainnet`; point `pg_url` at the database Tiger provisions for the service instead. tidx treats database creation as best-effort on managed Postgres and continues with the configured URL if the platform blocks it.
+
+2. **Use one Tiger Cloud service per chain.** tidx tables are chain-local and do not include `chain_id`, so `mainnet` and `moderato` cannot share the same database/schema today.
+
+3. **Use a direct connection for cold-tier maintenance.** Chunk conversion can run longer than normal API statements; avoid transaction poolers for the sync process that runs `convert_to_columnstore`.
+
 Compression progress is visible in the logs (`Converted chunk to columnstore`, per-table sizes) and Prometheus (`tidx_timescale_chunks_compressed_total`, `tidx_timescale_cold_ceiling_block`).
 
 ### Serving notes
