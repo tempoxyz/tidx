@@ -16,7 +16,8 @@ pub struct Args {
     #[arg(short, long, default_value = "config.toml")]
     pub config: PathBuf,
 
-    /// Force query engine (postgres, tiered, clickhouse). Auto-routes if not specified.
+    /// Force query engine (postgres, tiered, postgres-via-clickhouse,
+    /// clickhouse). Auto-routes if not specified.
     #[arg(short, long)]
     pub engine: Option<String>,
 
@@ -73,8 +74,9 @@ pub async fn run(args: Args) -> Result<()> {
         limit: args.limit,
     };
 
-    // CLI supports the PostgreSQL-backed engines (postgres, tiered).
-    // For ClickHouse OLAP queries, use the HTTP API with engine=clickhouse
+    // CLI supports the PostgreSQL-backed engines (postgres, tiered,
+    // postgres-via-clickhouse). For ClickHouse OLAP queries, use the HTTP
+    // API with engine=clickhouse
     if args.engine.as_deref() == Some("clickhouse") {
         anyhow::bail!(
             "ClickHouse engine not available in CLI. Use HTTP API with engine=clickhouse for OLAP queries."
@@ -82,7 +84,11 @@ pub async fn run(args: Args) -> Result<()> {
     }
 
     let sig_strs: Vec<&str> = args.signature.iter().map(String::as_str).collect();
-    let result = if args.engine.as_deref() == Some("tiered") {
+    let result = if args.engine.as_deref() == Some("postgres-via-clickhouse") {
+        // PostgreSQL over ch.* pg_clickhouse foreign tables (full archive).
+        service::execute_query_postgres_via_clickhouse(&pool, &args.sql, &sig_strs, &options)
+            .await?
+    } else if args.engine.as_deref() == Some("tiered") {
         // Best-effort ClickHouse engine for the tiered fast path's cold arm;
         // without it, eligible queries still fall back to the FDW views.
         let clickhouse = chain

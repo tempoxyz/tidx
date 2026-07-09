@@ -350,7 +350,9 @@ pub struct QueryParams {
     /// Maximum rows to return
     #[serde(default = "default_limit")]
     limit: i64,
-    /// Force a specific engine: "postgres" or "clickhouse"
+    /// Force a specific engine: "postgres", "clickhouse", "tiered", or
+    /// "postgres-via-clickhouse" (PostgreSQL over the ch.* pg_clickhouse
+    /// foreign tables — full ClickHouse archive, no hot PostgreSQL arm)
     #[serde(default)]
     engine: Option<String>,
 }
@@ -387,7 +389,9 @@ async fn handle_query(
     let signatures = extract_signatures(uri.query());
 
     if params.live {
-        if let Some(engine @ ("clickhouse" | "tiered")) = params.engine.as_deref() {
+        if let Some(engine @ ("clickhouse" | "tiered" | "postgres-via-clickhouse")) =
+            params.engine.as_deref()
+        {
             return ApiError::BadRequest(format!(
                 "engine={engine} is not supported with live=true (use PostgreSQL for real-time streaming)"
             ))
@@ -421,6 +425,7 @@ async fn handle_query_once(
     // Route to appropriate engine
     let use_clickhouse = matches!(params.engine.as_deref(), Some("clickhouse"));
     let use_tiered = matches!(params.engine.as_deref(), Some("tiered"));
+    let use_pg_via_ch = matches!(params.engine.as_deref(), Some("postgres-via-clickhouse"));
 
     let sigs: Vec<&str> = signatures.iter().map(String::as_str).collect();
 
@@ -467,6 +472,18 @@ async fn handle_query_once(
                 ApiError::QueryError(e.to_string())
             }
         })?
+    } else if use_pg_via_ch {
+        // PostgreSQL over the ch.* pg_clickhouse foreign tables: full
+        // ClickHouse archive, no hot PostgreSQL arm.
+        crate::service::execute_query_postgres_via_clickhouse(&pool, &params.sql, &sigs, &options)
+            .await
+            .map_err(|e| {
+                if e.to_string().contains("timeout") {
+                    ApiError::Timeout
+                } else {
+                    ApiError::QueryError(e.to_string())
+                }
+            })?
     } else {
         // Use PostgreSQL
         crate::service::execute_query_postgres(&pool, &params.sql, &sigs, &options)

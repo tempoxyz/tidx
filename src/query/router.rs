@@ -10,6 +10,9 @@ pub enum QueryEngine {
     /// PostgreSQL over `tiered.*` views: hot PG window + ClickHouse archive
     /// via pg_clickhouse (full history through one PG connection)
     Tiered,
+    /// PostgreSQL over `ch.*` pg_clickhouse foreign tables: full ClickHouse
+    /// archive through the PostgreSQL planner, no hot PostgreSQL arm
+    PostgresViaClickHouse,
 }
 
 impl fmt::Display for QueryEngine {
@@ -18,6 +21,7 @@ impl fmt::Display for QueryEngine {
             Self::ClickHouse => write!(f, "clickhouse"),
             Self::Postgres => write!(f, "postgres"),
             Self::Tiered => write!(f, "tiered"),
+            Self::PostgresViaClickHouse => write!(f, "postgres-via-clickhouse"),
         }
     }
 }

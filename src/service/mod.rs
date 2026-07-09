@@ -501,6 +501,44 @@ async fn execute_query_tiered_fdw(
     .await
 }
 
+/// PostgreSQL executing entirely over the `ch.*` pg_clickhouse foreign
+/// tables: full ClickHouse archive through the PostgreSQL planner, no hot
+/// PostgreSQL arm. Benchmarking reference against `tiered`.
+pub async fn execute_query_postgres_via_clickhouse(
+    pool: &Pool,
+    sql: &str,
+    signatures: &[&str],
+    options: &QueryOptions,
+) -> Result<QueryResult> {
+    // Without the ch.* schema, bare table names would silently resolve to
+    // public.* (plain PostgreSQL) — refuse instead.
+    if !crate::db::tiered::is_bootstrapped(pool).await? {
+        return Err(anyhow!(
+            "postgres-via-clickhouse requires tiered storage (ch.* foreign tables); enable tiered mode for this chain"
+        ));
+    }
+
+    // ch.* exposes the same ClickHouse text representation as tiered.*.
+    let sql = apply_event_signature_ctes_tiered(sql, signatures)?;
+    validate_query(&sql)?;
+    let sql = append_limit_if_missing(&sql, options.limit);
+
+    run_pg_query(
+        pool,
+        &sql,
+        options,
+        &[
+            // Core tables resolve to ch.* FDW; public supplies abi_string().
+            "SET LOCAL search_path = ch, public",
+            // ch.* carries prune-boundary CHECKs for the tiered views; the
+            // archive holds full history, so never let them prune scans here.
+            "SET LOCAL constraint_exclusion = off",
+        ],
+        "postgres-via-clickhouse",
+    )
+    .await
+}
+
 /// Run prepared SQL on PostgreSQL and stream the result rows into a
 /// [`QueryResult`]. `session_setup` statements (e.g. `SET LOCAL …`) run
 /// inside the transaction before the query.
