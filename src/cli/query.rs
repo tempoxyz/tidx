@@ -35,7 +35,7 @@ pub struct Args {
 
     /// Where the data lives: postgres (hot window), clickhouse (full archive
     /// via pg_clickhouse), or postgres-clickhouse (tiered: hot PG window +
-    /// cold ClickHouse archive). Defaults to the engine's native store.
+    /// cold ClickHouse archive). Defaults to postgres-clickhouse.
     #[arg(long)]
     pub source: Option<String>,
 

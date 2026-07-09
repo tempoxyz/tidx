@@ -357,7 +357,8 @@ pub struct QueryParams {
     /// Where the data lives: "postgres" (hot window), "clickhouse" (full
     /// archive via pg_clickhouse when engine=postgres), or
     /// "postgres-clickhouse" (tiered: hot PG window + cold ClickHouse
-    /// archive). Defaults to the engine's native store.
+    /// archive). Defaults to "postgres-clickhouse" for engine=postgres and
+    /// "clickhouse" for engine=clickhouse.
     #[serde(default)]
     source: Option<String>,
 }
@@ -393,12 +394,21 @@ async fn handle_query(
 ) -> Response {
     let signatures = extract_signatures(uri.query());
 
-    let route =
-        match crate::query::QueryRoute::resolve(params.engine.as_deref(), params.source.as_deref())
-        {
-            Ok(route) => route,
-            Err(e) => return ApiError::BadRequest(e).into_response(),
-        };
+    // Live streaming serves the hot PostgreSQL window, so bare ?live=true
+    // stays on plain PostgreSQL instead of the tiered default source.
+    let source = if params.live
+        && params.source.is_none()
+        && matches!(params.engine.as_deref(), None | Some("postgres"))
+    {
+        Some("postgres")
+    } else {
+        params.source.as_deref()
+    };
+
+    let route = match crate::query::QueryRoute::resolve(params.engine.as_deref(), source) {
+        Ok(route) => route,
+        Err(e) => return ApiError::BadRequest(e).into_response(),
+    };
 
     if params.live {
         if route != crate::query::QueryRoute::Postgres {

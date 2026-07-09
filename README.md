@@ -259,7 +259,7 @@ Options:
   -u, --url <URL>              TIDX HTTP API URL (e.g., http://localhost:8080)
   -n, --chain-id <CHAIN_ID>   Chain ID to query (uses first chain if not specified)
   -e, --engine <ENGINE>        Query engine (postgres, clickhouse)
-      --source <SOURCE>        Data source (postgres, clickhouse, postgres-clickhouse)
+      --source <SOURCE>        Data source (postgres, clickhouse, postgres-clickhouse) [default: postgres-clickhouse]
   -f, --format <FORMAT>        Output format (table, json, csv, toon) [default: table]
   -l, --limit <LIMIT>          Maximum rows to return [default: 10000]
   -s, --signature <SIGNATURE>  Event signature to create a CTE
@@ -362,7 +362,7 @@ GET  /query                                              Execute SQL query
      ?chainId               number    (required)         Chain ID to query
      ?signature             string                       Event signature for CTE generation
      ?engine                string    = postgres         Query engine: postgres or clickhouse
-     ?source                string    = engine native    Data source: postgres, clickhouse, or postgres-clickhouse
+     ?source                string    = postgres-clickhouse  Data source: postgres, clickhouse, or postgres-clickhouse
      ?live                  bool      = false            Enable SSE streaming (postgres only)
 GET  /views?chainId=                                     List materialized views
 GET  /views/{name}?chainId=                              Get view details

@@ -5,12 +5,12 @@ use std::fmt;
 ///
 /// Resolved from the user-facing `engine` and `source` parameters:
 ///
-/// | `engine`     | `source`              | route                   |
-/// |--------------|-----------------------|-------------------------|
-/// | `postgres`*  | `postgres`*           | `Postgres`              |
-/// | `postgres`*  | `clickhouse`          | `PostgresViaClickHouse` |
-/// | `postgres`*  | `postgres-clickhouse` | `Tiered`                |
-/// | `clickhouse` | `clickhouse`*         | `ClickHouse`            |
+/// | `engine`     | `source`               | route                   |
+/// |--------------|------------------------|-------------------------|
+/// | `postgres`*  | `postgres`             | `Postgres`              |
+/// | `postgres`*  | `clickhouse`           | `PostgresViaClickHouse` |
+/// | `postgres`*  | `postgres-clickhouse`* | `Tiered`                |
+/// | `clickhouse` | `clickhouse`*          | `ClickHouse`            |
 ///
 /// `*` = default when omitted. `engine=tiered` is accepted as a legacy alias
 /// for `engine=postgres&source=postgres-clickhouse`.
@@ -41,7 +41,7 @@ impl QueryRoute {
             };
         }
         match engine.unwrap_or("postgres") {
-            "postgres" => match source.unwrap_or("postgres") {
+            "postgres" => match source.unwrap_or("postgres-clickhouse") {
                 "postgres" => Ok(Self::Postgres),
                 "clickhouse" => Ok(Self::PostgresViaClickHouse),
                 "postgres-clickhouse" => Ok(Self::Tiered),
@@ -85,8 +85,8 @@ mod tests {
     fn resolves_engine_source_matrix() {
         use QueryRoute::*;
         let cases = [
-            (None, None, Postgres),
-            (Some("postgres"), None, Postgres),
+            (None, None, Tiered),
+            (Some("postgres"), None, Tiered),
             (Some("postgres"), Some("postgres"), Postgres),
             (None, Some("postgres"), Postgres),
             (Some("postgres"), Some("clickhouse"), PostgresViaClickHouse),

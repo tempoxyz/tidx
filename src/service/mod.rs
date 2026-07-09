@@ -298,7 +298,14 @@ pub async fn execute_query_tiered(
     signatures: &[&str],
     options: &QueryOptions,
 ) -> Result<QueryResult> {
-    match try_execute_tiered_split(pool, clickhouse, chain_id, sql, signatures, options).await? {
+    let (boundary, _) = crate::db::tiered::fetch_prune_boundary(pool, chain_id).await?;
+    if boundary <= 0 {
+        // Nothing pruned yet: full history is hot in PostgreSQL.
+        let mut result = execute_query_postgres(pool, sql, signatures, options).await?;
+        result.engine = Some("tiered".to_string());
+        return Ok(result);
+    }
+    match try_execute_tiered_split(pool, clickhouse, boundary, sql, signatures, options).await? {
         Some(result) => Ok(result),
         None => execute_query_tiered_fdw(pool, sql, signatures, options).await,
     }
@@ -308,7 +315,7 @@ pub async fn execute_query_tiered(
 async fn try_execute_tiered_split(
     pool: &Pool,
     clickhouse: Option<&crate::clickhouse::ClickHouseEngine>,
-    chain_id: u64,
+    boundary: i64,
     sql: &str,
     signatures: &[&str],
     options: &QueryOptions,
@@ -338,14 +345,6 @@ async fn try_execute_tiered_split(
     // API cap; the split would silently cap. Let the fallback decide.
     if plan.sql_limit.is_some_and(|l| l > options.limit) {
         return Ok(None);
-    }
-
-    let (boundary, _) = crate::db::tiered::fetch_prune_boundary(pool, chain_id).await?;
-    if boundary <= 0 {
-        // Nothing pruned yet: full history is hot in PostgreSQL.
-        let mut result = execute_query_postgres(pool, sql, signatures, options).await?;
-        result.engine = Some("tiered".to_string());
-        return Ok(Some(result));
     }
 
     let eff_limit = plan
