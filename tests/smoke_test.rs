@@ -620,6 +620,7 @@ async fn test_sync_state_save_and_load() {
         backfill_num: Some(100),
         sync_rate: None,
         started_at: Some(chrono::Utc::now()),
+        pruned_below: 0,
     };
 
     save_sync_state(&db.pool, &state)
@@ -648,6 +649,7 @@ async fn test_sync_state_methods() {
         backfill_num: Some(100),
         sync_rate: None,
         started_at: None,
+        pruned_below: 0,
     };
 
     // Test backfill methods

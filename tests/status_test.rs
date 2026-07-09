@@ -171,6 +171,7 @@ async fn test_status_uses_in_memory_gap_results() {
             backfill_num: Some(1),
             sync_rate: None,
             started_at: Some(chrono::Utc::now()),
+            pruned_below: 0,
         },
     )
     .await
@@ -226,6 +227,7 @@ async fn test_get_all_status_uses_single_pool_connection() {
             backfill_num: Some(1),
             sync_rate: None,
             started_at: Some(chrono::Utc::now()),
+            pruned_below: 0,
         },
     )
     .await

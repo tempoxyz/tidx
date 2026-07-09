@@ -16,7 +16,7 @@ async fn test_detect_all_gaps_empty_table() {
     db.truncate_all().await;
 
     // Empty table with tip_num > 0 should report entire range as gap (starting from block 1)
-    let gaps = detect_all_gaps(&db.pool, 100)
+    let gaps = detect_all_gaps(&db.pool, 1, 100)
         .await
         .expect("Failed to detect gaps");
 
@@ -35,7 +35,7 @@ async fn test_detect_all_gaps_empty_table_tip_zero() {
     db.truncate_all().await;
 
     // Empty table with tip_num = 0 has no gaps
-    let gaps = detect_all_gaps(&db.pool, 0)
+    let gaps = detect_all_gaps(&db.pool, 1, 0)
         .await
         .expect("Failed to detect gaps");
 
@@ -70,7 +70,7 @@ async fn test_detect_all_gaps_genesis_missing() {
         .expect("Failed to insert block");
     }
 
-    let gaps = detect_all_gaps(&db.pool, 10)
+    let gaps = detect_all_gaps(&db.pool, 1, 10)
         .await
         .expect("Failed to detect gaps");
 
@@ -103,7 +103,7 @@ async fn test_detect_all_gaps_genesis_present() {
         .expect("Failed to insert block");
     }
 
-    let gaps = detect_all_gaps(&db.pool, 10)
+    let gaps = detect_all_gaps(&db.pool, 1, 10)
         .await
         .expect("Failed to detect gaps");
 
@@ -139,7 +139,7 @@ async fn test_detect_all_gaps_multiple_gaps_sorted_by_recency() {
         .expect("Failed to insert block");
     }
 
-    let gaps = detect_all_gaps(&db.pool, 16)
+    let gaps = detect_all_gaps(&db.pool, 1, 16)
         .await
         .expect("Failed to detect gaps");
 
@@ -180,7 +180,7 @@ async fn test_detect_all_gaps_single_block_gap() {
         .expect("Failed to insert block");
     }
 
-    let gaps = detect_all_gaps(&db.pool, 5)
+    let gaps = detect_all_gaps(&db.pool, 1, 5)
         .await
         .expect("Failed to detect gaps");
 
@@ -210,7 +210,7 @@ async fn test_detect_all_gaps_only_genesis() {
     .expect("Failed to insert block");
 
     // With tip = 0, no gaps
-    let gaps = detect_all_gaps(&db.pool, 0)
+    let gaps = detect_all_gaps(&db.pool, 1, 0)
         .await
         .expect("Failed to detect gaps");
     assert!(
@@ -225,7 +225,7 @@ async fn test_detect_all_gaps_only_genesis() {
     // there's no gap from genesis. The gap from 1-10 would be detected as a gap between
     // existing blocks if we had block 11+. This is correct behavior - gap detection finds
     // discontinuities, not "how far we've synced."
-    let gaps = detect_all_gaps(&db.pool, 10)
+    let gaps = detect_all_gaps(&db.pool, 1, 10)
         .await
         .expect("Failed to detect gaps");
     // No gaps detected because there are no discontinuities from block 0 onward that are
@@ -262,7 +262,7 @@ async fn test_detect_all_gaps_filters_beyond_tip() {
     }
 
     // With tip = 10, should only show gaps up to block 10
-    let gaps = detect_all_gaps(&db.pool, 10)
+    let gaps = detect_all_gaps(&db.pool, 1, 10)
         .await
         .expect("Failed to detect gaps");
 
@@ -302,7 +302,7 @@ async fn test_detect_all_gaps_large_gap_range() {
         .expect("Failed to insert block");
     }
 
-    let gaps = detect_all_gaps(&db.pool, 1000)
+    let gaps = detect_all_gaps(&db.pool, 1, 1000)
         .await
         .expect("Failed to detect gaps");
 
@@ -345,7 +345,7 @@ async fn test_detect_gaps_vs_detect_all_gaps() {
     assert_eq!(gaps[0], (7, 9), "detect_gaps should find 7-9");
 
     // detect_all_gaps also includes gap from block 1
-    let all_gaps = detect_all_gaps(&db.pool, 11).await.expect("Failed");
+    let all_gaps = detect_all_gaps(&db.pool, 1, 11).await.expect("Failed");
     assert_eq!(
         all_gaps.len(),
         2,
@@ -389,7 +389,7 @@ async fn test_gap_order_prioritizes_recent() {
         .expect("Failed to insert block");
     }
 
-    let gaps = detect_all_gaps(&db.pool, 100)
+    let gaps = detect_all_gaps(&db.pool, 1, 100)
         .await
         .expect("Failed to detect gaps");
 
@@ -426,7 +426,7 @@ async fn test_gap_detection_with_realtime_jump() {
         .expect("Failed to insert block");
     }
 
-    let gaps = detect_all_gaps(&db.pool, 1000)
+    let gaps = detect_all_gaps(&db.pool, 1, 1000)
         .await
         .expect("Failed to detect gaps");
 
@@ -463,7 +463,7 @@ async fn test_gap_detection_consecutive_single_block_gaps() {
         .expect("Failed to insert block");
     }
 
-    let gaps = detect_all_gaps(&db.pool, 10)
+    let gaps = detect_all_gaps(&db.pool, 1, 10)
         .await
         .expect("Failed to detect gaps");
 
@@ -502,7 +502,7 @@ async fn test_gap_size_calculation() {
         .expect("Failed to insert block");
     }
 
-    let gaps = detect_all_gaps(&db.pool, 30)
+    let gaps = detect_all_gaps(&db.pool, 1, 30)
         .await
         .expect("Failed to detect gaps");
 
@@ -550,7 +550,7 @@ async fn test_fully_synced_returns_empty_gaps() {
         .expect("Failed to insert block");
     }
 
-    let gaps = detect_all_gaps(&db.pool, 100)
+    let gaps = detect_all_gaps(&db.pool, 1, 100)
         .await
         .expect("Failed to detect gaps");
 
@@ -710,7 +710,7 @@ async fn test_has_gaps_agrees_with_detect_all_gaps() {
     }
 
     // has_gaps and detect_all_gaps should agree
-    let gaps = detect_all_gaps(&db.pool, 12).await.unwrap();
+    let gaps = detect_all_gaps(&db.pool, 1, 12).await.unwrap();
     let has = has_gaps(&db.pool, 1, 12).await.unwrap();
 
     assert!(!gaps.is_empty(), "detect_all_gaps should find gaps");
@@ -733,7 +733,7 @@ async fn test_has_gaps_agrees_with_detect_all_gaps() {
         .unwrap();
     }
 
-    let gaps = detect_all_gaps(&db.pool, 12).await.unwrap();
+    let gaps = detect_all_gaps(&db.pool, 1, 12).await.unwrap();
     let has = has_gaps(&db.pool, 1, 12).await.unwrap();
 
     assert!(gaps.is_empty(), "detect_all_gaps should find no gaps");

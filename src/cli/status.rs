@@ -260,7 +260,8 @@ async fn print_json_status(config: &Config) -> Result<()> {
                 Ok(pool) => {
                     let state = load_sync_state(&pool, chain.chain_id).await.ok().flatten();
                     let tip = state.as_ref().map(|s| s.tip_num).unwrap_or(0);
-                    let gaps = detect_all_gaps(&pool, tip).await.unwrap_or_default();
+                    let floor = state.as_ref().map(|s| s.prune_floor()).unwrap_or(1);
+                    let gaps = detect_all_gaps(&pool, floor, tip).await.unwrap_or_default();
                     (state, gaps)
                 }
                 Err(_) => (None, vec![]),
