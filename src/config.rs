@@ -190,6 +190,18 @@ pub struct ClickHouseConfig {
     /// Scan and repair historical derived-table gaps on startup (default: true).
     #[serde(default = "default_true")]
     pub repair_derived_on_startup: bool,
+
+    /// Create the database with `ENGINE = Replicated` and MergeTree-family
+    /// tables as their `Replicated*` counterparts (default: false).
+    ///
+    /// Enable for self-hosted multi-replica ClickHouse coordinated by
+    /// Keeper/ZooKeeper: a `Replicated` database only replicates DDL, so table
+    /// engines must also be replicated for data to reach every replica. Leave
+    /// off for ClickHouse Cloud (replication is implicit) and single-node
+    /// instances. Only newly created objects are affected — existing databases
+    /// and tables are never converted.
+    #[serde(default)]
+    pub replicated_database: bool,
 }
 
 impl ClickHouseConfig {
@@ -226,6 +238,7 @@ impl Default for ClickHouseConfig {
             user: None,
             password_env: None,
             repair_derived_on_startup: true,
+            replicated_database: false,
         }
     }
 }
@@ -424,6 +437,7 @@ mod tests {
         assert_eq!(ch.url, "http://clickhouse-1:8123");
         assert_eq!(ch.failover_urls.len(), 2);
         assert!(ch.repair_derived_on_startup);
+        assert!(!ch.replicated_database);
         assert_eq!(
             ch.all_urls(),
             vec![
@@ -432,6 +446,24 @@ mod tests {
                 "http://clickhouse-3:8123",
             ]
         );
+    }
+
+    #[test]
+    fn test_clickhouse_config_replicated_database() {
+        let toml_str = r#"
+            name = "test"
+            chain_id = 1
+            rpc_url = "http://localhost:8545"
+            pg_url = "postgres://localhost/test"
+
+            [clickhouse]
+            enabled = true
+            url = "http://clickhouse:8123"
+            replicated_database = true
+        "#;
+
+        let config: ChainConfig = toml::from_str(toml_str).unwrap();
+        assert!(config.clickhouse.unwrap().replicated_database);
     }
 
     #[test]

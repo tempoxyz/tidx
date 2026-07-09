@@ -30,6 +30,10 @@ url = "http://clickhouse:8123"
 # password_env = "CH_PASSWORD"
 # Historical derived-table gap repair runs after base ClickHouse backfill by default.
 # repair_derived_on_startup = true
+# Self-hosted multi-replica clusters: create the database with ENGINE = Replicated
+# and MergeTree tables as their Replicated* counterparts. Leave off for
+# ClickHouse Cloud and single-node instances.
+# replicated_database = true
 
 [[chains]]
 name = "mainnet"
@@ -50,3 +54,7 @@ url = "http://clickhouse:8123"
 # password_env = "CH_PASSWORD"
 # Historical derived-table gap repair runs after base ClickHouse backfill by default.
 # repair_derived_on_startup = true
+# Self-hosted multi-replica clusters: create the database with ENGINE = Replicated
+# and MergeTree tables as their Replicated* counterparts. Leave off for
+# ClickHouse Cloud and single-node instances.
+# replicated_database = true

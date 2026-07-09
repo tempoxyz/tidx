@@ -184,7 +184,8 @@ pg_password_env = "TIDX_PG_PASSWORD"
 └── [clickhouse]                                     ClickHouse OLAP settings
     ├── enabled             bool      = false        Enable ClickHouse OLAP queries
     ├── url                 string    = "http://clickhouse:8123"  ClickHouse HTTP URL
-    └── repair_derived_on_startup bool = true        Repair historical derived-table gaps on startup
+    ├── repair_derived_on_startup bool = true        Repair historical derived-table gaps on startup
+    └── replicated_database bool      = false        Create the database as ENGINE = Replicated with Replicated* table engines
 ```
 
 ## CLI
@@ -584,6 +585,8 @@ For Transfer logs specifically, [`token_transfers`](#token_transfers) is pre-dec
 ClickHouse maintains these on insert and prunes them on reorg. Token-keyed tables answer "for this token, …"; address-keyed tables answer "for this account, …". Both families read from the same underlying Transfer/tx/receipt streams — the duplication exists so that either filter resolves via a sort-key seek instead of a full scan.
 
 On startup, tidx verifies built-in materialized tables after base ClickHouse backfill is caught up. It compares each table against its source SELECT in bounded block ranges, logs detected gaps, and replays only the missing ranges in chunks while realtime sync continues. Failed derived repairs are retried with backoff. Set `repair_derived_on_startup = false` under `[chains.clickhouse]` only if an operator needs to suppress historical repair work temporarily.
+
+For self-hosted multi-replica ClickHouse (coordinated by Keeper/ZooKeeper), set `replicated_database = true` under `[chains.clickhouse]`. The sink then creates the database with `ENGINE = Replicated` and rewrites MergeTree-family table engines to their `Replicated*` counterparts, so both DDL and data reach every replica. Leave it off for ClickHouse Cloud (replication is implicit) and single-node instances. The flag only affects newly created objects — point it at a fresh database when enabling replication for an existing chain.
 
 | Name | Purpose |
 |------|---------|

@@ -6,6 +6,7 @@
 use anyhow::{Result, anyhow};
 use clickhouse::{Row, RowOwned, RowRead};
 use serde::{Deserialize, Serialize};
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::time::{Duration, Instant};
@@ -54,6 +55,9 @@ pub struct ClickHouseSink {
     /// Client without database context, used for `CREATE DATABASE` DDL.
     base_client: clickhouse::Client,
     database: String,
+    /// Create the database with `ENGINE = Replicated` and rewrite
+    /// MergeTree-family table engines to their `Replicated*` counterparts.
+    replicated_database: bool,
 }
 
 /// A historical derived-table repair planned from the schema state observed
@@ -104,7 +108,20 @@ impl ClickHouseSink {
             client,
             base_client,
             database: database.to_string(),
+            replicated_database: false,
         })
+    }
+
+    /// Enable replicated schema DDL for self-hosted multi-replica clusters.
+    ///
+    /// The database is created with `ENGINE = Replicated` and MergeTree-family
+    /// table engines are rewritten to their `Replicated*` counterparts at
+    /// execution time. A `Replicated` database only replicates DDL — without
+    /// replicated table engines each replica would hold independent data.
+    /// Existing databases and tables are unaffected (`IF NOT EXISTS` DDL).
+    pub fn with_replicated_database(mut self, enabled: bool) -> Self {
+        self.replicated_database = enabled;
+        self
     }
 
     /// Reconcile the ClickHouse schema:
@@ -137,13 +154,14 @@ impl ClickHouseSink {
 
     async fn ensure_schema_objects(&self) -> Result<()> {
         self.base_client
-            .query(&format!("CREATE DATABASE IF NOT EXISTS {}", self.database))
+            .query(&self.create_database_ddl())
             .execute()
             .await
             .map_err(|e| anyhow!("Failed to create ClickHouse database: {e}"))?;
 
         for object in base_objects() {
-            let ddl = object.ddl();
+            let raw_ddl = object.ddl();
+            let ddl = self.prepare_ddl(&raw_ddl);
             self.client
                 .query(&ddl)
                 .execute()
@@ -172,11 +190,41 @@ impl ClickHouseSink {
 
     async fn ensure_schema_objects_table(&self) -> Result<()> {
         self.client
-            .query(SCHEMA_OBJECTS_TABLE_DDL)
+            .query(&self.prepare_ddl(SCHEMA_OBJECTS_TABLE_DDL))
             .execute()
             .await
             .map_err(|e| anyhow!("Failed to create tidx_schema_objects: {e}"))?;
         Ok(())
+    }
+
+    /// `CREATE DATABASE` DDL honoring `replicated_database`.
+    ///
+    /// The ZooKeeper path is derived from the database name (instead of the
+    /// `{uuid}` default) so that creating the same database on another replica
+    /// converges on the same replication group. `{shard}`/`{replica}` macros
+    /// come from server configuration.
+    fn create_database_ddl(&self) -> String {
+        if self.replicated_database {
+            format!(
+                "CREATE DATABASE IF NOT EXISTS {db} \
+                 ENGINE = Replicated('/clickhouse/databases/{db}', '{{shard}}', '{{replica}}')",
+                db = self.database
+            )
+        } else {
+            format!("CREATE DATABASE IF NOT EXISTS {}", self.database)
+        }
+    }
+
+    /// DDL as executed against the server, honoring `replicated_database`.
+    ///
+    /// Checksums are always computed on the raw catalog DDL, so toggling the
+    /// flag never triggers drop/recreate cycles for derived objects.
+    fn prepare_ddl<'a>(&self, ddl: &'a str) -> Cow<'a, str> {
+        if self.replicated_database {
+            Cow::Owned(to_replicated_engine_ddl(ddl))
+        } else {
+            Cow::Borrowed(ddl)
+        }
     }
 
     async fn load_applied_checksums(&self) -> Result<HashMap<String, String>> {
@@ -209,8 +257,9 @@ impl ClickHouseSink {
             return Ok(());
         }
 
+        let raw_ddl = migration.ddl();
         self.client
-            .query(&migration.ddl())
+            .query(&self.prepare_ddl(&raw_ddl))
             .execute()
             .await
             .map_err(|e| anyhow!("Failed to run ClickHouse migration {}: {e}", migration.name))?;
@@ -243,7 +292,7 @@ impl ClickHouseSink {
                 }
             }
 
-            let mut create = self.client.query(&ddl);
+            let mut create = self.client.query(&self.prepare_ddl(&ddl));
             if object.is_refreshable_materialized_view() {
                 // Refreshable materialized views are still gated behind an
                 // experimental setting in ClickHouse 25.x. It must be set on the
@@ -935,6 +984,24 @@ fn bounded_backfill_sql(plan: &DerivedBackfillPlan) -> String {
     )
 }
 
+/// Rewrite MergeTree-family engines to their `Replicated*` counterparts.
+///
+/// ZooKeeper path and replica-name arguments are intentionally omitted:
+/// inside a `Replicated` database ClickHouse forbids explicit path arguments
+/// and substitutes server defaults (`default_replica_path` /
+/// `default_replica_name`). Engine-specific arguments (e.g. the
+/// `ReplacingMergeTree` version column) are preserved, and engines that are
+/// already `Replicated*` are left untouched.
+fn to_replicated_engine_ddl(ddl: &str) -> String {
+    let engine = regex_lite::Regex::new(
+        r"\bENGINE\s*=\s*((?:Replacing|Summing|Aggregating|Collapsing|VersionedCollapsing|Graphite)?MergeTree)\b",
+    )
+    .expect("static engine rewrite regex must compile");
+    engine
+        .replace_all(ddl, "ENGINE = Replicated$1")
+        .into_owned()
+}
+
 fn ranged_backfill_sql(
     target: &str,
     select_sql: &str,
@@ -1012,6 +1079,72 @@ fn is_valid_identifier(name: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_to_replicated_engine_ddl() {
+        // Bare and parameterized MergeTree-family engines are rewritten.
+        assert_eq!(
+            to_replicated_engine_ddl("CREATE TABLE t (x Int64) ENGINE = MergeTree ORDER BY x"),
+            "CREATE TABLE t (x Int64) ENGINE = ReplicatedMergeTree ORDER BY x"
+        );
+        assert_eq!(
+            to_replicated_engine_ddl(") ENGINE = ReplacingMergeTree()\nORDER BY (a, b)"),
+            ") ENGINE = ReplicatedReplacingMergeTree()\nORDER BY (a, b)"
+        );
+        // Engine-specific arguments (version column) are preserved.
+        assert_eq!(
+            to_replicated_engine_ddl("ENGINE = ReplacingMergeTree(applied_at)"),
+            "ENGINE = ReplicatedReplacingMergeTree(applied_at)"
+        );
+        // Already-replicated engines and non-engine DDL are untouched.
+        assert_eq!(
+            to_replicated_engine_ddl("ENGINE = ReplicatedReplacingMergeTree(applied_at)"),
+            "ENGINE = ReplicatedReplacingMergeTree(applied_at)"
+        );
+        assert_eq!(
+            to_replicated_engine_ddl("ALTER TABLE logs ADD COLUMN IF NOT EXISTS x Int64"),
+            "ALTER TABLE logs ADD COLUMN IF NOT EXISTS x Int64"
+        );
+        assert_eq!(
+            to_replicated_engine_ddl("CREATE MATERIALIZED VIEW mv TO t AS SELECT 1"),
+            "CREATE MATERIALIZED VIEW mv TO t AS SELECT 1"
+        );
+    }
+
+    #[test]
+    fn test_schema_ddl_covers_all_catalog_engines() {
+        // Every MergeTree-family engine in the catalog must be rewritten when
+        // replication is enabled — a new engine variant outside the rewrite
+        // list would silently create non-replicated tables.
+        for object in base_objects().iter().chain(derived_objects()) {
+            let raw = object.ddl();
+            let rewritten = to_replicated_engine_ddl(&raw);
+            assert!(
+                !rewritten.contains("= MergeTree") && !rewritten.contains("= Replacing"),
+                "object {} still has a non-replicated MergeTree engine after rewrite: {raw}",
+                object.name
+            );
+        }
+        assert!(
+            !to_replicated_engine_ddl(SCHEMA_OBJECTS_TABLE_DDL).contains("= ReplacingMergeTree")
+        );
+    }
+
+    #[test]
+    fn test_create_database_ddl() {
+        let sink = ClickHouseSink::new("http://localhost:8123", "tidx_4217", None, None).unwrap();
+        assert_eq!(
+            sink.create_database_ddl(),
+            "CREATE DATABASE IF NOT EXISTS tidx_4217"
+        );
+
+        let sink = sink.with_replicated_database(true);
+        assert_eq!(
+            sink.create_database_ddl(),
+            "CREATE DATABASE IF NOT EXISTS tidx_4217 \
+             ENGINE = Replicated('/clickhouse/databases/tidx_4217', '{shard}', '{replica}')"
+        );
+    }
 
     #[test]
     fn test_hex_encode() {
