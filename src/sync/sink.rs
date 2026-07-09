@@ -44,6 +44,16 @@ impl SinkSet {
         &self.pool
     }
 
+    /// Whether a ClickHouse sink is active.
+    pub fn has_clickhouse(&self) -> bool {
+        self.ch.is_some()
+    }
+
+    /// Forget cached partition coverage (call after partitions are dropped).
+    pub async fn reset_partition_coverage(&self) {
+        self.partitions.reset().await;
+    }
+
     /// Ensure weekly partitions exist for every row timestamp in the batch.
     /// No-op on legacy (non-partitioned) deployments; cached per week.
     async fn ensure_partitions(
@@ -376,7 +386,7 @@ async fn pg_max_block_num(pool: &Pool) -> Result<Option<i64>> {
 }
 
 /// Load the CH backfill cursor for a chain. Returns 0 if no row exists.
-async fn load_ch_backfill_cursor(pool: &Pool, chain_id: u64) -> Result<i64> {
+pub(crate) async fn load_ch_backfill_cursor(pool: &Pool, chain_id: u64) -> Result<i64> {
     let conn = pool.get().await?;
     let row = conn
         .query_opt(

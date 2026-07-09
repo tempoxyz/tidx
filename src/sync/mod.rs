@@ -3,5 +3,6 @@ pub mod compress;
 pub mod decoder;
 pub mod engine;
 pub mod fetcher;
+pub mod pruner;
 pub mod sink;
 pub mod writer;

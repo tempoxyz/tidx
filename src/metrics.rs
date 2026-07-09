@@ -51,6 +51,21 @@ pub fn set_backfill_remaining(chain_id: u64, sink: &str, remaining: u64) {
     gauge!("tidx_backfill_remaining_blocks", &labels).set(remaining as f64);
 }
 
+pub fn set_pruned_below(chain_id: u64, block_num: u64) {
+    let labels = [("chain_id", chain_id.to_string())];
+    gauge!("tidx_pruned_below_block", &labels).set(block_num as f64);
+}
+
+pub fn record_prune_partitions_dropped(chain_id: u64, count: u64) {
+    let labels = [("chain_id", chain_id.to_string())];
+    counter!("tidx_prune_partitions_dropped_total", &labels).increment(count);
+}
+
+pub fn set_last_prune(chain_id: u64) {
+    let labels = [("chain_id", chain_id.to_string())];
+    gauge!("tidx_last_prune_timestamp_seconds", &labels).set(chrono::Utc::now().timestamp() as f64);
+}
+
 pub fn set_sync_rate(chain_id: u64, blocks_per_sec: f64) {
     let labels = [("chain_id", chain_id.to_string())];
     gauge!("tidx_sync_blocks_per_second", &labels).set(blocks_per_sec);

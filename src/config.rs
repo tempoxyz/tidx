@@ -187,7 +187,10 @@ impl RetentionConfig {
 
     pub fn prune_interval_duration(&self) -> Result<std::time::Duration> {
         let d = parse_duration(&self.prune_interval).with_context(|| {
-            format!("Invalid retention.prune_interval: '{}'", self.prune_interval)
+            format!(
+                "Invalid retention.prune_interval: '{}'",
+                self.prune_interval
+            )
         })?;
         Ok(d.to_std()?)
     }

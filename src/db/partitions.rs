@@ -96,11 +96,20 @@ pub async fn list_partitions(pool: &Pool, table: &str) -> Result<Vec<(String, Da
 pub async fn drop_partition(pool: &Pool, table: &str, name: &str) -> Result<()> {
     let conn = pool.get().await?;
     // DETACH CONCURRENTLY cannot run inside a transaction block.
-    conn.execute(
-        &format!("ALTER TABLE {table} DETACH PARTITION {name} CONCURRENTLY"),
-        &[],
-    )
-    .await?;
+    let detach = conn
+        .execute(
+            &format!("ALTER TABLE {table} DETACH PARTITION {name} CONCURRENTLY"),
+            &[],
+        )
+        .await;
+    if detach.is_err() {
+        // A cancelled prior detach leaves the partition pending; FINALIZE completes it.
+        conn.execute(
+            &format!("ALTER TABLE {table} DETACH PARTITION {name} FINALIZE"),
+            &[],
+        )
+        .await?;
+    }
     conn.execute(&format!("DROP TABLE IF EXISTS {name}"), &[])
         .await?;
     Ok(())
