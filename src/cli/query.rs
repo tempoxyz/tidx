@@ -16,7 +16,7 @@ pub struct Args {
     #[arg(short, long, default_value = "config.toml")]
     pub config: PathBuf,
 
-    /// Force query engine (postgres, clickhouse). Auto-routes if not specified.
+    /// Force query engine (postgres, tiered, clickhouse). Auto-routes if not specified.
     #[arg(short, long)]
     pub engine: Option<String>,
 
@@ -73,7 +73,7 @@ pub async fn run(args: Args) -> Result<()> {
         limit: args.limit,
     };
 
-    // CLI currently only supports PostgreSQL engine
+    // CLI supports the PostgreSQL-backed engines (postgres, tiered).
     // For ClickHouse OLAP queries, use the HTTP API with engine=clickhouse
     if args.engine.as_deref() == Some("clickhouse") {
         anyhow::bail!(
@@ -82,7 +82,11 @@ pub async fn run(args: Args) -> Result<()> {
     }
 
     let sig_strs: Vec<&str> = args.signature.iter().map(String::as_str).collect();
-    let result = execute_query_postgres(&pool, &args.sql, &sig_strs, &options).await?;
+    let result = if args.engine.as_deref() == Some("tiered") {
+        service::execute_query_tiered(&pool, &args.sql, &sig_strs, &options).await?
+    } else {
+        execute_query_postgres(&pool, &args.sql, &sig_strs, &options).await?
+    };
 
     if result.row_count == 0 {
         println!("No results");

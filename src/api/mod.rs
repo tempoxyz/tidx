@@ -387,10 +387,11 @@ async fn handle_query(
     let signatures = extract_signatures(uri.query());
 
     if params.live {
-        if params.engine.as_deref() == Some("clickhouse") {
-            return ApiError::BadRequest(
-                "engine=clickhouse is not supported with live=true (use PostgreSQL for real-time streaming)".to_string()
-            ).into_response();
+        if let Some(engine @ ("clickhouse" | "tiered")) = params.engine.as_deref() {
+            return ApiError::BadRequest(format!(
+                "engine={engine} is not supported with live=true (use PostgreSQL for real-time streaming)"
+            ))
+            .into_response();
         }
         handle_query_live(state, params, signatures)
             .await
@@ -419,6 +420,7 @@ async fn handle_query_once(
 
     // Route to appropriate engine
     let use_clickhouse = matches!(params.engine.as_deref(), Some("clickhouse"));
+    let use_tiered = matches!(params.engine.as_deref(), Some("tiered"));
 
     let sigs: Vec<&str> = signatures.iter().map(String::as_str).collect();
 
@@ -445,6 +447,17 @@ async fn handle_query_once(
                 query_time_ms: r.query_time_ms,
             })
             .map_err(|e| ApiError::QueryError(e.to_string()))?
+    } else if use_tiered {
+        // PostgreSQL over tiered.* views (hot PG window + ClickHouse archive)
+        crate::service::execute_query_tiered(&pool, &params.sql, &sigs, &options)
+            .await
+            .map_err(|e| {
+                if e.to_string().contains("timeout") {
+                    ApiError::Timeout
+                } else {
+                    ApiError::QueryError(e.to_string())
+                }
+            })?
     } else {
         // Use PostgreSQL
         crate::service::execute_query_postgres(&pool, &params.sql, &sigs, &options)

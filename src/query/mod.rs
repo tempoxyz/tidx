@@ -4,8 +4,9 @@ mod validator;
 
 pub use parser::{
     AbiParam, AbiType, EventSignature, apply_event_signature_ctes_clickhouse,
-    apply_event_signature_ctes_postgres, extract_column_references, extract_equality_filters,
-    extract_group_by_columns, extract_order_by_columns, extract_raw_column_predicates,
+    apply_event_signature_ctes_postgres, apply_event_signature_ctes_tiered,
+    extract_column_references, extract_equality_filters, extract_group_by_columns,
+    extract_order_by_columns, extract_raw_column_predicates,
 };
 pub use router::QueryEngine;
 pub use validator::{HARD_LIMIT_MAX, validate_clickhouse_query, validate_query};

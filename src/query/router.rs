@@ -7,6 +7,9 @@ pub enum QueryEngine {
     ClickHouse,
     /// PostgreSQL for transactional queries (OLTP)
     Postgres,
+    /// PostgreSQL over `tiered.*` views: hot PG window + ClickHouse archive
+    /// via pg_clickhouse (full history through one PG connection)
+    Tiered,
 }
 
 impl fmt::Display for QueryEngine {
@@ -14,6 +17,7 @@ impl fmt::Display for QueryEngine {
         match self {
             Self::ClickHouse => write!(f, "clickhouse"),
             Self::Postgres => write!(f, "postgres"),
+            Self::Tiered => write!(f, "tiered"),
         }
     }
 }

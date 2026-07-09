@@ -7,7 +7,10 @@ use tokio_postgres::types::ToSql;
 
 use crate::db::Pool;
 use crate::metrics;
-use crate::query::{HARD_LIMIT_MAX, apply_event_signature_ctes_postgres, validate_query};
+use crate::query::{
+    HARD_LIMIT_MAX, apply_event_signature_ctes_postgres, apply_event_signature_ctes_tiered,
+    validate_query,
+};
 
 #[derive(Debug, Clone, Serialize)]
 pub struct SyncStatus {
@@ -181,6 +184,54 @@ pub async fn execute_query_postgres(
     // Only replace hex values (40+ chars), not short '0x' prefixes used in concat()
     let sql = crate::query::convert_hex_literals_postgres(&sql);
 
+    run_pg_query(pool, &sql, options, &[], "postgres").await
+}
+
+/// Execute a query on the tiered engine: PostgreSQL over `tiered.*` views
+/// (hot PG window UNION ALL ClickHouse archive via pg_clickhouse).
+///
+/// The views expose ClickHouse's text representation, so '0x…' literals pass
+/// through unconverted and push down to the ClickHouse arm.
+pub async fn execute_query_tiered(
+    pool: &Pool,
+    sql: &str,
+    signatures: &[&str],
+    options: &QueryOptions,
+) -> Result<QueryResult> {
+    let sql = apply_event_signature_ctes_tiered(sql, signatures)?;
+
+    // Validate query (after CTE wrapping so signature-derived table names are valid)
+    validate_query(&sql)?;
+
+    // Add LIMIT if not present (AST-based detection to avoid string matching bypass)
+    let sql = append_limit_if_missing(&sql, options.limit);
+
+    run_pg_query(
+        pool,
+        &sql,
+        options,
+        &[
+            // Resolve bare table names to the tiered views.
+            "SET LOCAL search_path = tiered, public",
+            // Prove away the ClickHouse arm (foreign-table CHECK constraints)
+            // for hot-window-bounded queries.
+            "SET LOCAL constraint_exclusion = on",
+        ],
+        "tiered",
+    )
+    .await
+}
+
+/// Run prepared SQL on PostgreSQL and stream the result rows into a
+/// [`QueryResult`]. `session_setup` statements (e.g. `SET LOCAL …`) run
+/// inside the transaction before the query.
+async fn run_pg_query(
+    pool: &Pool,
+    sql: &str,
+    options: &QueryOptions,
+    session_setup: &[&str],
+    engine: &str,
+) -> Result<QueryResult> {
     let mut conn = pool.get().await?;
     let tx = conn.transaction().await?;
 
@@ -190,12 +241,16 @@ pub async fn execute_query_postgres(
     )
     .await?;
 
+    for stmt in session_setup {
+        tx.execute(*stmt, &[]).await?;
+    }
+
     let start = Instant::now();
     let timeout = std::time::Duration::from_millis(options.timeout_ms + 100);
     let limit = options.limit as usize;
     let result = tokio::time::timeout(timeout, async {
         let params = std::iter::empty::<&(dyn ToSql + Sync)>();
-        let stream = tx.query_raw(&sql, params).await?;
+        let stream = tx.query_raw(sql, params).await?;
         futures::pin_mut!(stream);
         let mut columns: Option<Vec<String>> = None;
         let mut rows = Vec::new();
@@ -251,7 +306,7 @@ pub async fn execute_query_postgres(
 
     if columns.is_empty() {
         columns = conn
-            .prepare(&sql)
+            .prepare(sql)
             .await
             .ok()
             .map(|s| s.columns().iter().map(|c| c.name().to_string()).collect())
@@ -266,7 +321,7 @@ pub async fn execute_query_postgres(
         columns,
         rows: result_rows,
         row_count,
-        engine: Some("postgres".to_string()),
+        engine: Some(engine.to_string()),
         query_time_ms: Some(elapsed_ms),
     })
 }
@@ -444,6 +499,22 @@ mod tests {
         )
         .unwrap();
         assert_snapshot!(sig.to_cte_sql_clickhouse());
+    }
+
+    #[test]
+    fn test_transfer_cte_tiered() {
+        let sig = EventSignature::parse(
+            "Transfer(address indexed from, address indexed to, uint256 value)",
+        )
+        .unwrap();
+        assert_snapshot!(sig.to_cte_sql_tiered());
+    }
+
+    #[test]
+    fn test_apply_ctes_tiered_pushdown() {
+        let sql = "SELECT \"from\", \"to\", value FROM Transfer WHERE address = '0x20c54c5f742f123abb49a982ffe9ba3d82fd8a86' AND block_num > 100";
+        let sigs = ["Transfer(address indexed from, address indexed to, uint256 value)"];
+        assert_snapshot!(apply_event_signature_ctes_tiered(sql, &sigs).unwrap());
     }
 
     #[test]
