@@ -8,7 +8,6 @@ use tokio::sync::broadcast;
 use tracing::{debug, error, info};
 
 use crate::broadcast::{BlockUpdate, Broadcaster};
-use crate::db::{Pool, ThrottledPool};
 use crate::metrics::{self, SyncProgress};
 use crate::types::{LogRow, ReceiptRow, SyncState};
 
@@ -18,10 +17,7 @@ use super::decoder::{
 };
 use super::fetcher::RpcClient;
 use super::sink::SinkSet;
-use super::writer::{
-    detect_all_gaps, detect_blocks_missing_receipts, find_fork_point, get_block_hash, has_gaps,
-    load_sync_state, save_sync_state, update_sync_rate, update_synced_num, update_tip_num,
-};
+use super::store::SyncStore;
 use crate::virtual_address::mark_virtual_forward_hops;
 
 /// RPC concurrency limits
@@ -31,11 +27,16 @@ const RECEIPT_BACKFILL_BLOCK_LIMIT: i64 = 100;
 const RECEIPT_BACKFILL_MAX_WRITE_ROWS: usize = 50_000;
 const RECEIPT_BACKFILL_INFO_ROWS: usize = 10_000;
 
+/// Max concurrent backfill operations. Each may use up to 4 PG connections
+/// (parallel table writes), so effective max backfill connections = limit × 4.
+const DEFAULT_BACKFILL_LIMIT: usize = 6;
+
 pub struct SyncEngine {
-    /// Throttled pool - shared by all, but backfill is rate-limited
-    throttled_pool: ThrottledPool,
-    /// Fan-out writer for all configured sinks (PG, and later CH)
+    /// Fan-out writer for all configured sinks (PG and/or CH)
     sinks: SinkSet,
+    /// Semaphore limiting concurrent backfill operations so backfill
+    /// can't starve realtime sync or API queries.
+    backfill_semaphore: Arc<tokio::sync::Semaphore>,
     /// RPC client for realtime sync (guaranteed capacity)
     realtime_rpc: RpcClient,
     /// RPC client for backfill (separate limit, can't starve realtime)
@@ -50,9 +51,9 @@ pub struct SyncEngine {
 }
 
 impl SyncEngine {
-    /// Creates a sync engine with a throttled pool and pre-configured sinks.
+    /// Creates a sync engine with pre-configured sinks.
     /// Uses separate RPC clients for realtime vs backfill to guarantee capacity.
-    pub async fn new(throttled_pool: ThrottledPool, sinks: SinkSet, rpc_url: &str) -> Result<Self> {
+    pub async fn new(sinks: SinkSet, rpc_url: &str) -> Result<Self> {
         let realtime_rpc = RpcClient::with_concurrency(rpc_url, REALTIME_RPC_CONCURRENCY);
         let backfill_rpc = RpcClient::with_concurrency(rpc_url, BACKFILL_RPC_CONCURRENCY);
         let chain_id = realtime_rpc.chain_id().await?;
@@ -65,8 +66,8 @@ impl SyncEngine {
         );
 
         Ok(Self {
-            throttled_pool,
             sinks,
+            backfill_semaphore: Arc::new(tokio::sync::Semaphore::new(DEFAULT_BACKFILL_LIMIT)),
             realtime_rpc,
             backfill_rpc,
             chain_id,
@@ -103,14 +104,14 @@ impl SyncEngine {
         self
     }
 
-    /// Returns the underlying pool (for realtime/API operations).
-    fn pool(&self) -> &Pool {
-        self.throttled_pool.inner()
+    /// Returns the sync-state store (PG when configured, else CH).
+    fn store(&self) -> SyncStore<'_> {
+        self.sinks.store()
     }
 
     /// Returns the backfill semaphore for throttled operations.
-    fn backfill_semaphore(&self) -> &std::sync::Arc<tokio::sync::Semaphore> {
-        &self.throttled_pool.backfill_semaphore
+    fn backfill_semaphore(&self) -> &Arc<tokio::sync::Semaphore> {
+        &self.backfill_semaphore
     }
 
     /// Run sync engine with two concurrent loops:
@@ -128,7 +129,9 @@ impl SyncEngine {
 
     /// Run backfill to completion, then switch to realtime sync.
     async fn run_backfill_first(&mut self, shutdown: broadcast::Receiver<()>) -> Result<()> {
-        let state = load_sync_state(self.pool(), self.chain_id)
+        let state = self
+            .store()
+            .load_sync_state(self.chain_id)
             .await?
             .unwrap_or_default();
         let mut progress = SyncProgress::new(self.chain_id, state.synced_num);
@@ -151,10 +154,12 @@ impl SyncEngine {
 
             // Get current head to know our target
             let remote_head = self.realtime_rpc.latest_block_number().await?;
-            update_tip_num(self.pool(), self.chain_id, remote_head, remote_head).await?;
+            self.store()
+                .update_tip_num(self.chain_id, remote_head, remote_head)
+                .await?;
 
             // Check for gaps
-            let gaps = detect_all_gaps(self.pool(), remote_head).await?;
+            let gaps = self.store().detect_all_gaps(remote_head).await?;
             if gaps.is_empty() {
                 info!(
                     chain_id = self.chain_id,
@@ -213,7 +218,9 @@ impl SyncEngine {
 
     /// Run realtime, gap-fill, and receipt backfill concurrently (default mode).
     async fn run_concurrent(&mut self, shutdown: broadcast::Receiver<()>) -> Result<()> {
-        let state = load_sync_state(self.pool(), self.chain_id)
+        let state = self
+            .store()
+            .load_sync_state(self.chain_id)
             .await?
             .unwrap_or_default();
         let mut realtime_progress = SyncProgress::new(self.chain_id, state.tip_num);
@@ -293,7 +300,9 @@ impl SyncEngine {
     /// them atomically before advancing the tip. This keeps log-backed views
     /// consistent with newly indexed transactions.
     async fn tick_realtime(&mut self, progress: &mut SyncProgress) -> Result<()> {
-        let state = load_sync_state(self.pool(), self.chain_id)
+        let state = self
+            .store()
+            .load_sync_state(self.chain_id)
             .await?
             .unwrap_or_default();
         let remote_head = self.realtime_rpc.latest_block_number().await?;
@@ -386,7 +395,9 @@ impl SyncEngine {
                 fetch_ms = 0;
             }
 
-            update_tip_num(self.pool(), self.chain_id, current_to, remote_head).await?;
+            self.store()
+                .update_tip_num(self.chain_id, current_to, remote_head)
+                .await?;
 
             let batch_ms = batch_start.elapsed().as_millis();
             let block_count = blocks.len();
@@ -454,7 +465,7 @@ impl SyncEngine {
 
         // Check parent hash against stored block (if not genesis)
         if first_num > 0
-            && let Some(stored_hash) = get_block_hash(self.pool(), first_num - 1).await?
+            && let Some(stored_hash) = self.store().get_block_hash(first_num - 1).await?
         {
             let expected_parent: [u8; 32] = stored_hash
                 .try_into()
@@ -491,13 +502,10 @@ impl SyncEngine {
         );
 
         // Find where the chain diverged
-        let fork_point = find_fork_point(
-            self.pool(),
-            &self.realtime_rpc,
-            mismatch_block,
-            MAX_REORG_DEPTH,
-        )
-        .await?;
+        let fork_point = self
+            .store()
+            .find_fork_point(&self.realtime_rpc, mismatch_block, MAX_REORG_DEPTH)
+            .await?;
 
         match fork_point {
             Some(fork_block) => {
@@ -514,7 +522,9 @@ impl SyncEngine {
                 );
 
                 // Update tip_num to fork point so realtime sync continues from there
-                update_tip_num(self.pool(), self.chain_id, fork_block, fork_block).await?;
+                self.store()
+                    .update_tip_num(self.chain_id, fork_block, fork_block)
+                    .await?;
 
                 Ok(())
             }
@@ -528,10 +538,12 @@ impl SyncEngine {
 
     /// Detect and fill any gaps in the indexed block sequence
     pub async fn fill_gaps(&self) -> Result<usize> {
-        let state = load_sync_state(self.pool(), self.chain_id)
+        let state = self
+            .store()
+            .load_sync_state(self.chain_id)
             .await?
             .unwrap_or_default();
-        let gaps = detect_all_gaps(self.pool(), state.tip_num).await?;
+        let gaps = self.store().detect_all_gaps(state.tip_num).await?;
         let mut filled = 0;
 
         for (start, end) in gaps {
@@ -678,7 +690,9 @@ impl SyncEngine {
             .await?;
 
         // Update sync state
-        let state = load_sync_state(self.pool(), self.chain_id)
+        let state = self
+            .store()
+            .load_sync_state(self.chain_id)
             .await?
             .unwrap_or_default();
         let new_state = SyncState {
@@ -690,7 +704,7 @@ impl SyncEngine {
             sync_rate: state.sync_rate,
             started_at: state.started_at,
         };
-        save_sync_state(self.pool(), &new_state).await?;
+        self.store().save_sync_state(&new_state).await?;
 
         Ok(())
     }
@@ -710,7 +724,9 @@ impl SyncEngine {
             ));
         }
 
-        let mut state = load_sync_state(self.pool(), self.chain_id)
+        let mut state = self
+            .store()
+            .load_sync_state(self.chain_id)
             .await?
             .unwrap_or_default();
 
@@ -760,7 +776,7 @@ impl SyncEngine {
             if state.chain_id == 0 {
                 state.chain_id = self.chain_id;
             }
-            save_sync_state(self.pool(), &state).await?;
+            self.store().save_sync_state(&state).await?;
 
             metrics::record_blocks_indexed(self.chain_id, batch_blocks);
             progress.report_backfill(current_start, to, batch_blocks);
@@ -781,7 +797,9 @@ impl SyncEngine {
 
     /// Get current sync status
     pub async fn status(&self) -> Result<SyncState> {
-        let state = load_sync_state(self.pool(), self.chain_id)
+        let state = self
+            .store()
+            .load_sync_state(self.chain_id)
             .await?
             .unwrap_or_default();
         Ok(state)
@@ -810,7 +828,9 @@ async fn run_gapfill_loop(
     concurrency: usize,
     mut shutdown: broadcast::Receiver<()>,
 ) -> Result<()> {
-    let state = load_sync_state(sinks.pool(), chain_id)
+    let state = sinks
+        .store()
+        .load_sync_state(chain_id)
         .await?
         .unwrap_or_default();
     let mut progress = SyncProgress::new(chain_id, state.synced_num);
@@ -855,8 +875,9 @@ async fn tick_gapfill_parallel(
     concurrency: usize,
     progress: &mut SyncProgress,
 ) -> Result<()> {
-    let pool = sinks.pool();
-    let state = load_sync_state(pool, chain_id).await?.unwrap_or_default();
+    let store = sinks.store();
+    let store_label = store.name();
+    let state = store.load_sync_state(chain_id).await?.unwrap_or_default();
 
     // Adaptive throttling: pause backfill when realtime lag is high
     // This ensures realtime sync always has priority
@@ -880,25 +901,25 @@ async fn tick_gapfill_parallel(
     // function when gaps actually exist and we need their exact ranges.
     // With 0.5s block time, tip_num races ahead of synced_num constantly,
     // so we check the range [1, tip_num] cheaply via COUNT vs expected.
-    if state.tip_num > 0 && !has_gaps(pool, 1, state.tip_num).await? {
-        metrics::set_gap_ranges(chain_id, "postgres", &[]);
+    if state.tip_num > 0 && !store.has_gaps(1, state.tip_num).await? {
+        metrics::set_gap_ranges(chain_id, store_label, &[]);
         metrics::set_synced(chain_id, realtime_lag == 0);
         if state.synced_num < state.tip_num {
-            update_synced_num(pool, chain_id, state.tip_num).await?;
+            store.update_synced_num(chain_id, state.tip_num).await?;
         }
         tokio::time::sleep(Duration::from_secs(2)).await;
         return Ok(());
     }
 
     // Gaps exist — run the expensive window function to find exact ranges
-    let gaps = detect_all_gaps(pool, state.tip_num).await?;
+    let gaps = store.detect_all_gaps(state.tip_num).await?;
 
     if gaps.is_empty() {
         // No gaps - fully synced from genesis to tip
-        metrics::set_gap_ranges(chain_id, "postgres", &[]);
+        metrics::set_gap_ranges(chain_id, store_label, &[]);
         metrics::set_synced(chain_id, realtime_lag == 0);
         if state.synced_num < state.tip_num {
-            update_synced_num(pool, chain_id, state.tip_num).await?;
+            store.update_synced_num(chain_id, state.tip_num).await?;
             info!(synced_num = state.tip_num, "Gap sync: fully synced");
         }
         tokio::time::sleep(Duration::from_secs(2)).await;
@@ -907,7 +928,7 @@ async fn tick_gapfill_parallel(
 
     let total_gap_blocks: u64 = gaps.iter().map(|(s, e)| e - s + 1).sum();
     let gap_count = gaps.len();
-    metrics::set_gap_ranges(chain_id, "postgres", &gaps);
+    metrics::set_gap_ranges(chain_id, store_label, &gaps);
     metrics::set_synced(chain_id, false);
 
     // Collect all batch ranges to process (from most recent gaps first)
@@ -934,7 +955,7 @@ async fn tick_gapfill_parallel(
         "Gap sync: processing with parallel workers (throttled)"
     );
 
-    metrics::set_backfill_remaining(chain_id, "postgres", total_gap_blocks);
+    metrics::set_backfill_remaining(chain_id, store_label, total_gap_blocks);
 
     // Process batches with N concurrent workers using JoinSet
     // Each worker acquires a semaphore permit before getting a DB connection
@@ -975,7 +996,8 @@ async fn tick_gapfill_parallel(
         if last_lag_check.elapsed().as_secs() >= 5 {
             last_lag_check = std::time::Instant::now();
             if let Ok(current_head) = rpc.latest_block_number().await {
-                let current_state = load_sync_state(pool, chain_id)
+                let current_state = store
+                    .load_sync_state(chain_id)
                     .await
                     .ok()
                     .flatten()
@@ -1003,7 +1025,7 @@ async fn tick_gapfill_parallel(
                 metrics::record_blocks_indexed(chain_id, batch_count);
                 metrics::set_backfill_remaining(
                     chain_id,
-                    "postgres",
+                    store_label,
                     total_gap_blocks.saturating_sub(completed),
                 );
                 progress.report_gap_fill(completed, total_gap_blocks, batch_count);
@@ -1131,7 +1153,7 @@ async fn tick_gapfill_parallel(
     };
 
     if rate > 0.0 {
-        update_sync_rate(pool, chain_id, rate).await.ok();
+        store.update_sync_rate(chain_id, rate).await.ok();
     }
 
     info!(
@@ -1146,7 +1168,7 @@ async fn tick_gapfill_parallel(
     if lowest_block < u64::MAX {
         let mut updated_state = state.clone();
         updated_state.backfill_num = Some(lowest_block);
-        save_sync_state(pool, &updated_state).await?;
+        store.save_sync_state(&updated_state).await?;
     }
 
     Ok(())
@@ -1161,16 +1183,17 @@ async fn tick_gapfill_parallel_no_throttle(
     concurrency: usize,
     progress: &mut SyncProgress,
 ) -> Result<()> {
-    let pool = sinks.pool();
-    let state = load_sync_state(pool, chain_id).await?.unwrap_or_default();
+    let store = sinks.store();
+    let store_label = store.name();
+    let state = store.load_sync_state(chain_id).await?.unwrap_or_default();
 
     // Detect ALL gaps including from genesis, sorted by end DESC (most recent first)
-    let gaps = detect_all_gaps(pool, state.tip_num).await?;
+    let gaps = store.detect_all_gaps(state.tip_num).await?;
 
     if gaps.is_empty() {
-        metrics::set_gap_ranges(chain_id, "postgres", &[]);
+        metrics::set_gap_ranges(chain_id, store_label, &[]);
         if state.synced_num < state.tip_num {
-            update_synced_num(pool, chain_id, state.tip_num).await?;
+            store.update_synced_num(chain_id, state.tip_num).await?;
             info!(synced_num = state.tip_num, "Backfill: fully synced");
         }
         return Ok(());
@@ -1178,7 +1201,7 @@ async fn tick_gapfill_parallel_no_throttle(
 
     let total_gap_blocks: u64 = gaps.iter().map(|(s, e)| e - s + 1).sum();
     let gap_count = gaps.len();
-    metrics::set_gap_ranges(chain_id, "postgres", &gaps);
+    metrics::set_gap_ranges(chain_id, store_label, &gaps);
 
     // Collect all batch ranges to process (from most recent gaps first)
     let mut batch_ranges: Vec<(u64, u64)> = Vec::new();
@@ -1203,7 +1226,7 @@ async fn tick_gapfill_parallel_no_throttle(
         "Backfill: processing with parallel workers"
     );
 
-    metrics::set_backfill_remaining(chain_id, "postgres", total_gap_blocks);
+    metrics::set_backfill_remaining(chain_id, store_label, total_gap_blocks);
 
     // Process batches with N concurrent workers using JoinSet
     let mut join_set = tokio::task::JoinSet::new();
@@ -1235,7 +1258,7 @@ async fn tick_gapfill_parallel_no_throttle(
                 metrics::record_blocks_indexed(chain_id, batch_count);
                 metrics::set_backfill_remaining(
                     chain_id,
-                    "postgres",
+                    store_label,
                     total_gap_blocks.saturating_sub(completed),
                 );
                 progress.report_gap_fill(completed, total_gap_blocks, batch_count);
@@ -1318,7 +1341,7 @@ async fn tick_gapfill_parallel_no_throttle(
     };
 
     if rate > 0.0 {
-        update_sync_rate(pool, chain_id, rate).await.ok();
+        store.update_sync_rate(chain_id, rate).await.ok();
     }
 
     info!(
@@ -1333,17 +1356,10 @@ async fn tick_gapfill_parallel_no_throttle(
     if lowest_block < u64::MAX {
         let mut updated_state = state.clone();
         updated_state.backfill_num = Some(lowest_block);
-        save_sync_state(pool, &updated_state).await?;
+        store.save_sync_state(&updated_state).await?;
     }
 
     Ok(())
-}
-
-/// Check if fully synced (no gaps from genesis to tip)
-#[allow(dead_code)]
-async fn is_fully_synced(pool: &Pool, tip_num: u64) -> Result<bool> {
-    let gaps = detect_all_gaps(pool, tip_num).await?;
-    Ok(gaps.is_empty())
 }
 
 /// Standalone sync_range for gap-fill (doesn't need SyncEngine self)
@@ -1460,10 +1476,12 @@ async fn tick_receipt_backfill(sinks: &SinkSet, rpc: &RpcClient, chain_id: u64) 
     use super::decoder::{decode_log, decode_receipt};
     use alloy::network::ReceiptResponse;
 
-    let pool = sinks.pool();
+    let store = sinks.store();
 
     // Find blocks that have no receipts (most recent first)
-    let blocks_missing = detect_blocks_missing_receipts(pool, RECEIPT_BACKFILL_BLOCK_LIMIT).await?;
+    let blocks_missing = store
+        .detect_blocks_missing_receipts(RECEIPT_BACKFILL_BLOCK_LIMIT)
+        .await?;
 
     if blocks_missing.is_empty() {
         // All caught up, sleep before checking again
@@ -1495,23 +1513,8 @@ async fn tick_receipt_backfill(sinks: &SinkSet, rpc: &RpcClient, chain_id: u64) 
             }
         };
 
-        // Get block timestamps from DB (blocks already exist)
-        let conn = pool.get().await?;
-        let rows = conn
-            .query(
-                "SELECT num, timestamp FROM blocks WHERE num >= $1 AND num <= $2",
-                &[&(from as i64), &(to as i64)],
-            )
-            .await?;
-
-        let block_timestamps: HashMap<u64, _> = rows
-            .iter()
-            .map(|r| {
-                let num: i64 = r.get(0);
-                let ts: chrono::DateTime<chrono::Utc> = r.get(1);
-                (num as u64, ts)
-            })
-            .collect();
+        // Get block timestamps from the store (blocks already exist)
+        let block_timestamps = store.block_timestamps(from, to).await?;
 
         let mut chunk_logs: Vec<LogRow> = Vec::new();
         let mut chunk_receipts: Vec<ReceiptRow> = Vec::new();
@@ -1611,18 +1614,9 @@ async fn tick_receipt_backfill(sinks: &SinkSet, rpc: &RpcClient, chain_id: u64) 
         .await?;
     }
 
-    // Single UPDATE txs covering all processed ranges (instead of per-range)
+    // Single denormalization pass covering all processed ranges (instead of per-range)
     if let (Some(lo), Some(hi)) = (min_block, max_block) {
-        let conn = pool.get().await?;
-        conn.execute(
-            "UPDATE txs SET gas_used = r.gas_used, fee_payer = r.fee_payer \
-             FROM receipts r \
-             WHERE txs.block_num = r.block_num AND txs.idx = r.tx_idx \
-               AND txs.block_num >= $1 AND txs.block_num <= $2 \
-               AND txs.gas_used IS NULL",
-            &[&(lo as i64), &(hi as i64)],
-        )
-        .await?;
+        store.finalize_receipt_backfill(lo, hi).await?;
     }
 
     Ok(())

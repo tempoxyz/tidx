@@ -4,7 +4,6 @@ use common::tempo::TempoNode;
 use common::testdb::TestDb;
 
 use serial_test::serial;
-use tidx::db::ThrottledPool;
 use tidx::sync::engine::SyncEngine;
 use tidx::sync::sink::SinkSet;
 use tidx::sync::writer::{write_blocks, write_logs, write_txs};
@@ -493,13 +492,9 @@ async fn test_pipelined_sync() {
         .expect("Block 30 not reached");
 
     let sinks = SinkSet::new(db.pool.clone());
-    let mut engine = SyncEngine::new(
-        ThrottledPool::from_pool(db.pool.clone()),
-        sinks,
-        &tempo.rpc_url,
-    )
-    .await
-    .expect("Failed to create sync engine");
+    let mut engine = SyncEngine::new(sinks, &tempo.rpc_url)
+        .await
+        .expect("Failed to create sync engine");
 
     // Create a shutdown channel
     let (shutdown_tx, shutdown_rx) = tokio::sync::broadcast::channel::<()>(1);

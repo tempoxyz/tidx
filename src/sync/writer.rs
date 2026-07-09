@@ -1063,34 +1063,3 @@ pub async fn delete_blocks_from(pool: &Pool, from_block: u64) -> Result<u64> {
 
     Ok(deleted)
 }
-
-/// Find the fork point by walking back from a mismatch until we find a matching hash.
-/// Returns the last block number where the stored hash matches the chain.
-/// If no match is found within max_depth, returns None.
-pub async fn find_fork_point(
-    pool: &Pool,
-    rpc: &super::fetcher::RpcClient,
-    mismatch_block: u64,
-    max_depth: u64,
-) -> Result<Option<u64>> {
-    let min_block = mismatch_block.saturating_sub(max_depth).max(1);
-
-    for block_num in (min_block..mismatch_block).rev() {
-        let stored_hash = get_block_hash(pool, block_num).await?;
-
-        if let Some(stored) = stored_hash {
-            // Fetch the canonical hash from RPC
-            let rpc_block = rpc.get_block(block_num, false).await?;
-            let rpc_hash = rpc_block.header.hash.0.to_vec();
-
-            if stored == rpc_hash {
-                return Ok(Some(block_num));
-            }
-        } else {
-            // No stored block at this height - this is the fork point
-            return Ok(Some(block_num));
-        }
-    }
-
-    Ok(None)
-}

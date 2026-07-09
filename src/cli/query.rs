@@ -65,24 +65,53 @@ pub async fn run(args: Args) -> Result<()> {
             .ok_or_else(|| anyhow::anyhow!("No chains configured"))?
     };
 
-    let pg_url = chain.resolved_pg_url()?;
-    let pool = db::create_pool(&pg_url).await?;
-
     let options = QueryOptions {
         timeout_ms: args.timeout,
         limit: args.limit,
     };
 
-    // CLI currently only supports PostgreSQL engine
-    // For ClickHouse OLAP queries, use the HTTP API with engine=clickhouse
+    // CLI supports the Postgres wire-protocol engines (postgres, clickhouse_pg).
+    // For ClickHouse OLAP queries, use the HTTP API with engine=clickhouse.
     if args.engine.as_deref() == Some("clickhouse") {
         anyhow::bail!(
             "ClickHouse engine not available in CLI. Use HTTP API with engine=clickhouse for OLAP queries."
         );
     }
 
+    let clickhouse_pg_url = chain
+        .clickhouse_enabled()
+        .map(|ch| ch.resolved_pg_url())
+        .transpose()?
+        .flatten();
+
     let sig_strs: Vec<&str> = args.signature.iter().map(String::as_str).collect();
-    let result = execute_query_postgres(&pool, &args.sql, &sig_strs, &options).await?;
+
+    // engine=postgres (the default) aliases to clickhouse_pg when the chain
+    // has no postgres configured, mirroring the HTTP API.
+    let use_clickhouse_pg = match args.engine.as_deref() {
+        Some("clickhouse_pg") => true,
+        _ => chain.postgres.is_none(),
+    };
+
+    let result = if use_clickhouse_pg {
+        let pg_url = clickhouse_pg_url.ok_or_else(|| {
+            anyhow::anyhow!(
+                "chain '{}' has no postgres configured and no clickhouse pg_url \
+                 (set [chains.clickhouse] pg_url to a pg_clickhouse endpoint)",
+                chain.name
+            )
+        })?;
+        let pool = db::connect_pool(&pg_url, 4).await?;
+        service::execute_query_clickhouse_pg(&pool, &args.sql, &sig_strs, &options).await?
+    } else {
+        let pg_url = chain
+            .postgres
+            .as_ref()
+            .expect("postgres presence checked above")
+            .resolved_url()?;
+        let pool = db::create_pool(&pg_url).await?;
+        execute_query_postgres(&pool, &args.sql, &sig_strs, &options).await?
+    };
 
     if result.row_count == 0 {
         println!("No results");

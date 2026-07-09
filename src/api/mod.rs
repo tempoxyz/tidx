@@ -29,6 +29,7 @@ use crate::broadcast::Broadcaster;
 use crate::clickhouse::ClickHouseEngine;
 use crate::config::HttpConfig;
 use crate::db::Pool;
+use crate::query::QueryEngine;
 use crate::service::{QueryOptions, QueryResult, SyncStatus};
 
 pub type SharedPools = Arc<RwLock<HashMap<u64, Pool>>>;
@@ -48,8 +49,11 @@ const MAX_CONCURRENT_API_QUERIES: usize = 8;
 
 #[derive(Clone)]
 pub struct AppState {
-    /// Map of chain_id -> pool (hot-reloadable)
+    /// Map of chain_id -> PostgreSQL pool (hot-reloadable).
+    /// Chains without a `postgres` config have no entry here.
     pub pools: SharedPools,
+    /// Map of chain_id -> pg_clickhouse pool (Postgres wire protocol onto ClickHouse)
+    pub clickhouse_pg_pools: SharedPools,
     /// Default chain_id (first chain)
     pub default_chain_id: u64,
     pub broadcaster: Arc<Broadcaster>,
@@ -70,6 +74,21 @@ impl AppState {
     async fn get_clickhouse(&self, chain_id: Option<u64>) -> Option<Arc<ClickHouseEngine>> {
         let id = chain_id.unwrap_or(self.default_chain_id);
         self.clickhouse_engines.read().await.get(&id).cloned()
+    }
+
+    async fn get_clickhouse_pg(&self, chain_id: Option<u64>) -> Option<Pool> {
+        let id = chain_id.unwrap_or(self.default_chain_id);
+        self.clickhouse_pg_pools.read().await.get(&id).cloned()
+    }
+
+    async fn is_known_chain(&self, chain_id: u64) -> bool {
+        self.pools.read().await.contains_key(&chain_id)
+            || self.clickhouse_engines.read().await.contains_key(&chain_id)
+            || self
+                .clickhouse_pg_pools
+                .read()
+                .await
+                .contains_key(&chain_id)
     }
 
     /// Check if an IP address is in the trusted CIDRs
@@ -153,33 +172,41 @@ pub fn router(
         default_chain_id,
         broadcaster,
         HashMap::new(),
+        HashMap::new(),
+        HashMap::new(),
         &HttpConfig::default(),
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn router_with_options(
     pools: HashMap<u64, Pool>,
     default_chain_id: u64,
     broadcaster: Arc<Broadcaster>,
     clickhouse_configs: HashMap<u64, ChainClickHouseConfig>,
+    clickhouse_pg_pools: HashMap<u64, Pool>,
+    clickhouse_engines: HashMap<u64, Arc<ClickHouseEngine>>,
     http_config: &HttpConfig,
 ) -> AnyhowResult<Router<()>> {
     let trusted_cidrs = Arc::new(StdRwLock::new(parse_cidrs(&http_config.trusted_cidrs)?));
 
     let state = AppState {
         pools: Arc::new(RwLock::new(pools)),
+        clickhouse_pg_pools: Arc::new(RwLock::new(clickhouse_pg_pools)),
         default_chain_id,
         broadcaster,
         clickhouse_configs: Arc::new(RwLock::new(clickhouse_configs)),
-        clickhouse_engines: Arc::new(RwLock::new(HashMap::new())),
+        clickhouse_engines: Arc::new(RwLock::new(clickhouse_engines)),
         trusted_cidrs,
     };
 
     Ok(build_router(state))
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn router_shared(
     pools: SharedPools,
+    clickhouse_pg_pools: SharedPools,
     default_chain_id: u64,
     broadcaster: Arc<Broadcaster>,
     clickhouse_configs: SharedClickHouseConfigs,
@@ -188,6 +215,7 @@ pub fn router_shared(
 ) -> Router<()> {
     let state = AppState {
         pools,
+        clickhouse_pg_pools,
         default_chain_id,
         broadcaster,
         clickhouse_configs,
@@ -249,6 +277,10 @@ async fn handle_status(State(state): State<AppState>) -> Result<Json<StatusRespo
         .iter()
         .map(|(chain_id, pool)| (*chain_id, pool.clone()))
         .collect();
+    // Chains whose status rows came from a PostgreSQL pool (a pool can hold
+    // sync_state rows for multiple chains).
+    let mut pg_chain_ids: std::collections::HashSet<u64> =
+        pools.iter().map(|(id, _)| *id).collect();
     for (chain_id, pool) in pools {
         let chains = crate::service::get_all_status(&pool).await.map_err(|e| {
             ApiError::QueryError(format!("Failed to load status for chain {chain_id}: {e}"))
@@ -256,9 +288,32 @@ async fn handle_status(State(state): State<AppState>) -> Result<Json<StatusRespo
         if chains.is_empty() {
             all_chains.push(empty_status(chain_id));
         } else {
+            pg_chain_ids.extend(chains.iter().map(|c| c.chain_id as u64));
             all_chains.extend(chains);
         }
     }
+
+    // ClickHouse-only chains: sync state lives in the CH sync_state table
+    let engines: Vec<(u64, Arc<ClickHouseEngine>)> = state
+        .clickhouse_engines
+        .read()
+        .await
+        .iter()
+        .filter(|(chain_id, _)| !pg_chain_ids.contains(chain_id))
+        .map(|(chain_id, engine)| (*chain_id, Arc::clone(engine)))
+        .collect();
+    for (chain_id, engine) in engines {
+        match clickhouse_sync_status(&engine, chain_id).await {
+            Ok(Some(status)) => all_chains.push(status),
+            Ok(None) => all_chains.push(empty_status(chain_id)),
+            Err(e) => {
+                return Err(ApiError::QueryError(format!(
+                    "Failed to load status for chain {chain_id}: {e}"
+                )));
+            }
+        }
+    }
+
     all_chains.sort_by_key(|chain| chain.chain_id);
 
     // Populate per-table store status for each chain
@@ -267,21 +322,24 @@ async fn handle_status(State(state): State<AppState>) -> Result<Json<StatusRespo
         let chain_id = chain.chain_id as u64;
 
         // PostgreSQL per-table watermarks (from in-memory atomics, no table scans)
-        let (pg_blocks, pg_txs, pg_logs, pg_receipts) =
-            crate::metrics::get_sink_watermarks("postgres");
-        let (pg_bc, pg_tc, pg_lc, pg_rc) = crate::metrics::get_sink_row_counts("postgres");
-        if pg_blocks.is_some() || pg_txs.is_some() || pg_logs.is_some() || pg_receipts.is_some() {
-            chain.postgres = Some(crate::service::StoreStatus {
-                blocks: pg_blocks,
-                txs: pg_txs,
-                logs: pg_logs,
-                receipts: pg_receipts,
-                rate: crate::metrics::get_sink_block_rate("postgres"),
-                blocks_count: Some(pg_bc),
-                txs_count: Some(pg_tc),
-                logs_count: Some(pg_lc),
-                receipts_count: Some(pg_rc),
-            });
+        if pg_chain_ids.contains(&chain_id) {
+            let (pg_blocks, pg_txs, pg_logs, pg_receipts) =
+                crate::metrics::get_sink_watermarks("postgres");
+            let (pg_bc, pg_tc, pg_lc, pg_rc) = crate::metrics::get_sink_row_counts("postgres");
+            if pg_blocks.is_some() || pg_txs.is_some() || pg_logs.is_some() || pg_receipts.is_some()
+            {
+                chain.postgres = Some(crate::service::StoreStatus {
+                    blocks: pg_blocks,
+                    txs: pg_txs,
+                    logs: pg_logs,
+                    receipts: pg_receipts,
+                    rate: crate::metrics::get_sink_block_rate("postgres"),
+                    blocks_count: Some(pg_bc),
+                    txs_count: Some(pg_tc),
+                    logs_count: Some(pg_lc),
+                    receipts_count: Some(pg_rc),
+                });
+            }
         }
 
         // ClickHouse per-table watermarks (from in-memory atomics, no table scans)
@@ -312,6 +370,104 @@ async fn handle_status(State(state): State<AppState>) -> Result<Json<StatusRespo
         rev: GIT_REV,
         chains: all_chains,
     }))
+}
+
+/// Load a chain's sync status from the ClickHouse `sync_state` table
+/// (chains with no PostgreSQL configured).
+async fn clickhouse_sync_status(
+    engine: &ClickHouseEngine,
+    chain_id: u64,
+) -> AnyhowResult<Option<SyncStatus>> {
+    let sql = format!(
+        "SELECT CAST(max(head_num) AS Int64) AS head_num, \
+         CAST(max(synced_num) AS Int64) AS synced_num, \
+         CAST(max(tip_num) AS Int64) AS tip_num, \
+         CAST(min(backfill_num) AS Nullable(Int64)) AS backfill_num, \
+         CAST(min(started_at) AS Nullable(DateTime64(3, 'UTC'))) AS started_at, \
+         CAST(max(updated_at) AS DateTime64(3, 'UTC')) AS updated_at \
+         FROM sync_state WHERE chain_id = {chain_id} GROUP BY chain_id"
+    );
+    let result = engine.query(&sql, &[]).await?;
+
+    let Some(row) = result.rows.first() else {
+        return Ok(None);
+    };
+    let col = |name: &str| {
+        result
+            .columns
+            .iter()
+            .position(|c| c == name)
+            .and_then(|i| row.get(i))
+    };
+
+    let head_num = col("head_num").and_then(json_i64).unwrap_or(0);
+    let synced_num = col("synced_num").and_then(json_i64).unwrap_or(0);
+    let tip_num = col("tip_num").and_then(json_i64).unwrap_or(0);
+    let backfill_num = col("backfill_num").and_then(json_i64);
+    let started_at = col("started_at").and_then(json_datetime);
+    let updated_at = col("updated_at").and_then(json_datetime);
+
+    let backfill_remaining = match backfill_num {
+        None => synced_num.saturating_sub(1),
+        Some(0) => 0,
+        Some(n) => n,
+    };
+
+    let sync_rate = started_at.and_then(|started| {
+        let secs = Utc::now().signed_duration_since(started).num_seconds() as f64;
+        let total_indexed = match backfill_num {
+            Some(n) => synced_num - n + 1,
+            None => 1,
+        };
+        (secs > 0.0).then(|| total_indexed as f64 / secs)
+    });
+
+    let eta_secs =
+        sync_rate.and_then(|rate| (rate > 0.0).then(|| backfill_remaining as f64 / rate));
+
+    let gaps = crate::metrics::get_gap_status(chain_id, "clickhouse")
+        .map(|status| {
+            status
+                .ranges
+                .into_iter()
+                .map(|(start, end)| (start as i64, end as i64))
+                .collect()
+        })
+        .unwrap_or_default();
+
+    Ok(Some(SyncStatus {
+        chain_id: chain_id as i64,
+        head_num,
+        synced_num,
+        tip_num,
+        lag: head_num - tip_num,
+        gap_blocks: tip_num.saturating_sub(synced_num),
+        gaps,
+        backfill_num,
+        backfill_remaining,
+        sync_rate,
+        eta_secs,
+        updated_at: updated_at.unwrap_or_else(Utc::now),
+        postgres: None,
+        clickhouse: None,
+    }))
+}
+
+/// ClickHouse JSON output renders 64-bit integers as strings.
+fn json_i64(value: &serde_json::Value) -> Option<i64> {
+    match value {
+        serde_json::Value::Number(n) => n.as_i64(),
+        serde_json::Value::String(s) => s.parse().ok(),
+        _ => None,
+    }
+}
+
+/// Parse a ClickHouse DateTime64 JSON value ("2026-07-09 12:34:56.789").
+fn json_datetime(value: &serde_json::Value) -> Option<chrono::DateTime<Utc>> {
+    let s = value.as_str()?;
+    chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S%.f")
+        .ok()
+        .map(|naive| naive.and_utc())
 }
 
 fn empty_status(chain_id: u64) -> SyncStatus {
@@ -350,7 +506,9 @@ pub struct QueryParams {
     /// Maximum rows to return
     #[serde(default = "default_limit")]
     limit: i64,
-    /// Force a specific engine: "postgres" or "clickhouse"
+    /// Force a specific engine: "postgres", "clickhouse", or "clickhouse_pg".
+    /// Defaults to "postgres", which is served by pg_clickhouse when the
+    /// chain has no PostgreSQL configured.
     #[serde(default)]
     engine: Option<String>,
 }
@@ -387,10 +545,15 @@ async fn handle_query(
     let signatures = extract_signatures(uri.query());
 
     if params.live {
-        if params.engine.as_deref() == Some("clickhouse") {
-            return ApiError::BadRequest(
-                "engine=clickhouse is not supported with live=true (use PostgreSQL for real-time streaming)".to_string()
-            ).into_response();
+        if matches!(
+            params.engine.as_deref(),
+            Some("clickhouse") | Some("clickhouse_pg")
+        ) {
+            return ApiError::BadRequest(format!(
+                "engine={} is not supported with live=true (use PostgreSQL for real-time streaming)",
+                params.engine.as_deref().unwrap_or_default()
+            ))
+            .into_response();
         }
         handle_query_live(state, params, signatures)
             .await
@@ -402,39 +565,94 @@ async fn handle_query(
     }
 }
 
+/// A query route resolved from the requested engine and the chain's configured stores.
+enum QueryRoute {
+    Postgres(Pool),
+    ClickHouse(Arc<ClickHouseEngine>),
+    ClickHousePg(Pool),
+}
+
+/// Resolve the `engine=` parameter against the chain's configured stores.
+///
+/// `postgres` (the default) is aliased to `clickhouse_pg` when the chain has
+/// no PostgreSQL configured, so existing clients keep working on
+/// ClickHouse-only chains.
+async fn resolve_query_route(
+    state: &AppState,
+    chain_id: u64,
+    engine: Option<&str>,
+) -> Result<QueryRoute, ApiError> {
+    let requested = engine
+        .map(|e| {
+            QueryEngine::parse(e).ok_or_else(|| {
+                ApiError::BadRequest(format!(
+                    "Unknown engine '{e}' (expected postgres, clickhouse, or clickhouse_pg)"
+                ))
+            })
+        })
+        .transpose()?;
+
+    if !state.is_known_chain(chain_id).await {
+        return Err(ApiError::BadRequest(format!(
+            "Unknown chain_id: {chain_id}"
+        )));
+    }
+
+    match requested {
+        None | Some(QueryEngine::Postgres) => {
+            if let Some(pool) = state.get_pool(Some(chain_id)).await {
+                return Ok(QueryRoute::Postgres(pool));
+            }
+            if let Some(pool) = state.get_clickhouse_pg(Some(chain_id)).await {
+                return Ok(QueryRoute::ClickHousePg(pool));
+            }
+            Err(ApiError::BadRequest(format!(
+                "PostgreSQL not configured for chain_id {chain_id} (and no clickhouse pg_url fallback); use engine=clickhouse"
+            )))
+        }
+        Some(QueryEngine::ClickHouse) => state
+            .get_clickhouse(Some(chain_id))
+            .await
+            .map(QueryRoute::ClickHouse)
+            .ok_or_else(|| {
+                ApiError::BadRequest(format!("ClickHouse not configured for chain_id: {chain_id}"))
+            }),
+        Some(QueryEngine::ClickHousePg) => state
+            .get_clickhouse_pg(Some(chain_id))
+            .await
+            .map(QueryRoute::ClickHousePg)
+            .ok_or_else(|| {
+                ApiError::BadRequest(format!(
+                    "clickhouse_pg not configured for chain_id {chain_id} (set clickhouse.pg_url to a pg_clickhouse endpoint)"
+                ))
+            }),
+    }
+}
+
 async fn handle_query_once(
     state: AppState,
     params: QueryParams,
     signatures: Vec<String>,
 ) -> Result<Json<QueryResponse>, ApiError> {
-    let pool = state
-        .get_pool(Some(params.chain_id))
-        .await
-        .ok_or_else(|| ApiError::BadRequest(format!("Unknown chain_id: {}", params.chain_id)))?;
+    let route = resolve_query_route(&state, params.chain_id, params.engine.as_deref()).await?;
 
     let options = QueryOptions {
         timeout_ms: params.timeout_ms.clamp(100, 30000),
         limit: params.limit.clamp(1, crate::query::HARD_LIMIT_MAX),
     };
 
-    // Route to appropriate engine
-    let use_clickhouse = matches!(params.engine.as_deref(), Some("clickhouse"));
-
     let sigs: Vec<&str> = signatures.iter().map(String::as_str).collect();
 
-    let result = if use_clickhouse {
-        // Use ClickHouse engine for OLAP queries
-        let clickhouse = state
-            .get_clickhouse(Some(params.chain_id))
-            .await
-            .ok_or_else(|| {
-                ApiError::BadRequest(format!(
-                    "ClickHouse not configured for chain_id: {}",
-                    params.chain_id
-                ))
-            })?;
+    let map_pg_err = |e: anyhow::Error| {
+        if e.to_string().contains("timeout") {
+            ApiError::Timeout
+        } else {
+            ApiError::QueryError(e.to_string())
+        }
+    };
 
-        clickhouse
+    let result = match route {
+        QueryRoute::ClickHouse(clickhouse) => clickhouse
             .query_user(&params.sql, &sigs, options.timeout_ms, options.limit)
             .await
             .map(|r| QueryResult {
@@ -444,18 +662,17 @@ async fn handle_query_once(
                 engine: r.engine,
                 query_time_ms: r.query_time_ms,
             })
-            .map_err(|e| ApiError::QueryError(e.to_string()))?
-    } else {
-        // Use PostgreSQL
-        crate::service::execute_query_postgres(&pool, &params.sql, &sigs, &options)
-            .await
-            .map_err(|e| {
-                if e.to_string().contains("timeout") {
-                    ApiError::Timeout
-                } else {
-                    ApiError::QueryError(e.to_string())
-                }
-            })?
+            .map_err(|e| ApiError::QueryError(e.to_string()))?,
+        QueryRoute::Postgres(pool) => {
+            crate::service::execute_query_postgres(&pool, &params.sql, &sigs, &options)
+                .await
+                .map_err(map_pg_err)?
+        }
+        QueryRoute::ClickHousePg(pool) => {
+            crate::service::execute_query_clickhouse_pg(&pool, &params.sql, &sigs, &options)
+                .await
+                .map_err(map_pg_err)?
+        }
     };
 
     Ok(Json(QueryResponse { result, ok: true }))
@@ -486,10 +703,15 @@ async fn handle_query_live(
     let pool = match state.get_pool(Some(params.chain_id)).await {
         Some(p) => p,
         None => {
+            let error = if state.is_known_chain(params.chain_id).await {
+                "live=true requires a PostgreSQL-backed chain"
+            } else {
+                "Unknown chain_id"
+            };
             let stream: SseStream = Box::pin(async_stream::stream! {
                 yield Ok(SseEvent::default()
                     .event("error")
-                    .json_data(serde_json::json!({ "ok": false, "error": "Unknown chain_id" }))
+                    .json_data(serde_json::json!({ "ok": false, "error": error }))
                     .unwrap());
             });
             return Sse::new(stream).keep_alive(KeepAlive::default());
@@ -776,6 +998,8 @@ mod tests {
             0,
             Arc::new(Broadcaster::new()),
             HashMap::new(),
+            HashMap::new(),
+            HashMap::new(),
             &http_config,
         );
 
@@ -786,6 +1010,7 @@ mod tests {
     fn test_trusted_ip_fails_closed_when_empty() {
         let state = AppState {
             pools: Arc::new(RwLock::new(HashMap::new())),
+            clickhouse_pg_pools: Arc::new(RwLock::new(HashMap::new())),
             default_chain_id: 0,
             broadcaster: Arc::new(Broadcaster::new()),
             clickhouse_configs: Arc::new(RwLock::new(HashMap::new())),

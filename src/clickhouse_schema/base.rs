@@ -4,6 +4,7 @@ const BLOCKS_SCHEMA: &str = include_str!("../../db/clickhouse/blocks.sql");
 const TXS_SCHEMA: &str = include_str!("../../db/clickhouse/txs.sql");
 const LOGS_SCHEMA: &str = include_str!("../../db/clickhouse/logs.sql");
 const RECEIPTS_SCHEMA: &str = include_str!("../../db/clickhouse/receipts.sql");
+const SYNC_STATE_SCHEMA: &str = include_str!("../../db/clickhouse/sync_state.sql");
 
 const LOGS_MIGRATION_20260416: &str =
     include_str!("../../db/clickhouse/migrations/20260416_add_is_virtual_forward.sql");
@@ -83,6 +84,16 @@ pub const TABLES: &[ClickHouseObject] = &[
         depends_on: &["blocks", "txs"],
         public_query: true,
         block_column: Some("block_num"),
+        backfill: None,
+    },
+    // Internal sync-engine state for ClickHouse-only chains. Not publicly
+    // queryable and never pruned on reorg (watermarks are monotonic, like PG).
+    ClickHouseObject {
+        name: "sync_state",
+        kind: ClickHouseObjectKind::Table(SYNC_STATE_SCHEMA),
+        depends_on: &[],
+        public_query: false,
+        block_column: None,
         backfill: None,
     },
 ];

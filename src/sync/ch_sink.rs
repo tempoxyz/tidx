@@ -16,7 +16,7 @@ use crate::clickhouse_schema::{
     derived_objects, migrations, post_derived_migrations, reorg_tables,
 };
 use crate::metrics;
-use crate::types::{BlockRow, LogRow, ReceiptRow, TxRow};
+use crate::types::{BlockRow, LogRow, ReceiptRow, SyncState, TxRow};
 
 /// DDL for the catalog state table that records the checksum of every
 /// migration / view / materialized view the sink has applied. Used to detect
@@ -461,6 +461,26 @@ impl ClickHouseSink {
         Ok(())
     }
 
+    /// Query the lowest block number in ClickHouse, or None if empty.
+    async fn min_block_num(&self) -> Result<Option<i64>> {
+        let count: u64 = self
+            .client
+            .query("SELECT count() FROM blocks")
+            .fetch_one()
+            .await
+            .map_err(|e| anyhow!("ClickHouse query failed: {e}"))?;
+        if count == 0 {
+            return Ok(None);
+        }
+        let min: i64 = self
+            .client
+            .query("SELECT min(num) FROM blocks")
+            .fetch_one()
+            .await
+            .map_err(|e| anyhow!("ClickHouse query failed: {e}"))?;
+        Ok(Some(min))
+    }
+
     /// Query the highest block number in ClickHouse, or None if empty.
     pub async fn max_block_num(&self) -> Result<Option<i64>> {
         let count: u64 = self
@@ -514,6 +534,273 @@ impl ClickHouseSink {
             .fetch_one()
             .await
             .map_err(|e| anyhow!("ClickHouse query failed: {e}"))
+    }
+
+    // ── Sync-engine state (ClickHouse-only chains) ─────────────────────────
+    //
+    // Mirrors the Postgres `sync_state` upserts in `sync::writer`. Partial
+    // updates insert a full row with neutral values (0 for max-merged
+    // watermarks, NULL for the rest); AggregatingMergeTree merges them.
+
+    pub async fn load_sync_state(&self, chain_id: u64) -> Result<Option<SyncState>> {
+        let row: Option<ChSyncStateRow> = self
+            .client
+            // Casts unwrap the SimpleAggregateFunction result types, which the
+            // client cannot parse as response columns.
+            .query(
+                "SELECT chain_id, CAST(max(head_num) AS Int64) AS head_num, \
+                 CAST(max(synced_num) AS Int64) AS synced_num, \
+                 CAST(max(tip_num) AS Int64) AS tip_num, \
+                 CAST(min(backfill_num) AS Nullable(Int64)) AS backfill_num, \
+                 CAST(argMax(sync_rate, updated_at) AS Nullable(Float64)) AS sync_rate, \
+                 CAST(min(started_at) AS Nullable(DateTime64(3, 'UTC'))) AS started_at \
+                 FROM sync_state WHERE chain_id = ? GROUP BY chain_id",
+            )
+            .bind(chain_id)
+            .fetch_optional()
+            .await
+            .map_err(|e| anyhow!("ClickHouse sync_state query failed: {e}"))?;
+
+        Ok(row.map(|r| SyncState {
+            chain_id: r.chain_id,
+            head_num: r.head_num.max(0) as u64,
+            synced_num: r.synced_num.max(0) as u64,
+            tip_num: r.tip_num.max(0) as u64,
+            backfill_num: r.backfill_num.map(|n| n.max(0) as u64),
+            sync_rate: r.sync_rate,
+            started_at: r.started_at,
+        }))
+    }
+
+    pub async fn save_sync_state(&self, state: &SyncState) -> Result<()> {
+        self.insert_sync_state(ChSyncStateWire {
+            chain_id: state.chain_id,
+            head_num: state.head_num as i64,
+            synced_num: state.synced_num as i64,
+            tip_num: state.tip_num as i64,
+            backfill_num: state.backfill_num.map(|n| n as i64),
+            sync_rate: state.sync_rate,
+            started_at: Some(state.started_at.unwrap_or_else(chrono::Utc::now)),
+            updated_at: chrono::Utc::now(),
+        })
+        .await
+    }
+
+    /// Update only tip_num/head_num (realtime sync; watermarks merge with max).
+    pub async fn update_tip_num(&self, chain_id: u64, tip_num: u64, head_num: u64) -> Result<()> {
+        self.insert_sync_state(ChSyncStateWire {
+            chain_id,
+            head_num: head_num as i64,
+            synced_num: 0,
+            tip_num: tip_num as i64,
+            backfill_num: None,
+            sync_rate: None,
+            started_at: Some(chrono::Utc::now()),
+            updated_at: chrono::Utc::now(),
+        })
+        .await
+    }
+
+    /// Update only synced_num (gap-fill sync).
+    pub async fn update_synced_num(&self, chain_id: u64, synced_num: u64) -> Result<()> {
+        self.insert_sync_state(ChSyncStateWire {
+            chain_id,
+            head_num: 0,
+            synced_num: synced_num as i64,
+            tip_num: 0,
+            backfill_num: None,
+            sync_rate: None,
+            started_at: None,
+            updated_at: chrono::Utc::now(),
+        })
+        .await
+    }
+
+    /// Update the current sync rate (rolling window average).
+    pub async fn update_sync_rate(&self, chain_id: u64, rate: f64) -> Result<()> {
+        self.insert_sync_state(ChSyncStateWire {
+            chain_id,
+            head_num: 0,
+            synced_num: 0,
+            tip_num: 0,
+            backfill_num: None,
+            sync_rate: Some(rate),
+            started_at: None,
+            updated_at: chrono::Utc::now(),
+        })
+        .await
+    }
+
+    /// Plain-SQL insert: the typed insert API cannot describe
+    /// SimpleAggregateFunction columns. All values are numeric, so direct
+    /// interpolation is safe.
+    async fn insert_sync_state(&self, row: ChSyncStateWire) -> Result<()> {
+        let nullable_i64 = |v: Option<i64>| v.map_or("NULL".to_string(), |n| n.to_string());
+        let sql = format!(
+            "INSERT INTO sync_state \
+             (chain_id, head_num, synced_num, tip_num, backfill_num, sync_rate, started_at, updated_at) \
+             VALUES ({}, {}, {}, {}, {}, {}, {}, fromUnixTimestamp64Milli({}))",
+            row.chain_id,
+            row.head_num,
+            row.synced_num,
+            row.tip_num,
+            nullable_i64(row.backfill_num),
+            row.sync_rate
+                .filter(|r| r.is_finite())
+                .map_or("NULL".to_string(), |r| r.to_string()),
+            row.started_at.map_or("NULL".to_string(), |t| {
+                format!("fromUnixTimestamp64Milli({})", t.timestamp_millis())
+            }),
+            row.updated_at.timestamp_millis(),
+        );
+        self.client
+            .query(&sql)
+            .execute()
+            .await
+            .map_err(|e| anyhow!("ClickHouse sync_state insert failed: {e}"))?;
+        Ok(())
+    }
+
+    /// Get block hash by block number (for parent hash validation).
+    /// Returns raw hash bytes (blocks.hash is stored as 0x-prefixed hex).
+    pub async fn get_block_hash(&self, block_num: u64) -> Result<Option<Vec<u8>>> {
+        let hash: Option<String> = self
+            .client
+            .query("SELECT hash FROM blocks WHERE num = ? ORDER BY timestamp DESC LIMIT 1")
+            .bind(block_num as i64)
+            .fetch_optional()
+            .await
+            .map_err(|e| anyhow!("ClickHouse block hash query failed: {e}"))?;
+
+        hash.map(|h| {
+            hex::decode(h.trim_start_matches("0x"))
+                .map_err(|e| anyhow!("Invalid stored block hash: {e}"))
+        })
+        .transpose()
+    }
+
+    /// Fast check: are there any gaps in [from, to]?
+    /// uniqExact tolerates pre-merge duplicate rows in ReplacingMergeTree.
+    pub async fn has_gaps(&self, from: u64, to: u64) -> Result<bool> {
+        if to < from {
+            return Ok(false);
+        }
+        let count: u64 = self
+            .client
+            .query("SELECT uniqExact(num) FROM blocks WHERE num >= ? AND num <= ?")
+            .bind(from as i64)
+            .bind(to as i64)
+            .fetch_one()
+            .await
+            .map_err(|e| anyhow!("ClickHouse gap check failed: {e}"))?;
+        Ok(count != to - from + 1)
+    }
+
+    /// Detect ALL gaps including from genesis to first block.
+    /// Returns gaps sorted by end block descending (mirrors `writer::detect_all_gaps`).
+    pub async fn detect_all_gaps(&self, tip_num: u64) -> Result<Vec<(u64, u64)>> {
+        let min_block = self.min_block_num().await?;
+
+        let rows: Vec<ChGapRow> = self
+            .client
+            .query(
+                "SELECT (prev_num + 1) AS gap_start, (num - 1) AS gap_end \
+                 FROM ( \
+                     SELECT num, lagInFrame(num, 1, num) OVER ( \
+                         ORDER BY num ASC ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW \
+                     ) AS prev_num \
+                     FROM (SELECT DISTINCT num FROM blocks WHERE num <= ?) \
+                 ) \
+                 WHERE num - prev_num > 1",
+            )
+            .bind(tip_num.min(i64::MAX as u64) as i64)
+            .fetch_all()
+            .await
+            .map_err(|e| anyhow!("ClickHouse gap detection failed: {e}"))?;
+
+        let mut gaps: Vec<(u64, u64)> = rows
+            .iter()
+            .map(|r| (r.gap_start.max(0) as u64, r.gap_end.max(0) as u64))
+            .collect();
+
+        // Genesis gap handling mirrors writer::detect_all_gaps: block 0 is empty,
+        // so coverage starts at block 1.
+        if let Some(min) = min_block {
+            if min > 1 {
+                gaps.push((1, min as u64 - 1));
+            }
+        } else if tip_num > 0 {
+            gaps.push((1, tip_num));
+        }
+
+        gaps.retain(|(_, end)| *end <= tip_num);
+        gaps.sort_by_key(|b| std::cmp::Reverse(b.1));
+
+        Ok(gaps)
+    }
+
+    /// Detect recent blocks that have no receipts (deferred receipt backfill).
+    ///
+    /// Bounded to a recent window: block+receipt batches commit together, so
+    /// holes are crash artifacts near the head. A full-history anti-join over
+    /// billions of rows is too heavy to run every tick on ClickHouse.
+    pub async fn detect_blocks_missing_receipts(&self, limit: i64) -> Result<Vec<u64>> {
+        const RECEIPT_SCAN_WINDOW: i64 = 100_000;
+
+        let Some(max_block) = self.max_block_num().await? else {
+            return Ok(Vec::new());
+        };
+        let from = (max_block - RECEIPT_SCAN_WINDOW).max(0);
+
+        let rows: Vec<i64> = self
+            .client
+            .query(
+                "SELECT b.num FROM (SELECT DISTINCT num FROM blocks WHERE num >= ?) AS b \
+                 LEFT ANTI JOIN ( \
+                     SELECT DISTINCT block_num FROM receipts WHERE block_num >= ? \
+                 ) AS r ON r.block_num = b.num \
+                 ORDER BY b.num DESC \
+                 LIMIT ?",
+            )
+            .bind(from)
+            .bind(from)
+            .bind(limit)
+            .fetch_all()
+            .await
+            .map_err(|e| anyhow!("ClickHouse missing-receipt scan failed: {e}"))?;
+
+        Ok(rows.into_iter().map(|n| n.max(0) as u64).collect())
+    }
+
+    /// Block timestamps for a range (receipt backfill decoding).
+    pub async fn block_timestamps(
+        &self,
+        from: u64,
+        to: u64,
+    ) -> Result<HashMap<u64, chrono::DateTime<chrono::Utc>>> {
+        let rows: Vec<ChBlockTimestampRow> = self
+            .client
+            .query("SELECT num, timestamp FROM blocks WHERE num >= ? AND num <= ?")
+            .bind(from as i64)
+            .bind(to as i64)
+            .fetch_all()
+            .await
+            .map_err(|e| anyhow!("ClickHouse block timestamp query failed: {e}"))?;
+
+        Ok(rows
+            .into_iter()
+            .map(|r| (r.num.max(0) as u64, r.timestamp))
+            .collect())
+    }
+
+    /// Distinct block count at or above a block number (reorg delete reporting).
+    pub async fn count_blocks_from(&self, block_num: u64) -> Result<u64> {
+        self.client
+            .query("SELECT uniqExact(num) FROM blocks WHERE num >= ?")
+            .bind(block_num as i64)
+            .fetch_one()
+            .await
+            .map_err(|e| anyhow!("ClickHouse block count query failed: {e}"))
     }
 
     async fn source_min_max_for_select(
@@ -737,6 +1024,43 @@ impl ClickHouseSink {
 struct ChSchemaObjectRow {
     name: String,
     checksum: String,
+}
+
+/// Pending sync_state row, rendered to a plain-SQL INSERT.
+struct ChSyncStateWire {
+    chain_id: u64,
+    head_num: i64,
+    synced_num: i64,
+    tip_num: i64,
+    backfill_num: Option<i64>,
+    sync_rate: Option<f64>,
+    started_at: Option<chrono::DateTime<chrono::Utc>>,
+    updated_at: chrono::DateTime<chrono::Utc>,
+}
+
+#[derive(Row, Deserialize)]
+struct ChSyncStateRow {
+    chain_id: u64,
+    head_num: i64,
+    synced_num: i64,
+    tip_num: i64,
+    backfill_num: Option<i64>,
+    sync_rate: Option<f64>,
+    #[serde(with = "clickhouse::serde::chrono::datetime64::millis::option")]
+    started_at: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+#[derive(Row, Deserialize)]
+struct ChGapRow {
+    gap_start: i64,
+    gap_end: i64,
+}
+
+#[derive(Row, Deserialize)]
+struct ChBlockTimestampRow {
+    num: i64,
+    #[serde(with = "clickhouse::serde::chrono::datetime64::millis")]
+    timestamp: chrono::DateTime<chrono::Utc>,
 }
 
 #[derive(Row, Serialize)]

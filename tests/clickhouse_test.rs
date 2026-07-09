@@ -15,7 +15,7 @@ use tidx::query::EventSignature;
 use tidx::sync::ch_sink::ClickHouseSink;
 use tidx::sync::sink::SinkSet;
 use tidx::sync::writer;
-use tidx::types::{BlockRow, LogRow, ReceiptRow, TxRow};
+use tidx::types::{BlockRow, LogRow, ReceiptRow, SyncState, TxRow};
 
 const TEST_DB: &str = "tidx_test";
 
@@ -2213,4 +2213,232 @@ async fn test_backfill_idempotent() {
         .expect("second backfill failed");
     assert_eq!(ch.table_count("blocks").await.unwrap(), 10);
     assert_eq!(ch.table_count("txs").await.unwrap(), 10);
+}
+
+// ============================================================================
+// ClickHouse Sync-State Store Tests (postgres-less chains)
+// ============================================================================
+
+#[tokio::test]
+#[serial(clickhouse)]
+async fn test_clickhouse_sync_state_roundtrip_and_merge_semantics() {
+    let Some((sink, _ch)) = setup_sink().await else {
+        return;
+    };
+
+    assert!(
+        sink.load_sync_state(TEST_CHAIN_ID)
+            .await
+            .expect("load empty")
+            .is_none()
+    );
+
+    let state = SyncState {
+        chain_id: TEST_CHAIN_ID,
+        head_num: 100,
+        synced_num: 90,
+        tip_num: 95,
+        backfill_num: Some(50),
+        sync_rate: Some(12.5),
+        started_at: None,
+    };
+    sink.save_sync_state(&state).await.expect("save");
+
+    let loaded = sink
+        .load_sync_state(TEST_CHAIN_ID)
+        .await
+        .expect("load")
+        .expect("state exists");
+    assert_eq!(loaded.head_num, 100);
+    assert_eq!(loaded.synced_num, 90);
+    assert_eq!(loaded.tip_num, 95);
+    assert_eq!(loaded.backfill_num, Some(50));
+    assert!(loaded.started_at.is_some(), "started_at seeded on save");
+
+    // Partial updates merge with the Postgres upsert semantics
+    sink.update_tip_num(TEST_CHAIN_ID, 120, 125)
+        .await
+        .expect("update tip");
+    sink.update_synced_num(TEST_CHAIN_ID, 110)
+        .await
+        .expect("update synced");
+    sink.update_sync_rate(TEST_CHAIN_ID, 99.0)
+        .await
+        .expect("update rate");
+
+    let loaded = sink
+        .load_sync_state(TEST_CHAIN_ID)
+        .await
+        .expect("load")
+        .expect("state exists");
+    assert_eq!(loaded.tip_num, 120);
+    assert_eq!(loaded.head_num, 125);
+    assert_eq!(loaded.synced_num, 110);
+    assert_eq!(loaded.backfill_num, Some(50), "backfill cursor untouched");
+    assert_eq!(loaded.sync_rate, Some(99.0));
+
+    // Watermarks are monotonic: lower values never clobber (GREATEST in PG)
+    sink.update_tip_num(TEST_CHAIN_ID, 60, 60)
+        .await
+        .expect("update tip lower");
+    let loaded = sink
+        .load_sync_state(TEST_CHAIN_ID)
+        .await
+        .expect("load")
+        .expect("state exists");
+    assert_eq!(loaded.tip_num, 120);
+    assert_eq!(loaded.head_num, 125);
+
+    // Backfill cursor only descends toward genesis
+    sink.save_sync_state(&SyncState {
+        chain_id: TEST_CHAIN_ID,
+        head_num: 0,
+        synced_num: 0,
+        tip_num: 0,
+        backfill_num: Some(30),
+        sync_rate: None,
+        started_at: None,
+    })
+    .await
+    .expect("save backfill");
+    let loaded = sink
+        .load_sync_state(TEST_CHAIN_ID)
+        .await
+        .expect("load")
+        .expect("state exists");
+    assert_eq!(loaded.backfill_num, Some(30));
+    assert_eq!(loaded.tip_num, 120, "zeroed watermarks don't clobber");
+}
+
+#[tokio::test]
+#[serial(clickhouse)]
+async fn test_clickhouse_gap_detection_and_block_hash() {
+    let Some((sink, _ch)) = setup_sink().await else {
+        return;
+    };
+
+    // Blocks 5-7 and 10-12: gaps are (1,4) from genesis and (8,9)
+    let blocks: Vec<BlockRow> = (5..=7).chain(10..=12).map(make_block).collect();
+    sink.write_blocks(&blocks).await.expect("write blocks");
+
+    assert!(sink.has_gaps(1, 12).await.expect("has_gaps full range"));
+    assert!(!sink.has_gaps(5, 7).await.expect("has_gaps contiguous"));
+    assert!(!sink.has_gaps(10, 12).await.expect("has_gaps contiguous"));
+
+    let gaps = sink.detect_all_gaps(12).await.expect("detect gaps");
+    assert_eq!(gaps, vec![(8, 9), (1, 4)], "end-descending order");
+
+    // Block hash decodes back to raw bytes
+    let hash = sink
+        .get_block_hash(5)
+        .await
+        .expect("get hash")
+        .expect("hash present");
+    assert_eq!(hash, vec![5u8; 32]);
+    assert!(
+        sink.get_block_hash(8)
+            .await
+            .expect("get missing hash")
+            .is_none()
+    );
+
+    assert_eq!(sink.count_blocks_from(10).await.expect("count"), 3);
+}
+
+#[tokio::test]
+#[serial(clickhouse)]
+async fn test_clickhouse_detect_blocks_missing_receipts() {
+    let Some((sink, _ch)) = setup_sink().await else {
+        return;
+    };
+
+    let blocks: Vec<BlockRow> = (1..=5).map(make_block).collect();
+    sink.write_blocks(&blocks).await.expect("write blocks");
+    let receipts: Vec<ReceiptRow> = (1..=3).map(|n| make_receipt(n, 0)).collect();
+    sink.write_receipts(&receipts)
+        .await
+        .expect("write receipts");
+
+    let missing = sink
+        .detect_blocks_missing_receipts(10)
+        .await
+        .expect("scan missing");
+    assert_eq!(missing, vec![5, 4], "most recent first");
+
+    sink.write_receipts(&[make_receipt(4, 0), make_receipt(5, 0)])
+        .await
+        .expect("write remaining receipts");
+    assert!(
+        sink.detect_blocks_missing_receipts(10)
+            .await
+            .expect("rescan")
+            .is_empty()
+    );
+}
+
+#[tokio::test]
+#[serial(clickhouse)]
+async fn test_clickhouse_only_sinkset_store_and_reorg_delete() {
+    let Some((sink, _ch)) = setup_sink().await else {
+        return;
+    };
+    let sinks = SinkSet::clickhouse_only(sink);
+
+    let blocks: Vec<BlockRow> = (1..=5).map(make_block).collect();
+    let txs: Vec<TxRow> = (1..=5).map(|n| make_tx(n, 0)).collect();
+    let logs: Vec<LogRow> = (1..=5).map(|n| make_log(n, 0)).collect();
+    let receipts: Vec<ReceiptRow> = (1..=5).map(|n| make_receipt(n, 0)).collect();
+    sinks
+        .write_all(&blocks, &txs, &logs, &receipts)
+        .await
+        .expect("write_all without postgres");
+
+    let store = sinks.store();
+    assert_eq!(store.name(), "clickhouse");
+
+    store
+        .update_tip_num(TEST_CHAIN_ID, 5, 5)
+        .await
+        .expect("update tip");
+    let state = store
+        .load_sync_state(TEST_CHAIN_ID)
+        .await
+        .expect("load")
+        .expect("state exists");
+    assert_eq!(state.tip_num, 5);
+    assert!(
+        store
+            .detect_all_gaps(5)
+            .await
+            .expect("detect gaps")
+            .is_empty()
+    );
+
+    let timestamps = store.block_timestamps(2, 4).await.expect("timestamps");
+    assert_eq!(timestamps.len(), 3);
+    assert!(timestamps.contains_key(&3));
+
+    // finalize_receipt_backfill is a no-op on ClickHouse
+    store
+        .finalize_receipt_backfill(1, 5)
+        .await
+        .expect("finalize noop");
+
+    // Reorg delete reports the number of removed blocks
+    let deleted = sinks.delete_from(4).await.expect("reorg delete");
+    assert_eq!(deleted, 2);
+    assert!(
+        sinks
+            .store()
+            .detect_all_gaps(3)
+            .await
+            .expect("gaps after reorg")
+            .is_empty()
+    );
+
+    // PG->CH mirror backfill is a no-op without postgres
+    sinks
+        .backfill_clickhouse(TEST_CHAIN_ID)
+        .await
+        .expect("backfill noop");
 }

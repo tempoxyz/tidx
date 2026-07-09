@@ -511,6 +511,7 @@ mod tests {
     fn test_state_with_trusted_cidrs(trusted_cidrs: Vec<(IpAddr, u8)>) -> AppState {
         AppState {
             pools: Arc::new(RwLock::new(HashMap::new())),
+            clickhouse_pg_pools: Arc::new(RwLock::new(HashMap::new())),
             default_chain_id: 0,
             broadcaster: Arc::new(Broadcaster::new()),
             clickhouse_configs: Arc::new(RwLock::new(HashMap::new())),

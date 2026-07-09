@@ -37,7 +37,16 @@ pub async fn run(args: Args) -> Result<()> {
             .ok_or_else(|| anyhow::anyhow!("No chains configured"))?
     };
 
-    let pg_url = chain.resolved_pg_url()?;
+    let pg_url = chain
+        .postgres
+        .as_ref()
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "chain '{}' has no postgres configured (this command backfills PostgreSQL)",
+                chain.name
+            )
+        })?
+        .resolved_url()?;
     let pool = db::create_pool(&pg_url).await?;
     let conn = pool.get().await?;
 

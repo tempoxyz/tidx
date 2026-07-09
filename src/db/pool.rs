@@ -11,7 +11,12 @@ pub async fn create_pool(database_url: &str) -> Result<Pool> {
 /// Creates a pool with custom max connections
 pub async fn create_pool_with_size(database_url: &str, max_size: usize) -> Result<Pool> {
     ensure_database_exists(database_url).await?;
+    connect_pool(database_url, max_size).await
+}
 
+/// Connect a pool without attempting to create the database.
+/// Used for externally-managed servers (e.g. pg_clickhouse endpoints).
+pub async fn connect_pool(database_url: &str, max_size: usize) -> Result<Pool> {
     // Kill idle or active long-running statements in transactions after 60s to prevent
     // lock contention. API queries still use stricter SET LOCAL timeouts when requested,
     // and Clean recycling clears leaked session state.

@@ -4,7 +4,6 @@ use common::tempo::TempoNode;
 use common::testdb::TestDb;
 
 use serial_test::serial;
-use tidx::db::ThrottledPool;
 use tidx::query::EventSignature;
 use tidx::sync::engine::SyncEngine;
 use tidx::sync::sink::SinkSet;
@@ -30,13 +29,9 @@ async fn test_sync_single_block() {
         .expect("Block not reached");
 
     let sinks = SinkSet::new(db.pool.clone());
-    let engine = SyncEngine::new(
-        ThrottledPool::from_pool(db.pool.clone()),
-        sinks,
-        &tempo.rpc_url,
-    )
-    .await
-    .expect("Failed to create sync engine");
+    let engine = SyncEngine::new(sinks, &tempo.rpc_url)
+        .await
+        .expect("Failed to create sync engine");
 
     engine
         .sync_block(target_block)
@@ -71,13 +66,9 @@ async fn test_sync_state_persisted() {
         .expect("Block 10 not reached");
 
     let sinks = SinkSet::new(db.pool.clone());
-    let engine = SyncEngine::new(
-        ThrottledPool::from_pool(db.pool.clone()),
-        sinks,
-        &tempo.rpc_url,
-    )
-    .await
-    .expect("Failed to create sync engine");
+    let engine = SyncEngine::new(sinks, &tempo.rpc_url)
+        .await
+        .expect("Failed to create sync engine");
 
     engine.sync_block(10).await.expect("Failed to sync block");
 
@@ -112,13 +103,9 @@ async fn test_sync_block_range() {
         .expect("Block 20 not reached");
 
     let sinks = SinkSet::new(db.pool.clone());
-    let engine = SyncEngine::new(
-        ThrottledPool::from_pool(db.pool.clone()),
-        sinks,
-        &tempo.rpc_url,
-    )
-    .await
-    .expect("Failed to create sync engine");
+    let engine = SyncEngine::new(sinks, &tempo.rpc_url)
+        .await
+        .expect("Failed to create sync engine");
 
     // Sync blocks 1-20
     for block_num in 1..=20 {
@@ -158,13 +145,9 @@ async fn test_sync_logs() {
         .expect("Block 50 not reached");
 
     let sinks = SinkSet::new(db.pool.clone());
-    let engine = SyncEngine::new(
-        ThrottledPool::from_pool(db.pool.clone()),
-        sinks,
-        &tempo.rpc_url,
-    )
-    .await
-    .expect("Failed to create sync engine");
+    let engine = SyncEngine::new(sinks, &tempo.rpc_url)
+        .await
+        .expect("Failed to create sync engine");
 
     // Sync blocks 1-50
     for block_num in 1..=50 {
@@ -351,13 +334,9 @@ async fn test_parent_hash_validation() {
         .expect("Block 10 not reached");
 
     let sinks = SinkSet::new(db.pool.clone());
-    let engine = SyncEngine::new(
-        ThrottledPool::from_pool(db.pool.clone()),
-        sinks,
-        &tempo.rpc_url,
-    )
-    .await
-    .expect("Failed to create sync engine");
+    let engine = SyncEngine::new(sinks, &tempo.rpc_url)
+        .await
+        .expect("Failed to create sync engine");
 
     // Sync blocks 1-10 sequentially
     for block_num in 1..=10 {
@@ -857,13 +836,9 @@ async fn test_sync_receipts() {
         .expect("Block 50 not reached");
 
     let sinks = SinkSet::new(db.pool.clone());
-    let engine = SyncEngine::new(
-        ThrottledPool::from_pool(db.pool.clone()),
-        sinks,
-        &tempo.rpc_url,
-    )
-    .await
-    .expect("Failed to create sync engine");
+    let engine = SyncEngine::new(sinks, &tempo.rpc_url)
+        .await
+        .expect("Failed to create sync engine");
 
     // Sync blocks 1-50
     for block_num in 1..=50 {

@@ -2,11 +2,12 @@ use anyhow::Result;
 use clap::Args as ClapArgs;
 use std::path::PathBuf;
 
-use tidx::config::Config;
+use tidx::config::{ChainConfig, Config};
 use tidx::db;
 use tidx::sync::ch_sink::ClickHouseSink;
 use tidx::sync::fetcher::RpcClient;
 use tidx::sync::writer::{detect_all_gaps, load_sync_state};
+use tidx::types::SyncState;
 
 #[derive(ClapArgs)]
 pub struct Args {
@@ -168,6 +169,48 @@ fn print_http_status(resp: &serde_json::Value) -> Result<()> {
     Ok(())
 }
 
+/// Build a ClickHouse sink for a chain, if ClickHouse is enabled and reachable config-wise.
+fn clickhouse_sink(chain: &ChainConfig) -> Option<ClickHouseSink> {
+    let ch = chain.clickhouse_enabled()?;
+    let database = ch
+        .database
+        .clone()
+        .unwrap_or_else(|| format!("tidx_{}", chain.chain_id));
+    let password = ch.resolved_password().ok().flatten();
+    ClickHouseSink::new(&ch.url, &database, ch.user.as_deref(), password.as_deref()).ok()
+}
+
+/// Load sync state (and gaps, when requested) from the chain's state store:
+/// PostgreSQL when configured, otherwise ClickHouse.
+async fn load_chain_state(
+    chain: &ChainConfig,
+    with_gaps: bool,
+) -> Result<(Option<SyncState>, Vec<(u64, u64)>)> {
+    if let Some(pg) = &chain.postgres {
+        let pg_url = pg.resolved_url()?;
+        let pool = db::create_pool(&pg_url).await?;
+        let state = load_sync_state(&pool, chain.chain_id).await?;
+        let gaps = if with_gaps {
+            let tip = state.as_ref().map(|s| s.tip_num).unwrap_or(0);
+            detect_all_gaps(&pool, tip).await.unwrap_or_default()
+        } else {
+            vec![]
+        };
+        return Ok((state, gaps));
+    }
+
+    let sink = clickhouse_sink(chain)
+        .ok_or_else(|| anyhow::anyhow!("chain '{}' has no reachable store", chain.name))?;
+    let state = sink.load_sync_state(chain.chain_id).await?;
+    let gaps = if with_gaps {
+        let tip = state.as_ref().map(|s| s.tip_num).unwrap_or(0);
+        sink.detect_all_gaps(tip).await.unwrap_or_default()
+    } else {
+        vec![]
+    };
+    Ok((state, gaps))
+}
+
 async fn print_status(config: &Config) -> Result<()> {
     println!("╔═══════════════════════════════════════════════════════════╗");
     println!("║                     TIDX Indexer Status                   ║");
@@ -186,21 +229,11 @@ async fn print_status(config: &Config) -> Result<()> {
         );
         println!("│");
 
-        // Connect to this chain's database
-        let pg_url = match chain.resolved_pg_url() {
-            Ok(url) => url,
+        // Load sync state from this chain's state store (PG or CH)
+        let state = match load_chain_state(chain, false).await {
+            Ok((state, _)) => state,
             Err(e) => {
-                println!("│  Status: Failed to resolve pg_url");
-                println!("│  Error: {e}");
-                println!("└───────────────────────────────────────────────────────────");
-                println!();
-                continue;
-            }
-        };
-        let pool = match db::create_pool(&pg_url).await {
-            Ok(p) => p,
-            Err(e) => {
-                println!("│  Status: Database connection failed");
+                println!("│  Status: State store connection failed");
                 println!("│  Error: {e}");
                 println!("└───────────────────────────────────────────────────────────");
                 println!();
@@ -208,7 +241,7 @@ async fn print_status(config: &Config) -> Result<()> {
             }
         };
 
-        let head = if let Some(state) = load_sync_state(&pool, chain.chain_id).await? {
+        let head = if let Some(state) = state {
             let head = live_head.unwrap_or(state.head_num);
             let lag = head.saturating_sub(state.tip_num);
             println!(
@@ -228,15 +261,15 @@ async fn print_status(config: &Config) -> Result<()> {
         };
 
         // PostgreSQL per-table status (from in-memory watermarks)
-        println!("│");
-        print_store_status_from_watermarks("PostgreSQL", "postgres", head as i64);
+        if chain.postgres.is_some() {
+            println!("│");
+            print_store_status_from_watermarks("PostgreSQL", "postgres", head as i64);
+        }
 
         // ClickHouse per-table status (from in-memory watermarks)
-        if let Some(ref ch_config) = chain.clickhouse {
-            if ch_config.enabled {
-                println!("│");
-                print_store_status_from_watermarks("ClickHouse", "clickhouse", head as i64);
-            }
+        if chain.clickhouse_enabled().is_some() {
+            println!("│");
+            print_store_status_from_watermarks("ClickHouse", "clickhouse", head as i64);
         }
 
         println!("└───────────────────────────────────────────────────────────");
@@ -255,18 +288,9 @@ async fn print_json_status(config: &Config) -> Result<()> {
             Err(_) => None,
         };
 
-        let (state, gaps) = match chain.resolved_pg_url() {
-            Ok(pg_url) => match db::create_pool(&pg_url).await {
-                Ok(pool) => {
-                    let state = load_sync_state(&pool, chain.chain_id).await.ok().flatten();
-                    let tip = state.as_ref().map(|s| s.tip_num).unwrap_or(0);
-                    let gaps = detect_all_gaps(&pool, tip).await.unwrap_or_default();
-                    (state, gaps)
-                }
-                Err(_) => (None, vec![]),
-            },
-            Err(_) => (None, vec![]),
-        };
+        let (state, gaps) = load_chain_state(chain, true)
+            .await
+            .unwrap_or((None, vec![]));
 
         let gaps_json: Vec<_> = gaps
             .iter()
@@ -278,7 +302,7 @@ async fn print_json_status(config: &Config) -> Result<()> {
             "name": chain.name,
             "chain_id": chain.chain_id,
             "rpc_url": chain.redacted_rpc_url(),
-            "pg_url": chain.pg_url,
+            "pg_url": chain.postgres.as_ref().map(|pg| pg.url.clone()),
             "head": live_head,
             "tip_num": state.as_ref().map(|s| s.tip_num),
             "synced_num": state.as_ref().map(|s| s.synced_num),
@@ -293,31 +317,17 @@ async fn print_json_status(config: &Config) -> Result<()> {
         });
 
         // Add ClickHouse status if configured
-        if let Some(ref ch_config) = chain.clickhouse {
-            if ch_config.enabled {
-                let database = ch_config
-                    .database
-                    .clone()
-                    .unwrap_or_else(|| format!("tidx_{}", chain.chain_id));
-                let ch_password = ch_config.resolved_password().ok().flatten();
-                if let Ok(sink) = ClickHouseSink::new(
-                    &ch_config.url,
-                    &database,
-                    ch_config.user.as_deref(),
-                    ch_password.as_deref(),
-                ) {
-                    let blocks = sink.max_block_in_table("blocks").await.ok().flatten();
-                    let txs = sink.max_block_in_table("txs").await.ok().flatten();
-                    let logs = sink.max_block_in_table("logs").await.ok().flatten();
-                    let receipts = sink.max_block_in_table("receipts").await.ok().flatten();
-                    chain_status["clickhouse"] = serde_json::json!({
-                        "blocks": blocks,
-                        "txs": txs,
-                        "logs": logs,
-                        "receipts": receipts,
-                    });
-                }
-            }
+        if let Some(sink) = clickhouse_sink(chain) {
+            let blocks = sink.max_block_in_table("blocks").await.ok().flatten();
+            let txs = sink.max_block_in_table("txs").await.ok().flatten();
+            let logs = sink.max_block_in_table("logs").await.ok().flatten();
+            let receipts = sink.max_block_in_table("receipts").await.ok().flatten();
+            chain_status["clickhouse"] = serde_json::json!({
+                "blocks": blocks,
+                "txs": txs,
+                "logs": logs,
+                "receipts": receipts,
+            });
         }
 
         chains.push(chain_status);

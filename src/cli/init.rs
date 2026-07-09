@@ -104,9 +104,11 @@ port = 9090
 name = "{name}"
 chain_id = {chain_id}
 rpc_url = "{rpc_url}"
-pg_url = "{pg_url}"
 backfill = true
 batch_size = 100
+
+[chains.postgres]
+url = "{pg_url}"
 "#
     )
 }

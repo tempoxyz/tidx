@@ -7,7 +7,10 @@ use tokio_postgres::types::ToSql;
 
 use crate::db::Pool;
 use crate::metrics;
-use crate::query::{HARD_LIMIT_MAX, apply_event_signature_ctes_postgres, validate_query};
+use crate::query::{
+    HARD_LIMIT_MAX, apply_event_signature_ctes_postgres, validate_query,
+    validate_query_clickhouse_pg,
+};
 
 #[derive(Debug, Clone, Serialize)]
 pub struct SyncStatus {
@@ -180,6 +183,41 @@ pub async fn execute_query_postgres(
     // Only replace hex values (40+ chars), not short '0x' prefixes used in concat()
     let sql = crate::query::convert_hex_literals_postgres(&sql);
 
+    execute_prepared_pg_wire_query(pool, &sql, options, "postgres").await
+}
+
+/// Execute a Postgres-dialect query against a pg_clickhouse endpoint.
+///
+/// The queryable tables are the public ClickHouse tables, and hashes/addresses
+/// are 0x-prefixed hex text (ClickHouse String columns), so no bytea literal
+/// conversion applies. Event-signature CTEs decode the Postgres bytea schema
+/// and are not supported on this engine.
+pub async fn execute_query_clickhouse_pg(
+    pool: &Pool,
+    sql: &str,
+    signatures: &[&str],
+    options: &QueryOptions,
+) -> Result<QueryResult> {
+    if !signatures.is_empty() {
+        return Err(anyhow!(
+            "Event signatures are not supported with engine=clickhouse_pg (use engine=clickhouse)"
+        ));
+    }
+
+    validate_query_clickhouse_pg(sql)?;
+
+    let sql = append_limit_if_missing(sql, options.limit);
+
+    execute_prepared_pg_wire_query(pool, &sql, options, "clickhouse_pg").await
+}
+
+/// Execute a validated query over the PostgreSQL wire protocol.
+async fn execute_prepared_pg_wire_query(
+    pool: &Pool,
+    sql: &str,
+    options: &QueryOptions,
+    engine: &str,
+) -> Result<QueryResult> {
     let mut conn = pool.get().await?;
     let tx = conn.transaction().await?;
 
@@ -194,7 +232,7 @@ pub async fn execute_query_postgres(
     let limit = options.limit as usize;
     let result = tokio::time::timeout(timeout, async {
         let params = std::iter::empty::<&(dyn ToSql + Sync)>();
-        let stream = tx.query_raw(&sql, params).await?;
+        let stream = tx.query_raw(sql, params).await?;
         futures::pin_mut!(stream);
         let mut columns: Option<Vec<String>> = None;
         let mut rows = Vec::new();
@@ -250,7 +288,7 @@ pub async fn execute_query_postgres(
 
     if columns.is_empty() {
         columns = conn
-            .prepare(&sql)
+            .prepare(sql)
             .await
             .ok()
             .map(|s| s.columns().iter().map(|c| c.name().to_string()).collect())
@@ -265,7 +303,7 @@ pub async fn execute_query_postgres(
         columns,
         rows: result_rows,
         row_count,
-        engine: Some("postgres".to_string()),
+        engine: Some(engine.to_string()),
         query_time_ms: Some(elapsed_ms),
     })
 }

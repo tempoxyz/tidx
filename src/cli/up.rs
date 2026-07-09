@@ -1,8 +1,9 @@
 use std::collections::HashMap;
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::sync::Arc;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::Args as ClapArgs;
 use metrics_exporter_prometheus::PrometheusBuilder;
 use tokio::sync::RwLock;
@@ -14,13 +15,14 @@ use tidx::api::{
 use tidx::broadcast::Broadcaster;
 use tidx::clickhouse::ClickHouseEngine;
 use tidx::config::{ChainConfig, Config, ConfigWatcher, NewChainEvent};
-use tidx::db::{self, ThrottledPool};
+use tidx::db::{self, Pool, ThrottledPool};
 use tidx::sync::ch_sink::ClickHouseSink;
 use tidx::sync::engine::SyncEngine;
 use tidx::sync::sink::SinkSet;
 
 const CLICKHOUSE_BACKFILL_RETRY_MAX_SECS: u64 = 10;
 const CLICKHOUSE_DERIVED_REPAIR_RETRY_MAX_SECS: u64 = 300;
+const CLICKHOUSE_PG_POOL_SIZE: usize = 8;
 
 #[derive(ClapArgs)]
 pub struct Args {
@@ -33,7 +35,15 @@ pub struct Args {
     pub no_watch: bool,
 }
 
-use std::path::PathBuf;
+/// Per-chain runtime built from its configured stores.
+struct ChainRuntime {
+    /// Fan-out sinks (PG and/or CH) for the sync engine.
+    sinks: SinkSet,
+    /// PostgreSQL pool for the HTTP API (None when postgres is not configured).
+    api_pool: Option<Pool>,
+    /// pg_clickhouse pool for `engine=clickhouse_pg` queries.
+    clickhouse_pg_pool: Option<Pool>,
+}
 
 pub async fn run(args: Args) -> Result<()> {
     let config = Config::load(&args.config)?;
@@ -75,50 +85,48 @@ pub async fn run(args: Args) -> Result<()> {
     });
 
     let pools: SharedPools = Arc::new(RwLock::new(HashMap::new()));
+    let clickhouse_pg_pools: SharedPools = Arc::new(RwLock::new(HashMap::new()));
     let clickhouse_configs: SharedClickHouseConfigs = Arc::new(RwLock::new(HashMap::new()));
     let clickhouse_engines: SharedClickHouseEngines = Arc::new(RwLock::new(HashMap::new()));
     let mut default_chain_id = 0u64;
 
     for chain in &config.chains {
-        let throttled_pool = initialize_chain(chain, Arc::clone(&clickhouse_configs)).await?;
+        let runtime = initialize_chain(chain, Arc::clone(&clickhouse_configs)).await?;
 
         if default_chain_id == 0 {
             default_chain_id = chain.chain_id;
         }
 
-        // Initialize ClickHouse if configured (for each chain)
-        if let Some(ref ch_config) = chain.clickhouse {
-            if ch_config.enabled {
-                match ClickHouseEngine::new(ch_config, chain.chain_id) {
-                    Ok(engine) => {
-                        let engine = Arc::new(engine);
-                        clickhouse_engines
-                            .write()
-                            .await
-                            .insert(chain.chain_id, engine);
-                        info!(chain = %chain.name, chain_id = chain.chain_id, "ClickHouse OLAP engine initialized");
-                    }
-                    Err(e) => {
-                        error!(error = %e, chain = %chain.name, "Failed to create ClickHouse engine");
-                    }
+        // Initialize ClickHouse query engine if configured (for each chain)
+        if let Some(ch_config) = chain.clickhouse_enabled() {
+            match ClickHouseEngine::new(ch_config, chain.chain_id) {
+                Ok(engine) => {
+                    let engine = Arc::new(engine);
+                    clickhouse_engines
+                        .write()
+                        .await
+                        .insert(chain.chain_id, engine);
+                    info!(chain = %chain.name, chain_id = chain.chain_id, "ClickHouse OLAP engine initialized");
+                }
+                Err(e) => {
+                    error!(error = %e, chain = %chain.name, "Failed to create ClickHouse engine");
                 }
             }
         }
 
-        // Use a separate read-only API pool if API credentials are configured,
-        // otherwise fall back to the shared pool.
-        let api_pool = match chain.resolved_api_pg_url()? {
-            Some(api_url) => {
-                info!(chain = %chain.name, "Creating separate API pool with dedicated credentials");
-                db::create_pool(&api_url).await?
-            }
-            None => throttled_pool.pool.clone(),
-        };
-        pools.write().await.insert(chain.chain_id, api_pool);
+        if let Some(api_pool) = runtime.api_pool.clone() {
+            pools.write().await.insert(chain.chain_id, api_pool);
+        }
+        if let Some(ch_pg_pool) = runtime.clickhouse_pg_pool.clone() {
+            clickhouse_pg_pools
+                .write()
+                .await
+                .insert(chain.chain_id, ch_pg_pool);
+        }
 
         spawn_sync_engine(
             chain.clone(),
-            throttled_pool,
+            runtime.sinks,
             broadcaster.clone(),
             shutdown_tx.subscribe(),
         );
@@ -136,6 +144,7 @@ pub async fn run(args: Args) -> Result<()> {
 
             let router = api::router_shared(
                 Arc::clone(&pools),
+                Arc::clone(&clickhouse_pg_pools),
                 default_chain_id,
                 broadcaster.clone(),
                 Arc::clone(&clickhouse_configs),
@@ -162,6 +171,7 @@ pub async fn run(args: Args) -> Result<()> {
         }
 
         let pools_for_watcher = Arc::clone(&pools);
+        let ch_pg_pools_for_watcher = Arc::clone(&clickhouse_pg_pools);
         let clickhouse_configs_for_watcher = Arc::clone(&clickhouse_configs);
         let broadcaster_for_watcher = broadcaster.clone();
         let shutdown_tx_for_watcher = shutdown_tx.clone();
@@ -171,22 +181,23 @@ pub async fn run(args: Args) -> Result<()> {
                 match initialize_chain(&event.chain, Arc::clone(&clickhouse_configs_for_watcher))
                     .await
                 {
-                    Ok(throttled_pool) => {
-                        let api_pool = match event.chain.resolved_api_pg_url() {
-                            Ok(Some(api_url)) => match db::create_pool(&api_url).await {
-                                Ok(pool) => pool,
-                                Err(_) => throttled_pool.pool.clone(),
-                            },
-                            _ => throttled_pool.pool.clone(),
-                        };
-                        pools_for_watcher
-                            .write()
-                            .await
-                            .insert(event.chain.chain_id, api_pool);
+                    Ok(runtime) => {
+                        if let Some(api_pool) = runtime.api_pool.clone() {
+                            pools_for_watcher
+                                .write()
+                                .await
+                                .insert(event.chain.chain_id, api_pool);
+                        }
+                        if let Some(ch_pg_pool) = runtime.clickhouse_pg_pool.clone() {
+                            ch_pg_pools_for_watcher
+                                .write()
+                                .await
+                                .insert(event.chain.chain_id, ch_pg_pool);
+                        }
 
                         spawn_sync_engine(
                             event.chain,
-                            throttled_pool,
+                            runtime.sinks,
                             broadcaster_for_watcher.clone(),
                             shutdown_tx_for_watcher.subscribe(),
                         );
@@ -204,6 +215,8 @@ pub async fn run(args: Args) -> Result<()> {
             default_chain_id,
             broadcaster.clone(),
             clickhouse_configs.read().await.clone(),
+            clickhouse_pg_pools.read().await.clone(),
+            clickhouse_engines.read().await.clone(),
             &config.http,
         )?;
 
@@ -231,40 +244,49 @@ pub async fn run(args: Args) -> Result<()> {
     Ok(())
 }
 
+/// Initialize a chain's stores: PostgreSQL pool + migrations when configured,
+/// ClickHouse sink + schema when enabled. At least one is required (validated
+/// at config load). ClickHouse failures are fatal only when it is the sole store.
 async fn initialize_chain(
     chain: &ChainConfig,
     clickhouse_configs: SharedClickHouseConfigs,
-) -> Result<ThrottledPool> {
-    let pg_url = chain.resolved_pg_url()?;
-    info!(chain = %chain.name, "Connecting to database with throttled pool...");
-    let throttled_pool = ThrottledPool::new(&pg_url).await?;
+) -> Result<ChainRuntime> {
+    let mut throttled_pool = None;
 
-    info!(chain = %chain.name, "Running migrations...");
-    db::run_migrations(&throttled_pool.pool).await?;
+    if let Some(pg_config) = &chain.postgres {
+        let pg_url = pg_config.resolved_url()?;
+        info!(chain = %chain.name, "Connecting to database with throttled pool...");
+        let pool = ThrottledPool::new(&pg_url).await?;
 
-    {
-        let pool = throttled_pool.pool.clone();
-        let chain_name = chain.name.clone();
-        tokio::spawn(async move {
-            // Concurrent index creation can take longer than startup on
-            // existing installations, so keep it outside the blocking boot path.
-            match db::run_post_startup_migrations(&pool).await {
-                Ok(()) => info!(chain = %chain_name, "Post-startup migrations complete"),
-                Err(e) => warn!(
-                    error = %e,
-                    chain = %chain_name,
-                    "Post-startup migrations failed"
-                ),
-            }
-        });
+        info!(chain = %chain.name, "Running migrations...");
+        db::run_migrations(&pool.pool).await?;
+
+        {
+            let pool = pool.pool.clone();
+            let chain_name = chain.name.clone();
+            tokio::spawn(async move {
+                // Concurrent index creation can take longer than startup on
+                // existing installations, so keep it outside the blocking boot path.
+                match db::run_post_startup_migrations(&pool).await {
+                    Ok(()) => info!(chain = %chain_name, "Post-startup migrations complete"),
+                    Err(e) => warn!(
+                        error = %e,
+                        chain = %chain_name,
+                        "Post-startup migrations failed"
+                    ),
+                }
+            });
+        }
+
+        // Seed in-memory watermarks and row counts from existing DB data
+        // so that status display is accurate immediately after restart.
+        seed_metrics_from_db(&pool.pool).await;
+
+        throttled_pool = Some(pool);
     }
 
-    // Seed in-memory watermarks and row counts from existing DB data
-    // so that status display is accurate immediately after restart.
-    seed_metrics_from_db(&throttled_pool.pool).await;
-
     // Store ClickHouse config for this chain (if enabled)
-    if let Some(ref ch_config) = chain.clickhouse {
+    if let Some(ch_config) = chain.clickhouse_enabled() {
         let config = ChainClickHouseConfig {
             enabled: ch_config.enabled,
             url: ch_config.url.clone(),
@@ -277,12 +299,135 @@ async fn initialize_chain(
         info!(chain = %chain.name, "ClickHouse OLAP engine configured");
     }
 
-    Ok(throttled_pool)
+    // Build the ClickHouse direct-write sink. With PostgreSQL present a CH
+    // failure degrades to PG-only (current behavior); without PostgreSQL the
+    // chain cannot run, so the error propagates.
+    let ch_sink = match build_clickhouse_sink(chain).await {
+        Ok(sink) => sink,
+        Err(e) if chain.postgres.is_some() => {
+            error!(
+                error = %e,
+                chain = %chain.name,
+                "Failed to initialize ClickHouse sink (continuing without CH)"
+            );
+            None
+        }
+        Err(e) => return Err(e).with_context(|| {
+            format!(
+                "chain '{}' has no PostgreSQL configured and its ClickHouse sink failed to initialize",
+                chain.name
+            )
+        }),
+    };
+
+    let sinks = match (&throttled_pool, ch_sink) {
+        (Some(pool), Some(ch)) => SinkSet::new(pool.pool.clone()).with_clickhouse(ch),
+        (Some(pool), None) => SinkSet::new(pool.pool.clone()),
+        (None, Some(ch)) => SinkSet::clickhouse_only(ch),
+        (None, None) => anyhow::bail!(
+            "chain '{}': no storage engine available (validated config should prevent this)",
+            chain.name
+        ),
+    };
+
+    // Use a separate read-only API pool if API credentials are configured,
+    // otherwise fall back to the shared pool.
+    let api_pool = match &throttled_pool {
+        Some(pool) => match resolve_api_pool(chain).await {
+            Some(api_pool) => Some(api_pool),
+            None => Some(pool.pool.clone()),
+        },
+        None => None,
+    };
+
+    // pg_clickhouse pool for engine=clickhouse_pg queries (best-effort).
+    let clickhouse_pg_pool = match chain
+        .clickhouse_enabled()
+        .map(|ch| ch.resolved_pg_url())
+        .transpose()?
+        .flatten()
+    {
+        Some(url) => match db::connect_pool(&url, CLICKHOUSE_PG_POOL_SIZE).await {
+            Ok(pool) => {
+                info!(chain = %chain.name, "pg_clickhouse pool connected");
+                Some(pool)
+            }
+            Err(e) => {
+                error!(
+                    error = %e,
+                    chain = %chain.name,
+                    "Failed to connect pg_clickhouse pool (engine=clickhouse_pg unavailable)"
+                );
+                None
+            }
+        },
+        None => None,
+    };
+
+    Ok(ChainRuntime {
+        sinks,
+        api_pool,
+        clickhouse_pg_pool,
+    })
+}
+
+/// Build and schema-initialize the ClickHouse direct-write sink, if enabled.
+async fn build_clickhouse_sink(chain: &ChainConfig) -> Result<Option<ClickHouseSink>> {
+    let Some(ch_config) = chain.clickhouse_enabled() else {
+        return Ok(None);
+    };
+
+    let database = ch_config
+        .database
+        .clone()
+        .unwrap_or_else(|| format!("tidx_{}", chain.chain_id));
+
+    let ch_password = ch_config.resolved_password()?;
+
+    let sink = ClickHouseSink::new(
+        &ch_config.url,
+        &database,
+        ch_config.user.as_deref(),
+        ch_password.as_deref(),
+    )?;
+    sink.ensure_schema_only().await?;
+
+    info!(
+        chain = %chain.name,
+        database = %database,
+        "ClickHouse direct-write sink enabled"
+    );
+
+    seed_metrics_from_clickhouse(&sink).await;
+
+    Ok(Some(sink))
+}
+
+/// Create the dedicated API pool when `postgres.api_url` is configured.
+/// Falls back to the shared pool (None) on failure.
+async fn resolve_api_pool(chain: &ChainConfig) -> Option<Pool> {
+    let api_url = match chain.postgres.as_ref()?.resolved_api_url() {
+        Ok(Some(url)) => url,
+        Ok(None) => return None,
+        Err(e) => {
+            warn!(error = %e, chain = %chain.name, "Failed to resolve API pool URL, using shared pool");
+            return None;
+        }
+    };
+
+    info!(chain = %chain.name, "Creating separate API pool with dedicated credentials");
+    match db::create_pool(&api_url).await {
+        Ok(pool) => Some(pool),
+        Err(e) => {
+            warn!(error = %e, chain = %chain.name, "Failed to create API pool, using shared pool");
+            None
+        }
+    }
 }
 
 fn spawn_sync_engine(
     chain: ChainConfig,
-    throttled_pool: ThrottledPool,
+    sinks: SinkSet,
     broadcaster: Arc<Broadcaster>,
     shutdown_rx: tokio::sync::broadcast::Receiver<()>,
 ) {
@@ -303,97 +448,40 @@ fn spawn_sync_engine(
         chain = %chain.name,
         chain_id = chain.chain_id,
         rpc = %redacted_rpc_url,
-        backfill_limit = throttled_pool.backfill_semaphore.available_permits(),
-        "Starting sync for chain (throttled pool: 16 connections, backfill limited)"
+        postgres = chain.postgres.is_some(),
+        clickhouse = sinks.clickhouse().is_some(),
+        "Starting sync for chain"
     );
 
     let backfill_first = chain.backfill_first;
     let trust_rpc = chain.trust_rpc;
 
     tokio::spawn(async move {
-        // Build SinkSet with PG (always) + optional ClickHouse direct-write sink
-        let mut sinks = SinkSet::new(throttled_pool.inner().clone());
-        let mut derived_repair_sink = None;
+        // ClickHouse maintenance: mirror-backfill from PG (no-op without PG),
+        // then repair historical derived-table gaps. Runs in the background so
+        // the sync engine starts immediately. Retries with exponential backoff.
+        if sinks.clickhouse().is_some() {
+            let derived_repair_sink = chain
+                .clickhouse_enabled()
+                .is_some_and(|ch| ch.repair_derived_on_startup)
+                .then(|| sinks.clickhouse().cloned())
+                .flatten();
 
-        if let Some(ref ch_config) = chain.clickhouse {
-            if ch_config.enabled {
-                let database = ch_config
-                    .database
-                    .clone()
-                    .unwrap_or_else(|| format!("tidx_{}", chain.chain_id));
-
-                let ch_password = match ch_config.resolved_password() {
-                    Ok(p) => p,
-                    Err(e) => {
-                        error!(
-                            error = %e,
-                            chain = %chain.name,
-                            "Failed to resolve ClickHouse password (continuing without CH)"
-                        );
-                        None
-                    }
-                };
-                if ch_password.is_none() && ch_config.password_env.is_some() {
-                    // password_env was set but resolution failed — skip CH
-                } else {
-                    match ClickHouseSink::new(
-                        &ch_config.url,
-                        &database,
-                        ch_config.user.as_deref(),
-                        ch_password.as_deref(),
-                    ) {
-                        Ok(ch_sink) => match ch_sink.ensure_schema_only().await {
-                            Ok(()) => {
-                                info!(
-                                    chain = %chain.name,
-                                    database = %database,
-                                    "ClickHouse direct-write sink enabled"
-                                );
-                                if ch_config.repair_derived_on_startup {
-                                    derived_repair_sink = Some(ch_sink.clone());
-                                    info!(
-                                        chain = %chain.name,
-                                        database = %database,
-                                        "ClickHouse derived table repair scheduled after base backfill"
-                                    );
-                                } else {
-                                    info!(
-                                        chain = %chain.name,
-                                        database = %database,
-                                        "ClickHouse startup derived table repair disabled"
-                                    );
-                                }
-                                seed_metrics_from_clickhouse(&ch_sink).await;
-                                sinks = sinks.with_clickhouse(ch_sink);
-                            }
-                            Err(e) => {
-                                error!(
-                                    error = %e,
-                                    chain = %chain.name,
-                                    "Failed to initialize ClickHouse schema (continuing without CH sink)"
-                                );
-                            }
-                        },
-                        Err(e) => {
-                            error!(
-                                error = %e,
-                                chain = %chain.name,
-                                "Failed to create ClickHouse sink (continuing without CH)"
-                            );
-                        }
-                    }
-                }
+            if derived_repair_sink.is_some() {
+                info!(
+                    chain = %chain.name,
+                    "ClickHouse derived table repair scheduled after base backfill"
+                );
+            } else {
+                info!(
+                    chain = %chain.name,
+                    "ClickHouse startup derived table repair disabled"
+                );
             }
-        }
 
-        // Auto-backfill ClickHouse from PostgreSQL in background (non-blocking).
-        // SyncEngine starts immediately so new blocks are indexed while CH catches up.
-        // Retries indefinitely with exponential backoff on failure.
-        {
             let backfill_sinks = sinks.clone();
             let backfill_chain_name = chain.name.clone();
             let backfill_chain_id = chain.chain_id;
-            let derived_repair_sink = derived_repair_sink.clone();
             tokio::spawn(async move {
                 let mut attempt: u32 = 0;
                 loop {
@@ -422,9 +510,9 @@ fn spawn_sync_engine(
             });
         }
 
-        // Create sync engine with throttled pool and configured sinks (retry on transient RPC failures)
+        // Create sync engine with configured sinks (retry on transient RPC failures)
         let mut engine = loop {
-            match SyncEngine::new(throttled_pool.clone(), sinks.clone(), &rpc_url).await {
+            match SyncEngine::new(sinks.clone(), &rpc_url).await {
                 Ok(e) => {
                     break e
                         .with_broadcaster(broadcaster)

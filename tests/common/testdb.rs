@@ -1,4 +1,4 @@
-use tidx::db::{Pool, ThrottledPool, create_pool, run_migrations};
+use tidx::db::{Pool, create_pool, run_migrations};
 use tidx::sync::engine::SyncEngine;
 use tidx::sync::sink::SinkSet;
 use tokio::sync::{Mutex, MutexGuard, OnceCell};
@@ -74,13 +74,9 @@ and ensure DATABASE_URL points at the Postgres container (for example \
         tempo.wait_for_block(50).await.ok();
 
         let sinks = SinkSet::new(self.pool.clone());
-        let engine = SyncEngine::new(
-            ThrottledPool::from_pool(self.pool.clone()),
-            sinks,
-            &tempo.rpc_url,
-        )
-        .await
-        .expect("Failed to create sync engine");
+        let engine = SyncEngine::new(sinks, &tempo.rpc_url)
+            .await
+            .expect("Failed to create sync engine");
 
         let head = tempo.block_number().await.unwrap_or(50).min(100);
         for block_num in 1..=head {

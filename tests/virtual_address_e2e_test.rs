@@ -5,7 +5,6 @@ use serial_test::serial;
 use std::net::TcpListener;
 use std::process::Stdio;
 use std::time::{Duration, Instant};
-use tidx::db::ThrottledPool;
 use tidx::sync::engine::SyncEngine;
 use tidx::sync::sink::SinkSet;
 
@@ -113,8 +112,7 @@ async fn run_virtual_address_e2e(rpc_url: String) -> anyhow::Result<()> {
     db.truncate_all().await;
 
     let sinks = SinkSet::new(db.pool.clone());
-    let engine =
-        SyncEngine::new(ThrottledPool::from_pool(db.pool.clone()), sinks, &rpc_url).await?;
+    let engine = SyncEngine::new(sinks, &rpc_url).await?;
     engine.sync_block(block_num).await?;
 
     assert_virtual_address_rows(&db, &tx_hash).await
@@ -155,8 +153,7 @@ async fn run_virtual_address_e2e_via_sync_range(rpc_url: String) -> anyhow::Resu
     db.truncate_all().await;
 
     let sinks = SinkSet::new(db.pool.clone());
-    let engine =
-        SyncEngine::new(ThrottledPool::from_pool(db.pool.clone()), sinks, &rpc_url).await?;
+    let engine = SyncEngine::new(sinks, &rpc_url).await?;
     engine.sync_range(block_num, block_num).await?;
 
     assert_virtual_address_rows(&db, &tx_hash).await

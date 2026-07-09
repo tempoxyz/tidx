@@ -4,4 +4,5 @@ pub mod decoder;
 pub mod engine;
 pub mod fetcher;
 pub mod sink;
+pub mod store;
 pub mod writer;

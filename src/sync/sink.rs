@@ -6,6 +6,7 @@ use crate::metrics;
 use crate::types::{BlockRow, LogRow, ReceiptRow, TxRow};
 
 use super::ch_sink::ClickHouseSink;
+use super::store::SyncStore;
 use super::writer;
 
 /// Number of blocks worth of data to fetch per query during backfill.
@@ -14,17 +15,28 @@ const BACKFILL_BLOCK_BATCH: i64 = 5_000;
 
 /// Fan-out writer that sends data to all configured sinks.
 ///
-/// PostgreSQL is always present. ClickHouse is optional.
+/// At least one of PostgreSQL or ClickHouse is present; both are optional.
 /// Write failures from either sink are fatal and propagate to the caller.
 #[derive(Clone)]
 pub struct SinkSet {
-    pool: Pool,
+    pg: Option<Pool>,
     ch: Option<ClickHouseSink>,
 }
 
 impl SinkSet {
     pub fn new(pool: Pool) -> Self {
-        Self { pool, ch: None }
+        Self {
+            pg: Some(pool),
+            ch: None,
+        }
+    }
+
+    /// ClickHouse-only sink set (no PostgreSQL).
+    pub fn clickhouse_only(ch: ClickHouseSink) -> Self {
+        Self {
+            pg: None,
+            ch: Some(ch),
+        }
     }
 
     pub fn with_clickhouse(mut self, ch: ClickHouseSink) -> Self {
@@ -32,49 +44,74 @@ impl SinkSet {
         self
     }
 
-    /// Access the underlying PG pool for read operations (sync state, gap detection, etc.)
-    pub fn pool(&self) -> &Pool {
-        &self.pool
+    /// The PG pool, when PostgreSQL is configured.
+    pub fn pg(&self) -> Option<&Pool> {
+        self.pg.as_ref()
+    }
+
+    /// The ClickHouse sink, when configured.
+    pub fn clickhouse(&self) -> Option<&ClickHouseSink> {
+        self.ch.as_ref()
+    }
+
+    /// Store backing sync-engine state: PostgreSQL when present, else ClickHouse.
+    pub fn store(&self) -> SyncStore<'_> {
+        if let Some(pg) = &self.pg {
+            SyncStore::Postgres(pg)
+        } else if let Some(ch) = &self.ch {
+            SyncStore::ClickHouse(ch)
+        } else {
+            unreachable!("SinkSet constructed without any sink")
+        }
     }
 
     pub async fn write_blocks(&self, blocks: &[BlockRow]) -> Result<()> {
-        if let Some(ch) = &self.ch {
-            tokio::try_join!(
-                writer::write_blocks(&self.pool, blocks),
-                ch.write_blocks(blocks),
-            )?;
-        } else {
-            writer::write_blocks(&self.pool, blocks).await?;
+        match (&self.pg, &self.ch) {
+            (Some(pg), Some(ch)) => {
+                tokio::try_join!(writer::write_blocks(pg, blocks), ch.write_blocks(blocks))?;
+            }
+            (Some(pg), None) => writer::write_blocks(pg, blocks).await?,
+            (None, Some(ch)) => ch.write_blocks(blocks).await?,
+            (None, None) => unreachable!("SinkSet constructed without any sink"),
         }
         Ok(())
     }
 
     pub async fn write_txs(&self, txs: &[TxRow]) -> Result<()> {
-        if let Some(ch) = &self.ch {
-            tokio::try_join!(writer::write_txs(&self.pool, txs), ch.write_txs(txs),)?;
-        } else {
-            writer::write_txs(&self.pool, txs).await?;
+        match (&self.pg, &self.ch) {
+            (Some(pg), Some(ch)) => {
+                tokio::try_join!(writer::write_txs(pg, txs), ch.write_txs(txs))?;
+            }
+            (Some(pg), None) => writer::write_txs(pg, txs).await?,
+            (None, Some(ch)) => ch.write_txs(txs).await?,
+            (None, None) => unreachable!("SinkSet constructed without any sink"),
         }
         Ok(())
     }
 
     pub async fn write_logs(&self, logs: &[LogRow]) -> Result<()> {
-        if let Some(ch) = &self.ch {
-            tokio::try_join!(writer::write_logs(&self.pool, logs), ch.write_logs(logs),)?;
-        } else {
-            writer::write_logs(&self.pool, logs).await?;
+        match (&self.pg, &self.ch) {
+            (Some(pg), Some(ch)) => {
+                tokio::try_join!(writer::write_logs(pg, logs), ch.write_logs(logs))?;
+            }
+            (Some(pg), None) => writer::write_logs(pg, logs).await?,
+            (None, Some(ch)) => ch.write_logs(logs).await?,
+            (None, None) => unreachable!("SinkSet constructed without any sink"),
         }
         Ok(())
     }
 
     pub async fn write_receipts(&self, receipts: &[ReceiptRow]) -> Result<()> {
-        if let Some(ch) = &self.ch {
-            tokio::try_join!(
-                writer::write_receipts(&self.pool, receipts),
-                ch.write_receipts(receipts),
-            )?;
-        } else {
-            writer::write_receipts(&self.pool, receipts).await?;
+        match (&self.pg, &self.ch) {
+            (Some(pg), Some(ch)) => {
+                tokio::try_join!(
+                    writer::write_receipts(pg, receipts),
+                    ch.write_receipts(receipts),
+                )?;
+            }
+            (Some(pg), None) => writer::write_receipts(pg, receipts).await?,
+            (None, Some(ch)) => ch.write_receipts(receipts).await?,
+            (None, None) => unreachable!("SinkSet constructed without any sink"),
         }
         Ok(())
     }
@@ -111,55 +148,50 @@ impl SinkSet {
         receipts: &[ReceiptRow],
         application_name: Option<&str>,
     ) -> Result<()> {
-        if let Some(ch) = &self.ch {
-            tokio::try_join!(
-                async {
-                    if let Some(application_name) = application_name {
-                        writer::write_batch_with_application_name(
-                            &self.pool,
-                            blocks,
-                            txs,
-                            logs,
-                            receipts,
-                            application_name,
-                        )
-                        .await
-                    } else {
-                        writer::write_batch(&self.pool, blocks, txs, logs, receipts).await
-                    }
-                },
-                ch.write_blocks(blocks),
-                ch.write_txs(txs),
-                ch.write_logs(logs),
-                ch.write_receipts(receipts),
-            )?;
-        } else if let Some(application_name) = application_name {
-            writer::write_batch_with_application_name(
-                &self.pool,
-                blocks,
-                txs,
-                logs,
-                receipts,
-                application_name,
-            )
-            .await?;
-        } else {
-            writer::write_batch(&self.pool, blocks, txs, logs, receipts).await?;
+        match (&self.pg, &self.ch) {
+            (Some(pg), Some(ch)) => {
+                tokio::try_join!(
+                    write_pg_batch(pg, blocks, txs, logs, receipts, application_name),
+                    ch.write_blocks(blocks),
+                    ch.write_txs(txs),
+                    ch.write_logs(logs),
+                    ch.write_receipts(receipts),
+                )?;
+            }
+            (Some(pg), None) => {
+                write_pg_batch(pg, blocks, txs, logs, receipts, application_name).await?;
+            }
+            (None, Some(ch)) => {
+                tokio::try_join!(
+                    ch.write_blocks(blocks),
+                    ch.write_txs(txs),
+                    ch.write_logs(logs),
+                    ch.write_receipts(receipts),
+                )?;
+            }
+            (None, None) => unreachable!("SinkSet constructed without any sink"),
         }
         Ok(())
     }
 
     /// Delete all data from a given block number onwards (reorg support).
-    /// Returns the number of blocks deleted from PostgreSQL.
+    /// Returns the number of blocks deleted.
     pub async fn delete_from(&self, block_num: u64) -> Result<u64> {
-        if let Some(ch) = &self.ch {
-            let (deleted, ()) = tokio::try_join!(
-                writer::delete_blocks_from(&self.pool, block_num),
-                ch.delete_from(block_num),
-            )?;
-            Ok(deleted)
-        } else {
-            writer::delete_blocks_from(&self.pool, block_num).await
+        match (&self.pg, &self.ch) {
+            (Some(pg), Some(ch)) => {
+                let (deleted, ()) = tokio::try_join!(
+                    writer::delete_blocks_from(pg, block_num),
+                    ch.delete_from(block_num),
+                )?;
+                Ok(deleted)
+            }
+            (Some(pg), None) => writer::delete_blocks_from(pg, block_num).await,
+            (None, Some(ch)) => {
+                let deleted = ch.count_blocks_from(block_num).await.unwrap_or(0);
+                ch.delete_from(block_num).await?;
+                Ok(deleted)
+            }
+            (None, None) => unreachable!("SinkSet constructed without any sink"),
         }
     }
 
@@ -173,19 +205,20 @@ impl SinkSet {
     /// block range. The cursor advances only after all tables succeed for that range.
     /// Tables use ReplacingMergeTree so re-inserts after a crash are safe.
     pub async fn backfill_clickhouse(&self, chain_id: u64) -> Result<()> {
-        let ch = match &self.ch {
-            Some(ch) => ch,
-            None => return Ok(()),
+        // Only meaningful when mirroring PG into CH; ClickHouse-only chains
+        // write directly to CH and have no source to backfill from.
+        let (Some(pool), Some(ch)) = (&self.pg, &self.ch) else {
+            return Ok(());
         };
 
-        let pg_max = pg_max_block_num(&self.pool).await?;
+        let pg_max = pg_max_block_num(pool).await?;
         let pg_max = match pg_max {
             Some(n) => n,
             None => return Ok(()), // PG is empty, nothing to backfill
         };
 
         // Load persisted cursor from PG (survives restarts)
-        let cursor = load_ch_backfill_cursor(&self.pool, chain_id).await?;
+        let cursor = load_ch_backfill_cursor(pool, chain_id).await?;
         let from_block = cursor + 1;
 
         if from_block > pg_max {
@@ -214,7 +247,7 @@ impl SinkSet {
         // Pre-fetch the first batch so we can pipeline fetch(N+1) with write(N)
         let mut pending = {
             let batch_end = (current + BACKFILL_BLOCK_BATCH - 1).min(pg_max);
-            let conn = self.pool.get().await?;
+            let conn = pool.get().await?;
             let data = tokio::try_join!(
                 fetch_blocks(&conn, current, batch_end),
                 fetch_txs(&conn, current, batch_end),
@@ -239,7 +272,7 @@ impl SinkSet {
                     return Ok(None);
                 }
                 let next_end = (current + BACKFILL_BLOCK_BATCH - 1).min(pg_max);
-                let conn = self.pool.get().await?;
+                let conn = pool.get().await?;
                 let data = tokio::try_join!(
                     fetch_blocks(&conn, current, next_end),
                     fetch_txs(&conn, current, next_end),
@@ -285,7 +318,7 @@ impl SinkSet {
             let (next_data, _) = tokio::try_join!(next_fetch, ch_write)?;
 
             // Advance cursor only after all tables written successfully
-            save_ch_backfill_cursor(&self.pool, chain_id, batch_end).await?;
+            save_ch_backfill_cursor(pool, chain_id, batch_end).await?;
 
             blocks_written += block_count;
             let remaining = pg_max - batch_end;
@@ -323,6 +356,23 @@ impl SinkSet {
         }
 
         Ok(())
+    }
+}
+
+/// Write a full batch to PostgreSQL, optionally tagged with an application name.
+async fn write_pg_batch(
+    pg: &Pool,
+    blocks: &[BlockRow],
+    txs: &[TxRow],
+    logs: &[LogRow],
+    receipts: &[ReceiptRow],
+    application_name: Option<&str>,
+) -> Result<()> {
+    if let Some(application_name) = application_name {
+        writer::write_batch_with_application_name(pg, blocks, txs, logs, receipts, application_name)
+            .await
+    } else {
+        writer::write_batch(pg, blocks, txs, logs, receipts).await
     }
 }
 
