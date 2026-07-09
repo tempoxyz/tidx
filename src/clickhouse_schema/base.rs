@@ -13,6 +13,18 @@ const BLOCKS_MIGRATION_20260430: &str =
     include_str!("../../db/clickhouse/migrations/20260430_add_blocks_consensus_proposer.sql");
 const RECEIPTS_MIGRATION_20260604: &str =
     include_str!("../../db/clickhouse/migrations/20260604_add_receipts_type_fee_token.sql");
+const RECEIPTS_MIGRATION_20260709: &str =
+    include_str!("../../db/clickhouse/migrations/20260709_add_receipts_lookup_indexes.sql");
+const TXS_MIGRATION_20260709: &str =
+    include_str!("../../db/clickhouse/migrations/20260709_add_txs_hash_index.sql");
+const LOGS_MIGRATION_20260709: &str =
+    include_str!("../../db/clickhouse/migrations/20260709_add_logs_tx_hash_index.sql");
+const MATERIALIZE_RECEIPTS_INDEXES_20260709: &str =
+    include_str!("../../db/clickhouse/migrations/20260709_materialize_receipts_lookup_indexes.sql");
+const MATERIALIZE_TXS_INDEX_20260709: &str =
+    include_str!("../../db/clickhouse/migrations/20260709_materialize_txs_hash_index.sql");
+const MATERIALIZE_LOGS_INDEX_20260709: &str =
+    include_str!("../../db/clickhouse/migrations/20260709_materialize_logs_tx_hash_index.sql");
 const TOKEN_HOLDER_DELTAS_MIGRATION_20260618: &str =
     include_str!("../../db/clickhouse/migrations/20260618_delete_guard_token_holder_deltas.sql");
 const ADDRESS_HOLDER_DELTAS_MIGRATION_20260618: &str =
@@ -116,6 +128,54 @@ pub const MIGRATIONS: &[ClickHouseObject] = &[
         name: "receipts_20260604_type_fee_token",
         kind: ClickHouseObjectKind::Migration(RECEIPTS_MIGRATION_20260604),
         depends_on: &["receipts"],
+        public_query: false,
+        block_column: None,
+        backfill: None,
+    },
+    ClickHouseObject {
+        name: "receipts_20260709_lookup_indexes",
+        kind: ClickHouseObjectKind::Migration(RECEIPTS_MIGRATION_20260709),
+        depends_on: &["receipts"],
+        public_query: false,
+        block_column: None,
+        backfill: None,
+    },
+    ClickHouseObject {
+        name: "txs_20260709_hash_index",
+        kind: ClickHouseObjectKind::Migration(TXS_MIGRATION_20260709),
+        depends_on: &["txs"],
+        public_query: false,
+        block_column: None,
+        backfill: None,
+    },
+    ClickHouseObject {
+        name: "logs_20260709_tx_hash_index",
+        kind: ClickHouseObjectKind::Migration(LOGS_MIGRATION_20260709),
+        depends_on: &["logs"],
+        public_query: false,
+        block_column: None,
+        backfill: None,
+    },
+    ClickHouseObject {
+        name: "receipts_20260709_materialize_lookup_indexes",
+        kind: ClickHouseObjectKind::Migration(MATERIALIZE_RECEIPTS_INDEXES_20260709),
+        depends_on: &["receipts"],
+        public_query: false,
+        block_column: None,
+        backfill: None,
+    },
+    ClickHouseObject {
+        name: "txs_20260709_materialize_hash_index",
+        kind: ClickHouseObjectKind::Migration(MATERIALIZE_TXS_INDEX_20260709),
+        depends_on: &["txs"],
+        public_query: false,
+        block_column: None,
+        backfill: None,
+    },
+    ClickHouseObject {
+        name: "logs_20260709_materialize_tx_hash_index",
+        kind: ClickHouseObjectKind::Migration(MATERIALIZE_LOGS_INDEX_20260709),
+        depends_on: &["logs"],
         public_query: false,
         block_column: None,
         backfill: None,

@@ -20,7 +20,9 @@ CREATE TABLE IF NOT EXISTS txs (
     call_count              Int16,
     valid_before            Nullable(Int64),
     valid_after             Nullable(Int64),
-    signature_type          Nullable(Int16)
+    signature_type          Nullable(Int16),
+
+    INDEX idx_hash hash TYPE bloom_filter GRANULARITY 1
 ) ENGINE = ReplacingMergeTree()
 PARTITION BY toYYYYMM(block_timestamp)
 ORDER BY (block_num, idx)
