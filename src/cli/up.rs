@@ -342,7 +342,9 @@ fn spawn_sync_engine(
                         &database,
                         ch_config.user.as_deref(),
                         ch_password.as_deref(),
-                    ) {
+                    )
+                    .map(|sink| sink.with_replicated_database(ch_config.replicated_database))
+                    {
                         Ok(ch_sink) => match ch_sink.ensure_schema_only().await {
                             Ok(()) => {
                                 info!(
