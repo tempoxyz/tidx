@@ -1040,12 +1040,11 @@ pub async fn detect_all_gaps(pool: &Pool, floor: u64, tip_num: u64) -> Result<Ve
     let floor = floor.max(1);
     let conn = pool.get().await?;
 
-    // Get the lowest block number we have at or above the floor
+    // Lowest stored block, unfiltered: a stored block at/below the floor
+    // (e.g. genesis 0) means there is no leading gap; detect_gaps already
+    // reports discontinuities above it.
     let min_block: Option<i64> = conn
-        .query_one(
-            "SELECT MIN(num) FROM blocks WHERE num >= $1",
-            &[&(floor as i64)],
-        )
+        .query_one("SELECT MIN(num) FROM blocks", &[])
         .await?
         .get(0);
 
