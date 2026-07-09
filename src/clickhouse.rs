@@ -264,6 +264,7 @@ impl ClickHouseEngine {
         if json_response.trim().is_empty() {
             return Ok(QueryResult {
                 columns: vec![],
+                column_types: vec![],
                 rows: vec![],
                 row_count: 0,
                 engine: Some("clickhouse".to_string()),
@@ -281,6 +282,19 @@ impl ClickHouseEngine {
             .map(|m| {
                 m.iter()
                     .filter_map(|col| col.get("name").and_then(|n| n.as_str()).map(String::from))
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        let column_types: Vec<String> = meta
+            .map(|m| {
+                m.iter()
+                    .map(|col| {
+                        col.get("type")
+                            .and_then(|t| t.as_str())
+                            .unwrap_or_default()
+                            .to_string()
+                    })
                     .collect()
             })
             .unwrap_or_default();
@@ -303,6 +317,7 @@ impl ClickHouseEngine {
 
         Ok(QueryResult {
             columns,
+            column_types,
             rows,
             row_count,
             engine: Some("clickhouse".to_string()),
@@ -370,6 +385,8 @@ fn is_connection_error(err: &anyhow::Error) -> bool {
 #[derive(Debug, Clone)]
 pub struct QueryResult {
     pub columns: Vec<String>,
+    /// ClickHouse type per column (JSON `meta`), e.g. `Int64`, `Nullable(String)`.
+    pub column_types: Vec<String>,
     pub rows: Vec<Vec<serde_json::Value>>,
     pub row_count: usize,
     pub engine: Option<String>,

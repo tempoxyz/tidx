@@ -199,12 +199,87 @@ pub async fn execute_query_postgres(
     run_pg_query(pool, &sql, options, &[], "postgres").await
 }
 
-/// ClickHouse output settings for the tiered cold arm, matching the hot
-/// (PostgreSQL) arm's JSON formatting: unquoted 64-bit ints, RFC 3339 times.
+/// ClickHouse settings for the tiered cold arm. 64-bit+ integers keep
+/// ClickHouse's default quoting (exact strings; unquoted UInt256 would parse
+/// lossily as f64) — [`normalize_cold_result`] then converts per column type.
 const TIERED_COLD_CH_SETTINGS: &[(&str, &str)] = &[
-    ("output_format_json_quote_64bit_integers", "0"),
     ("date_time_output_format", "iso"),
+    // Dedupe ReplacingMergeTree rows, matching the FDW views' `final = 1`.
+    ("final", "1"),
 ];
+
+/// Rewrite ClickHouse JSON values to the hot (PostgreSQL) arm's
+/// representations, per column type:
+///
+/// - `Int64`/`UInt64`: quoted string → JSON number (PG int8 is a number);
+/// - `DateTime*`: ISO string → chrono RFC 3339 (PG timestamptz formatting);
+/// - `(U)Int128`/`(U)Int256`: PG NUMERIC parity — decimal string when the
+///   value fits [`rust_decimal::Decimal`], else NULL (PG's formatter nulls
+///   values past Decimal's 96-bit mantissa, see [`try_format_column_json`]);
+/// - `selector_null_cols` (projection indexes): '' → NULL, undoing the
+///   ClickHouse sink's empty-string encoding of PG NULL selectors.
+fn normalize_cold_result(
+    result: &mut crate::clickhouse::QueryResult,
+    selector_null_cols: &[usize],
+) {
+    for &i in selector_null_cols {
+        for row in &mut result.rows {
+            if let Some(cell) = row.get_mut(i)
+                && matches!(&*cell, serde_json::Value::String(s) if s.is_empty())
+            {
+                *cell = serde_json::Value::Null;
+            }
+        }
+    }
+    for (i, ty) in result.column_types.iter().enumerate() {
+        let base = ty
+            .strip_prefix("Nullable(")
+            .and_then(|t| t.strip_suffix(')'))
+            .unwrap_or(ty);
+        enum Kind {
+            Int64,
+            UInt64,
+            BigNum,
+            DateTime,
+        }
+        let kind = match base {
+            "Int64" => Kind::Int64,
+            "UInt64" => Kind::UInt64,
+            "Int128" | "UInt128" | "Int256" | "UInt256" => Kind::BigNum,
+            t if t.starts_with("DateTime") => Kind::DateTime,
+            _ => continue,
+        };
+        for row in &mut result.rows {
+            let Some(cell) = row.get_mut(i) else { continue };
+            let serde_json::Value::String(s) = &*cell else {
+                continue;
+            };
+            match kind {
+                Kind::Int64 => {
+                    if let Ok(v) = s.parse::<i64>() {
+                        *cell = serde_json::Value::Number(v.into());
+                    }
+                }
+                Kind::UInt64 => {
+                    if let Ok(v) = s.parse::<u64>() {
+                        *cell = serde_json::Value::Number(v.into());
+                    }
+                }
+                Kind::BigNum => {
+                    *cell = match s.parse::<rust_decimal::Decimal>() {
+                        Ok(v) => serde_json::Value::String(v.to_string()),
+                        Err(_) => serde_json::Value::Null,
+                    };
+                }
+                Kind::DateTime => {
+                    if let Ok(v) = DateTime::parse_from_rfc3339(s) {
+                        *cell = serde_json::Value::String(v.with_timezone(&Utc).to_rfc3339());
+                    }
+                }
+            }
+        }
+    }
+}
 
 /// Floor for the cold arm's remaining timeout budget.
 const TIERED_COLD_MIN_TIMEOUT_MS: u64 = 250;
@@ -240,17 +315,30 @@ async fn try_execute_tiered_split(
 ) -> Result<Option<QueryResult>> {
     let start = Instant::now();
 
-    let mut event_tables = std::collections::HashSet::new();
+    let mut events = Vec::with_capacity(signatures.len());
     for sig in signatures {
         // Let the fallback path surface signature parse errors.
         let Ok(parsed) = EventSignature::parse(sig) else {
             return Ok(None);
         };
-        event_tables.insert(parsed.name.to_lowercase());
+        events.push(parsed);
     }
-    let Some(plan) = plan_tiered_split(sql, &event_tables) else {
+    let Some(plan) = plan_tiered_split(sql, &events) else {
         return Ok(None);
     };
+    // Mirror the fallback's raw-SQL gates (LIMIT ALL, length, …): the arms
+    // re-emit SQL from the AST, which would otherwise erase them.
+    if apply_event_signature_ctes_tiered(sql, signatures)
+        .and_then(|s| validate_query(&s))
+        .is_err()
+    {
+        return Ok(None);
+    }
+    // Plain PG errors when an explicit SQL LIMIT streams more rows than the
+    // API cap; the split would silently cap. Let the fallback decide.
+    if plan.sql_limit.is_some_and(|l| l > options.limit) {
+        return Ok(None);
+    }
 
     let (boundary, _) = crate::db::tiered::fetch_prune_boundary(pool, chain_id).await?;
     if boundary <= 0 {
@@ -270,39 +358,40 @@ async fn try_execute_tiered_split(
             .max(TIERED_COLD_MIN_TIMEOUT_MS)
     };
 
-    let (first, second) = if plan.cold_leads {
-        // Ascending order: cold (ClickHouse) rows sort first.
+    // The hot arm always runs: it carries plain-PostgreSQL semantics, so any
+    // error PostgreSQL would raise for this query surfaces even when cold
+    // rows alone could fill the page.
+    let (hot, cold) = if plan.cold_leads {
+        // Ascending order: cold (ClickHouse) rows sort first. Run both arms
+        // concurrently; cold may fill the page, hot back-fills the rest.
         let Some(ch) = clickhouse else {
             return Ok(None);
         };
         let cold_sql = plan.arm_sql(false, boundary, Some(eff_limit));
-        let cold: QueryResult = ch
-            .query_user_with_settings(
-                &cold_sql,
-                signatures,
-                budget(&start),
-                eff_limit.max(1),
-                TIERED_COLD_CH_SETTINGS,
-            )
-            .await?
-            .into();
-        if cold.row_count as i64 >= eff_limit {
-            return Ok(Some(finish_tiered(cold, None, start)));
-        }
-        let remaining = eff_limit - cold.row_count as i64;
-        let hot_sql = plan.arm_sql(true, boundary, Some(remaining));
+        let hot_sql = plan.arm_sql(true, boundary, Some(eff_limit));
+        let timeout_ms = budget(&start);
         let hot_options = QueryOptions {
-            timeout_ms: budget(&start),
+            timeout_ms,
             limit: options.limit,
         };
-        let hot = execute_query_postgres(pool, &hot_sql, signatures, &hot_options).await?;
-        (cold, hot)
+        let (mut cold_raw, hot) = tokio::try_join!(
+            ch.query_user_with_settings(
+                &cold_sql,
+                signatures,
+                timeout_ms,
+                eff_limit.max(1),
+                TIERED_COLD_CH_SETTINGS,
+            ),
+            execute_query_postgres(pool, &hot_sql, signatures, &hot_options),
+        )?;
+        normalize_cold_result(&mut cold_raw, &plan.selector_null_cols);
+        (hot, cold_raw.into())
     } else {
         // Descending or unordered: hot (PostgreSQL) rows first.
         let hot_sql = plan.arm_sql(true, boundary, Some(eff_limit.max(0)));
         let hot = execute_query_postgres(pool, &hot_sql, signatures, options).await?;
         if hot.row_count as i64 >= eff_limit {
-            return Ok(Some(finish_tiered(hot, None, start)));
+            return Ok(Some(finish_tiered(hot, None, false, eff_limit, start)));
         }
         // Hot under-filled: fill the remainder from the ClickHouse archive.
         let Some(ch) = clickhouse else {
@@ -310,7 +399,7 @@ async fn try_execute_tiered_split(
         };
         let remaining = eff_limit - hot.row_count as i64;
         let cold_sql = plan.arm_sql(false, boundary, Some(remaining));
-        let cold: QueryResult = ch
+        let mut cold_raw = ch
             .query_user_with_settings(
                 &cold_sql,
                 signatures,
@@ -318,47 +407,63 @@ async fn try_execute_tiered_split(
                 remaining,
                 TIERED_COLD_CH_SETTINGS,
             )
-            .await?
-            .into();
-        (hot, cold)
+            .await?;
+        normalize_cold_result(&mut cold_raw, &plan.selector_null_cols);
+        (hot, cold_raw.into())
     };
+    let cold: QueryResult = cold;
 
     // Column sets must line up to concatenate rows; a mismatch (shouldn't
-    // happen for planned shapes) falls back to the FDW path for correctness.
-    let names_match = first.columns.len() == second.columns.len()
-        && first
-            .columns
-            .iter()
-            .zip(&second.columns)
-            .all(|(a, b)| a.eq_ignore_ascii_case(b));
-    if !names_match && first.row_count > 0 && second.row_count > 0 {
+    // happen for planned shapes — e.g. ClickHouse renaming an output column)
+    // falls back to the FDW path for correctness. Exact comparison: the
+    // planner already normalizes identifier case.
+    let names_match = hot.columns.len() == cold.columns.len()
+        && hot.columns.iter().zip(&cold.columns).all(|(a, b)| a == b);
+    if !names_match && !hot.columns.is_empty() && !cold.columns.is_empty() {
         tracing::warn!(
-            hot_cols = ?first.columns,
-            cold_cols = ?second.columns,
+            hot_cols = ?hot.columns,
+            cold_cols = ?cold.columns,
             "tiered split arms returned mismatched columns; falling back to FDW path"
         );
         return Ok(None);
     }
 
-    Ok(Some(finish_tiered(first, Some(second), start)))
+    Ok(Some(finish_tiered(
+        hot,
+        Some(cold),
+        plan.cold_leads,
+        eff_limit,
+        start,
+    )))
 }
 
-/// Assemble the stitched tiered result (arm order already correct).
+/// Assemble the stitched tiered result. Hot (PostgreSQL) column names win:
+/// they are byte-identical to the plain-postgres engine's output.
 fn finish_tiered(
-    mut first: QueryResult,
-    second: Option<QueryResult>,
+    hot: QueryResult,
+    cold: Option<QueryResult>,
+    cold_leads: bool,
+    limit: i64,
     start: Instant,
 ) -> QueryResult {
-    if let Some(second) = second {
-        if first.columns.is_empty() {
-            first.columns = second.columns;
+    let mut result = hot;
+    if let Some(mut cold) = cold {
+        if result.columns.is_empty() {
+            result.columns = std::mem::take(&mut cold.columns);
         }
-        first.rows.extend(second.rows);
-        first.row_count = first.rows.len();
+        if cold_leads {
+            let hot_rows = std::mem::take(&mut result.rows);
+            result.rows = cold.rows;
+            result.rows.extend(hot_rows);
+        } else {
+            result.rows.extend(cold.rows);
+        }
+        result.rows.truncate(limit.max(0) as usize);
+        result.row_count = result.rows.len();
     }
-    first.engine = Some("tiered".to_string());
-    first.query_time_ms = Some(start.elapsed().as_secs_f64() * 1000.0);
-    first
+    result.engine = Some("tiered".to_string());
+    result.query_time_ms = Some(start.elapsed().as_secs_f64() * 1000.0);
+    result
 }
 
 /// Tiered fallback: PostgreSQL over `tiered.*` views (hot PG window
@@ -652,6 +757,74 @@ mod tests {
     use super::*;
     use crate::query::EventSignature;
     use insta::assert_snapshot;
+    use serde_json::{Value as J, json};
+
+    // ========================================================================
+    // Tiered cold-arm normalization
+    // ========================================================================
+
+    fn ch_result(column_types: &[&str], rows: Vec<Vec<J>>) -> crate::clickhouse::QueryResult {
+        crate::clickhouse::QueryResult {
+            columns: (0..column_types.len()).map(|i| format!("c{i}")).collect(),
+            column_types: column_types.iter().map(ToString::to_string).collect(),
+            row_count: rows.len(),
+            rows,
+            engine: None,
+            query_time_ms: None,
+        }
+    }
+
+    #[test]
+    fn normalize_cold_converts_int64_and_datetime() {
+        let mut r = ch_result(
+            &[
+                "Int64",
+                "Nullable(Int64)",
+                "UInt64",
+                "DateTime64(3, 'UTC')",
+                "UInt256",
+                "UInt256",
+            ],
+            vec![vec![
+                json!("42"),
+                J::Null,
+                json!("18446744073709551615"),
+                // CH `date_time_output_format=iso` emits Z-suffixed strings.
+                json!("2025-06-01T12:30:45.123Z"),
+                json!("1000000000000000000"),
+                json!(
+                    "115792089237316195423570985008687907853269984665640564039457584007913129639935"
+                ),
+            ]],
+        );
+        normalize_cold_result(&mut r, &[]);
+        assert_eq!(r.rows[0][0], json!(42));
+        assert_eq!(r.rows[0][1], J::Null);
+        assert_eq!(r.rows[0][2], json!(18_446_744_073_709_551_615_u64));
+        // RFC 3339 in UTC, matching PG timestamptz serialization.
+        assert_eq!(r.rows[0][3], json!("2025-06-01T12:30:45.123+00:00"));
+        // Fits rust_decimal: decimal string, like PG NUMERIC.
+        assert_eq!(r.rows[0][4], json!("1000000000000000000"));
+        // Exceeds Decimal's 96-bit mantissa: NULL, matching PG's formatter.
+        assert_eq!(r.rows[0][5], J::Null);
+    }
+
+    #[test]
+    fn normalize_cold_rewrites_empty_selector_to_null() {
+        let mut r = ch_result(
+            &["String", "String"],
+            vec![
+                vec![json!(""), json!("")],
+                vec![json!("0xddf252ad"), json!("keep")],
+            ],
+        );
+        // Only column 0 is a projected `logs.selector`.
+        normalize_cold_result(&mut r, &[0]);
+        assert_eq!(r.rows[0][0], J::Null);
+        assert_eq!(r.rows[0][1], json!("")); // non-selector '' kept
+        assert_eq!(r.rows[1][0], json!("0xddf252ad"));
+        assert_eq!(r.rows[1][1], json!("keep"));
+    }
 
     // ========================================================================
     // Event CTE SQL Generation Tests (Both Engines)

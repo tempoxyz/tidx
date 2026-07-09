@@ -26,3 +26,12 @@ static HEX_LITERAL_RE: LazyLock<Regex> =
 pub fn convert_hex_literals_postgres(sql: &str) -> String {
     HEX_LITERAL_RE.replace_all(sql, r"'\x$1'").into_owned()
 }
+
+/// Whether `sql` contains a 40+ digit '0x…' literal with uppercase hex.
+/// PostgreSQL decodes these case-insensitively as bytea; ClickHouse compares
+/// its lowercase hex strings case-sensitively.
+pub(crate) fn has_mixed_case_hex_literal(sql: &str) -> bool {
+    HEX_LITERAL_RE
+        .captures_iter(sql)
+        .any(|c| c[1].bytes().any(|b| b.is_ascii_uppercase()))
+}
