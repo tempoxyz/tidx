@@ -1318,9 +1318,18 @@ impl AbiType {
             AbiType::Bytes(Some(_) | None) => {
                 format!("concat('0x', lower(substring(data, {hex_start}, 64)))")
             }
-            // String: dynamic, not fully supported yet
+            // String: offset word → length word → UTF-8 bytes, mirroring
+            // PostgreSQL's abi_string (db/functions.sql). Offsets/lengths fit
+            // u64, so read each word's last 8 bytes (16 hex chars).
             AbiType::String => {
-                format!("concat('0x', lower(substring(data, {hex_start}, 64)))")
+                let off = format!(
+                    "reinterpretAsUInt64(reverse(unhex(substring(data, {}, 16))))",
+                    hex_start + 48
+                );
+                let len = format!(
+                    "reinterpretAsUInt64(reverse(unhex(substring(data, 51 + 2 * {off}, 16))))"
+                );
+                format!("unhex(substring(data, 67 + 2 * {off}, 2 * {len}))")
             }
             _ => format!("concat('0x', lower(substring(data, {hex_start}, 64)))"),
         }

@@ -36,8 +36,7 @@
 //! - secondary ORDER BY keys come from a per-table allowlist of NOT NULL
 //!   numeric/time columns that sort identically in both stores;
 //! - event tables are ineligible when the signature decodes `bool` (PG
-//!   boolean vs CH UInt8) or non-indexed `string` (PG decodes text, CH
-//!   returns hex) parameters;
+//!   boolean vs CH UInt8) or composite parameters;
 //! - `logs.is_virtual_forward` is ineligible (PG boolean vs CH UInt8).
 //!
 //! Anything not provably safe returns `None` and falls back to the FDW view
@@ -181,8 +180,8 @@ const EVENT_META_COLUMNS: &[(&str, ColKind)] = &[
 ];
 
 /// Column map for an event CTE, or `None` when any decoded param diverges
-/// across engines: `bool` renders PG boolean vs CH UInt8, non-indexed
-/// `string` PG text vs CH hex, and composite types are unsupported.
+/// across engines: `bool` renders PG boolean vs CH UInt8, and composite
+/// types are unsupported.
 fn event_columns(sig: &EventSignature) -> Option<HashMap<String, ColKind>> {
     let mut map: HashMap<String, ColKind> = EVENT_META_COLUMNS
         .iter()
@@ -191,7 +190,10 @@ fn event_columns(sig: &EventSignature) -> Option<HashMap<String, ColKind>> {
     for (i, p) in sig.params.iter().enumerate() {
         let kind = match &p.ty {
             AbiType::Address | AbiType::Bytes(_) => Hex,
+            // Indexed strings are keccak topic hashes (hex both sides);
+            // non-indexed strings decode to UTF-8 text on both engines.
             AbiType::String if p.indexed => Hex,
+            AbiType::String => Text,
             AbiType::Uint(_) | AbiType::Int(_) => NumText,
             _ => return None,
         };
@@ -1116,10 +1118,32 @@ mod tests {
             )
             .is_none()
         );
-        // Non-indexed string: PG decodes text, CH returns hex.
+    }
+
+    #[test]
+    fn event_with_string_param_eligible() {
+        // Non-indexed strings decode to UTF-8 text on both engines.
         assert!(
             plan_ev(
                 "SELECT token, name FROM TokenCreated ORDER BY block_num DESC LIMIT 11",
+                &["TokenCreated(address indexed token, string name)"],
+            )
+            .is_some()
+        );
+        // Equality on a decoded string column is exact on both engines.
+        assert!(
+            plan_ev(
+                "SELECT token FROM TokenCreated WHERE name = 'Token' \
+                 ORDER BY block_num DESC LIMIT 11",
+                &["TokenCreated(address indexed token, string name)"],
+            )
+            .is_some()
+        );
+        // Ranges over text are collation-dependent; reject.
+        assert!(
+            plan_ev(
+                "SELECT token FROM TokenCreated WHERE name > 'Token' \
+                 ORDER BY block_num DESC LIMIT 11",
                 &["TokenCreated(address indexed token, string name)"],
             )
             .is_none()
