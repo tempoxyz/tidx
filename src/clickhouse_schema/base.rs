@@ -25,6 +25,23 @@ const MATERIALIZE_TXS_INDEX_20260709: &str =
     include_str!("../../db/clickhouse/migrations/20260709_materialize_txs_hash_index.sql");
 const MATERIALIZE_LOGS_INDEX_20260709: &str =
     include_str!("../../db/clickhouse/migrations/20260709_materialize_logs_tx_hash_index.sql");
+const BLOCKS_MIGRATION_20260710: &str =
+    include_str!("../../db/clickhouse/migrations/20260710_add_blocks_hash_index.sql");
+const LOGS_MIGRATION_20260710: &str =
+    include_str!("../../db/clickhouse/migrations/20260710_add_logs_topic3_index.sql");
+const TXS_MIGRATION_20260710: &str =
+    include_str!("../../db/clickhouse/migrations/20260710_add_txs_from_to_indexes.sql");
+const RECEIPTS_MIGRATION_20260710: &str =
+    include_str!("../../db/clickhouse/migrations/20260710_add_receipts_contract_address_index.sql");
+const MATERIALIZE_BLOCKS_INDEX_20260710: &str =
+    include_str!("../../db/clickhouse/migrations/20260710_materialize_blocks_hash_index.sql");
+const MATERIALIZE_LOGS_INDEX_20260710: &str =
+    include_str!("../../db/clickhouse/migrations/20260710_materialize_logs_topic3_index.sql");
+const MATERIALIZE_TXS_INDEXES_20260710: &str =
+    include_str!("../../db/clickhouse/migrations/20260710_materialize_txs_from_to_indexes.sql");
+const MATERIALIZE_RECEIPTS_INDEX_20260710: &str = include_str!(
+    "../../db/clickhouse/migrations/20260710_materialize_receipts_contract_address_index.sql"
+);
 const TOKEN_HOLDER_DELTAS_MIGRATION_20260618: &str =
     include_str!("../../db/clickhouse/migrations/20260618_delete_guard_token_holder_deltas.sql");
 const ADDRESS_HOLDER_DELTAS_MIGRATION_20260618: &str =
@@ -176,6 +193,70 @@ pub const MIGRATIONS: &[ClickHouseObject] = &[
         name: "logs_20260709_materialize_tx_hash_index",
         kind: ClickHouseObjectKind::Migration(MATERIALIZE_LOGS_INDEX_20260709),
         depends_on: &["logs"],
+        public_query: false,
+        block_column: None,
+        backfill: None,
+    },
+    ClickHouseObject {
+        name: "blocks_20260710_hash_index",
+        kind: ClickHouseObjectKind::Migration(BLOCKS_MIGRATION_20260710),
+        depends_on: &["blocks"],
+        public_query: false,
+        block_column: None,
+        backfill: None,
+    },
+    ClickHouseObject {
+        name: "logs_20260710_topic3_index",
+        kind: ClickHouseObjectKind::Migration(LOGS_MIGRATION_20260710),
+        depends_on: &["logs"],
+        public_query: false,
+        block_column: None,
+        backfill: None,
+    },
+    ClickHouseObject {
+        name: "txs_20260710_from_to_indexes",
+        kind: ClickHouseObjectKind::Migration(TXS_MIGRATION_20260710),
+        depends_on: &["txs"],
+        public_query: false,
+        block_column: None,
+        backfill: None,
+    },
+    ClickHouseObject {
+        name: "receipts_20260710_contract_address_index",
+        kind: ClickHouseObjectKind::Migration(RECEIPTS_MIGRATION_20260710),
+        depends_on: &["receipts"],
+        public_query: false,
+        block_column: None,
+        backfill: None,
+    },
+    ClickHouseObject {
+        name: "blocks_20260710_materialize_hash_index",
+        kind: ClickHouseObjectKind::Migration(MATERIALIZE_BLOCKS_INDEX_20260710),
+        depends_on: &["blocks"],
+        public_query: false,
+        block_column: None,
+        backfill: None,
+    },
+    ClickHouseObject {
+        name: "logs_20260710_materialize_topic3_index",
+        kind: ClickHouseObjectKind::Migration(MATERIALIZE_LOGS_INDEX_20260710),
+        depends_on: &["logs"],
+        public_query: false,
+        block_column: None,
+        backfill: None,
+    },
+    ClickHouseObject {
+        name: "txs_20260710_materialize_from_to_indexes",
+        kind: ClickHouseObjectKind::Migration(MATERIALIZE_TXS_INDEXES_20260710),
+        depends_on: &["txs"],
+        public_query: false,
+        block_column: None,
+        backfill: None,
+    },
+    ClickHouseObject {
+        name: "receipts_20260710_materialize_contract_address_index",
+        kind: ClickHouseObjectKind::Migration(MATERIALIZE_RECEIPTS_INDEX_20260710),
+        depends_on: &["receipts"],
         public_query: false,
         block_column: None,
         backfill: None,

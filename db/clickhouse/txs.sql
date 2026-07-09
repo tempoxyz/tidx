@@ -22,7 +22,9 @@ CREATE TABLE IF NOT EXISTS txs (
     valid_after             Nullable(Int64),
     signature_type          Nullable(Int16),
 
-    INDEX idx_hash hash TYPE bloom_filter GRANULARITY 1
+    INDEX idx_hash hash TYPE bloom_filter GRANULARITY 1,
+    INDEX idx_from `from` TYPE bloom_filter GRANULARITY 1,
+    INDEX idx_to   `to`   TYPE bloom_filter GRANULARITY 1
 ) ENGINE = ReplacingMergeTree()
 PARTITION BY toYYYYMM(block_timestamp)
 ORDER BY (block_num, idx)
