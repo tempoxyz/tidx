@@ -126,12 +126,12 @@ impl SyncState {
         self.backfill_num.is_some()
     }
 
-    /// Returns the number of blocks remaining to backfill
+    /// Returns the number of blocks remaining to backfill.
+    /// Blocks at or below the prune floor were intentionally dropped and don't count.
     pub fn backfill_remaining(&self) -> u64 {
         match self.backfill_num {
-            None => self.tip_num, // Haven't started, need to fill 0..tip_num
-            Some(0) => 0,         // Complete
-            Some(n) => n,         // Blocks 0..n remain
+            None => self.tip_num.saturating_sub(self.pruned_below),
+            Some(n) => n.saturating_sub(self.pruned_below),
         }
     }
 
