@@ -448,16 +448,25 @@ async fn handle_query_once(
             })
             .map_err(|e| ApiError::QueryError(e.to_string()))?
     } else if use_tiered {
-        // PostgreSQL over tiered.* views (hot PG window + ClickHouse archive)
-        crate::service::execute_query_tiered(&pool, &params.sql, &sigs, &options)
-            .await
-            .map_err(|e| {
-                if e.to_string().contains("timeout") {
-                    ApiError::Timeout
-                } else {
-                    ApiError::QueryError(e.to_string())
-                }
-            })?
+        // Split hot/cold at the prune boundary when possible; otherwise
+        // PostgreSQL over tiered.* views (hot PG window + ClickHouse archive).
+        let clickhouse = state.get_clickhouse(Some(params.chain_id)).await;
+        crate::service::execute_query_tiered(
+            &pool,
+            clickhouse.as_deref(),
+            params.chain_id,
+            &params.sql,
+            &sigs,
+            &options,
+        )
+        .await
+        .map_err(|e| {
+            if e.to_string().contains("timeout") {
+                ApiError::Timeout
+            } else {
+                ApiError::QueryError(e.to_string())
+            }
+        })?
     } else {
         // Use PostgreSQL
         crate::service::execute_query_postgres(&pool, &params.sql, &sigs, &options)

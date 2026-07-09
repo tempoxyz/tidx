@@ -107,10 +107,26 @@ impl ClickHouseEngine {
         timeout_ms: u64,
         limit: i64,
     ) -> Result<QueryResult> {
+        self.query_user_with_settings(sql, signatures, timeout_ms, limit, &[])
+            .await
+    }
+
+    /// [`Self::query_user`] with extra ClickHouse settings appended to the
+    /// request URL (e.g. output formatting for the tiered cold arm). Keys and
+    /// values must be URL-safe tokens.
+    pub async fn query_user_with_settings(
+        &self,
+        sql: &str,
+        signatures: &[&str],
+        timeout_ms: u64,
+        limit: i64,
+        settings: &[(&str, &str)],
+    ) -> Result<QueryResult> {
         let sql = Self::prepare_query(sql, signatures)?;
         validate_clickhouse_query(&sql)?;
         let sql = Self::wrap_user_query_with_limit(&sql, limit.clamp(1, HARD_LIMIT_MAX));
-        self.execute_prepared_query(&sql, Some(timeout_ms)).await
+        self.execute_prepared_query_with_settings(&sql, Some(timeout_ms), settings)
+            .await
     }
 
     pub async fn query_with_timeout(
@@ -138,6 +154,16 @@ impl ClickHouseEngine {
         sql: &str,
         timeout_ms: Option<u64>,
     ) -> Result<QueryResult> {
+        self.execute_prepared_query_with_settings(sql, timeout_ms, &[])
+            .await
+    }
+
+    async fn execute_prepared_query_with_settings(
+        &self,
+        sql: &str,
+        timeout_ms: Option<u64>,
+        settings: &[(&str, &str)],
+    ) -> Result<QueryResult> {
         let start = std::time::Instant::now();
         let n = self.instances.len();
         let starting = self.active.load(Ordering::Relaxed);
@@ -146,7 +172,7 @@ impl ClickHouseEngine {
             let idx = (starting + attempt) % n;
             let inst = &self.instances[idx];
 
-            match self.try_query(inst, sql, start, timeout_ms).await {
+            match self.try_query(inst, sql, start, timeout_ms, settings).await {
                 Ok(result) => {
                     if attempt > 0 {
                         self.active.store(idx, Ordering::Relaxed);
@@ -174,8 +200,13 @@ impl ClickHouseEngine {
         Err(anyhow!("All ClickHouse instances unreachable"))
     }
 
-    fn query_url(&self, inst: &Instance, timeout_ms: Option<u64>) -> String {
-        let base = format!(
+    fn query_url(
+        &self,
+        inst: &Instance,
+        timeout_ms: Option<u64>,
+        settings: &[(&str, &str)],
+    ) -> String {
+        let mut url = format!(
             "{}/?database={}&default_format=JSON&max_result_bytes={}&result_overflow_mode=throw",
             inst.url.trim_end_matches('/'),
             self.database,
@@ -183,10 +214,12 @@ impl ClickHouseEngine {
         );
         if let Some(timeout_ms) = timeout_ms {
             let max_execution_time = timeout_ms.div_ceil(1000).max(1);
-            format!("{base}&max_execution_time={max_execution_time}")
-        } else {
-            base
+            url.push_str(&format!("&max_execution_time={max_execution_time}"));
         }
+        for (key, value) in settings {
+            url.push_str(&format!("&{key}={value}"));
+        }
+        url
     }
 
     async fn try_query(
@@ -195,8 +228,9 @@ impl ClickHouseEngine {
         sql: &str,
         start: std::time::Instant,
         timeout_ms: Option<u64>,
+        settings: &[(&str, &str)],
     ) -> Result<QueryResult> {
-        let url = self.query_url(inst, timeout_ms);
+        let url = self.query_url(inst, timeout_ms, settings);
 
         let request_timeout = timeout_ms.map(clickhouse_request_timeout);
         let mut req = inst.http_client.post(&url).body(sql.to_string());
@@ -465,7 +499,7 @@ mod tests {
         };
 
         let engine = ClickHouseEngine::new(&config, 4217).unwrap();
-        let url = engine.query_url(&engine.instances[0], None);
+        let url = engine.query_url(&engine.instances[0], None, &[]);
 
         assert_eq!(
             url,
@@ -485,7 +519,7 @@ mod tests {
         };
 
         let engine = ClickHouseEngine::new(&config, 4217).unwrap();
-        let url = engine.query_url(&engine.instances[0], Some(1_001));
+        let url = engine.query_url(&engine.instances[0], Some(1_001), &[]);
 
         assert_eq!(
             url,

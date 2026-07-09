@@ -8,8 +8,8 @@ use tokio_postgres::types::ToSql;
 use crate::db::Pool;
 use crate::metrics;
 use crate::query::{
-    HARD_LIMIT_MAX, apply_event_signature_ctes_postgres, apply_event_signature_ctes_tiered,
-    validate_query,
+    EventSignature, HARD_LIMIT_MAX, apply_event_signature_ctes_postgres,
+    apply_event_signature_ctes_tiered, plan_tiered_split, validate_query,
 };
 
 #[derive(Debug, Clone, Serialize)]
@@ -148,6 +148,18 @@ pub struct QueryResult {
     pub query_time_ms: Option<f64>,
 }
 
+impl From<crate::clickhouse::QueryResult> for QueryResult {
+    fn from(r: crate::clickhouse::QueryResult) -> Self {
+        Self {
+            columns: r.columns,
+            rows: r.rows,
+            row_count: r.row_count,
+            engine: r.engine,
+            query_time_ms: r.query_time_ms,
+        }
+    }
+}
+
 pub struct QueryOptions {
     pub timeout_ms: u64,
     pub limit: i64,
@@ -187,12 +199,174 @@ pub async fn execute_query_postgres(
     run_pg_query(pool, &sql, options, &[], "postgres").await
 }
 
-/// Execute a query on the tiered engine: PostgreSQL over `tiered.*` views
-/// (hot PG window UNION ALL ClickHouse archive via pg_clickhouse).
+/// ClickHouse output settings for the tiered cold arm, matching the hot
+/// (PostgreSQL) arm's JSON formatting: unquoted 64-bit ints, RFC 3339 times.
+const TIERED_COLD_CH_SETTINGS: &[(&str, &str)] = &[
+    ("output_format_json_quote_64bit_integers", "0"),
+    ("date_time_output_format", "iso"),
+];
+
+/// Floor for the cold arm's remaining timeout budget.
+const TIERED_COLD_MIN_TIMEOUT_MS: u64 = 250;
+
+/// Execute a query on the tiered engine.
+///
+/// Eligible shapes (see [`plan_tiered_split`]) are split at the prune
+/// boundary and served natively — hot arm on PostgreSQL `public.*`, cold arm
+/// on ClickHouse — then stitched. Everything else falls back to the
+/// pg_clickhouse FDW views (`tiered.*`).
+pub async fn execute_query_tiered(
+    pool: &Pool,
+    clickhouse: Option<&crate::clickhouse::ClickHouseEngine>,
+    chain_id: u64,
+    sql: &str,
+    signatures: &[&str],
+    options: &QueryOptions,
+) -> Result<QueryResult> {
+    match try_execute_tiered_split(pool, clickhouse, chain_id, sql, signatures, options).await? {
+        Some(result) => Ok(result),
+        None => execute_query_tiered_fdw(pool, sql, signatures, options).await,
+    }
+}
+
+/// Attempt the tiered fast path. `Ok(None)` = ineligible, use the FDW path.
+async fn try_execute_tiered_split(
+    pool: &Pool,
+    clickhouse: Option<&crate::clickhouse::ClickHouseEngine>,
+    chain_id: u64,
+    sql: &str,
+    signatures: &[&str],
+    options: &QueryOptions,
+) -> Result<Option<QueryResult>> {
+    let start = Instant::now();
+
+    let mut event_tables = std::collections::HashSet::new();
+    for sig in signatures {
+        // Let the fallback path surface signature parse errors.
+        let Ok(parsed) = EventSignature::parse(sig) else {
+            return Ok(None);
+        };
+        event_tables.insert(parsed.name.to_lowercase());
+    }
+    let Some(plan) = plan_tiered_split(sql, &event_tables) else {
+        return Ok(None);
+    };
+
+    let (boundary, _) = crate::db::tiered::fetch_prune_boundary(pool, chain_id).await?;
+    if boundary <= 0 {
+        // Nothing pruned yet: full history is hot in PostgreSQL.
+        let mut result = execute_query_postgres(pool, sql, signatures, options).await?;
+        result.engine = Some("tiered".to_string());
+        return Ok(Some(result));
+    }
+
+    let eff_limit = plan
+        .sql_limit
+        .map_or(options.limit, |l| l.min(options.limit));
+    let budget = |start: &Instant| {
+        options
+            .timeout_ms
+            .saturating_sub(start.elapsed().as_millis() as u64)
+            .max(TIERED_COLD_MIN_TIMEOUT_MS)
+    };
+
+    let (first, second) = if plan.cold_leads {
+        // Ascending order: cold (ClickHouse) rows sort first.
+        let Some(ch) = clickhouse else {
+            return Ok(None);
+        };
+        let cold_sql = plan.arm_sql(false, boundary, Some(eff_limit));
+        let cold: QueryResult = ch
+            .query_user_with_settings(
+                &cold_sql,
+                signatures,
+                budget(&start),
+                eff_limit.max(1),
+                TIERED_COLD_CH_SETTINGS,
+            )
+            .await?
+            .into();
+        if cold.row_count as i64 >= eff_limit {
+            return Ok(Some(finish_tiered(cold, None, start)));
+        }
+        let remaining = eff_limit - cold.row_count as i64;
+        let hot_sql = plan.arm_sql(true, boundary, Some(remaining));
+        let hot_options = QueryOptions {
+            timeout_ms: budget(&start),
+            limit: options.limit,
+        };
+        let hot = execute_query_postgres(pool, &hot_sql, signatures, &hot_options).await?;
+        (cold, hot)
+    } else {
+        // Descending or unordered: hot (PostgreSQL) rows first.
+        let hot_sql = plan.arm_sql(true, boundary, Some(eff_limit.max(0)));
+        let hot = execute_query_postgres(pool, &hot_sql, signatures, options).await?;
+        if hot.row_count as i64 >= eff_limit {
+            return Ok(Some(finish_tiered(hot, None, start)));
+        }
+        // Hot under-filled: fill the remainder from the ClickHouse archive.
+        let Some(ch) = clickhouse else {
+            return Ok(None);
+        };
+        let remaining = eff_limit - hot.row_count as i64;
+        let cold_sql = plan.arm_sql(false, boundary, Some(remaining));
+        let cold: QueryResult = ch
+            .query_user_with_settings(
+                &cold_sql,
+                signatures,
+                budget(&start),
+                remaining,
+                TIERED_COLD_CH_SETTINGS,
+            )
+            .await?
+            .into();
+        (hot, cold)
+    };
+
+    // Column sets must line up to concatenate rows; a mismatch (shouldn't
+    // happen for planned shapes) falls back to the FDW path for correctness.
+    let names_match = first.columns.len() == second.columns.len()
+        && first
+            .columns
+            .iter()
+            .zip(&second.columns)
+            .all(|(a, b)| a.eq_ignore_ascii_case(b));
+    if !names_match && first.row_count > 0 && second.row_count > 0 {
+        tracing::warn!(
+            hot_cols = ?first.columns,
+            cold_cols = ?second.columns,
+            "tiered split arms returned mismatched columns; falling back to FDW path"
+        );
+        return Ok(None);
+    }
+
+    Ok(Some(finish_tiered(first, Some(second), start)))
+}
+
+/// Assemble the stitched tiered result (arm order already correct).
+fn finish_tiered(
+    mut first: QueryResult,
+    second: Option<QueryResult>,
+    start: Instant,
+) -> QueryResult {
+    if let Some(second) = second {
+        if first.columns.is_empty() {
+            first.columns = second.columns;
+        }
+        first.rows.extend(second.rows);
+        first.row_count = first.rows.len();
+    }
+    first.engine = Some("tiered".to_string());
+    first.query_time_ms = Some(start.elapsed().as_secs_f64() * 1000.0);
+    first
+}
+
+/// Tiered fallback: PostgreSQL over `tiered.*` views (hot PG window
+/// UNION ALL ClickHouse archive via pg_clickhouse).
 ///
 /// The views expose ClickHouse's text representation, so '0x…' literals pass
 /// through unconverted and push down to the ClickHouse arm.
-pub async fn execute_query_tiered(
+async fn execute_query_tiered_fdw(
     pool: &Pool,
     sql: &str,
     signatures: &[&str],

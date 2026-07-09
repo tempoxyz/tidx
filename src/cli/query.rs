@@ -83,7 +83,22 @@ pub async fn run(args: Args) -> Result<()> {
 
     let sig_strs: Vec<&str> = args.signature.iter().map(String::as_str).collect();
     let result = if args.engine.as_deref() == Some("tiered") {
-        service::execute_query_tiered(&pool, &args.sql, &sig_strs, &options).await?
+        // Best-effort ClickHouse engine for the tiered fast path's cold arm;
+        // without it, eligible queries still fall back to the FDW views.
+        let clickhouse = chain
+            .clickhouse
+            .as_ref()
+            .filter(|c| c.enabled)
+            .and_then(|c| tidx::clickhouse::ClickHouseEngine::new(c, chain.chain_id).ok());
+        service::execute_query_tiered(
+            &pool,
+            clickhouse.as_ref(),
+            chain.chain_id,
+            &args.sql,
+            &sig_strs,
+            &options,
+        )
+        .await?
     } else {
         execute_query_postgres(&pool, &args.sql, &sig_strs, &options).await?
     };

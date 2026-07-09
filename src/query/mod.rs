@@ -1,5 +1,6 @@
 mod parser;
 mod router;
+mod tiered_split;
 mod validator;
 
 pub use parser::{
@@ -9,6 +10,7 @@ pub use parser::{
     extract_order_by_columns, extract_raw_column_predicates,
 };
 pub use router::QueryEngine;
+pub use tiered_split::{TieredSplit, plan_tiered_split};
 pub use validator::{HARD_LIMIT_MAX, validate_clickhouse_query, validate_query};
 
 use regex_lite::Regex;
