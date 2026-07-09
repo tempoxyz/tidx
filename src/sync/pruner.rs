@@ -122,6 +122,7 @@ impl Pruner {
         // block in it is durable. Stop at the first that isn't.
         let mut weeks = Vec::new();
         let mut new_pruned_below = 0u64;
+        let mut new_pruned_below_ts = None;
         {
             let conn = pool.get().await?;
             for (name, start) in &candidates {
@@ -133,6 +134,7 @@ impl Pruner {
                     None => weeks.push(week_index(*start)),
                     Some(max) if (max as u64) <= allowed => {
                         new_pruned_below = new_pruned_below.max(max as u64);
+                        new_pruned_below_ts = Some(*start + Duration::weeks(1));
                         weeks.push(week_index(*start));
                     }
                     Some(max) => {
@@ -155,8 +157,14 @@ impl Pruner {
 
         // Watermark first (crash-safe order: extra data, never a lying floor).
         if new_pruned_below > state.pruned_below {
-            update_pruned_below(pool, self.chain_id, new_pruned_below).await?;
+            update_pruned_below(pool, self.chain_id, new_pruned_below, new_pruned_below_ts).await?;
             metrics::set_pruned_below(self.chain_id, new_pruned_below);
+
+            // Rebake tiered views/constraints at the new boundary BEFORE
+            // dropping partitions, so the views never expose a hole. A
+            // failure here aborts the round (partitions stay; views stay
+            // consistent at the old boundary). No-op when not bootstrapped.
+            crate::db::tiered::refresh_boundary(pool, self.chain_id).await?;
         }
 
         // Drop in dependency-safe order; blocks last.

@@ -259,6 +259,12 @@ pub struct ClickHouseConfig {
     /// Scan and repair historical derived-table gaps on startup (default: true).
     #[serde(default = "default_true")]
     pub repair_derived_on_startup: bool,
+
+    /// ClickHouse URL as reachable from the PostgreSQL server itself, used by
+    /// the pg_clickhouse FDW for tiered queries (default: `url`).
+    /// Set when PostgreSQL reaches ClickHouse via a different host than tidx.
+    #[serde(default)]
+    pub fdw_url: Option<String>,
 }
 
 impl ClickHouseConfig {
@@ -295,6 +301,7 @@ impl Default for ClickHouseConfig {
             user: None,
             password_env: None,
             repair_derived_on_startup: true,
+            fdw_url: None,
         }
     }
 }

@@ -17,6 +17,10 @@ ALTER TABLE sync_state ADD COLUMN IF NOT EXISTS ch_backfill_block INT8 NOT NULL 
 -- Gap detection and backfill ignore blocks at or below this.
 ALTER TABLE sync_state ADD COLUMN IF NOT EXISTS pruned_below INT8 NOT NULL DEFAULT 0;
 
+-- Partition-boundary timestamp of the prune floor: every pruned row has
+-- block_timestamp strictly below this. Bakes into tiered-view CHECK constraints.
+ALTER TABLE sync_state ADD COLUMN IF NOT EXISTS pruned_below_ts TIMESTAMPTZ;
+
 COMMENT ON COLUMN sync_state.synced_num IS 'Highest contiguous block synced from genesis (no gaps up to here)';
 COMMENT ON COLUMN sync_state.tip_num IS 'Highest block synced near chain head (may have gaps below)';
 COMMENT ON COLUMN sync_state.backfill_num IS 'Lowest block synced going backwards (NULL=not started, 0=complete)';
@@ -24,3 +28,4 @@ COMMENT ON COLUMN sync_state.sync_rate IS 'Current sync rate in blocks/second (r
 COMMENT ON COLUMN sync_state.started_at IS 'When this sync instance started';
 COMMENT ON COLUMN sync_state.ch_backfill_block IS 'ClickHouse backfill cursor: highest block written to all CH tables (0=not started)';
 COMMENT ON COLUMN sync_state.pruned_below IS 'Highest block intentionally pruned from Postgres (0=nothing pruned); gap detection ignores blocks at or below this';
+COMMENT ON COLUMN sync_state.pruned_below_ts IS 'Exclusive upper timestamp bound of pruned rows (weekly partition boundary); NULL=nothing pruned';

@@ -910,18 +910,26 @@ pub async fn update_synced_num(pool: &Pool, chain_id: u64, synced_num: u64) -> R
 
 /// Record that Postgres history up to `pruned_below` was intentionally
 /// pruned (tiered storage). Monotonic: only ever advances.
-pub async fn update_pruned_below(pool: &Pool, chain_id: u64, pruned_below: u64) -> Result<()> {
+/// `pruned_below_ts` is the partition-boundary timestamp: every pruned row
+/// has block_timestamp strictly below it.
+pub async fn update_pruned_below(
+    pool: &Pool,
+    chain_id: u64,
+    pruned_below: u64,
+    pruned_below_ts: Option<chrono::DateTime<chrono::Utc>>,
+) -> Result<()> {
     let conn = pool.get().await?;
 
     conn.execute(
         r#"
-        INSERT INTO sync_state (chain_id, pruned_below)
-        VALUES ($1, $2)
+        INSERT INTO sync_state (chain_id, pruned_below, pruned_below_ts)
+        VALUES ($1, $2, $3)
         ON CONFLICT (chain_id) DO UPDATE SET
             pruned_below = GREATEST(sync_state.pruned_below, EXCLUDED.pruned_below),
+            pruned_below_ts = GREATEST(sync_state.pruned_below_ts, EXCLUDED.pruned_below_ts),
             updated_at = NOW()
         "#,
-        &[&(chain_id as i64), &(pruned_below as i64)],
+        &[&(chain_id as i64), &(pruned_below as i64), &pruned_below_ts],
     )
     .await?;
 

@@ -366,6 +366,40 @@ fn spawn_sync_engine(
                                 }
                                 seed_metrics_from_clickhouse(&ch_sink).await;
                                 sinks = sinks.with_clickhouse(ch_sink);
+
+                                // Tiered storage: pg_clickhouse foreign tables
+                                // + tiered.* views over hot PG and the CH
+                                // archive. Requires retention (the boundary
+                                // maintenance) and the pg_clickhouse extension.
+                                if chain.retention.is_some() {
+                                    let fdw_url =
+                                        ch_config.fdw_url.as_deref().unwrap_or(&ch_config.url);
+                                    let target = db::tiered::FdwTarget::new(
+                                        fdw_url,
+                                        database.clone(),
+                                        ch_config.user.clone(),
+                                        ch_password.clone(),
+                                    );
+                                    let result = match target {
+                                        Ok(target) => {
+                                            db::tiered::bootstrap(
+                                                throttled_pool.inner(),
+                                                &target,
+                                                chain.chain_id,
+                                            )
+                                            .await
+                                        }
+                                        Err(e) => Err(e),
+                                    };
+                                    if let Err(e) = result {
+                                        warn!(
+                                            error = %e,
+                                            chain = %chain.name,
+                                            "Tiered storage bootstrap failed; engine=tiered unavailable \
+                                             (is the pg_clickhouse extension installed in PostgreSQL?)"
+                                        );
+                                    }
+                                }
                             }
                             Err(e) => {
                                 error!(
