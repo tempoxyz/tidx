@@ -16,8 +16,8 @@ pub struct Args {
     #[arg(short, long, default_value = "config.toml")]
     pub config: PathBuf,
 
-    /// Force query engine (postgres, tiered, postgres-via-clickhouse,
-    /// clickhouse). Auto-routes if not specified.
+    /// Query executor: postgres (default) or clickhouse.
+    /// "tiered" is a legacy alias for --engine postgres --source postgres-clickhouse.
     #[arg(short, long)]
     pub engine: Option<String>,
 
@@ -32,6 +32,12 @@ pub struct Args {
     /// Event signature(s) to create CTEs (e.g., "Transfer(address indexed from, address indexed to, uint256 value)")
     #[arg(short, long)]
     pub signature: Vec<String>,
+
+    /// Where the data lives: postgres (hot window), clickhouse (full archive
+    /// via pg_clickhouse), or postgres-clickhouse (tiered: hot PG window +
+    /// cold ClickHouse archive). Defaults to the engine's native store.
+    #[arg(long)]
+    pub source: Option<String>,
 
     /// SQL query (SELECT only). Use event name from --signature as table.
     pub sql: String,
@@ -74,39 +80,43 @@ pub async fn run(args: Args) -> Result<()> {
         limit: args.limit,
     };
 
-    // CLI supports the PostgreSQL-backed engines (postgres, tiered,
-    // postgres-via-clickhouse). For ClickHouse OLAP queries, use the HTTP
-    // API with engine=clickhouse
-    if args.engine.as_deref() == Some("clickhouse") {
-        anyhow::bail!(
-            "ClickHouse engine not available in CLI. Use HTTP API with engine=clickhouse for OLAP queries."
-        );
-    }
+    let route = tidx::query::QueryRoute::resolve(args.engine.as_deref(), args.source.as_deref())
+        .map_err(|e| anyhow::anyhow!(e))?;
 
     let sig_strs: Vec<&str> = args.signature.iter().map(String::as_str).collect();
-    let result = if args.engine.as_deref() == Some("postgres-via-clickhouse") {
-        // PostgreSQL over ch.* pg_clickhouse foreign tables (full archive).
-        service::execute_query_postgres_via_clickhouse(&pool, &args.sql, &sig_strs, &options)
+    let result = match route {
+        tidx::query::QueryRoute::ClickHouse => {
+            // CLI executes through PostgreSQL only.
+            anyhow::bail!(
+                "ClickHouse engine not available in CLI. Use HTTP API with engine=clickhouse for OLAP queries."
+            );
+        }
+        tidx::query::QueryRoute::PostgresViaClickHouse => {
+            // PostgreSQL over ch.* pg_clickhouse foreign tables (full archive).
+            service::execute_query_postgres_via_clickhouse(&pool, &args.sql, &sig_strs, &options)
+                .await?
+        }
+        tidx::query::QueryRoute::Tiered => {
+            // Best-effort ClickHouse engine for the tiered fast path's cold arm;
+            // without it, eligible queries still fall back to the FDW views.
+            let clickhouse = chain
+                .clickhouse
+                .as_ref()
+                .filter(|c| c.enabled)
+                .and_then(|c| tidx::clickhouse::ClickHouseEngine::new(c, chain.chain_id).ok());
+            service::execute_query_tiered(
+                &pool,
+                clickhouse.as_ref(),
+                chain.chain_id,
+                &args.sql,
+                &sig_strs,
+                &options,
+            )
             .await?
-    } else if args.engine.as_deref() == Some("tiered") {
-        // Best-effort ClickHouse engine for the tiered fast path's cold arm;
-        // without it, eligible queries still fall back to the FDW views.
-        let clickhouse = chain
-            .clickhouse
-            .as_ref()
-            .filter(|c| c.enabled)
-            .and_then(|c| tidx::clickhouse::ClickHouseEngine::new(c, chain.chain_id).ok());
-        service::execute_query_tiered(
-            &pool,
-            clickhouse.as_ref(),
-            chain.chain_id,
-            &args.sql,
-            &sig_strs,
-            &options,
-        )
-        .await?
-    } else {
-        execute_query_postgres(&pool, &args.sql, &sig_strs, &options).await?
+        }
+        tidx::query::QueryRoute::Postgres => {
+            execute_query_postgres(&pool, &args.sql, &sig_strs, &options).await?
+        }
     };
 
     if result.row_count == 0 {
@@ -216,6 +226,9 @@ async fn run_via_http(base_url: &str, args: &Args) -> Result<()> {
     }
     if let Some(engine) = &args.engine {
         url.query_pairs_mut().append_pair("engine", engine);
+    }
+    if let Some(source) = &args.source {
+        url.query_pairs_mut().append_pair("source", source);
     }
 
     let mut req = client.get(url);
