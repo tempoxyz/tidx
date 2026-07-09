@@ -155,6 +155,72 @@ pub struct ChainConfig {
     /// ClickHouse OLAP settings (for analytical queries)
     #[serde(default)]
     pub clickhouse: Option<ClickHouseConfig>,
+
+    /// Tiered-storage retention: keep a hot window in Postgres, prune the
+    /// rest once durable in ClickHouse. Requires `[chains.clickhouse]` enabled.
+    #[serde(default)]
+    pub retention: Option<RetentionConfig>,
+}
+
+/// Tiered-storage retention settings (Postgres hot window).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RetentionConfig {
+    /// How much recent data to keep in Postgres, e.g. "30d" or "36h".
+    pub pg_keep: String,
+
+    /// How often the pruner runs (default "1h").
+    #[serde(default = "default_prune_interval")]
+    pub prune_interval: String,
+
+    /// Refuse to prune unless the ClickHouse archive has durably consumed
+    /// the data (default true). `false` is an explicit opt-in to a rolling
+    /// window where pruned history is gone forever.
+    #[serde(default = "default_require_clickhouse")]
+    pub require_clickhouse: bool,
+}
+
+impl RetentionConfig {
+    pub fn pg_keep_duration(&self) -> Result<chrono::Duration> {
+        parse_duration(&self.pg_keep)
+            .with_context(|| format!("Invalid retention.pg_keep: '{}'", self.pg_keep))
+    }
+
+    pub fn prune_interval_duration(&self) -> Result<std::time::Duration> {
+        let d = parse_duration(&self.prune_interval).with_context(|| {
+            format!("Invalid retention.prune_interval: '{}'", self.prune_interval)
+        })?;
+        Ok(d.to_std()?)
+    }
+}
+
+fn default_prune_interval() -> String {
+    "1h".to_string()
+}
+
+fn default_require_clickhouse() -> bool {
+    true
+}
+
+/// Parse durations like "30d", "36h", "90m", "45s".
+fn parse_duration(s: &str) -> Result<chrono::Duration> {
+    let s = s.trim();
+    if s.len() < 2 || !s.is_ascii() {
+        anyhow::bail!("expected a duration like '30d', '12h', '30m', or '45s'");
+    }
+    let (num, unit) = s.split_at(s.len() - 1);
+    let n: i64 = num
+        .parse()
+        .map_err(|_| anyhow::anyhow!("invalid number '{num}'"))?;
+    if n <= 0 {
+        anyhow::bail!("duration must be positive");
+    }
+    match unit {
+        "d" => Ok(chrono::Duration::days(n)),
+        "h" => Ok(chrono::Duration::hours(n)),
+        "m" => Ok(chrono::Duration::minutes(n)),
+        "s" => Ok(chrono::Duration::seconds(n)),
+        _ => anyhow::bail!("unknown duration unit '{unit}' (use d, h, m, or s)"),
+    }
 }
 
 /// Configuration for ClickHouse OLAP engine
@@ -350,6 +416,30 @@ impl Config {
             anyhow::bail!("No chains configured. Add at least one [[chains]] section.");
         }
 
+        for chain in &config.chains {
+            if let Some(retention) = &chain.retention {
+                let keep = retention.pg_keep_duration().with_context(|| {
+                    format!("chain '{}': invalid [chains.retention]", chain.name)
+                })?;
+                retention.prune_interval_duration().with_context(|| {
+                    format!("chain '{}': invalid [chains.retention]", chain.name)
+                })?;
+                anyhow::ensure!(
+                    keep >= chrono::Duration::days(1),
+                    "chain '{}': retention.pg_keep must be at least 1d",
+                    chain.name
+                );
+                let ch_enabled = chain.clickhouse.as_ref().is_some_and(|c| c.enabled);
+                anyhow::ensure!(
+                    ch_enabled || !retention.require_clickhouse,
+                    "chain '{}': [chains.retention] requires [chains.clickhouse] with enabled = true \
+                     (pruned data must remain queryable in the ClickHouse archive). \
+                     Set retention.require_clickhouse = false to run a rolling window without an archive",
+                    chain.name
+                );
+            }
+        }
+
         Ok(config)
     }
 }
@@ -491,6 +581,7 @@ mod tests {
             api_pg_url: None,
             api_pg_password_env: None,
             clickhouse: None,
+            retention: None,
         };
 
         assert_eq!(
@@ -517,6 +608,7 @@ mod tests {
             api_pg_url: None,
             api_pg_password_env: None,
             clickhouse: None,
+            retention: None,
         };
 
         let resolved = config.resolved_pg_url().unwrap();
@@ -542,6 +634,7 @@ mod tests {
             api_pg_url: None,
             api_pg_password_env: None,
             clickhouse: None,
+            retention: None,
         };
 
         assert!(config.resolved_pg_url().is_err());
@@ -564,6 +657,7 @@ mod tests {
             api_pg_url: None,
             api_pg_password_env: None,
             clickhouse: None,
+            retention: None,
         };
 
         let resolved = config.resolved_rpc_url().unwrap();
