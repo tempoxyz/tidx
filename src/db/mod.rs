@@ -1,3 +1,4 @@
+pub mod partitions;
 mod pool;
 mod schema;
 

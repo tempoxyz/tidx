@@ -64,6 +64,18 @@ pub async fn run_migrations(pool: &Pool) -> Result<()> {
     conn.batch_execute(include_str!("../../db/extensions.sql"))
         .await?;
 
+    drop(conn);
+
+    // Pre-create weekly partitions around now (partitioned installs only)
+    // so realtime writes never wait on partition DDL.
+    let now = chrono::Utc::now();
+    super::partitions::ensure_partitions_covering(
+        pool,
+        now - chrono::Duration::days(7),
+        now + chrono::Duration::days(35),
+    )
+    .await?;
+
     Ok(())
 }
 

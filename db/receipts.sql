@@ -12,7 +12,7 @@ CREATE TABLE IF NOT EXISTS receipts (
     status                  INT2,
     fee_payer               BYTEA,
     PRIMARY KEY (block_timestamp, block_num, tx_idx)
-);
+) PARTITION BY RANGE (block_timestamp);
 
 CREATE INDEX IF NOT EXISTS idx_receipts_tx_hash ON receipts (tx_hash);
 CREATE INDEX IF NOT EXISTS idx_receipts_block_num ON receipts (block_num DESC);
