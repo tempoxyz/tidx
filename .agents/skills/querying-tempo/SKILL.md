@@ -19,7 +19,7 @@ GET /query?sql&chainId&engine&signature&timeout_ms&limit&live
 |-------|----------|---------|-------------|
 | `sql` | yes | — | SQL query (SELECT only) |
 | `chainId` | yes | — | Chain ID (e.g., `4217` for Presto mainnet) |
-| `engine` | no | auto | Force engine: `postgres` or `clickhouse` |
+| `engine` | no | `postgres` | Force engine: `postgres`, `clickhouse`, or `clickhouse_pg` (pg_clickhouse; also serves `postgres` on ClickHouse-only chains) |
 | `signature` | no | — | Event signature for CTE decoding (repeatable) |
 | `timeout_ms` | no | `5000` | Query timeout in ms |
 | `limit` | no | `10000` | Max rows (hard cap: 10,000) |
@@ -47,7 +47,7 @@ tidx query --url <url> --chain-id <chain_id> [OPTIONS] <sql>
 |------|-------|----------|---------|-------------|
 | `--url` | `-u` | yes | — | tidx HTTP API URL (e.g., `http://localhost:8080`) |
 | `--chain-id` | `-n` | yes | — | Chain ID |
-| `--engine` | `-e` | no | auto | Force engine: `postgres` or `clickhouse` |
+| `--engine` | `-e` | no | `postgres` | Force engine: `postgres` or `clickhouse_pg` (`clickhouse` is HTTP-API only) |
 | `--format` | `-f` | no | `table` | Output: `table`, `json`, `csv`, `toon` |
 | `--limit` | `-l` | no | `10000` | Max rows |
 | `--signature` | `-s` | no | — | Event signature (repeatable) |

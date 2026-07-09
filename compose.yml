@@ -16,10 +16,12 @@ x-tidx-command: &tidx-command
     name = "$${TIDX_CHAIN_NAME:-local-testnet}"
     chain_id = $${TIDX_CHAIN_ID:-42431}
     rpc_url = "$${TIDX_RPC_URL:-http://anvil:8545}"
-    pg_url = "$${TIDX_PG_URL:-postgres://tidx:tidx@postgres:5432/tidx}"
     backfill = $${TIDX_BACKFILL:-false}
     batch_size = $${TIDX_BATCH_SIZE:-25}
     concurrency = $${TIDX_CONCURRENCY:-1}
+
+    [chains.postgres]
+    url = "$${TIDX_PG_URL:-postgres://tidx:tidx@postgres:5432/tidx}"
 
     [chains.clickhouse]
     enabled = $${TIDX_CLICKHOUSE_ENABLED:-true}

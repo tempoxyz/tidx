@@ -9,17 +9,29 @@ bind = "0.0.0.0"
 enabled = true
 port = 9090
 
+# Each chain needs at least one storage engine: a `postgres` table and/or an
+# enabled `clickhouse` table. With both, PostgreSQL serves OLTP queries and
+# ClickHouse serves OLAP queries. With only ClickHouse, sync state lives in
+# ClickHouse and `engine=postgres` queries are served via pg_clickhouse.
+
 [[chains]]
 name = "moderato"
 chain_id = 42431
 rpc_url = "https://rpc.testnet.tempo.xyz"
 rpc_auth_env = "TEMPO_RPC_AUTH_MODERATO"
-pg_url = "postgres://tidx:tidx@postgres:5432/tidx_moderato"
 backfill = true
 batch_size = 500
 concurrency = 8
 
-# ClickHouse OLAP engine (optional)
+# PostgreSQL OLTP engine (optional)
+[chains.postgres]
+url = "postgres://tidx:tidx@postgres:5432/tidx_moderato"
+# password_env = "PG_PASSWORD"
+# Separate read-replica URL for the HTTP API:
+# api_url = "postgres://tidx:tidx@postgres-replica:5432/tidx_moderato"
+# api_password_env = "PG_API_PASSWORD"
+
+# ClickHouse OLAP engine (optional; enabled by default when present)
 # Data is written directly via HTTP batch inserts (JSONEachRow).
 # Queries go to the primary; failover instances are tried on connection failure.
 [chains.clickhouse]
@@ -28,6 +40,10 @@ url = "http://clickhouse:8123"
 # failover_urls = ["http://clickhouse-2:8123"]
 # user = "default"
 # password_env = "CH_PASSWORD"
+# PostgreSQL wire-protocol endpoint served by pg_clickhouse, for
+# engine=clickhouse_pg queries (and engine=postgres when no postgres is set):
+# pg_url = "postgres://postgres:postgres@pg-clickhouse:5432/tidx_42431"
+# pg_password_env = "CH_PG_PASSWORD"
 # Historical derived-table gap repair runs after base ClickHouse backfill by default.
 # repair_derived_on_startup = true
 
@@ -36,17 +52,21 @@ name = "mainnet"
 chain_id = 4217
 rpc_url = "https://rpc.tempo.xyz"
 rpc_auth_env = "TEMPO_RPC_AUTH_MAINNET"
-pg_url = "postgres://tidx:tidx@postgres:5432/tidx_mainnet"
 backfill = true
 batch_size = 500
 concurrency = 8
 
-# ClickHouse OLAP engine (optional)
+# PostgreSQL OLTP engine (optional)
+[chains.postgres]
+url = "postgres://tidx:tidx@postgres:5432/tidx_mainnet"
+
+# ClickHouse OLAP engine (optional; enabled by default when present)
 [chains.clickhouse]
 enabled = false
 url = "http://clickhouse:8123"
 # failover_urls = ["http://clickhouse-2:8123"]
 # user = "default"
 # password_env = "CH_PASSWORD"
+# pg_url = "postgres://postgres:postgres@pg-clickhouse:5432/tidx_4217"
 # Historical derived-table gap repair runs after base ClickHouse backfill by default.
 # repair_derived_on_startup = true

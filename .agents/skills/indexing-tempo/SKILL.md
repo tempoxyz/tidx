@@ -89,7 +89,9 @@ port = 8080
 name = "mainnet"
 chain_id = 4217
 rpc_url = "https://rpc.tempo.xyz"
-pg_url = "postgres://user:pass@localhost:5432/tidx_mainnet"
+
+[chains.postgres]
+url = "postgres://user:pass@localhost:5432/tidx_mainnet"
 ```
 
 ### Full Config
@@ -109,14 +111,17 @@ port = 9090
 name = "mainnet"
 chain_id = 4217
 rpc_url = "https://rpc.tempo.xyz"
-pg_url = "postgres://user@host:5432/tidx_mainnet"
-pg_password_env = "PG_PASSWORD"         # Password from env var
-api_pg_url = "postgres://user@replica:5432/tidx_mainnet"  # Read replica for API
-api_pg_password_env = "PG_API_PASSWORD"
 batch_size = 500                         # Blocks per RPC batch (default: 100)
 concurrency = 8                          # Parallel gap-fill workers (default: 4)
 backfill = true                          # Sync to genesis (default: true)
 trust_rpc = false                        # Skip reorg detection (default: false)
+
+# At least one of [chains.postgres] / [chains.clickhouse] is required.
+[chains.postgres]
+url = "postgres://user@host:5432/tidx_mainnet"
+password_env = "PG_PASSWORD"             # Password from env var
+api_url = "postgres://user@replica:5432/tidx_mainnet"  # Read replica for API
+api_password_env = "PG_API_PASSWORD"
 
 [chains.clickhouse]
 enabled = true
@@ -124,13 +129,16 @@ url = "http://clickhouse:8123"
 failover_urls = ["http://clickhouse-2:8123"]
 user = "default"
 password_env = "CH_PASSWORD"
+pg_url = "postgres://postgres@pg-clickhouse:5432/tidx_4217"  # pg_clickhouse endpoint (engine=clickhouse_pg)
 
 [[chains]]
 name = "testnet"
 chain_id = 42429
 rpc_url = "https://rpc.testnet.tempo.xyz"
-pg_url = "postgres://user@host:5432/tidx_testnet"
-pg_password_env = "PG_PASSWORD"
+
+[chains.postgres]
+url = "postgres://user@host:5432/tidx_testnet"
+password_env = "PG_PASSWORD"
 ```
 
 ### Config Reference
@@ -146,26 +154,30 @@ pg_password_env = "PG_PASSWORD"
 ├── enabled           bool      = true       Enable metrics endpoint
 └── port              u16       = 9090       Metrics port
 
-[[chains]]
+[[chains]]                                   Needs [postgres] and/or [clickhouse]
 ├── name              string    (required)   Display name
 ├── chain_id          u64       (required)   Chain ID
 ├── rpc_url           string    (required)   JSON-RPC URL
-├── pg_url            string    (required)   PostgreSQL URL
-├── pg_password_env   string    (optional)   Env var for PG password
-├── api_pg_url        string    (optional)   Separate PG URL for API (read replica)
-├── api_pg_password_env string  (optional)   Env var for API PG password
 ├── batch_size        u64       = 100        Blocks per RPC batch
 ├── concurrency       usize     = 4          Parallel gap-fill workers
 ├── backfill          bool      = true       Sync to genesis
 ├── backfill_first    bool      = false      Complete backfill before realtime
 ├── trust_rpc         bool      = false      Skip reorg detection
-└── [clickhouse]
-    ├── enabled       bool      = false      Enable ClickHouse
+├── [postgres]                               Optional PostgreSQL OLTP store
+│   ├── url           string    (required)   PostgreSQL URL
+│   ├── password_env  string    (optional)   Env var for PG password
+│   ├── api_url       string    (optional)   Separate PG URL for API (read replica)
+│   └── api_password_env string (optional)   Env var for API PG password
+└── [clickhouse]                             Optional ClickHouse OLAP store
+    ├── enabled       bool      = true       Enable ClickHouse (on when section present)
     ├── url           string    = "http://clickhouse:8123"
     ├── failover_urls string[]  = []         Failover ClickHouse URLs
     ├── database      string    (optional)   DB name (default: tidx_{chain_id})
     ├── user          string    (optional)   HTTP basic auth user
-    └── password_env  string    (optional)   Env var for CH password
+    ├── password_env  string    (optional)   Env var for CH password
+    ├── pg_url        string    (optional)   pg_clickhouse endpoint (engine=clickhouse_pg;
+    │                                        serves engine=postgres when no [postgres])
+    └── pg_password_env string  (optional)   Env var for pg_clickhouse password
 ```
 
 ## Tempo Networks
