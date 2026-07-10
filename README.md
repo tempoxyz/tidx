@@ -65,8 +65,8 @@ The sync engine writes to both PostgreSQL and ClickHouse in parallel. With `[cha
           ┌──────────────────────────┐                ┌──────────────────────────┐
           │        PostgreSQL        │  pg_clickhouse │        ClickHouse        │
           │    hot window (OLTP)     │     (FDW)      │    full archive (OLAP)   │
-          │  last `pg_keep` blocks,  │───────────────►│   + materialized views   │
-          │  pruned once archived    │                │      (auto-updated)      │
+          │    point reads ~1 ms     │───────────────►│   90d rollups ~160 ms    │
+          │     30d hot ≈ 8 GB       │                │   full chain ≈ 26 GB     │
           └────────────┬─────────────┘                └────────────┬─────────────┘
                        ▲                                           ▲
                        │                                           │
