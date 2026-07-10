@@ -594,6 +594,9 @@ pub async fn execute_query_postgres_via_clickhouse(
             // ch.* carries prune-boundary CHECKs for the tiered views; the
             // archive holds full history, so never let them prune scans here.
             "SET LOCAL constraint_exclusion = off",
+            // Drop pg_clickhouse's default `final 1`: FINAL merges cost reads
+            // dearly; match the native ClickHouse engine's semantics instead.
+            "SET LOCAL pg_clickhouse.session_settings = 'join_use_nulls 1, group_by_use_nulls 1, final 0'",
         ],
         "postgres-via-clickhouse",
     )

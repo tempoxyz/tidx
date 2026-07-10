@@ -25,8 +25,9 @@
 //! The pruner refreshes the boundary right after advancing `pruned_below`
 //! and **before** dropping partitions, so the views never expose a hole.
 //!
-//! pg_clickhouse queries ClickHouse with the `final = 1` setting, so the
-//! cold arm reads ReplacingMergeTree data deduplicated even before merges.
+//! All cold reads (native and FDW) run without `final`: unmerged
+//! ReplacingMergeTree duplicates are possible but rare (crash replay only;
+//! reorgs delete synchronously), matching the native ClickHouse engine.
 
 use anyhow::{Context, Result, anyhow};
 use chrono::{DateTime, Utc};
