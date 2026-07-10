@@ -204,12 +204,9 @@ pub async fn execute_query_postgres(
 /// lossily as f64) — [`normalize_cold_result`] then converts per column type.
 const TIERED_COLD_CH_SETTINGS: &[(&str, &str)] = &[
     ("date_time_output_format", "iso"),
-    // Dedupe ReplacingMergeTree rows, matching the FDW views' `final = 1`.
-    ("final", "1"),
-    // Skip the FINAL merge for fully-merged partitions (all but the
-    // actively-written month), keeping dedup while restoring most of the
-    // non-FINAL read speed on historical scans.
-    ("do_not_merge_across_partitions_select_final", "1"),
+    // No `final = 1`: reads match the native ClickHouse engine's semantics
+    // (unmerged ReplacingMergeTree duplicates are possible but rare, and the
+    // split cold arm only reads long-merged history below the prune boundary).
 ];
 
 /// Rewrite ClickHouse JSON values to the hot (PostgreSQL) arm's
