@@ -21,7 +21,7 @@
 
 ## Features
 
-- **Dual Storage** — PostgreSQL (OLTP) + ClickHouse (OLAP), written in parallel
+- **Tiered Storage** — hot window in PostgreSQL (OLTP), full archive in ClickHouse (OLAP), queried as one
 - **Event/Function Decoding** — Query decoded events or function calldata by ABI signature (no pre-registration)
 - **HTTP API + CLI** — Query data via REST, SQL, or command line
 
@@ -46,38 +46,53 @@ curl -L https://tidx.vercel.app/docker | bash
 
 ## Overview
 
-The sync engine writes to both PostgreSQL and ClickHouse in parallel. Use the `engine` query parameter to choose which backend to query:
+The sync engine writes to both PostgreSQL and ClickHouse in parallel. With `[chains.retention]` enabled, PostgreSQL keeps only a hot window of recent blocks (e.g. `pg_keep = "30d"`) and prunes the rest once it is durable in ClickHouse, which holds the full archive. Without retention, both stores hold full history. Queries route across the tiers via the `engine` and `source` parameters:
 
 ```
-                                              ┌─────────────────────┐
-                                              │      /query         │
-                                              │                     │
-                                              │  ?signature=...     │◄─── Lazy event decoding
-                                              │  ?engine=...        │     (no pre-registration)
-                                              └──────────┬──────────┘
-                                                         │
-              ┌──────────────────────────────────────────┼──────────────────────────────────────────┐
-              │                                          │                                          │
-              ▼                                          ▼                                          ▼
-┌─────────────────────┐                    ┌─────────────────────┐                    ┌─────────────────────┐
-│    PostgreSQL       │                    │     ClickHouse      │                    │  Materialized Views │
-│    (OLTP)           │                    │      (OLAP)         │ ─────────────────► │  (auto-updated)     │
-│                     │                    │                     │                    │                     │
-└─────────┬───────────┘                    └─────────┬───────────┘                    └─────────────────────┘
-          │                                          │
-          └──────────────────┬───────────────────────┘
-                             │
-                     ┌───────┴───────┐
-                     │  Dual Sink    │
-                     └───────┬───────┘
-                             │
-                     ┌───────┴───────┐
-                     │  Sync Engine  │
-                     └───────────────┘
+                        ┌───────────────────────────────────────┐
+                        │                /query                 │
+                        │                                       │
+                        │  ?signature=...                       │◄─── Lazy event decoding
+                        │  ?engine=...  &source=...             │     (no pre-registration)
+                        └───────────────────┬───────────────────┘
+                                            │
+                                            ▼
+                        ┌───────────────────────────────────────┐
+                        │             Query Router              │
+                        └───────┬───────────────────────┬───────┘
+                          hot   │                       │   cold / analytics
+                                ▼                       ▼
+          ┌──────────────────────────┐                ┌──────────────────────────┐
+          │        PostgreSQL        │  pg_clickhouse │        ClickHouse        │
+          │    hot window (OLTP)     │     (FDW)      │    full archive (OLAP)   │
+          │  last `pg_keep` blocks,  │───────────────►│   + materialized views   │
+          │  pruned once archived    │                │      (auto-updated)      │
+          └────────────┬─────────────┘                └────────────┬─────────────┘
+                       ▲                                           ▲
+                       │                                           │
+                       └─────────────────────┬─────────────────────┘
+                                             │
+                                     ┌───────┴───────┐
+                                     │   Dual Sink   │
+                                     └───────┬───────┘
+                                             │
+                                     ┌───────┴───────┐
+                                     │  Sync Engine  │
+                                     └───────────────┘
 ```
+
+| `engine` | `source` | Route |
+|----------|----------|-------|
+| `postgres`* | `postgres-clickhouse`* | **Tiered** — hot reads on PostgreSQL, cold/analytical reads on native ClickHouse; provably-safe shapes split at the prune boundary, everything else falls back to `pg_clickhouse` (FDW) |
+| `postgres`* | `postgres` | Plain PostgreSQL (hot window only when retention is enabled) |
+| `postgres`* | `clickhouse` | PostgreSQL planner over the full ClickHouse archive via `pg_clickhouse` foreign tables |
+| `clickhouse` | `clickhouse`* | Native ClickHouse (full archive + materialized views) |
+
+`*` — default when omitted. `engine=tiered` is accepted as a legacy alias for `engine=postgres&source=postgres-clickhouse`.
 
 ```bash
-# PostgreSQL (OLTP) - last 10 transfers from an address
+# Tiered (default) - last 10 transfers from an address; hot rows come from
+# PostgreSQL, older rows from the ClickHouse archive
 curl "https://indexer.tempo.xyz/query \
   ?chainId=4217 \
   &signature=Transfer(address,address,uint256) \
@@ -151,6 +166,11 @@ url = "http://clickhouse:8123"
 # Historical materialized-table repair runs after base ClickHouse backfill by default.
 repair_derived_on_startup = true
 
+# Optional: tiered storage. Keeps a 30d hot window in PostgreSQL and prunes
+# older rows once they are durable in the ClickHouse archive.
+[chains.retention]
+pg_keep = "30d"
+
 [[chains]]
 name = "moderato"
 chain_id = 42431
@@ -181,11 +201,16 @@ pg_password_env = "TIDX_PG_PASSWORD"
 ├── api_pg_url              string    (optional)     Separate PostgreSQL URL for API (e.g., read replica)
 ├── api_pg_password_env     string    (optional)     Env var name for API PostgreSQL password
 ├── batch_size              u64       = 100          Blocks per RPC batch request
-└── [clickhouse]                                     ClickHouse OLAP settings
-    ├── enabled             bool      = false        Enable ClickHouse OLAP queries
-    ├── url                 string    = "http://clickhouse:8123"  ClickHouse HTTP URL
-    ├── repair_derived_on_startup bool = true        Repair historical derived-table gaps on startup
-    └── replicated_database bool      = false        Create the database as ENGINE = Replicated with Replicated* table engines
+├── [clickhouse]                                     ClickHouse OLAP settings
+│   ├── enabled             bool      = false        Enable ClickHouse OLAP queries
+│   ├── url                 string    = "http://clickhouse:8123"  ClickHouse HTTP URL
+│   ├── fdw_url             string    = url          ClickHouse URL as reachable from PostgreSQL (pg_clickhouse FDW)
+│   ├── repair_derived_on_startup bool = true        Repair historical derived-table gaps on startup
+│   └── replicated_database bool      = false        Create the database as ENGINE = Replicated with Replicated* table engines
+└── [retention]                                      Tiered storage (PostgreSQL hot window)
+    ├── pg_keep             string    (required)     Recent data kept in PostgreSQL, e.g. "30d" or "36h"
+    ├── prune_interval      string    = "1h"         How often the pruner runs
+    └── require_clickhouse  bool      = true         Only prune rows durably archived in ClickHouse
 ```
 
 ## CLI
@@ -339,12 +364,12 @@ Hosted endpoints:
 ### Examples
 
 ```bash
-# Point lookup (auto-routed to PostgreSQL)
+# Point lookup (tiered by default: hot rows from PostgreSQL, archived rows from ClickHouse)
 curl "https://indexer.tempo.xyz/query?chainId=4217&sql=SELECT * FROM blocks WHERE num = 12345"
-> {"columns":["num","hash","timestamp"],"rows":[[12345,"0xabc...","2024-01-01T00:00:00Z"]],"row_count":1,"engine":"postgres","ok":true}
+> {"columns":["num","hash","timestamp"],"rows":[[12345,"0xabc...","2024-01-01T00:00:00Z"]],"row_count":1,"engine":"tiered","ok":true}
 
-# Aggregation (auto-routed to ClickHouse)
-curl "https://indexer.tempo.xyz/query?chainId=4217&sql=SELECT type, COUNT(*) FROM txs GROUP BY type"
+# Aggregation (native ClickHouse)
+curl "https://indexer.tempo.xyz/query?chainId=4217&engine=clickhouse&sql=SELECT type, COUNT(*) FROM txs GROUP BY type"
 > {"columns":["type","count"],"rows":[[0,50000],[2,120000]],"row_count":2,"engine":"clickhouse","ok":true}
 
 # Status
