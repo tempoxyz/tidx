@@ -298,7 +298,7 @@ pub async fn execute_query_tiered(
     signatures: &[&str],
     options: &QueryOptions,
 ) -> Result<QueryResult> {
-    let (boundary, _) = crate::db::tiered::fetch_prune_boundary(pool, chain_id).await?;
+    let (boundary, boundary_ts) = crate::db::tiered::fetch_prune_boundary(pool, chain_id).await?;
     if boundary <= 0 {
         // Nothing pruned yet: full history is hot in PostgreSQL.
         let mut result = execute_query_postgres(pool, sql, signatures, options).await?;
@@ -307,7 +307,21 @@ pub async fn execute_query_tiered(
     }
     match try_execute_tiered_split(pool, clickhouse, boundary, sql, signatures, options).await? {
         Some(result) => Ok(result),
-        None => execute_query_tiered_fdw(pool, sql, signatures, options).await,
+        None if crate::query::hot_window_confined(sql, boundary, boundary_ts) => {
+            // Confined to the hot window: PG indexes + constraint exclusion
+            // prune the ClickHouse arm out of the FDW views.
+            execute_query_tiered_fdw(pool, sql, signatures, options).await
+        }
+        None => {
+            // Cold or unbounded history: the views cannot push ORDER BY/
+            // LIMIT/aggregates past the UNION ALL, so run the whole query
+            // against the full ClickHouse archive instead.
+            tracing::debug!(target: "tidx::query", "tiered: split-ineligible, not hot-confined; routing to clickhouse archive");
+            let mut result =
+                execute_query_postgres_via_clickhouse(pool, sql, signatures, options).await?;
+            result.engine = Some("tiered".to_string());
+            Ok(result)
+        }
     }
 }
 

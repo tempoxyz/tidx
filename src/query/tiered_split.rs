@@ -45,6 +45,8 @@
 use std::collections::{HashMap, HashSet};
 use std::ops::ControlFlow;
 
+use chrono::{DateTime, NaiveDate, NaiveDateTime, Utc};
+
 use sqlparser::ast::{
     BinaryOperator, Expr, GroupByExpr, Ident, JoinConstraint, JoinOperator, LimitClause,
     ObjectNamePart, OrderByKind, Query, Select, SelectFlavor, SelectItem, SetExpr, Statement,
@@ -1017,6 +1019,151 @@ fn order_direction(query: &Query, relations: &[SplitRelation]) -> Option<Option<
     Some(first_asc)
 }
 
+// ─── Split-ineligible routing: hot-window confinement ──────────────────────
+
+/// Block-number columns whose lower bounds can confine a query to the hot
+/// PostgreSQL window.
+const BLOCK_BOUND_COLUMNS: &[&str] = &["block_num", "block_number", "num"];
+
+/// Timestamp columns, compared against the boundary block's timestamp.
+const TS_BOUND_COLUMNS: &[&str] = &["block_timestamp", "timestamp"];
+
+/// Whether the query carries a lower bound on a block-number or timestamp
+/// column landing at or above the prune boundary.
+///
+/// Routes split-ineligible tiered queries. A hot lower bound means the data
+/// lives in the hot PostgreSQL window, where the `tiered.*` FDW path wins
+/// (local rows, PG indexes, cold arm pruned by constraint exclusion). No
+/// such bound means deep or full history, where ClickHouse-only wins: the
+/// UNION ALL views cannot push ORDER BY/LIMIT/OFFSET/aggregates past the
+/// Append node, so PostgreSQL would drag raw ClickHouse rows and do that
+/// work itself.
+///
+/// Bounds are detected anywhere in the statement (CTEs, subqueries, even OR
+/// branches); over-matching errs toward the FDW path, i.e. today's behavior.
+/// Unparseable SQL also counts as confined for the same reason.
+pub fn hot_window_confined(sql: &str, boundary: i64, boundary_ts: Option<DateTime<Utc>>) -> bool {
+    let Ok(statements) = Parser::parse_sql(&GenericDialect {}, sql) else {
+        return true;
+    };
+    let mut confined = false;
+    let _ = visit_expressions(&statements, |expr: &Expr| {
+        if is_hot_lower_bound(expr, boundary, boundary_ts) {
+            confined = true;
+            return ControlFlow::Break(());
+        }
+        ControlFlow::Continue(())
+    });
+    confined
+}
+
+fn is_hot_lower_bound(expr: &Expr, boundary: i64, boundary_ts: Option<DateTime<Utc>>) -> bool {
+    use BinaryOperator::{Eq, Gt, GtEq, Lt, LtEq};
+    match expr {
+        Expr::BinaryOp { left, op, right } => match op {
+            GtEq | Gt => bound_is_hot(left, right, boundary, boundary_ts),
+            LtEq | Lt => bound_is_hot(right, left, boundary, boundary_ts),
+            Eq => {
+                bound_is_hot(left, right, boundary, boundary_ts)
+                    || bound_is_hot(right, left, boundary, boundary_ts)
+            }
+            _ => false,
+        },
+        Expr::Between {
+            expr,
+            negated: false,
+            low,
+            ..
+        } => bound_is_hot(expr, low, boundary, boundary_ts),
+        // Block-list membership with every block at/above the boundary
+        // (page-enrichment shapes: `block_num IN (…recent blocks…)`).
+        Expr::InList {
+            expr,
+            list,
+            negated: false,
+        } => {
+            column_parts(unwrap_nested(expr))
+                .is_some_and(|(_, name)| BLOCK_BOUND_COLUMNS.contains(&name.as_str()))
+                && !list.is_empty()
+                && list
+                    .iter()
+                    .all(|e| literal_i64(e).is_some_and(|v| v >= boundary))
+        }
+        _ => false,
+    }
+}
+
+/// `col ≥ lit` (or `col = lit`) with the literal at or above the boundary.
+fn bound_is_hot(col: &Expr, lit: &Expr, boundary: i64, boundary_ts: Option<DateTime<Utc>>) -> bool {
+    let Some((_, name)) = column_parts(unwrap_nested(col)) else {
+        return false;
+    };
+    if BLOCK_BOUND_COLUMNS.contains(&name.as_str()) {
+        return literal_i64(lit).is_some_and(|v| v >= boundary);
+    }
+    if TS_BOUND_COLUMNS.contains(&name.as_str()) {
+        return match (literal_ts(lit), boundary_ts) {
+            (Some(v), Some(b)) => v >= b,
+            // Boundary timestamp unknown: assume hot (today's FDW behavior).
+            (Some(_), None) => true,
+            (None, _) => false,
+        };
+    }
+    false
+}
+
+/// Integer value of a numeric literal, folding `a + b` / `a - b` / unary `-`.
+fn literal_i64(expr: &Expr) -> Option<i64> {
+    match unwrap_nested(expr) {
+        Expr::Value(v) => match &v.value {
+            Value::Number(n, _) => n.parse().ok(),
+            _ => None,
+        },
+        Expr::UnaryOp {
+            op: UnaryOperator::Minus,
+            expr,
+        } => literal_i64(expr).map(i64::wrapping_neg),
+        Expr::BinaryOp { left, op, right } => {
+            let (l, r) = (literal_i64(left)?, literal_i64(right)?);
+            match op {
+                BinaryOperator::Plus => l.checked_add(r),
+                BinaryOperator::Minus => l.checked_sub(r),
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
+/// Timestamp value of a `'…'` / `TIMESTAMP '…'` / `CAST('…' AS …)` literal.
+fn literal_ts(expr: &Expr) -> Option<DateTime<Utc>> {
+    match unwrap_nested(expr) {
+        Expr::Value(v) => match &v.value {
+            Value::SingleQuotedString(s) => parse_ts(s),
+            _ => None,
+        },
+        Expr::TypedString(ts) => match &ts.value.value {
+            Value::SingleQuotedString(s) => parse_ts(s),
+            _ => None,
+        },
+        Expr::Cast { expr, .. } => literal_ts(expr),
+        _ => None,
+    }
+}
+
+fn parse_ts(s: &str) -> Option<DateTime<Utc>> {
+    if let Ok(dt) = DateTime::parse_from_rfc3339(s) {
+        return Some(dt.with_timezone(&Utc));
+    }
+    for fmt in ["%Y-%m-%d %H:%M:%S%.f", "%Y-%m-%dT%H:%M:%S%.f"] {
+        if let Ok(naive) = NaiveDateTime::parse_from_str(s, fmt) {
+            return Some(naive.and_utc());
+        }
+    }
+    let date = NaiveDate::parse_from_str(s, "%Y-%m-%d").ok()?;
+    Some(date.and_hms_opt(0, 0, 0)?.and_utc())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1447,5 +1594,113 @@ mod tests {
             p.arm_sql(true, 7, None),
             "SELECT b.num FROM blocks b WHERE b.num > 7 ORDER BY b.num DESC LIMIT 1"
         );
+    }
+
+    // ── hot_window_confined ─────────────────────────────────────────────
+
+    const B: i64 = 23_464_893;
+
+    fn confined(sql: &str) -> bool {
+        hot_window_confined(sql, B, None)
+    }
+
+    #[test]
+    fn hot_confined_block_lower_bounds() {
+        // At/above the boundary, both operand orders, strict and non-strict.
+        assert!(confined(
+            "SELECT 1 FROM receipts WHERE block_num >= 24456940 GROUP BY fee_payer"
+        ));
+        assert!(confined(
+            "SELECT 1 FROM receipts WHERE 24456940 <= block_num GROUP BY fee_payer"
+        ));
+        assert!(confined("SELECT 1 FROM logs WHERE block_num > 23464893"));
+        // Below the boundary: spans cold history.
+        assert!(!confined(
+            "SELECT 1 FROM txs WHERE block_num >= 14108813 GROUP BY sender"
+        ));
+        // Upper bound alone does not confine.
+        assert!(!confined(
+            "SELECT 1 FROM txs WHERE block_num <= 29218717 GROUP BY sender"
+        ));
+    }
+
+    #[test]
+    fn hot_confined_equality_between_and_in_list() {
+        assert!(confined(
+            "SELECT 1 FROM logs WHERE block_num = 29060842 GROUP BY address"
+        ));
+        assert!(!confined(
+            "SELECT 1 FROM logs WHERE block_num = 1000 GROUP BY address"
+        ));
+        assert!(confined(
+            "SELECT 1 FROM txs WHERE block_num BETWEEN 29000000 AND 29218717 GROUP BY sender"
+        ));
+        assert!(confined(
+            "SELECT count(*) FROM txs WHERE block_num IN (29000001, 29000002) GROUP BY block_num"
+        ));
+        assert!(!confined(
+            "SELECT count(*) FROM txs WHERE block_num IN (29000001, 1000) GROUP BY block_num"
+        ));
+        assert!(!confined(
+            "SELECT 1 FROM txs WHERE block_num NOT IN (29000001)"
+        ));
+    }
+
+    #[test]
+    fn hot_confined_folds_literal_arithmetic() {
+        assert!(confined(
+            "SELECT 1 FROM txs WHERE block_num >= 29218717 - 1000000 GROUP BY sender"
+        ));
+        assert!(!confined(
+            "SELECT 1 FROM txs WHERE block_num >= 29218717 - 20000000 GROUP BY sender"
+        ));
+    }
+
+    #[test]
+    fn hot_confined_unbounded_shapes_route_cold() {
+        // OFFSET page, no bound.
+        assert!(!confined(
+            "SELECT hash FROM txs ORDER BY block_num DESC, idx DESC LIMIT 11 OFFSET 490"
+        ));
+        // Key-only full-history filter.
+        assert!(!confined(
+            "SELECT count(*) FROM logs WHERE address = '0xab' AND topic0 = '0xcd'"
+        ));
+        // UNION of LIMIT subqueries.
+        assert!(!confined(
+            "SELECT DISTINCT block_num, idx FROM ((SELECT block_num, idx FROM txs WHERE \"from\" = '0xab' LIMIT 10000) UNION ALL (SELECT block_num, idx FROM txs WHERE \"to\" = '0xab' LIMIT 10000)) u"
+        ));
+    }
+
+    #[test]
+    fn hot_confined_bound_inside_cte() {
+        assert!(confined(
+            "WITH t AS (SELECT address, block_num FROM logs WHERE block_num >= 24456940) \
+             SELECT address, count(*) FROM t GROUP BY address ORDER BY count(*) DESC LIMIT 20"
+        ));
+    }
+
+    #[test]
+    fn hot_confined_timestamp_bounds() {
+        let bts = DateTime::parse_from_rfc3339("2026-06-10T00:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let sql = "SELECT 1 FROM txs WHERE timestamp >= '2026-06-15 00:00:00' GROUP BY sender";
+        assert!(hot_window_confined(sql, B, Some(bts)));
+        let sql_cold = "SELECT 1 FROM txs WHERE timestamp >= '2026-05-01' GROUP BY sender";
+        assert!(!hot_window_confined(sql_cold, B, Some(bts)));
+        // Unknown boundary timestamp: assume hot (preserve FDW behavior).
+        assert!(hot_window_confined(sql_cold, B, None));
+        // block_timestamp column and TIMESTAMP literal syntax.
+        assert!(hot_window_confined(
+            "SELECT 1 FROM receipts WHERE block_timestamp > TIMESTAMP '2026-07-01 12:00:00' GROUP BY fee_payer",
+            B,
+            Some(bts),
+        ));
+    }
+
+    #[test]
+    fn hot_confined_unparseable_stays_fdw() {
+        assert!(confined("SELECT ??? FROM"));
     }
 }

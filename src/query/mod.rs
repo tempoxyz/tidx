@@ -10,7 +10,7 @@ pub use parser::{
     extract_order_by_columns, extract_raw_column_predicates,
 };
 pub use router::QueryRoute;
-pub use tiered_split::{TieredSplit, plan_tiered_split};
+pub use tiered_split::{TieredSplit, hot_window_confined, plan_tiered_split};
 pub use validator::{HARD_LIMIT_MAX, validate_clickhouse_query, validate_query};
 
 use regex_lite::Regex;
