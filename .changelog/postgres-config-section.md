@@ -2,7 +2,7 @@
 tidx: major
 ---
 
-Moved PostgreSQL chain settings into a nested `[chains.postgres]` section (`url`, `password_env`, `api_url`, `api_password_env`), removing the root-level `pg_url`, `pg_password_env`, `api_pg_url`, and `api_pg_password_env` fields.
+**Breaking:** Moved PostgreSQL chain settings into a nested `[chains.postgres]` section (`url`, `password_env`, `api_url`, `api_password_env`), removing the root-level `pg_url`, `pg_password_env`, `api_pg_url`, and `api_pg_password_env` fields.
 
 ```diff
  [[chains]]
