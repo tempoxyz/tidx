@@ -23,6 +23,7 @@ CREATE MATERIALIZED VIEW IF NOT EXISTS address_balances_snapshot
 REFRESH EVERY 15 MINUTE
 ENGINE = MergeTree
 ORDER BY (holder, balance, token)
+SETTINGS default_compression_codec = 'ZSTD(1)'
 AS
 SELECT
     holder,

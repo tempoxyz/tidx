@@ -20,6 +20,7 @@ CREATE MATERIALIZED VIEW IF NOT EXISTS token_holder_counts
 REFRESH EVERY 15 MINUTE
 ENGINE = MergeTree
 ORDER BY (token)
+SETTINGS default_compression_codec = 'ZSTD(1)'
 AS
 SELECT
     token,

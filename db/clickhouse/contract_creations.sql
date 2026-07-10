@@ -11,3 +11,4 @@ CREATE TABLE IF NOT EXISTS contract_creations (
 ) ENGINE = ReplacingMergeTree()
 PARTITION BY toYYYYMM(block_timestamp)
 ORDER BY (creator, block_num, tx_idx)
+SETTINGS default_compression_codec = 'ZSTD(1)'

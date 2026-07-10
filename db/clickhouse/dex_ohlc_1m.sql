@@ -37,6 +37,7 @@ REFRESH EVERY 1 MINUTE
 ENGINE = MergeTree
 PARTITION BY toYYYYMM(bucket)
 ORDER BY (token, bucket)
+SETTINGS default_compression_codec = 'ZSTD(1)'
 AS
 SELECT
     toStartOfInterval(block_timestamp, INTERVAL 1 MINUTE) AS bucket,

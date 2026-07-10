@@ -12,3 +12,4 @@ CREATE TABLE IF NOT EXISTS blocks (
 ) ENGINE = ReplacingMergeTree()
 PARTITION BY toYYYYMM(timestamp)
 ORDER BY (num)
+SETTINGS default_compression_codec = 'ZSTD(1)'

@@ -19,3 +19,4 @@ CREATE TABLE IF NOT EXISTS dex_orders (
 ) ENGINE = ReplacingMergeTree()
 PARTITION BY toYYYYMM(block_timestamp)
 ORDER BY (token, orderId)
+SETTINGS default_compression_codec = 'ZSTD(1)'
