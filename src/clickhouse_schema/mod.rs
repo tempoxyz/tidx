@@ -5,6 +5,7 @@ mod base;
 mod catalog;
 mod contract_creations;
 mod dex;
+mod functions;
 mod token_approvals;
 mod token_approvals_current;
 mod token_balances;
@@ -14,6 +15,7 @@ mod token_transfer_stats;
 mod token_transfers;
 
 pub use catalog::{BackfillPolicy, BlockScopedTable, ClickHouseObject, ClickHouseObjectKind};
+pub use functions::function_statements;
 
 pub fn base_objects() -> &'static [ClickHouseObject] {
     base::TABLES

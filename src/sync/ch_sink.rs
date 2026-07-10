@@ -14,7 +14,7 @@ use tracing::{debug, error, info, warn};
 
 use crate::clickhouse_schema::{
     BackfillPolicy, ClickHouseObject, ClickHouseObjectKind, base_objects, derived_backfills,
-    derived_objects, migrations, post_derived_migrations, reorg_tables,
+    derived_objects, function_statements, migrations, post_derived_migrations, reorg_tables,
 };
 use crate::metrics;
 use crate::types::{BlockRow, LogRow, ReceiptRow, TxRow};
@@ -158,6 +158,18 @@ impl ClickHouseSink {
             .execute()
             .await
             .map_err(|e| anyhow!("Failed to create ClickHouse database: {e}"))?;
+
+        // ABI decode UDFs: CREATE OR REPLACE keeps them idempotent and lets
+        // definition edits take effect on restart. Server-global (not
+        // per-database) and not replicated by the Replicated database engine.
+        for stmt in function_statements() {
+            self.base_client
+                .query(&stmt)
+                .execute()
+                .await
+                .map_err(|e| anyhow!("Failed to create ClickHouse function: {e}"))?;
+        }
+        debug!(database = %self.database, "ClickHouse ABI functions ready");
 
         for object in base_objects() {
             let raw_ddl = object.ddl();
