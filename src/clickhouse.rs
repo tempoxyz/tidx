@@ -524,7 +524,7 @@ mod tests {
 
         assert_eq!(
             url,
-            "http://clickhouse-1:8123/?database=tidx_4217&default_format=JSON&max_result_bytes=10485760&result_overflow_mode=throw"
+            "http://clickhouse-1:8123/?database=tidx_4217&default_format=JSON&max_result_bytes=10485760&result_overflow_mode=throw&union_default_mode=DISTINCT"
         );
         assert!(!url.contains("max_execution_time"));
     }
@@ -544,7 +544,7 @@ mod tests {
 
         assert_eq!(
             url,
-            "http://clickhouse-1:8123/?database=tidx_4217&default_format=JSON&max_result_bytes=10485760&result_overflow_mode=throw&max_execution_time=2"
+            "http://clickhouse-1:8123/?database=tidx_4217&default_format=JSON&max_result_bytes=10485760&result_overflow_mode=throw&union_default_mode=DISTINCT&max_execution_time=2"
         );
     }
 
