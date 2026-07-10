@@ -110,14 +110,6 @@ pub struct ChainConfig {
     #[serde(default)]
     pub postgres: Option<PostgresConfig>,
 
-    /// Deprecated: use `url` under `[chains.postgres]`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub pg_url: Option<String>,
-
-    /// Deprecated: use `password_env` under `[chains.postgres]`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub pg_password_env: Option<String>,
-
     /// Enable backfill to genesis (default: true)
     #[serde(default = "default_backfill")]
     pub backfill: bool,
@@ -141,14 +133,6 @@ pub struct ChainConfig {
     /// Use for chains with frequent shallow reorgs where RPC is authoritative.
     #[serde(default)]
     pub trust_rpc: bool,
-
-    /// Deprecated: use `api_url` under `[chains.postgres]`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub api_pg_url: Option<String>,
-
-    /// Deprecated: use `api_password_env` under `[chains.postgres]`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub api_pg_password_env: Option<String>,
 
     /// ClickHouse OLAP settings (for analytical queries)
     #[serde(default)]
@@ -379,23 +363,14 @@ impl ChainConfig {
         redact_url_credentials(&self.rpc_url)
     }
 
-    /// Effective PostgreSQL settings: `[chains.postgres]`, or the deprecated
-    /// root-level `pg_url` / `pg_password_env` / `api_pg_url` / `api_pg_password_env`.
+    /// PostgreSQL settings from `[chains.postgres]`.
     pub fn postgres(&self) -> Result<PostgresConfig> {
-        if let Some(pg) = &self.postgres {
-            return Ok(pg.clone());
-        }
-        let url = self.pg_url.clone().with_context(|| {
+        self.postgres.clone().with_context(|| {
             format!(
-                "chain '{}': missing [chains.postgres] section (set postgres.url)",
+                "chain '{}': missing [chains.postgres] section (set postgres.url; \
+                 the root-level pg_url field was removed)",
                 self.name
             )
-        })?;
-        Ok(PostgresConfig {
-            url,
-            password_env: self.pg_password_env.clone(),
-            api_url: self.api_pg_url.clone(),
-            api_password_env: self.api_pg_password_env.clone(),
         })
     }
 
@@ -670,15 +645,11 @@ mod tests {
             rpc_url: "http://localhost:8545".to_string(),
             rpc_auth_env: None,
             postgres,
-            pg_url: None,
-            pg_password_env: None,
             backfill: true,
             batch_size: 100,
             concurrency: 4,
             backfill_first: false,
             trust_rpc: false,
-            api_pg_url: None,
-            api_pg_password_env: None,
             clickhouse: None,
             retention: None,
         }
@@ -723,35 +694,17 @@ mod tests {
     }
 
     #[test]
-    fn test_deprecated_root_pg_url_fallback() {
+    fn test_removed_root_pg_url_errors() {
         let toml_str = r#"
             name = "test"
             chain_id = 1
             rpc_url = "http://localhost:8545"
             pg_url = "postgres://user:pass@localhost/db"
-            api_pg_url = "postgres://user:pass@localhost/db_r"
         "#;
 
         let config: ChainConfig = toml::from_str(toml_str).unwrap();
-        assert_eq!(
-            config.resolved_pg_url().unwrap(),
-            "postgres://user:pass@localhost/db"
-        );
-        assert_eq!(
-            config.resolved_api_pg_url().unwrap().unwrap(),
-            "postgres://user:pass@localhost/db_r"
-        );
-    }
-
-    #[test]
-    fn test_postgres_section_wins_over_deprecated_root_fields() {
-        let mut config = test_chain(Some(pg("postgres://localhost/new")));
-        config.pg_url = Some("postgres://localhost/old".to_string());
-
-        assert_eq!(
-            config.resolved_pg_url().unwrap(),
-            "postgres://localhost/new"
-        );
+        let err = config.resolved_pg_url().unwrap_err().to_string();
+        assert!(err.contains("missing [chains.postgres]"), "{err}");
     }
 
     #[test]
