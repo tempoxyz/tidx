@@ -13,7 +13,8 @@ use tracing::{error, warn};
 
 use crate::config::ClickHouseConfig;
 use crate::query::{
-    HARD_LIMIT_MAX, apply_event_signature_ctes_clickhouse, validate_clickhouse_query,
+    HARD_LIMIT_MAX, apply_event_signature_ctes_clickhouse, convert_timestamp_literals_clickhouse,
+    validate_clickhouse_query,
 };
 
 const MAX_QUERY_RESULT_BYTES: usize = 10 * 1024 * 1024;
@@ -140,7 +141,8 @@ impl ClickHouseEngine {
     }
 
     fn prepare_query(sql: &str, signatures: &[&str]) -> Result<String> {
-        apply_event_signature_ctes_clickhouse(sql, signatures)
+        let sql = convert_timestamp_literals_clickhouse(sql);
+        apply_event_signature_ctes_clickhouse(&sql, signatures)
     }
 
     fn wrap_user_query_with_limit(sql: &str, limit: i64) -> String {
@@ -206,8 +208,10 @@ impl ClickHouseEngine {
         timeout_ms: Option<u64>,
         settings: &[(&str, &str)],
     ) -> String {
+        // union_default_mode: bare UNION behaves as UNION DISTINCT
+        // (PostgreSQL semantics); ClickHouse otherwise rejects it.
         let mut url = format!(
-            "{}/?database={}&default_format=JSON&max_result_bytes={}&result_overflow_mode=throw",
+            "{}/?database={}&default_format=JSON&max_result_bytes={}&result_overflow_mode=throw&union_default_mode=DISTINCT",
             inst.url.trim_end_matches('/'),
             self.database,
             MAX_QUERY_RESULT_BYTES
