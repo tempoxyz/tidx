@@ -1,11 +1,12 @@
 ---
 source: src/api/views.rs
+assertion_line: 833
 expression: sql
 ---
 WITH Approval AS (
     SELECT block_num, block_timestamp, log_idx, tx_idx, 
            concat('0x', lower(substring(tx_hash, 3))) AS tx_hash,
-           concat('0x', lower(substring(address, 3))) AS address, selector, topic1, topic2, topic3, data, concat('0x', lower(substring(topic1, 27))) AS "owner", concat('0x', lower(substring(topic2, 27))) AS "spender", reinterpretAsUInt256(reverse(unhex(substring(data, 3, 64)))) AS "value"
+           concat('0x', lower(substring(address, 3))) AS address, selector, topic1, topic2, topic3, data, abi_address(topic1) AS "owner", abi_address(topic2) AS "spender", abi_uint(abi_word(data, 0)) AS "value"
     FROM logs
     WHERE selector = '0x8c5be1e5ebec7d5bd14f71427d1e84f3dd0314c0f7b2291e5b200ac8c7c3b925'
 ) SELECT 

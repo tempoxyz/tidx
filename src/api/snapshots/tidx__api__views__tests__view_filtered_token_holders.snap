@@ -1,11 +1,12 @@
 ---
 source: src/api/views.rs
+assertion_line: 875
 expression: sql
 ---
 WITH Transfer AS (
     SELECT block_num, block_timestamp, log_idx, tx_idx, 
            concat('0x', lower(substring(tx_hash, 3))) AS tx_hash,
-           concat('0x', lower(substring(address, 3))) AS address, selector, topic1, topic2, topic3, data, concat('0x', lower(substring(topic1, 27))) AS "from", concat('0x', lower(substring(topic2, 27))) AS "to", reinterpretAsUInt256(reverse(unhex(substring(data, 3, 64)))) AS "value"
+           concat('0x', lower(substring(address, 3))) AS address, selector, topic1, topic2, topic3, data, abi_address(topic1) AS "from", abi_address(topic2) AS "to", abi_uint(abi_word(data, 0)) AS "value"
     FROM logs
     WHERE selector = '0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef' AND address = '0xdAC17F958D2ee523a2206206994597C13D831ec7'
 ) SELECT "to" as holder, SUM(CAST("value" AS Int256)) as balance

@@ -1259,79 +1259,38 @@ impl AbiType {
         }
     }
 
-    // ClickHouse decode functions for 0x-prefixed hex data (direct-write)
+    // ClickHouse decode functions for '0x'-prefixed hex columns (direct-write).
     //
-    // Columns are stored as '0x'-prefixed hex strings via ClickHouseSink.
-    // e.g., topic1 = '0x000000000000000000000000a975ba910c2ee169956f3df99ee2ece79d3887cf'
-    // We need to:
-    // 1. Strip the '0x' prefix with substring(..., 3)
-    // 2. Work with hex string (64 chars = 32 bytes) using substring on the hex
-    // 3. unhex() only when we need actual bytes for reinterpret functions
+    // Decodes via the abi_* SQL lambda UDFs (db/clickhouse/functions.sql),
+    // applied by ClickHouseSink::ensure_schema. Lambdas substitute at parse
+    // time, equivalent to inlining the expressions.
 
     pub fn topic_decode_sql_clickhouse(&self, topic_idx: usize) -> String {
         // topic_idx is 1-based from the signature parser, maps to topic0, topic1, etc.
         let col = format!("topic{}", topic_idx.saturating_sub(1));
-        // Strip '0x' prefix: substring(col, 3) gives us the 64-char hex string
         match self {
-            // Address: last 20 bytes = last 40 hex chars, add 0x prefix
-            AbiType::Address => format!("concat('0x', lower(substring({col}, 27)))"),
-            // Uint: unhex the full 64 chars, reverse for big-endian, reinterpret
-            AbiType::Uint(_) | AbiType::Int(_) => {
-                format!("reinterpretAsUInt256(reverse(unhex(substring({col}, 3))))")
-            }
-            // Bool: check last byte (last 2 hex chars)
-            AbiType::Bool => format!("unhex(substring({col}, 67, 2)) != unhex('00')"),
-            // Bytes32: just format as 0x-prefixed, already lowercase
-            AbiType::Bytes(Some(_) | None) => format!("concat('0x', substring({col}, 3))"),
-            _ => format!("concat('0x', substring({col}, 3))"),
+            AbiType::Address => format!("abi_address({col})"),
+            AbiType::Uint(_) => format!("abi_uint({col})"),
+            AbiType::Int(_) => format!("abi_int({col})"),
+            AbiType::Bool => format!("abi_bool({col})"),
+            AbiType::Bytes(Some(_) | None) => format!("abi_bytes32({col})"),
+            _ => format!("abi_bytes32({col})"),
         }
     }
 
     pub fn data_decode_sql_clickhouse(&self, offset: usize) -> String {
-        // data is stored as '0x' + hex string
-        // offset is in bytes, but we're working with hex (2 chars per byte)
-        // +3 to skip '0x' prefix, then offset*2 for hex position
-        let hex_start = 3 + offset * 2;
+        // offset is the byte offset of this param's head slot in `data`.
+        // Static types decode the word in place; dynamic types follow the
+        // offset word to the payload (see abi_bytes/abi_string).
         match self {
-            // Address: skip first 12 bytes (24 hex chars) of 32-byte word, take 20 bytes (40 hex chars)
-            AbiType::Address => {
-                format!(
-                    "concat('0x', lower(substring(data, {}, 40)))",
-                    hex_start + 24
-                )
-            }
-            // Uint: unhex 32 bytes (64 hex chars), reverse, reinterpret
-            AbiType::Uint(_) => {
-                format!("reinterpretAsUInt256(reverse(unhex(substring(data, {hex_start}, 64))))")
-            }
-            AbiType::Int(_) => {
-                format!("reinterpretAsInt256(reverse(unhex(substring(data, {hex_start}, 64))))")
-            }
-            // Bool: check last byte of 32-byte word (last 2 hex chars of 64)
-            AbiType::Bool => {
-                format!(
-                    "unhex(substring(data, {}, 2)) != unhex('00')",
-                    hex_start + 62
-                )
-            }
-            // Bytes32: take 64 hex chars, format with 0x prefix
-            AbiType::Bytes(Some(_) | None) => {
-                format!("concat('0x', lower(substring(data, {hex_start}, 64)))")
-            }
-            // String: offset word → length word → UTF-8 bytes, mirroring
-            // PostgreSQL's abi_string (db/functions.sql). Offsets/lengths fit
-            // u64, so read each word's last 8 bytes (16 hex chars).
-            AbiType::String => {
-                let off = format!(
-                    "reinterpretAsUInt64(reverse(unhex(substring(data, {}, 16))))",
-                    hex_start + 48
-                );
-                let len = format!(
-                    "reinterpretAsUInt64(reverse(unhex(substring(data, 51 + 2 * {off}, 16))))"
-                );
-                format!("unhex(substring(data, 67 + 2 * {off}, 2 * {len}))")
-            }
-            _ => format!("concat('0x', lower(substring(data, {hex_start}, 64)))"),
+            AbiType::Address => format!("abi_address(abi_word(data, {offset}))"),
+            AbiType::Uint(_) => format!("abi_uint(abi_word(data, {offset}))"),
+            AbiType::Int(_) => format!("abi_int(abi_word(data, {offset}))"),
+            AbiType::Bool => format!("abi_bool(abi_word(data, {offset}))"),
+            AbiType::Bytes(None) => format!("abi_bytes(data, {offset})"),
+            AbiType::Bytes(Some(_)) => format!("abi_bytes32(abi_word(data, {offset}))"),
+            AbiType::String => format!("abi_string(data, {offset})"),
+            _ => format!("abi_bytes32(abi_word(data, {offset}))"),
         }
     }
 
