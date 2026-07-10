@@ -1,0 +1,12 @@
+---
+source: src/query/parser.rs
+assertion_line: 1574
+expression: sig.to_cte_sql_clickhouse()
+---
+Message AS (
+    SELECT block_num, block_timestamp, log_idx, tx_idx, 
+           concat('0x', lower(substring(tx_hash, 3))) AS tx_hash,
+           concat('0x', lower(substring(address, 3))) AS address, selector, topic1, topic2, topic3, data, abi_address(topic1) AS "sender", abi_string(data, 0) AS "text", abi_bytes(data, 32) AS "payload"
+    FROM logs
+    WHERE selector = '0x231c600c72fa045357f7d6c6195e838ac110931b1452bda25371094e85fe4860'
+)

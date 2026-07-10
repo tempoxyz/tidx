@@ -1567,6 +1567,14 @@ mod tests {
     }
 
     #[test]
+    fn test_cte_clickhouse_dynamic_string_bytes() {
+        let sig =
+            EventSignature::parse("Message(address indexed sender, string text, bytes payload)")
+                .unwrap();
+        assert_snapshot!(sig.to_cte_sql_clickhouse());
+    }
+
+    #[test]
     fn test_extract_column_references() {
         let cols =
             extract_column_references("SELECT \"to\", COUNT(*) FROM transfer GROUP BY \"to\"");

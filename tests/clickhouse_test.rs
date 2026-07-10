@@ -10,7 +10,9 @@ mod common;
 
 use common::clickhouse::TestClickHouse;
 use serial_test::serial;
-use tidx::clickhouse_schema::{base_objects, migrations, post_derived_migrations};
+use tidx::clickhouse_schema::{
+    base_objects, function_statements, migrations, post_derived_migrations,
+};
 use tidx::query::EventSignature;
 use tidx::sync::ch_sink::ClickHouseSink;
 use tidx::sync::sink::SinkSet;
@@ -617,6 +619,90 @@ async fn test_uniswap_swap_cte() {
 
     assert!(data.is_some());
     assert_eq!(data.unwrap().len(), 1);
+}
+
+#[tokio::test]
+#[serial(clickhouse)]
+async fn test_dynamic_string_bytes_cte() {
+    let ch = TestClickHouse::new(TEST_DB)
+        .await
+        .expect("Failed to create ClickHouse client");
+
+    if ch.wait_for_ready().await.is_err() {
+        println!("ClickHouse not available, skipping test");
+        return;
+    }
+
+    ch.reset_database().await.expect("Failed to reset database");
+    ch.create_mock_logs_table()
+        .await
+        .expect("Failed to create logs table");
+
+    // UDFs are server-global; apply explicitly so the test is self-contained.
+    for stmt in function_statements() {
+        ch.query_raw(&stmt).await.expect("Failed to create UDF");
+    }
+
+    // Message(address indexed sender, string text, bytes payload)
+    let topic0 = "0x231c600c72fa045357f7d6c6195e838ac110931b1452bda25371094e85fe4860";
+    let sender = "0x000000000000000000000000a975ba910c2ee169956f3df99ee2ece79d3887cf";
+
+    // ABI data: two dynamic params.
+    // head: [offset to string = 0x40, offset to bytes = 0x80]
+    // 0x40: len 11, "hello tempo" padded
+    // 0x80: len 4, 0xdeadbeef padded
+    let data = concat!(
+        "0x",
+        "0000000000000000000000000000000000000000000000000000000000000040",
+        "0000000000000000000000000000000000000000000000000000000000000080",
+        "000000000000000000000000000000000000000000000000000000000000000b",
+        "68656c6c6f2074656d706f000000000000000000000000000000000000000000",
+        "0000000000000000000000000000000000000000000000000000000000000004",
+        "deadbeef00000000000000000000000000000000000000000000000000000000",
+    );
+
+    ch.insert_mock_log(
+        1,
+        0,
+        0,
+        "0x0000000000000000000000000000000000000000000000000000000000000001",
+        "0xdAC17F958D2ee523a2206206994597C13D831ec7",
+        topic0,
+        sender,
+        "0x0000000000000000000000000000000000000000000000000000000000000000",
+        "0x0000000000000000000000000000000000000000000000000000000000000000",
+        data,
+    )
+    .await
+    .expect("Failed to insert log");
+
+    let sig = EventSignature::parse("Message(address indexed sender, string text, bytes payload)")
+        .expect("Failed to parse signature");
+
+    let sql = format!(
+        r#"WITH {}
+        SELECT sender, text, payload FROM Message"#,
+        sig.to_cte_sql_clickhouse()
+    );
+
+    let result = ch.query_json(&sql).await.expect("Query failed");
+    let rows = result
+        .get("data")
+        .and_then(|d| d.as_array())
+        .expect("Missing data");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(
+        rows[0].get("sender").and_then(|v| v.as_str()),
+        Some("0xa975ba910c2ee169956f3df99ee2ece79d3887cf")
+    );
+    assert_eq!(
+        rows[0].get("text").and_then(|v| v.as_str()),
+        Some("hello tempo")
+    );
+    assert_eq!(
+        rows[0].get("payload").and_then(|v| v.as_str()),
+        Some("0xdeadbeef")
+    );
 }
 
 #[tokio::test]
