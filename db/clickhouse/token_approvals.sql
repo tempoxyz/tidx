@@ -16,3 +16,4 @@ CREATE TABLE IF NOT EXISTS token_approvals (
 ) ENGINE = ReplacingMergeTree()
 PARTITION BY toYYYYMM(block_timestamp)
 ORDER BY (token, block_num, log_idx, tx_hash)
+SETTINGS default_compression_codec = 'ZSTD(1)'

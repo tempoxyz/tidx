@@ -14,3 +14,4 @@ CREATE TABLE IF NOT EXISTS dex_pairs (
 ) ENGINE = ReplacingMergeTree()
 PARTITION BY toYYYYMM(block_timestamp)
 ORDER BY (block_num, log_idx)
+SETTINGS default_compression_codec = 'ZSTD(1)'

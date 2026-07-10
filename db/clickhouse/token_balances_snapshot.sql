@@ -21,6 +21,7 @@ CREATE MATERIALIZED VIEW IF NOT EXISTS token_balances_snapshot
 REFRESH EVERY 15 MINUTE
 ENGINE = MergeTree
 ORDER BY (token, balance)
+SETTINGS default_compression_codec = 'ZSTD(1)'
 AS
 SELECT
     token,
