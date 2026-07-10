@@ -285,6 +285,12 @@ fn normalize_cold_result(
 /// Floor for the cold arm's remaining timeout budget.
 const TIERED_COLD_MIN_TIMEOUT_MS: u64 = 250;
 
+/// Extra headroom on `statement_timeout` for FDW sessions: pg_clickhouse
+/// 0.3.x double-frees (and restarts PostgreSQL) when a statement-timeout
+/// cancel lands mid ClickHouse scan, so ClickHouse's own deadline
+/// (`max_execution_time`) must always fire first.
+const FDW_STATEMENT_TIMEOUT_MARGIN_MS: u64 = 5_000;
+
 /// Hot-confined aggregates whose proven scan span is at least this many
 /// blocks route to ClickHouse: columnar scans beat PostgreSQL index scans
 /// on wide-window rollups, while narrow shapes (page-enrichment IN-lists
@@ -584,6 +590,19 @@ pub async fn execute_query_postgres_via_clickhouse(
     validate_query(&sql)?;
     let sql = append_limit_if_missing(&sql, options.limit);
 
+    // ClickHouse aborts its scans strictly before PostgreSQL's
+    // statement_timeout: a cancel mid pg_clickhouse scan double-frees and
+    // restarts the server (upstream 0.3.x bug), so the FDW must never be
+    // what PostgreSQL cancels.
+    let ch_deadline_secs = (options.timeout_ms / 1000).max(1);
+    let session_settings = format!(
+        "SET LOCAL pg_clickhouse.session_settings = 'join_use_nulls 1, \
+         group_by_use_nulls 1, final 0, max_execution_time {ch_deadline_secs}'"
+    );
+    let statement_timeout = format!(
+        "SET LOCAL statement_timeout = {}",
+        options.timeout_ms + FDW_STATEMENT_TIMEOUT_MARGIN_MS
+    );
     run_pg_query(
         pool,
         &sql,
@@ -594,9 +613,11 @@ pub async fn execute_query_postgres_via_clickhouse(
             // ch.* carries prune-boundary CHECKs for the tiered views; the
             // archive holds full history, so never let them prune scans here.
             "SET LOCAL constraint_exclusion = off",
-            // Drop pg_clickhouse's default `final 1`: FINAL merges cost reads
-            // dearly; match the native ClickHouse engine's semantics instead.
-            "SET LOCAL pg_clickhouse.session_settings = 'join_use_nulls 1, group_by_use_nulls 1, final 0'",
+            // `final 0` drops pg_clickhouse's default FINAL merge (costly
+            // reads; native ClickHouse engine semantics instead).
+            &session_settings,
+            // Overrides run_pg_query's base statement_timeout (margin above).
+            &statement_timeout,
         ],
         "postgres-via-clickhouse",
     )
