@@ -92,6 +92,9 @@ The sync engine writes to both PostgreSQL and ClickHouse in parallel. With `[cha
 
 `*` — default when omitted. `engine=tiered` is accepted as a legacy alias for `engine=postgres&source=postgres-clickhouse`.
 
+> [!NOTE]
+> FDW routes require a `pg_clickhouse` build with [ClickHouse/pg_clickhouse#296](https://github.com/ClickHouse/pg_clickhouse/pull/296) (unreleased 0.4): 0.3.2 crashes PostgreSQL on LATERAL / correlated subqueries over foreign tables. Aggregates pushed to ClickHouse (e.g. `avg`) compute in Float64 and can differ from PostgreSQL `numeric` in the last decimal.
+
 ```bash
 # Tiered (default) - last 10 transfers from an address; hot rows come from
 # PostgreSQL, older rows from the ClickHouse archive

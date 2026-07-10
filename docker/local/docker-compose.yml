@@ -2,6 +2,8 @@ services:
   postgres:
     # Stock postgres:16 + the pg_clickhouse extension (ClickHouse FDW),
     # required for the tiered query engine (engine=tiered).
+    # Needs pg_clickhouse >= 0.4 (unreleased): 0.3.2 crashes on LATERAL /
+    # correlated subqueries over foreign tables (ClickHouse/pg_clickhouse#296).
     image: ghcr.io/clickhouse/pg_clickhouse:16
     environment:
       POSTGRES_USER: tidx
