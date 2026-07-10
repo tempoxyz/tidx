@@ -157,9 +157,11 @@ port = 9090
 name = "mainnet"
 chain_id = 4217
 rpc_url = "https://rpc.tempo.xyz"
-pg_url = "postgres://user@tidx.example.com:5432/tidx_mainnet"
-pg_password_env = "TIDX_PG_PASSWORD"  # Password from environment variable
 batch_size = 100
+
+[chains.postgres]
+url = "postgres://user@tidx.example.com:5432/tidx_mainnet"
+password_env = "TIDX_PG_PASSWORD"  # Password from environment variable
 
 # Optional: ClickHouse for OLAP queries
 [chains.clickhouse]
@@ -177,8 +179,10 @@ pg_keep = "30d"
 name = "moderato"
 chain_id = 42431
 rpc_url = "https://rpc.testnet.tempo.xyz"
-pg_url = "postgres://user@tidx.example.com:5432/tidx_moderato"
-pg_password_env = "TIDX_PG_PASSWORD"
+
+[chains.postgres]
+url = "postgres://user@tidx.example.com:5432/tidx_moderato"
+password_env = "TIDX_PG_PASSWORD"
 ```
 
 ### Reference
@@ -198,11 +202,12 @@ pg_password_env = "TIDX_PG_PASSWORD"
 ├── name                    string    (required)     Display name for logging
 ├── chain_id                u64       (required)     Chain ID
 ├── rpc_url                 string    (required)     JSON-RPC endpoint URL
-├── pg_url                  string    (required)     PostgreSQL connection string
-├── pg_password_env         string    (optional)     Env var name for PostgreSQL password
-├── api_pg_url              string    (optional)     Separate PostgreSQL URL for API (e.g., read replica)
-├── api_pg_password_env     string    (optional)     Env var name for API PostgreSQL password
 ├── batch_size              u64       = 100          Blocks per RPC batch request
+├── [postgres]                                       PostgreSQL settings
+│   ├── url                 string    (required)     PostgreSQL connection string
+│   ├── password_env        string    (optional)     Env var name for PostgreSQL password
+│   ├── api_url             string    (optional)     Separate PostgreSQL URL for API (e.g., read replica)
+│   └── api_password_env    string    (optional)     Env var name for API PostgreSQL password
 ├── [clickhouse]                                     ClickHouse OLAP settings
 │   ├── enabled             bool      = false        Enable ClickHouse OLAP queries
 │   ├── url                 string    = "http://clickhouse:8123"  ClickHouse HTTP URL

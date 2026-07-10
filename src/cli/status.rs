@@ -279,7 +279,7 @@ async fn print_json_status(config: &Config) -> Result<()> {
             "name": chain.name,
             "chain_id": chain.chain_id,
             "rpc_url": chain.redacted_rpc_url(),
-            "pg_url": chain.pg_url,
+            "pg_url": chain.postgres().ok().map(|pg| tidx::config::redact_url_credentials(&pg.url)),
             "head": live_head,
             "tip_num": state.as_ref().map(|s| s.tip_num),
             "synced_num": state.as_ref().map(|s| s.synced_num),
