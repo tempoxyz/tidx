@@ -21,3 +21,4 @@ CREATE TABLE IF NOT EXISTS receipts (
 ) ENGINE = ReplacingMergeTree()
 PARTITION BY toYYYYMM(block_timestamp)
 ORDER BY (block_num, tx_idx)
+SETTINGS default_compression_codec = 'ZSTD(1)'

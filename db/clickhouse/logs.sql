@@ -23,3 +23,4 @@ CREATE TABLE IF NOT EXISTS logs (
 ) ENGINE = ReplacingMergeTree()
 PARTITION BY toYYYYMM(block_timestamp)
 ORDER BY (address, selector, block_num, log_idx)
+SETTINGS default_compression_codec = 'ZSTD(1)'

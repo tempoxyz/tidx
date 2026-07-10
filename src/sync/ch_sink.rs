@@ -30,6 +30,7 @@ const SCHEMA_OBJECTS_TABLE_DDL: &str = "
         applied_at DateTime DEFAULT now()
     ) ENGINE = ReplacingMergeTree(applied_at)
     ORDER BY name
+    SETTINGS default_compression_codec = 'ZSTD(1)'
 ";
 
 /// Max rows per ClickHouse INSERT to avoid unbounded memory growth during backfills.
@@ -1127,6 +1128,9 @@ mod tests {
         }
         assert!(
             !to_replicated_engine_ddl(SCHEMA_OBJECTS_TABLE_DDL).contains("= ReplacingMergeTree")
+        );
+        assert!(
+            SCHEMA_OBJECTS_TABLE_DDL.contains("SETTINGS default_compression_codec = 'ZSTD(1)'")
         );
     }
 

@@ -13,3 +13,4 @@ CREATE TABLE IF NOT EXISTS address_holder_deltas (
 ) ENGINE = ReplacingMergeTree()
 PARTITION BY toYYYYMM(block_timestamp)
 ORDER BY (holder, token, block_num, tx_hash, log_idx, leg)
+SETTINGS default_compression_codec = 'ZSTD(1)'

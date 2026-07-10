@@ -957,12 +957,23 @@ async fn test_sink_ensure_schema_creates_tables() {
         "receipts",
         "token_transfers",
         "token_holder_deltas",
+        "token_balances_snapshot",
+        "tidx_schema_objects",
     ] {
         let count = ch
             .table_count(table)
             .await
             .unwrap_or_else(|_| panic!("Table {table} should exist"));
         assert_eq!(count, 0, "{table} should be empty after schema creation");
+
+        let ddl = ch
+            .query(&format!("SHOW CREATE TABLE {table}"))
+            .await
+            .unwrap_or_else(|_| panic!("Table {table} should expose its DDL"));
+        assert!(
+            ddl.contains("default_compression_codec = 'ZSTD(1)'"),
+            "table {table} should use ZSTD(1) by default: {ddl}"
+        );
     }
 
     let count = ch

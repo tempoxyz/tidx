@@ -12,3 +12,4 @@ CREATE TABLE IF NOT EXISTS address_txs (
 ) ENGINE = ReplacingMergeTree()
 PARTITION BY toYYYYMM(block_timestamp)
 ORDER BY (address, block_num, tx_idx, direction)
+SETTINGS default_compression_codec = 'ZSTD(1)'
