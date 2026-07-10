@@ -206,6 +206,10 @@ const TIERED_COLD_CH_SETTINGS: &[(&str, &str)] = &[
     ("date_time_output_format", "iso"),
     // Dedupe ReplacingMergeTree rows, matching the FDW views' `final = 1`.
     ("final", "1"),
+    // Skip the FINAL merge for fully-merged partitions (all but the
+    // actively-written month), keeping dedup while restoring most of the
+    // non-FINAL read speed on historical scans.
+    ("do_not_merge_across_partitions_select_final", "1"),
 ];
 
 /// Rewrite ClickHouse JSON values to the hot (PostgreSQL) arm's
