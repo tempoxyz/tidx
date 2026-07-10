@@ -40,10 +40,11 @@
 //! - `logs.is_virtual_forward` is ineligible (PG boolean vs CH UInt8).
 //!
 //! Anything not provably safe returns `None`. Split-ineligible queries then
-//! route by [`hot_window_confined`]: provably hot-only shapes run on plain
-//! PostgreSQL `public.*`; everything else runs natively on the ClickHouse
-//! archive, falling back to the pg_clickhouse FDW (`ch.*`) when ClickHouse
-//! rejects the SQL dialect.
+//! route by [`hot_window_confinement`]: provably hot-only shapes run on
+//! plain PostgreSQL `public.*` — except wide-span aggregates, which the
+//! ClickHouse archive serves faster; everything else runs natively on the
+//! ClickHouse archive, falling back on failure (hot-confined to plain
+//! PostgreSQL, the rest to the pg_clickhouse FDW `ch.*`).
 
 use std::collections::{HashMap, HashSet};
 use std::ops::ControlFlow;
@@ -1031,24 +1032,64 @@ const BLOCK_BOUND_COLUMNS: &[&str] = &["block_num", "block_number", "num"];
 /// Timestamp columns, compared against the boundary block's timestamp.
 const TS_BOUND_COLUMNS: &[&str] = &["block_timestamp", "timestamp"];
 
+/// Aggregate functions that mark a query as an aggregation shape.
+const AGGREGATE_FUNCTIONS: &[&str] = &["count", "sum", "avg", "min", "max"];
+
+/// Facts about a hot-window-confined query, for choosing its engine.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HotWindow {
+    /// Lowest proven block-number bound across all scans; `None` when some
+    /// scan is only timestamp-bounded (confined, but width unprovable).
+    pub floor: Option<i64>,
+    /// Whether the query aggregates (`count`/`sum`/`avg`/`min`/`max`
+    /// outside window clauses, anywhere in the tree).
+    pub aggregate: bool,
+}
+
+/// Proven lower bound of one or more scans. `Unknown`: confined via a
+/// timestamp bound, block-number width unprovable.
+#[derive(Clone, Copy)]
+enum Floor {
+    Block(i64),
+    Unknown,
+}
+
+impl Floor {
+    /// Combine bounds across scans: total work tracks the widest scan.
+    fn widen(self, other: Floor) -> Floor {
+        match (self, other) {
+            (Floor::Block(a), Floor::Block(b)) => Floor::Block(a.min(b)),
+            _ => Floor::Unknown,
+        }
+    }
+}
+
 /// Whether every table scan in the query is provably bounded to the hot
 /// PostgreSQL window (a lower bound at/above the prune boundary among the
 /// top-level WHERE conjuncts of each SELECT).
+pub fn hot_window_confined(sql: &str, boundary: i64, boundary_ts: Option<DateTime<Utc>>) -> bool {
+    hot_window_confinement(sql, boundary, boundary_ts).is_some()
+}
+
+/// [`hot_window_confined`], plus the scan floor and aggregation shape that
+/// pick the hot engine (PostgreSQL indexes vs ClickHouse columnar scans).
 ///
 /// Routes split-ineligible tiered queries to plain PostgreSQL `public.*`,
-/// which holds only the hot window — so this must be *sound*: a false
-/// positive returns truncated results, while a false negative merely routes
-/// to the ClickHouse archive, which holds full history and is always
+/// which holds only the hot window — so confinement must be *sound*: a
+/// false positive returns truncated results, while a false negative merely
+/// routes to the ClickHouse archive, which holds full history and is always
 /// correct. Hence the conservative grammar: single-relation FROM (no
 /// joins), no expression subqueries, CTE/derived sources confined by their
 /// own inner bounds, set operations confined on every branch. Unparseable
 /// SQL routes cold.
-pub fn hot_window_confined(sql: &str, boundary: i64, boundary_ts: Option<DateTime<Utc>>) -> bool {
-    let Ok(statements) = Parser::parse_sql(&GenericDialect {}, sql) else {
-        return false;
-    };
+pub fn hot_window_confinement(
+    sql: &str,
+    boundary: i64,
+    boundary_ts: Option<DateTime<Utc>>,
+) -> Option<HotWindow> {
+    let statements = Parser::parse_sql(&GenericDialect {}, sql).ok()?;
     let [Statement::Query(query)] = statements.as_slice() else {
-        return false;
+        return None;
     };
     // IN/EXISTS/scalar subqueries can scan cold history that the enclosing
     // SELECT's bound does not cover.
@@ -1064,25 +1105,50 @@ pub fn hot_window_confined(sql: &str, boundary: i64, boundary_ts: Option<DateTim
         ControlFlow::Continue(())
     });
     if has_expr_subquery {
-        return false;
+        return None;
     }
-    confined_query(query, &HashMap::new(), boundary, boundary_ts)
+    let floor = confined_query(query, &HashMap::new(), boundary, boundary_ts)?;
+    Some(HotWindow {
+        floor: match floor {
+            Floor::Block(v) => Some(v),
+            Floor::Unknown => None,
+        },
+        aggregate: query_has_aggregate(query),
+    })
+}
+
+/// Any `count`/`sum`/`avg`/`min`/`max` call outside a window clause.
+fn query_has_aggregate(query: &Query) -> bool {
+    let mut found = false;
+    let _ = visit_expressions(query, |expr: &Expr| {
+        if let Expr::Function(f) = expr {
+            if f.over.is_none()
+                && matches!(f.name.0.as_slice(), [ObjectNamePart::Identifier(id)]
+                    if AGGREGATE_FUNCTIONS.contains(&id.value.to_lowercase().as_str()))
+            {
+                found = true;
+                return ControlFlow::Break(());
+            }
+        }
+        ControlFlow::Continue(())
+    });
+    found
 }
 
 fn confined_query(
     query: &Query,
-    outer_ctes: &HashMap<String, bool>,
+    outer_ctes: &HashMap<String, Option<Floor>>,
     boundary: i64,
     boundary_ts: Option<DateTime<Utc>>,
-) -> bool {
+) -> Option<Floor> {
     let mut ctes = outer_ctes.clone();
     if let Some(with) = &query.with {
         if with.recursive {
-            return false;
+            return None;
         }
         for cte in &with.cte_tables {
-            let ok = confined_query(&cte.query, &ctes, boundary, boundary_ts);
-            ctes.insert(cte.alias.name.value.to_lowercase(), ok);
+            let floor = confined_query(&cte.query, &ctes, boundary, boundary_ts);
+            ctes.insert(cte.alias.name.value.to_lowercase(), floor);
         }
     }
     confined_body(&query.body, &ctes, boundary, boundary_ts)
@@ -1090,35 +1156,36 @@ fn confined_query(
 
 fn confined_body(
     body: &SetExpr,
-    ctes: &HashMap<String, bool>,
+    ctes: &HashMap<String, Option<Floor>>,
     boundary: i64,
     boundary_ts: Option<DateTime<Utc>>,
-) -> bool {
+) -> Option<Floor> {
     match body {
         SetExpr::Select(select) => confined_select(select, ctes, boundary, boundary_ts),
         SetExpr::Query(query) => confined_query(query, ctes, boundary, boundary_ts),
         SetExpr::SetOperation { left, right, .. } => {
-            confined_body(left, ctes, boundary, boundary_ts)
-                && confined_body(right, ctes, boundary, boundary_ts)
+            let l = confined_body(left, ctes, boundary, boundary_ts)?;
+            let r = confined_body(right, ctes, boundary, boundary_ts)?;
+            Some(l.widen(r))
         }
         // Reads no tables.
-        SetExpr::Values(_) => true,
-        _ => false,
+        SetExpr::Values(_) => Some(Floor::Block(i64::MAX)),
+        _ => None,
     }
 }
 
 /// Joins route cold: per-relation confinement is not provable syntactically.
 fn confined_select(
     select: &Select,
-    ctes: &HashMap<String, bool>,
+    ctes: &HashMap<String, Option<Floor>>,
     boundary: i64,
     boundary_ts: Option<DateTime<Utc>>,
-) -> bool {
+) -> Option<Floor> {
     let [table_with_joins] = select.from.as_slice() else {
-        return false;
+        return None;
     };
     if !table_with_joins.joins.is_empty() {
-        return false;
+        return None;
     }
     match &table_with_joins.relation {
         TableFactor::Derived {
@@ -1127,27 +1194,27 @@ fn confined_select(
             ..
         } => confined_query(subquery, ctes, boundary, boundary_ts),
         factor => {
-            let Some((name, _)) = plain_table(factor) else {
-                return false;
-            };
+            let (name, _) = plain_table(factor)?;
             // CTE outputs may aggregate or rename block columns, so an outer
             // bound proves nothing; only the CTE's own bound counts.
-            if let Some(&cte_confined) = ctes.get(&name.value.to_lowercase()) {
-                return cte_confined;
+            if let Some(&cte_floor) = ctes.get(&name.value.to_lowercase()) {
+                return cte_floor;
             }
             // Base table or event reference: needs a hot lower bound among
             // the top-level WHERE conjuncts.
-            select
-                .selection
-                .as_ref()
-                .is_some_and(|e| has_hot_conjunct(e, boundary, boundary_ts))
+            hot_conjunct_floor(select.selection.as_ref()?, boundary, boundary_ts)
         }
     }
 }
 
-/// Whether any AND-level conjunct is a hot lower bound. OR branches don't
-/// count: the other branch may match cold rows.
-fn has_hot_conjunct(expr: &Expr, boundary: i64, boundary_ts: Option<DateTime<Utc>>) -> bool {
+/// Tightest hot lower bound among AND-level conjuncts, if any. OR branches
+/// don't count: the other branch may match cold rows.
+fn hot_conjunct_floor(
+    expr: &Expr,
+    boundary: i64,
+    boundary_ts: Option<DateTime<Utc>>,
+) -> Option<Floor> {
+    let mut best: Option<Floor> = None;
     let mut stack = vec![expr];
     while let Some(e) = stack.pop() {
         match unwrap_nested(e) {
@@ -1160,33 +1227,40 @@ fn has_hot_conjunct(expr: &Expr, boundary: i64, boundary_ts: Option<DateTime<Utc
                 stack.push(right);
             }
             leaf => {
-                if is_hot_lower_bound(leaf, boundary, boundary_ts) {
-                    return true;
+                if let Some(found) = hot_lower_bound(leaf, boundary, boundary_ts) {
+                    // Block bounds beat Unknown; among blocks, keep the max.
+                    best = Some(match (best, found) {
+                        (Some(Floor::Block(a)), Floor::Block(b)) => Floor::Block(a.max(b)),
+                        (Some(Floor::Block(a)), Floor::Unknown) => Floor::Block(a),
+                        _ => found,
+                    });
                 }
             }
         }
     }
-    false
+    best
 }
 
-fn is_hot_lower_bound(expr: &Expr, boundary: i64, boundary_ts: Option<DateTime<Utc>>) -> bool {
+fn hot_lower_bound(
+    expr: &Expr,
+    boundary: i64,
+    boundary_ts: Option<DateTime<Utc>>,
+) -> Option<Floor> {
     use BinaryOperator::{Eq, Gt, GtEq, Lt, LtEq};
     match expr {
         Expr::BinaryOp { left, op, right } => match op {
-            GtEq | Gt => bound_is_hot(left, right, boundary, boundary_ts),
-            LtEq | Lt => bound_is_hot(right, left, boundary, boundary_ts),
-            Eq => {
-                bound_is_hot(left, right, boundary, boundary_ts)
-                    || bound_is_hot(right, left, boundary, boundary_ts)
-            }
-            _ => false,
+            GtEq | Gt => bound_floor(left, right, boundary, boundary_ts),
+            LtEq | Lt => bound_floor(right, left, boundary, boundary_ts),
+            Eq => bound_floor(left, right, boundary, boundary_ts)
+                .or_else(|| bound_floor(right, left, boundary, boundary_ts)),
+            _ => None,
         },
         Expr::Between {
             expr,
             negated: false,
             low,
             ..
-        } => bound_is_hot(expr, low, boundary, boundary_ts),
+        } => bound_floor(expr, low, boundary, boundary_ts),
         // Block-list membership with every block at/above the boundary
         // (page-enrichment shapes: `block_num IN (…recent blocks…)`).
         Expr::InList {
@@ -1194,33 +1268,47 @@ fn is_hot_lower_bound(expr: &Expr, boundary: i64, boundary_ts: Option<DateTime<U
             list,
             negated: false,
         } => {
-            column_parts(unwrap_nested(expr))
+            if !column_parts(unwrap_nested(expr))
                 .is_some_and(|(_, name)| BLOCK_BOUND_COLUMNS.contains(&name.as_str()))
-                && !list.is_empty()
-                && list
-                    .iter()
-                    .all(|e| literal_i64(e).is_some_and(|v| v >= boundary))
+                || list.is_empty()
+            {
+                return None;
+            }
+            let mut min = i64::MAX;
+            for e in list {
+                let v = literal_i64(e)?;
+                if v < boundary {
+                    return None;
+                }
+                min = min.min(v);
+            }
+            Some(Floor::Block(min))
         }
-        _ => false,
+        _ => None,
     }
 }
 
 /// `col ≥ lit` (or `col = lit`) with the literal at or above the boundary.
-fn bound_is_hot(col: &Expr, lit: &Expr, boundary: i64, boundary_ts: Option<DateTime<Utc>>) -> bool {
-    let Some((_, name)) = column_parts(unwrap_nested(col)) else {
-        return false;
-    };
+fn bound_floor(
+    col: &Expr,
+    lit: &Expr,
+    boundary: i64,
+    boundary_ts: Option<DateTime<Utc>>,
+) -> Option<Floor> {
+    let (_, name) = column_parts(unwrap_nested(col))?;
     if BLOCK_BOUND_COLUMNS.contains(&name.as_str()) {
-        return literal_i64(lit).is_some_and(|v| v >= boundary);
+        return literal_i64(lit)
+            .filter(|v| *v >= boundary)
+            .map(Floor::Block);
     }
     if TS_BOUND_COLUMNS.contains(&name.as_str()) {
         return match (literal_ts(lit), boundary_ts) {
-            (Some(v), Some(b)) => v >= b,
+            (Some(v), Some(b)) if v >= b => Some(Floor::Unknown),
             // Boundary timestamp unknown: cannot prove hot; route cold.
-            _ => false,
+            _ => None,
         };
     }
-    false
+    None
 }
 
 /// Integer value of a numeric literal, folding `a + b` / `a - b` / unary `-`.
@@ -1879,5 +1967,83 @@ mod tests {
             "SELECT block_num FROM txs WHERE block_num >= 29000000 \
              UNION ALL SELECT block_num FROM logs"
         ));
+    }
+
+    // ── hot_window_confinement facts ────────────────────────────────────
+
+    fn confinement(sql: &str) -> Option<HotWindow> {
+        hot_window_confinement(sql, B, None)
+    }
+
+    #[test]
+    fn confinement_reports_scan_floor() {
+        // Single bound: the literal itself.
+        let hw = confinement("SELECT 1 FROM logs WHERE block_num >= 29000000").unwrap();
+        assert_eq!(hw.floor, Some(29_000_000));
+        // Multiple conjuncts on one scan: the tightest (max) counts.
+        let hw =
+            confinement("SELECT 1 FROM logs WHERE block_num >= 24000000 AND block_num >= 29100000")
+                .unwrap();
+        assert_eq!(hw.floor, Some(29_100_000));
+        // Multiple scans (set operation): total work tracks the widest (min).
+        let hw = confinement(
+            "SELECT block_num FROM txs WHERE block_num >= 29200000 \
+             UNION ALL SELECT block_num FROM logs WHERE block_num >= 24000000",
+        )
+        .unwrap();
+        assert_eq!(hw.floor, Some(24_000_000));
+        // IN-list: floor is the smallest listed block.
+        let hw = confinement("SELECT 1 FROM txs WHERE block_num IN (29000005, 29000001)").unwrap();
+        assert_eq!(hw.floor, Some(29_000_001));
+    }
+
+    #[test]
+    fn confinement_timestamp_bound_has_unknown_floor() {
+        let bts = DateTime::parse_from_rfc3339("2026-06-10T00:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let hw = hot_window_confinement(
+            "SELECT count(*) FROM txs WHERE timestamp >= '2026-06-15 00:00:00'",
+            B,
+            Some(bts),
+        )
+        .unwrap();
+        assert_eq!(hw.floor, None);
+        assert!(hw.aggregate);
+    }
+
+    #[test]
+    fn confinement_detects_aggregates() {
+        for agg in [
+            "count(*)",
+            "sum(gas_used)",
+            "avg(gas_used)",
+            "min(num)",
+            "max(num)",
+        ] {
+            let sql = format!("SELECT {agg} FROM receipts WHERE block_num >= 29000000");
+            assert!(confinement(&sql).unwrap().aggregate, "{agg}");
+        }
+        // Aggregate inside a CTE counts.
+        let hw = confinement(
+            "WITH t AS (SELECT count(*) c FROM logs WHERE block_num >= 29000000) \
+             SELECT c FROM t",
+        )
+        .unwrap();
+        assert!(hw.aggregate);
+        // Page shapes are not aggregates.
+        let hw = confinement(
+            "SELECT hash FROM txs WHERE block_num >= 29000000 \
+             ORDER BY block_num DESC LIMIT 11",
+        )
+        .unwrap();
+        assert!(!hw.aggregate);
+        // Window functions are not aggregates.
+        let hw = confinement(
+            "SELECT row_number() OVER (ORDER BY block_num DESC) FROM txs \
+             WHERE block_num >= 29000000 LIMIT 11",
+        )
+        .unwrap();
+        assert!(!hw.aggregate);
     }
 }

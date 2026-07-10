@@ -284,14 +284,31 @@ fn normalize_cold_result(
 /// Floor for the cold arm's remaining timeout budget.
 const TIERED_COLD_MIN_TIMEOUT_MS: u64 = 250;
 
+/// Hot-confined aggregates whose proven scan span is at least this many
+/// blocks route to ClickHouse: columnar scans beat PostgreSQL index scans
+/// on wide-window rollups, while narrow shapes (page-enrichment IN-lists
+/// near the tip) stay on PostgreSQL.
+const TIERED_HOT_AGG_CH_MIN_SPAN: i64 = 50_000;
+
+/// Whether a hot-window-confined query should still prefer the ClickHouse
+/// archive: an aggregation shape scanning a wide (or unprovable) block span.
+fn hot_query_prefers_clickhouse(hw: &crate::query::HotWindow, tip: i64) -> bool {
+    hw.aggregate
+        && hw
+            .floor
+            .is_none_or(|floor| tip.saturating_sub(floor) >= TIERED_HOT_AGG_CH_MIN_SPAN)
+}
+
 /// Execute a query on the tiered engine.
 ///
 /// Eligible shapes (see [`plan_tiered_split`]) are split at the prune
 /// boundary and served natively — hot arm on PostgreSQL `public.*`, cold arm
 /// on ClickHouse — then stitched. Split-ineligible queries provably confined
-/// to the hot window run on plain PostgreSQL; everything else runs natively
-/// on the ClickHouse archive, falling back to the pg_clickhouse FDW (`ch.*`)
-/// when ClickHouse rejects the SQL dialect.
+/// to the hot window run on plain PostgreSQL, except wide-span aggregates,
+/// which ClickHouse serves faster. Everything else runs natively on the
+/// ClickHouse archive (it holds full history), falling back on failure:
+/// hot-confined queries to plain PostgreSQL, the rest to the pg_clickhouse
+/// FDW (`ch.*`).
 pub async fn execute_query_tiered(
     pool: &Pool,
     clickhouse: Option<&crate::clickhouse::ClickHouseEngine>,
@@ -300,7 +317,11 @@ pub async fn execute_query_tiered(
     signatures: &[&str],
     options: &QueryOptions,
 ) -> Result<QueryResult> {
-    let (boundary, boundary_ts) = crate::db::tiered::fetch_prune_boundary(pool, chain_id).await?;
+    let crate::db::tiered::PruneBoundary {
+        boundary,
+        boundary_ts,
+        tip,
+    } = crate::db::tiered::fetch_prune_boundary(pool, chain_id).await?;
     if boundary <= 0 {
         // Nothing pruned yet: full history is hot in PostgreSQL.
         let mut result = execute_query_postgres(pool, sql, signatures, options).await?;
@@ -309,18 +330,23 @@ pub async fn execute_query_tiered(
     }
     match try_execute_tiered_split(pool, clickhouse, boundary, sql, signatures, options).await? {
         Some(result) => Ok(result),
-        None if crate::query::hot_window_confined(sql, boundary, boundary_ts) => {
-            // Every scan is provably above the prune boundary: plain
-            // PostgreSQL serves it whole with local indexes.
-            let mut result = execute_query_postgres(pool, sql, signatures, options).await?;
-            result.engine = Some("tiered".to_string());
-            Ok(result)
-        }
         None => {
-            // Cold or unbounded history: run against the full ClickHouse
-            // archive — natively first (columnar sorts/aggregates, no FDW
-            // row transfer), then pg_clickhouse when ClickHouse rejects the
-            // PostgreSQL dialect (e.g. bare UNION, timestamp literals).
+            let hot = crate::query::hot_window_confinement(sql, boundary, boundary_ts);
+            let hot_on_pg = match &hot {
+                Some(hw) => clickhouse.is_none() || !hot_query_prefers_clickhouse(hw, tip),
+                None => false,
+            };
+            if hot_on_pg {
+                // Every scan is provably above the prune boundary and
+                // index-friendly: plain PostgreSQL serves it whole.
+                let mut result = execute_query_postgres(pool, sql, signatures, options).await?;
+                result.engine = Some("tiered".to_string());
+                return Ok(result);
+            }
+            // Cold/unbounded history, or a hot wide-span aggregate: run
+            // against the full ClickHouse archive — natively first (columnar
+            // sorts/aggregates, no FDW row transfer), with fallback when
+            // ClickHouse fails (e.g. bare UNION, timestamp literals).
             let start = Instant::now();
             let native = match clickhouse {
                 Some(ch) => Some(
@@ -343,8 +369,11 @@ pub async fn execute_query_tiered(
                     result.query_time_ms = Some(start.elapsed().as_secs_f64() * 1000.0);
                     Ok(result)
                 }
-                // Unreachable ClickHouse: pg_clickhouse shares the fate.
-                Some(Err(e)) if crate::clickhouse::is_connection_error(&e) => Err(e),
+                // Unreachable ClickHouse: pg_clickhouse shares the fate, but
+                // plain PostgreSQL is complete for hot-confined queries.
+                Some(Err(e)) if hot.is_none() && crate::clickhouse::is_connection_error(&e) => {
+                    Err(e)
+                }
                 Some(Err(e)) => {
                     let remaining = options
                         .timeout_ms
@@ -352,17 +381,17 @@ pub async fn execute_query_tiered(
                     if remaining < TIERED_COLD_MIN_TIMEOUT_MS {
                         return Err(e);
                     }
-                    tracing::debug!(target: "tidx::query", error = %e, "tiered: clickhouse rejected query; falling back to pg_clickhouse");
-                    let mut result = execute_query_postgres_via_clickhouse(
-                        pool,
-                        sql,
-                        signatures,
-                        &QueryOptions {
-                            timeout_ms: remaining,
-                            limit: options.limit,
-                        },
-                    )
-                    .await?;
+                    let opts = QueryOptions {
+                        timeout_ms: remaining,
+                        limit: options.limit,
+                    };
+                    let mut result = if hot.is_some() {
+                        tracing::debug!(target: "tidx::query", error = %e, "tiered: clickhouse failed hot aggregate; falling back to postgres");
+                        execute_query_postgres(pool, sql, signatures, &opts).await?
+                    } else {
+                        tracing::debug!(target: "tidx::query", error = %e, "tiered: clickhouse rejected query; falling back to pg_clickhouse");
+                        execute_query_postgres_via_clickhouse(pool, sql, signatures, &opts).await?
+                    };
                     result.engine = Some("tiered".to_string());
                     Ok(result)
                 }
@@ -893,6 +922,39 @@ mod tests {
         assert_eq!(r.rows[0][1], json!("")); // non-selector '' kept
         assert_eq!(r.rows[1][0], json!("0xddf252ad"));
         assert_eq!(r.rows[1][1], json!("keep"));
+    }
+
+    // ========================================================================
+    // Tiered hot-engine choice
+    // ========================================================================
+
+    #[test]
+    fn hot_aggregates_prefer_clickhouse_by_span() {
+        use crate::query::HotWindow;
+        let tip = 29_218_717;
+        let wide = HotWindow {
+            floor: Some(tip - TIERED_HOT_AGG_CH_MIN_SPAN),
+            aggregate: true,
+        };
+        assert!(hot_query_prefers_clickhouse(&wide, tip));
+        // Narrow aggregate (page-enrichment IN-list): stays on PostgreSQL.
+        let narrow = HotWindow {
+            floor: Some(tip - 100),
+            aggregate: true,
+        };
+        assert!(!hot_query_prefers_clickhouse(&narrow, tip));
+        // Unprovable span (timestamp bound): treated as wide.
+        let unknown = HotWindow {
+            floor: None,
+            aggregate: true,
+        };
+        assert!(hot_query_prefers_clickhouse(&unknown, tip));
+        // Non-aggregates always stay on PostgreSQL.
+        let page = HotWindow {
+            floor: None,
+            aggregate: false,
+        };
+        assert!(!hot_query_prefers_clickhouse(&page, tip));
     }
 
     // ========================================================================

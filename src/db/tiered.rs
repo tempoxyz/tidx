@@ -306,22 +306,34 @@ fn tiered_view_sql(t: &Table, boundary: i64) -> String {
     )
 }
 
-/// Read the prune watermark and its partition-boundary timestamp.
-/// Returns (0, None) when nothing has been pruned.
-pub async fn fetch_prune_boundary(
-    pool: &Pool,
-    chain_id: u64,
-) -> Result<(i64, Option<DateTime<Utc>>)> {
+/// Prune watermark plus the sync tip, read together from `sync_state`.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct PruneBoundary {
+    /// Highest block pruned from PostgreSQL (0 = nothing pruned).
+    pub boundary: i64,
+    /// Exclusive upper timestamp bound of pruned rows.
+    pub boundary_ts: Option<DateTime<Utc>>,
+    /// Highest block synced near chain head (`sync_state.tip_num`).
+    pub tip: i64,
+}
+
+/// Read the prune watermark, its partition-boundary timestamp, and the sync
+/// tip. Returns the default (all zero/None) when the chain has no state row.
+pub async fn fetch_prune_boundary(pool: &Pool, chain_id: u64) -> Result<PruneBoundary> {
     let conn = pool.get().await?;
     let row = conn
         .query_opt(
-            "SELECT pruned_below, pruned_below_ts FROM sync_state WHERE chain_id = $1",
+            "SELECT pruned_below, pruned_below_ts, tip_num FROM sync_state WHERE chain_id = $1",
             &[&(chain_id as i64)],
         )
         .await?;
     Ok(row
-        .map(|r| (r.get::<_, i64>(0), r.get::<_, Option<DateTime<Utc>>>(1)))
-        .unwrap_or((0, None)))
+        .map(|r| PruneBoundary {
+            boundary: r.get(0),
+            boundary_ts: r.get(1),
+            tip: r.get(2),
+        })
+        .unwrap_or_default())
 }
 
 /// Whether the tiered FDW server exists in this database.
@@ -393,7 +405,11 @@ pub async fn refresh_boundary(pool: &Pool, chain_id: u64) -> Result<i64> {
         return Ok(-1);
     }
 
-    let (boundary, boundary_ts) = fetch_prune_boundary(pool, chain_id).await?;
+    let PruneBoundary {
+        boundary,
+        boundary_ts,
+        ..
+    } = fetch_prune_boundary(pool, chain_id).await?;
     let mut ddl: Vec<String> = TABLES
         .iter()
         .map(|t| boundary_check_sql(t, boundary, boundary_ts))
