@@ -288,8 +288,10 @@ const TIERED_COLD_MIN_TIMEOUT_MS: u64 = 250;
 ///
 /// Eligible shapes (see [`plan_tiered_split`]) are split at the prune
 /// boundary and served natively — hot arm on PostgreSQL `public.*`, cold arm
-/// on ClickHouse — then stitched. Everything else falls back to the
-/// pg_clickhouse FDW views (`tiered.*`).
+/// on ClickHouse — then stitched. Split-ineligible queries provably confined
+/// to the hot window run on plain PostgreSQL; everything else runs natively
+/// on the ClickHouse archive, falling back to the pg_clickhouse FDW (`ch.*`)
+/// when ClickHouse rejects the SQL dialect.
 pub async fn execute_query_tiered(
     pool: &Pool,
     clickhouse: Option<&crate::clickhouse::ClickHouseEngine>,
@@ -308,19 +310,70 @@ pub async fn execute_query_tiered(
     match try_execute_tiered_split(pool, clickhouse, boundary, sql, signatures, options).await? {
         Some(result) => Ok(result),
         None if crate::query::hot_window_confined(sql, boundary, boundary_ts) => {
-            // Confined to the hot window: PG indexes + constraint exclusion
-            // prune the ClickHouse arm out of the FDW views.
-            execute_query_tiered_fdw(pool, sql, signatures, options).await
-        }
-        None => {
-            // Cold or unbounded history: the views cannot push ORDER BY/
-            // LIMIT/aggregates past the UNION ALL, so run the whole query
-            // against the full ClickHouse archive instead.
-            tracing::debug!(target: "tidx::query", "tiered: split-ineligible, not hot-confined; routing to clickhouse archive");
-            let mut result =
-                execute_query_postgres_via_clickhouse(pool, sql, signatures, options).await?;
+            // Every scan is provably above the prune boundary: plain
+            // PostgreSQL serves it whole with local indexes.
+            let mut result = execute_query_postgres(pool, sql, signatures, options).await?;
             result.engine = Some("tiered".to_string());
             Ok(result)
+        }
+        None => {
+            // Cold or unbounded history: run against the full ClickHouse
+            // archive — natively first (columnar sorts/aggregates, no FDW
+            // row transfer), then pg_clickhouse when ClickHouse rejects the
+            // PostgreSQL dialect (e.g. bare UNION, timestamp literals).
+            let start = Instant::now();
+            let native = match clickhouse {
+                Some(ch) => Some(
+                    ch.query_user_with_settings(
+                        sql,
+                        signatures,
+                        options.timeout_ms,
+                        options.limit,
+                        TIERED_COLD_CH_SETTINGS,
+                    )
+                    .await,
+                ),
+                None => None,
+            };
+            match native {
+                Some(Ok(mut raw)) => {
+                    normalize_cold_result(&mut raw, &[]);
+                    let mut result: QueryResult = raw.into();
+                    result.engine = Some("tiered".to_string());
+                    result.query_time_ms = Some(start.elapsed().as_secs_f64() * 1000.0);
+                    Ok(result)
+                }
+                // Unreachable ClickHouse: pg_clickhouse shares the fate.
+                Some(Err(e)) if crate::clickhouse::is_connection_error(&e) => Err(e),
+                Some(Err(e)) => {
+                    let remaining = options
+                        .timeout_ms
+                        .saturating_sub(start.elapsed().as_millis() as u64);
+                    if remaining < TIERED_COLD_MIN_TIMEOUT_MS {
+                        return Err(e);
+                    }
+                    tracing::debug!(target: "tidx::query", error = %e, "tiered: clickhouse rejected query; falling back to pg_clickhouse");
+                    let mut result = execute_query_postgres_via_clickhouse(
+                        pool,
+                        sql,
+                        signatures,
+                        &QueryOptions {
+                            timeout_ms: remaining,
+                            limit: options.limit,
+                        },
+                    )
+                    .await?;
+                    result.engine = Some("tiered".to_string());
+                    Ok(result)
+                }
+                None => {
+                    let mut result =
+                        execute_query_postgres_via_clickhouse(pool, sql, signatures, options)
+                            .await?;
+                    result.engine = Some("tiered".to_string());
+                    Ok(result)
+                }
+            }
         }
     }
 }
@@ -477,41 +530,6 @@ fn finish_tiered(
     result.engine = Some("tiered".to_string());
     result.query_time_ms = Some(start.elapsed().as_secs_f64() * 1000.0);
     result
-}
-
-/// Tiered fallback: PostgreSQL over `tiered.*` views (hot PG window
-/// UNION ALL ClickHouse archive via pg_clickhouse).
-///
-/// The views expose ClickHouse's text representation, so '0x…' literals pass
-/// through unconverted and push down to the ClickHouse arm.
-async fn execute_query_tiered_fdw(
-    pool: &Pool,
-    sql: &str,
-    signatures: &[&str],
-    options: &QueryOptions,
-) -> Result<QueryResult> {
-    let sql = apply_event_signature_ctes_tiered(sql, signatures)?;
-
-    // Validate query (after CTE wrapping so signature-derived table names are valid)
-    validate_query(&sql)?;
-
-    // Add LIMIT if not present (AST-based detection to avoid string matching bypass)
-    let sql = append_limit_if_missing(&sql, options.limit);
-
-    run_pg_query(
-        pool,
-        &sql,
-        options,
-        &[
-            // Resolve bare table names to the tiered views.
-            "SET LOCAL search_path = tiered, public",
-            // Prove away the ClickHouse arm (foreign-table CHECK constraints)
-            // for hot-window-bounded queries.
-            "SET LOCAL constraint_exclusion = on",
-        ],
-        "tiered",
-    )
-    .await
 }
 
 /// PostgreSQL executing entirely over the `ch.*` pg_clickhouse foreign

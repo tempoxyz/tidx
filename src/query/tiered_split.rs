@@ -39,8 +39,11 @@
 //!   boolean vs CH UInt8) or composite parameters;
 //! - `logs.is_virtual_forward` is ineligible (PG boolean vs CH UInt8).
 //!
-//! Anything not provably safe returns `None` and falls back to the FDW view
-//! path unchanged.
+//! Anything not provably safe returns `None`. Split-ineligible queries then
+//! route by [`hot_window_confined`]: provably hot-only shapes run on plain
+//! PostgreSQL `public.*`; everything else runs natively on the ClickHouse
+//! archive, falling back to the pg_clickhouse FDW (`ch.*`) when ClickHouse
+//! rejects the SQL dialect.
 
 use std::collections::{HashMap, HashSet};
 use std::ops::ControlFlow;
@@ -1028,33 +1031,142 @@ const BLOCK_BOUND_COLUMNS: &[&str] = &["block_num", "block_number", "num"];
 /// Timestamp columns, compared against the boundary block's timestamp.
 const TS_BOUND_COLUMNS: &[&str] = &["block_timestamp", "timestamp"];
 
-/// Whether the query carries a lower bound on a block-number or timestamp
-/// column landing at or above the prune boundary.
+/// Whether every table scan in the query is provably bounded to the hot
+/// PostgreSQL window (a lower bound at/above the prune boundary among the
+/// top-level WHERE conjuncts of each SELECT).
 ///
-/// Routes split-ineligible tiered queries. A hot lower bound means the data
-/// lives in the hot PostgreSQL window, where the `tiered.*` FDW path wins
-/// (local rows, PG indexes, cold arm pruned by constraint exclusion). No
-/// such bound means deep or full history, where ClickHouse-only wins: the
-/// UNION ALL views cannot push ORDER BY/LIMIT/OFFSET/aggregates past the
-/// Append node, so PostgreSQL would drag raw ClickHouse rows and do that
-/// work itself.
-///
-/// Bounds are detected anywhere in the statement (CTEs, subqueries, even OR
-/// branches); over-matching errs toward the FDW path, i.e. today's behavior.
-/// Unparseable SQL also counts as confined for the same reason.
+/// Routes split-ineligible tiered queries to plain PostgreSQL `public.*`,
+/// which holds only the hot window — so this must be *sound*: a false
+/// positive returns truncated results, while a false negative merely routes
+/// to the ClickHouse archive, which holds full history and is always
+/// correct. Hence the conservative grammar: single-relation FROM (no
+/// joins), no expression subqueries, CTE/derived sources confined by their
+/// own inner bounds, set operations confined on every branch. Unparseable
+/// SQL routes cold.
 pub fn hot_window_confined(sql: &str, boundary: i64, boundary_ts: Option<DateTime<Utc>>) -> bool {
     let Ok(statements) = Parser::parse_sql(&GenericDialect {}, sql) else {
-        return true;
+        return false;
     };
-    let mut confined = false;
-    let _ = visit_expressions(&statements, |expr: &Expr| {
-        if is_hot_lower_bound(expr, boundary, boundary_ts) {
-            confined = true;
+    let [Statement::Query(query)] = statements.as_slice() else {
+        return false;
+    };
+    // IN/EXISTS/scalar subqueries can scan cold history that the enclosing
+    // SELECT's bound does not cover.
+    let mut has_expr_subquery = false;
+    let _ = visit_expressions(query.as_ref(), |expr: &Expr| {
+        if matches!(
+            expr,
+            Expr::Subquery(_) | Expr::InSubquery { .. } | Expr::Exists { .. }
+        ) {
+            has_expr_subquery = true;
             return ControlFlow::Break(());
         }
         ControlFlow::Continue(())
     });
-    confined
+    if has_expr_subquery {
+        return false;
+    }
+    confined_query(query, &HashMap::new(), boundary, boundary_ts)
+}
+
+fn confined_query(
+    query: &Query,
+    outer_ctes: &HashMap<String, bool>,
+    boundary: i64,
+    boundary_ts: Option<DateTime<Utc>>,
+) -> bool {
+    let mut ctes = outer_ctes.clone();
+    if let Some(with) = &query.with {
+        if with.recursive {
+            return false;
+        }
+        for cte in &with.cte_tables {
+            let ok = confined_query(&cte.query, &ctes, boundary, boundary_ts);
+            ctes.insert(cte.alias.name.value.to_lowercase(), ok);
+        }
+    }
+    confined_body(&query.body, &ctes, boundary, boundary_ts)
+}
+
+fn confined_body(
+    body: &SetExpr,
+    ctes: &HashMap<String, bool>,
+    boundary: i64,
+    boundary_ts: Option<DateTime<Utc>>,
+) -> bool {
+    match body {
+        SetExpr::Select(select) => confined_select(select, ctes, boundary, boundary_ts),
+        SetExpr::Query(query) => confined_query(query, ctes, boundary, boundary_ts),
+        SetExpr::SetOperation { left, right, .. } => {
+            confined_body(left, ctes, boundary, boundary_ts)
+                && confined_body(right, ctes, boundary, boundary_ts)
+        }
+        // Reads no tables.
+        SetExpr::Values(_) => true,
+        _ => false,
+    }
+}
+
+/// Joins route cold: per-relation confinement is not provable syntactically.
+fn confined_select(
+    select: &Select,
+    ctes: &HashMap<String, bool>,
+    boundary: i64,
+    boundary_ts: Option<DateTime<Utc>>,
+) -> bool {
+    let [table_with_joins] = select.from.as_slice() else {
+        return false;
+    };
+    if !table_with_joins.joins.is_empty() {
+        return false;
+    }
+    match &table_with_joins.relation {
+        TableFactor::Derived {
+            lateral: false,
+            subquery,
+            ..
+        } => confined_query(subquery, ctes, boundary, boundary_ts),
+        factor => {
+            let Some((name, _)) = plain_table(factor) else {
+                return false;
+            };
+            // CTE outputs may aggregate or rename block columns, so an outer
+            // bound proves nothing; only the CTE's own bound counts.
+            if let Some(&cte_confined) = ctes.get(&name.value.to_lowercase()) {
+                return cte_confined;
+            }
+            // Base table or event reference: needs a hot lower bound among
+            // the top-level WHERE conjuncts.
+            select
+                .selection
+                .as_ref()
+                .is_some_and(|e| has_hot_conjunct(e, boundary, boundary_ts))
+        }
+    }
+}
+
+/// Whether any AND-level conjunct is a hot lower bound. OR branches don't
+/// count: the other branch may match cold rows.
+fn has_hot_conjunct(expr: &Expr, boundary: i64, boundary_ts: Option<DateTime<Utc>>) -> bool {
+    let mut stack = vec![expr];
+    while let Some(e) = stack.pop() {
+        match unwrap_nested(e) {
+            Expr::BinaryOp {
+                left,
+                op: BinaryOperator::And,
+                right,
+            } => {
+                stack.push(left);
+                stack.push(right);
+            }
+            leaf => {
+                if is_hot_lower_bound(leaf, boundary, boundary_ts) {
+                    return true;
+                }
+            }
+        }
+    }
+    false
 }
 
 fn is_hot_lower_bound(expr: &Expr, boundary: i64, boundary_ts: Option<DateTime<Utc>>) -> bool {
@@ -1104,9 +1216,8 @@ fn bound_is_hot(col: &Expr, lit: &Expr, boundary: i64, boundary_ts: Option<DateT
     if TS_BOUND_COLUMNS.contains(&name.as_str()) {
         return match (literal_ts(lit), boundary_ts) {
             (Some(v), Some(b)) => v >= b,
-            // Boundary timestamp unknown: assume hot (today's FDW behavior).
-            (Some(_), None) => true,
-            (None, _) => false,
+            // Boundary timestamp unknown: cannot prove hot; route cold.
+            _ => false,
         };
     }
     false
@@ -1689,8 +1800,8 @@ mod tests {
         assert!(hot_window_confined(sql, B, Some(bts)));
         let sql_cold = "SELECT 1 FROM txs WHERE timestamp >= '2026-05-01' GROUP BY sender";
         assert!(!hot_window_confined(sql_cold, B, Some(bts)));
-        // Unknown boundary timestamp: assume hot (preserve FDW behavior).
-        assert!(hot_window_confined(sql_cold, B, None));
+        // Unknown boundary timestamp: cannot prove hot; route cold.
+        assert!(!hot_window_confined(sql_cold, B, None));
         // block_timestamp column and TIMESTAMP literal syntax.
         assert!(hot_window_confined(
             "SELECT 1 FROM receipts WHERE block_timestamp > TIMESTAMP '2026-07-01 12:00:00' GROUP BY fee_payer",
@@ -1700,7 +1811,73 @@ mod tests {
     }
 
     #[test]
-    fn hot_confined_unparseable_stays_fdw() {
-        assert!(confined("SELECT ??? FROM"));
+    fn hot_confined_unparseable_routes_cold() {
+        assert!(!confined("SELECT ??? FROM"));
+    }
+
+    #[test]
+    fn hot_confined_requires_top_level_conjunct() {
+        // Bound inside an OR branch: the other branch matches cold rows.
+        assert!(!confined(
+            "SELECT 1 FROM logs WHERE block_num >= 29000000 OR address = '0xab'"
+        ));
+        // AND keeps the bound at top level, even beside an OR group.
+        assert!(confined(
+            "SELECT 1 FROM logs WHERE block_num >= 29000000 AND (address = '0xab' OR address = '0xcd')"
+        ));
+        assert!(confined(
+            "SELECT 1 FROM logs WHERE (address = '0xab') AND ((block_num >= 29000000))"
+        ));
+    }
+
+    #[test]
+    fn hot_confined_joins_route_cold() {
+        // Per-relation confinement is not provable syntactically.
+        assert!(!confined(
+            "SELECT r.tx_hash FROM receipts r JOIN logs l ON l.tx_hash = r.tx_hash \
+             WHERE r.block_num >= 29000000 ORDER BY r.block_num DESC LIMIT 80"
+        ));
+    }
+
+    #[test]
+    fn hot_confined_expr_subquery_routes_cold() {
+        // The IN-subquery scans logs unbounded.
+        assert!(!confined(
+            "SELECT 1 FROM txs WHERE block_num >= 29000000 AND hash IN (SELECT tx_hash FROM logs)"
+        ));
+    }
+
+    #[test]
+    fn hot_confined_unbounded_cte_routes_cold() {
+        // Outer bound proves nothing about the CTE's own scan.
+        assert!(!confined(
+            "WITH t AS (SELECT address, block_num FROM logs) \
+             SELECT count(*) FROM t WHERE block_num >= 29000000"
+        ));
+    }
+
+    #[test]
+    fn hot_confined_chained_ctes_and_derived() {
+        // A CTE reading a confined CTE stays confined.
+        assert!(confined(
+            "WITH a AS (SELECT block_num FROM logs WHERE block_num >= 29000000), \
+             b AS (SELECT block_num FROM a) SELECT count(*) FROM b"
+        ));
+        // Derived table with its own bound.
+        assert!(confined(
+            "SELECT count(*) FROM (SELECT block_num FROM txs WHERE block_num > 29000000) t"
+        ));
+    }
+
+    #[test]
+    fn hot_confined_set_operations_need_every_branch() {
+        assert!(confined(
+            "SELECT block_num FROM txs WHERE block_num >= 29000000 \
+             UNION ALL SELECT block_num FROM logs WHERE block_num >= 29000000"
+        ));
+        assert!(!confined(
+            "SELECT block_num FROM txs WHERE block_num >= 29000000 \
+             UNION ALL SELECT block_num FROM logs"
+        ));
     }
 }

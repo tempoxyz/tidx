@@ -370,7 +370,7 @@ async fn read_limited_response(mut resp: reqwest::Response) -> Result<String> {
 /// Returns true for errors that indicate the ClickHouse instance is unreachable
 /// (connection refused, timeout, DNS failure, etc.) — as opposed to query-level
 /// errors that would happen on any instance.
-fn is_connection_error(err: &anyhow::Error) -> bool {
+pub(crate) fn is_connection_error(err: &anyhow::Error) -> bool {
     let msg = err.to_string();
     msg.contains("HTTP request failed")
         || msg.contains("connection refused")
