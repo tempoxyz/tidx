@@ -65,8 +65,8 @@ The sync engine writes to both PostgreSQL and ClickHouse in parallel. With `[cha
           ┌──────────────────────────┐                ┌──────────────────────────┐
           │        PostgreSQL        │  pg_clickhouse │        ClickHouse        │
           │    hot window (OLTP)     │     (FDW)      │    full archive (OLAP)   │
-          │    point reads ~1 ms     │───────────────►│   90d rollups ~160 ms    │
-          │     30d hot ≈ 8 GB       │                │   full chain ≈ 26 GB     │
+          │   point reads ~1 ms †    │───────────────►│  90d rollups ~160 ms †   │
+          │    30d hot ≈ 8 GB †      │                │   full chain ≈ 26 GB †   │
           └────────────┬─────────────┘                └────────────┬─────────────┘
                        ▲                                           ▲
                        │                                           │
@@ -80,6 +80,8 @@ The sync engine writes to both PostgreSQL and ClickHouse in parallel. With `[cha
                                      │  Sync Engine  │
                                      └───────────────┘
 ```
+
+`†` — sampled from Tempo mainnet (chain `4217`): full archive ≈ 29.3M blocks, 30d hot window ≈ 5.8M blocks.
 
 | `engine` | `source` | Route |
 |----------|----------|-------|
