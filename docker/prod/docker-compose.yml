@@ -1,6 +1,9 @@
 services:
   postgres:
-    image: postgres:16
+    # postgres:16 + pg_clickhouse (ClickHouse FDW), required for tiered
+    # queries (the default engine). Pinned unreleased-0.4 build published
+    # by .github/workflows/pg-clickhouse.yml.
+    image: ghcr.io/tempoxyz/pg_clickhouse:16-02505c4
     environment:
       POSTGRES_USER: tidx
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-tidx}
