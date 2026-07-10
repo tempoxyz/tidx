@@ -52,8 +52,8 @@ The sync engine writes to both PostgreSQL and ClickHouse in parallel. With `[cha
                         ┌───────────────────────────────────────┐
                         │                /query                 │
                         │                                       │
-                        │  ?signature=...                       │◄─── Lazy event decoding
-                        │  ?engine=...  &source=...             │     (no pre-registration)
+                        │  ?signature=...                       │
+                        │  ?engine=...  &source=...             │
                         └───────────────────┬───────────────────┘
                                             │
                                             ▼
