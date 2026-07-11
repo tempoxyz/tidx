@@ -153,8 +153,12 @@ impl SyncEngine {
             let remote_head = self.realtime_rpc.latest_block_number().await?;
             update_tip_num(self.pool(), self.chain_id, remote_head, remote_head).await?;
 
-            // Check for gaps
-            let gaps = detect_all_gaps(self.pool(), remote_head).await?;
+            // Check for gaps (reload state: pruner may advance the floor)
+            let floor = load_sync_state(self.pool(), self.chain_id)
+                .await?
+                .unwrap_or_default()
+                .prune_floor();
+            let gaps = detect_all_gaps(self.pool(), floor, remote_head).await?;
             if gaps.is_empty() {
                 info!(
                     chain_id = self.chain_id,
@@ -531,7 +535,7 @@ impl SyncEngine {
         let state = load_sync_state(self.pool(), self.chain_id)
             .await?
             .unwrap_or_default();
-        let gaps = detect_all_gaps(self.pool(), state.tip_num).await?;
+        let gaps = detect_all_gaps(self.pool(), state.prune_floor(), state.tip_num).await?;
         let mut filled = 0;
 
         for (start, end) in gaps {
@@ -689,6 +693,7 @@ impl SyncEngine {
             backfill_num: state.backfill_num,
             sync_rate: state.sync_rate,
             started_at: state.started_at,
+            pruned_below: state.pruned_below,
         };
         save_sync_state(self.pool(), &new_state).await?;
 
@@ -879,8 +884,8 @@ async fn tick_gapfill_parallel(
     // are any gaps at all. Only fall back to the expensive LAG() window
     // function when gaps actually exist and we need their exact ranges.
     // With 0.5s block time, tip_num races ahead of synced_num constantly,
-    // so we check the range [1, tip_num] cheaply via COUNT vs expected.
-    if state.tip_num > 0 && !has_gaps(pool, 1, state.tip_num).await? {
+    // so we check the range [floor, tip_num] cheaply via COUNT vs expected.
+    if state.tip_num > 0 && !has_gaps(pool, state.prune_floor(), state.tip_num).await? {
         metrics::set_gap_ranges(chain_id, "postgres", &[]);
         metrics::set_synced(chain_id, realtime_lag == 0);
         if state.synced_num < state.tip_num {
@@ -891,7 +896,7 @@ async fn tick_gapfill_parallel(
     }
 
     // Gaps exist — run the expensive window function to find exact ranges
-    let gaps = detect_all_gaps(pool, state.tip_num).await?;
+    let gaps = detect_all_gaps(pool, state.prune_floor(), state.tip_num).await?;
 
     if gaps.is_empty() {
         // No gaps - fully synced from genesis to tip
@@ -1164,8 +1169,8 @@ async fn tick_gapfill_parallel_no_throttle(
     let pool = sinks.pool();
     let state = load_sync_state(pool, chain_id).await?.unwrap_or_default();
 
-    // Detect ALL gaps including from genesis, sorted by end DESC (most recent first)
-    let gaps = detect_all_gaps(pool, state.tip_num).await?;
+    // Detect ALL gaps above the prune floor, sorted by end DESC (most recent first)
+    let gaps = detect_all_gaps(pool, state.prune_floor(), state.tip_num).await?;
 
     if gaps.is_empty() {
         metrics::set_gap_ranges(chain_id, "postgres", &[]);
@@ -1339,10 +1344,10 @@ async fn tick_gapfill_parallel_no_throttle(
     Ok(())
 }
 
-/// Check if fully synced (no gaps from genesis to tip)
+/// Check if fully synced (no gaps from `floor` to tip)
 #[allow(dead_code)]
-async fn is_fully_synced(pool: &Pool, tip_num: u64) -> Result<bool> {
-    let gaps = detect_all_gaps(pool, tip_num).await?;
+async fn is_fully_synced(pool: &Pool, floor: u64, tip_num: u64) -> Result<bool> {
+    let gaps = detect_all_gaps(pool, floor, tip_num).await?;
     Ok(gaps.is_empty())
 }
 

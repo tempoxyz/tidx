@@ -12,7 +12,12 @@ CREATE TABLE IF NOT EXISTS receipts (
     status                  Nullable(Int16),
     fee_payer               Nullable(String),
     `type`                  Nullable(Int16),
-    fee_token               Nullable(String)
+    fee_token               Nullable(String),
+
+    INDEX idx_tx_hash   tx_hash   TYPE bloom_filter GRANULARITY 1,
+    INDEX idx_from      `from`    TYPE bloom_filter GRANULARITY 1,
+    INDEX idx_fee_payer fee_payer TYPE bloom_filter GRANULARITY 1,
+    INDEX idx_contract_address contract_address TYPE bloom_filter GRANULARITY 1
 ) ENGINE = ReplacingMergeTree()
 PARTITION BY toYYYYMM(block_timestamp)
 ORDER BY (block_num, tx_idx)

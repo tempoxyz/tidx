@@ -22,7 +22,7 @@ CREATE TABLE IF NOT EXISTS txs (
     valid_after             INT8,
     signature_type          INT2,
     PRIMARY KEY (block_timestamp, block_num, idx)
-);
+) PARTITION BY RANGE (block_timestamp);
 
 CREATE INDEX IF NOT EXISTS idx_txs_hash ON txs (hash);
 CREATE INDEX IF NOT EXISTS idx_txs_block_num ON txs (block_num DESC);

@@ -796,7 +796,7 @@ pub async fn load_sync_state(pool: &Pool, chain_id: u64) -> Result<Option<SyncSt
 
     let row = conn
         .query_opt(
-            "SELECT chain_id, head_num, synced_num, tip_num, backfill_num, sync_rate, started_at FROM sync_state WHERE chain_id = $1",
+            "SELECT chain_id, head_num, synced_num, tip_num, backfill_num, sync_rate, started_at, pruned_below FROM sync_state WHERE chain_id = $1",
             &[&(chain_id as i64)],
         )
         .await?;
@@ -809,6 +809,7 @@ pub async fn load_sync_state(pool: &Pool, chain_id: u64) -> Result<Option<SyncSt
         backfill_num: r.get::<_, Option<i64>>(4).map(|n| n as u64),
         sync_rate: r.get(5),
         started_at: r.get(6),
+        pruned_below: r.get::<_, i64>(7) as u64,
     }))
 }
 
@@ -818,7 +819,7 @@ pub async fn load_all_sync_states(pool: &Pool) -> Result<Vec<SyncState>> {
 
     let rows = conn
         .query(
-            "SELECT chain_id, head_num, synced_num, tip_num, backfill_num, sync_rate, started_at FROM sync_state ORDER BY chain_id",
+            "SELECT chain_id, head_num, synced_num, tip_num, backfill_num, sync_rate, started_at, pruned_below FROM sync_state ORDER BY chain_id",
             &[],
         )
         .await?;
@@ -833,6 +834,7 @@ pub async fn load_all_sync_states(pool: &Pool) -> Result<Vec<SyncState>> {
             backfill_num: r.get::<_, Option<i64>>(4).map(|n| n as u64),
             sync_rate: r.get(5),
             started_at: r.get(6),
+            pruned_below: r.get::<_, i64>(7) as u64,
         })
         .collect())
 }
@@ -842,15 +844,16 @@ pub async fn save_sync_state(pool: &Pool, state: &SyncState) -> Result<()> {
 
     conn.execute(
         r#"
-        INSERT INTO sync_state (chain_id, head_num, synced_num, tip_num, backfill_num, started_at, updated_at)
-        VALUES ($1, $2, $3, $4, $5, COALESCE($6, NOW()), NOW())
+        INSERT INTO sync_state (chain_id, head_num, synced_num, tip_num, backfill_num, started_at, updated_at, pruned_below)
+        VALUES ($1, $2, $3, $4, $5, COALESCE($6, NOW()), NOW(), $7)
         ON CONFLICT (chain_id) DO UPDATE SET
             head_num = GREATEST(sync_state.head_num, EXCLUDED.head_num),
             synced_num = GREATEST(sync_state.synced_num, EXCLUDED.synced_num),
             tip_num = GREATEST(sync_state.tip_num, EXCLUDED.tip_num),
             backfill_num = COALESCE(EXCLUDED.backfill_num, sync_state.backfill_num),
             started_at = COALESCE(sync_state.started_at, EXCLUDED.started_at),
-            updated_at = NOW()
+            updated_at = NOW(),
+            pruned_below = GREATEST(sync_state.pruned_below, EXCLUDED.pruned_below)
         "#,
         &[
             &(state.chain_id as i64),
@@ -859,6 +862,7 @@ pub async fn save_sync_state(pool: &Pool, state: &SyncState) -> Result<()> {
             &(state.tip_num as i64),
             &state.backfill_num.map(|n| n as i64),
             &state.started_at,
+            &(state.pruned_below as i64),
         ],
     )
     .await?;
@@ -898,6 +902,34 @@ pub async fn update_synced_num(pool: &Pool, chain_id: u64, synced_num: u64) -> R
         WHERE chain_id = $2
         "#,
         &[&(synced_num as i64), &(chain_id as i64)],
+    )
+    .await?;
+
+    Ok(())
+}
+
+/// Record that Postgres history up to `pruned_below` was intentionally
+/// pruned (tiered storage). Monotonic: only ever advances.
+/// `pruned_below_ts` is the partition-boundary timestamp: every pruned row
+/// has block_timestamp strictly below it.
+pub async fn update_pruned_below(
+    pool: &Pool,
+    chain_id: u64,
+    pruned_below: u64,
+    pruned_below_ts: Option<chrono::DateTime<chrono::Utc>>,
+) -> Result<()> {
+    let conn = pool.get().await?;
+
+    conn.execute(
+        r#"
+        INSERT INTO sync_state (chain_id, pruned_below, pruned_below_ts)
+        VALUES ($1, $2, $3)
+        ON CONFLICT (chain_id) DO UPDATE SET
+            pruned_below = GREATEST(sync_state.pruned_below, EXCLUDED.pruned_below),
+            pruned_below_ts = GREATEST(sync_state.pruned_below_ts, EXCLUDED.pruned_below_ts),
+            updated_at = NOW()
+        "#,
+        &[&(chain_id as i64), &(pruned_below as i64), &pruned_below_ts],
     )
     .await?;
 
@@ -1007,12 +1039,18 @@ pub async fn detect_blocks_missing_receipts(pool: &Pool, limit: i64) -> Result<V
     Ok(rows.iter().map(|r| r.get::<_, i64>(0) as u64).collect())
 }
 
-/// Detect ALL gaps including from genesis to first block
-/// Returns gaps sorted by end block descending (most recent first)
-pub async fn detect_all_gaps(pool: &Pool, tip_num: u64) -> Result<Vec<(u64, u64)>> {
+/// Detect ALL gaps between `floor` and `tip_num`, including the leading gap
+/// from `floor` to the first stored block.
+/// `floor` is the lowest block expected in PG (`SyncState::prune_floor()`);
+/// pass 1 when no pruning is configured (block 0 is genesis/empty).
+/// Returns gaps sorted by end block descending (most recent first).
+pub async fn detect_all_gaps(pool: &Pool, floor: u64, tip_num: u64) -> Result<Vec<(u64, u64)>> {
+    let floor = floor.max(1);
     let conn = pool.get().await?;
 
-    // Get the lowest block number we have
+    // Lowest stored block, unfiltered: a stored block at/below the floor
+    // (e.g. genesis 0) means there is no leading gap; detect_gaps already
+    // reports discontinuities above it.
     let min_block: Option<i64> = conn
         .query_one("SELECT MIN(num) FROM blocks", &[])
         .await?
@@ -1020,19 +1058,21 @@ pub async fn detect_all_gaps(pool: &Pool, tip_num: u64) -> Result<Vec<(u64, u64)
 
     let mut gaps = detect_gaps(pool, tip_num).await?;
 
-    // Add gap from block 1 to first block (if we have any blocks and min > 1)
-    // Block 0 is typically empty/genesis, so we start from block 1
+    // Add gap from floor to first stored block
     if let Some(min) = min_block {
-        if min > 1 {
-            gaps.push((1, min as u64 - 1));
+        if (min as u64) > floor {
+            gaps.push((floor, min as u64 - 1));
         }
-    } else if tip_num > 0 {
-        // No blocks at all - entire range is a gap (starting from 1)
-        gaps.push((1, tip_num));
+    } else if tip_num >= floor {
+        // No blocks at all - entire range is a gap
+        gaps.push((floor, tip_num));
     }
 
-    // Filter to only gaps up to tip_num
-    gaps.retain(|(_, end)| *end <= tip_num);
+    // Clamp to [floor, tip_num]: anything below floor was intentionally pruned
+    gaps.retain(|(_, end)| *end <= tip_num && *end >= floor);
+    for gap in &mut gaps {
+        gap.0 = gap.0.max(floor);
+    }
 
     // Sort by end block descending (most recent gaps first)
     gaps.sort_by_key(|b| std::cmp::Reverse(b.1));

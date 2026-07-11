@@ -10,7 +10,7 @@ CREATE TABLE IF NOT EXISTS blocks (
     extra_data      BYTEA,
     consensus_proposer BYTEA CHECK (consensus_proposer IS NULL OR octet_length(consensus_proposer) = 32),
     PRIMARY KEY (timestamp, num)
-);
+) PARTITION BY RANGE (timestamp);
 
 CREATE INDEX IF NOT EXISTS idx_blocks_num ON blocks (num DESC);
 DROP INDEX IF EXISTS idx_blocks_num_asc;

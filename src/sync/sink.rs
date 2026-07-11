@@ -1,7 +1,9 @@
 use anyhow::Result;
+use chrono::{DateTime, Utc};
 use tracing::info;
 
 use crate::db::Pool;
+use crate::db::partitions::PartitionCoverage;
 use crate::metrics;
 use crate::types::{BlockRow, LogRow, ReceiptRow, TxRow};
 
@@ -20,11 +22,16 @@ const BACKFILL_BLOCK_BATCH: i64 = 5_000;
 pub struct SinkSet {
     pool: Pool,
     ch: Option<ClickHouseSink>,
+    partitions: PartitionCoverage,
 }
 
 impl SinkSet {
     pub fn new(pool: Pool) -> Self {
-        Self { pool, ch: None }
+        Self {
+            pool,
+            ch: None,
+            partitions: PartitionCoverage::default(),
+        }
     }
 
     pub fn with_clickhouse(mut self, ch: ClickHouseSink) -> Self {
@@ -37,7 +44,37 @@ impl SinkSet {
         &self.pool
     }
 
+    /// Whether a ClickHouse sink is active.
+    pub fn has_clickhouse(&self) -> bool {
+        self.ch.is_some()
+    }
+
+    /// Forget cached partition coverage (call after partitions are dropped).
+    pub async fn reset_partition_coverage(&self) {
+        self.partitions.reset().await;
+    }
+
+    /// Ensure weekly partitions exist for every row timestamp in the batch.
+    /// No-op on legacy (non-partitioned) deployments; cached per week.
+    async fn ensure_partitions(
+        &self,
+        timestamps: impl Iterator<Item = DateTime<Utc>>,
+    ) -> Result<()> {
+        let mut min: Option<DateTime<Utc>> = None;
+        let mut max: Option<DateTime<Utc>> = None;
+        for ts in timestamps {
+            min = Some(min.map_or(ts, |m| m.min(ts)));
+            max = Some(max.map_or(ts, |m| m.max(ts)));
+        }
+        if let (Some(min), Some(max)) = (min, max) {
+            self.partitions.ensure(&self.pool, min, max).await?;
+        }
+        Ok(())
+    }
+
     pub async fn write_blocks(&self, blocks: &[BlockRow]) -> Result<()> {
+        self.ensure_partitions(blocks.iter().map(|b| b.timestamp))
+            .await?;
         if let Some(ch) = &self.ch {
             tokio::try_join!(
                 writer::write_blocks(&self.pool, blocks),
@@ -50,6 +87,8 @@ impl SinkSet {
     }
 
     pub async fn write_txs(&self, txs: &[TxRow]) -> Result<()> {
+        self.ensure_partitions(txs.iter().map(|t| t.block_timestamp))
+            .await?;
         if let Some(ch) = &self.ch {
             tokio::try_join!(writer::write_txs(&self.pool, txs), ch.write_txs(txs),)?;
         } else {
@@ -59,6 +98,8 @@ impl SinkSet {
     }
 
     pub async fn write_logs(&self, logs: &[LogRow]) -> Result<()> {
+        self.ensure_partitions(logs.iter().map(|l| l.block_timestamp))
+            .await?;
         if let Some(ch) = &self.ch {
             tokio::try_join!(writer::write_logs(&self.pool, logs), ch.write_logs(logs),)?;
         } else {
@@ -68,6 +109,8 @@ impl SinkSet {
     }
 
     pub async fn write_receipts(&self, receipts: &[ReceiptRow]) -> Result<()> {
+        self.ensure_partitions(receipts.iter().map(|r| r.block_timestamp))
+            .await?;
         if let Some(ch) = &self.ch {
             tokio::try_join!(
                 writer::write_receipts(&self.pool, receipts),
@@ -111,6 +154,15 @@ impl SinkSet {
         receipts: &[ReceiptRow],
         application_name: Option<&str>,
     ) -> Result<()> {
+        self.ensure_partitions(
+            blocks
+                .iter()
+                .map(|b| b.timestamp)
+                .chain(txs.iter().map(|t| t.block_timestamp))
+                .chain(logs.iter().map(|l| l.block_timestamp))
+                .chain(receipts.iter().map(|r| r.block_timestamp)),
+        )
+        .await?;
         if let Some(ch) = &self.ch {
             tokio::try_join!(
                 async {
@@ -334,7 +386,7 @@ async fn pg_max_block_num(pool: &Pool) -> Result<Option<i64>> {
 }
 
 /// Load the CH backfill cursor for a chain. Returns 0 if no row exists.
-async fn load_ch_backfill_cursor(pool: &Pool, chain_id: u64) -> Result<i64> {
+pub(crate) async fn load_ch_backfill_cursor(pool: &Pool, chain_id: u64) -> Result<i64> {
     let conn = pool.get().await?;
     let row = conn
         .query_opt(

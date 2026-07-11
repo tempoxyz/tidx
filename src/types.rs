@@ -99,12 +99,26 @@ pub struct SyncState {
     /// When sync started (for ETA calculations)
     #[serde(default)]
     pub started_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// Highest block intentionally pruned from Postgres (0 = nothing pruned).
+    /// Gap detection and backfill ignore blocks at or below this.
+    #[serde(default)]
+    pub pruned_below: u64,
 }
 
 impl SyncState {
-    /// Returns true if backfill is complete (reached genesis)
+    /// Lowest block expected to exist in Postgres.
+    /// Block 0 (genesis) is never indexed, so the floor is at least 1.
+    pub fn prune_floor(&self) -> u64 {
+        self.pruned_below + 1
+    }
+
+    /// Returns true if backfill is complete (reached genesis, or the prune
+    /// floor when history below it was intentionally pruned).
     pub fn backfill_complete(&self) -> bool {
-        self.backfill_num == Some(0)
+        match self.backfill_num {
+            Some(n) => n <= self.pruned_below,
+            None => false,
+        }
     }
 
     /// Returns true if backfill has started
@@ -112,12 +126,12 @@ impl SyncState {
         self.backfill_num.is_some()
     }
 
-    /// Returns the number of blocks remaining to backfill
+    /// Returns the number of blocks remaining to backfill.
+    /// Blocks at or below the prune floor were intentionally dropped and don't count.
     pub fn backfill_remaining(&self) -> u64 {
         match self.backfill_num {
-            None => self.tip_num, // Haven't started, need to fill 0..tip_num
-            Some(0) => 0,         // Complete
-            Some(n) => n,         // Blocks 0..n remain
+            None => self.tip_num.saturating_sub(self.pruned_below),
+            Some(n) => n.saturating_sub(self.pruned_below),
         }
     }
 

@@ -350,9 +350,17 @@ pub struct QueryParams {
     /// Maximum rows to return
     #[serde(default = "default_limit")]
     limit: i64,
-    /// Force a specific engine: "postgres" or "clickhouse"
+    /// Query executor: "postgres" (default) or "clickhouse".
+    /// "tiered" is a legacy alias for engine=postgres&source=postgres-clickhouse.
     #[serde(default)]
     engine: Option<String>,
+    /// Where the data lives: "postgres" (hot window), "clickhouse" (full
+    /// archive via pg_clickhouse when engine=postgres), or
+    /// "postgres-clickhouse" (tiered: hot PG window + cold ClickHouse
+    /// archive). Defaults to "postgres-clickhouse" for engine=postgres and
+    /// "clickhouse" for engine=clickhouse.
+    #[serde(default)]
+    source: Option<String>,
 }
 
 fn default_timeout() -> u64 {
@@ -386,17 +394,34 @@ async fn handle_query(
 ) -> Response {
     let signatures = extract_signatures(uri.query());
 
+    // Live streaming serves the hot PostgreSQL window, so bare ?live=true
+    // stays on plain PostgreSQL instead of the tiered default source.
+    let source = if params.live
+        && params.source.is_none()
+        && matches!(params.engine.as_deref(), None | Some("postgres"))
+    {
+        Some("postgres")
+    } else {
+        params.source.as_deref()
+    };
+
+    let route = match crate::query::QueryRoute::resolve(params.engine.as_deref(), source) {
+        Ok(route) => route,
+        Err(e) => return ApiError::BadRequest(e).into_response(),
+    };
+
     if params.live {
-        if params.engine.as_deref() == Some("clickhouse") {
-            return ApiError::BadRequest(
-                "engine=clickhouse is not supported with live=true (use PostgreSQL for real-time streaming)".to_string()
-            ).into_response();
+        if route != crate::query::QueryRoute::Postgres {
+            return ApiError::BadRequest(format!(
+                "{route} is not supported with live=true (use plain PostgreSQL for real-time streaming)"
+            ))
+            .into_response();
         }
         handle_query_live(state, params, signatures)
             .await
             .into_response()
     } else {
-        handle_query_once(state, params, signatures)
+        handle_query_once(state, params, signatures, route)
             .await
             .into_response()
     }
@@ -406,6 +431,7 @@ async fn handle_query_once(
     state: AppState,
     params: QueryParams,
     signatures: Vec<String>,
+    route: crate::query::QueryRoute,
 ) -> Result<Json<QueryResponse>, ApiError> {
     let pool = state
         .get_pool(Some(params.chain_id))
@@ -417,45 +443,73 @@ async fn handle_query_once(
         limit: params.limit.clamp(1, crate::query::HARD_LIMIT_MAX),
     };
 
-    // Route to appropriate engine
-    let use_clickhouse = matches!(params.engine.as_deref(), Some("clickhouse"));
-
     let sigs: Vec<&str> = signatures.iter().map(String::as_str).collect();
 
-    let result = if use_clickhouse {
-        // Use ClickHouse engine for OLAP queries
-        let clickhouse = state
-            .get_clickhouse(Some(params.chain_id))
-            .await
-            .ok_or_else(|| {
-                ApiError::BadRequest(format!(
-                    "ClickHouse not configured for chain_id: {}",
-                    params.chain_id
-                ))
-            })?;
+    let map_pg_err = |e: anyhow::Error| {
+        if e.to_string().contains("timeout") {
+            ApiError::Timeout
+        } else {
+            ApiError::QueryError(e.to_string())
+        }
+    };
 
-        clickhouse
-            .query_user(&params.sql, &sigs, options.timeout_ms, options.limit)
+    let result = match route {
+        crate::query::QueryRoute::ClickHouse => {
+            // ClickHouse directly for OLAP queries
+            let clickhouse = state
+                .get_clickhouse(Some(params.chain_id))
+                .await
+                .ok_or_else(|| {
+                    ApiError::BadRequest(format!(
+                        "ClickHouse not configured for chain_id: {}",
+                        params.chain_id
+                    ))
+                })?;
+
+            clickhouse
+                .query_user(&params.sql, &sigs, options.timeout_ms, options.limit)
+                .await
+                .map(|r| QueryResult {
+                    columns: r.columns,
+                    rows: r.rows,
+                    row_count: r.row_count,
+                    engine: r.engine,
+                    query_time_ms: r.query_time_ms,
+                })
+                .map_err(|e| ApiError::QueryError(e.to_string()))?
+        }
+        crate::query::QueryRoute::Tiered => {
+            // Split hot/cold at the prune boundary when possible; otherwise
+            // PostgreSQL over tiered.* views (hot PG window + ClickHouse archive).
+            let clickhouse = state.get_clickhouse(Some(params.chain_id)).await;
+            crate::service::execute_query_tiered(
+                &pool,
+                clickhouse.as_deref(),
+                params.chain_id,
+                &params.sql,
+                &sigs,
+                &options,
+            )
             .await
-            .map(|r| QueryResult {
-                columns: r.columns,
-                rows: r.rows,
-                row_count: r.row_count,
-                engine: r.engine,
-                query_time_ms: r.query_time_ms,
-            })
-            .map_err(|e| ApiError::QueryError(e.to_string()))?
-    } else {
-        // Use PostgreSQL
-        crate::service::execute_query_postgres(&pool, &params.sql, &sigs, &options)
+            .map_err(map_pg_err)?
+        }
+        crate::query::QueryRoute::PostgresViaClickHouse => {
+            // PostgreSQL over the ch.* pg_clickhouse foreign tables: full
+            // ClickHouse archive, no hot PostgreSQL arm.
+            crate::service::execute_query_postgres_via_clickhouse(
+                &pool,
+                &params.sql,
+                &sigs,
+                &options,
+            )
             .await
-            .map_err(|e| {
-                if e.to_string().contains("timeout") {
-                    ApiError::Timeout
-                } else {
-                    ApiError::QueryError(e.to_string())
-                }
-            })?
+            .map_err(map_pg_err)?
+        }
+        crate::query::QueryRoute::Postgres => {
+            crate::service::execute_query_postgres(&pool, &params.sql, &sigs, &options)
+                .await
+                .map_err(map_pg_err)?
+        }
     };
 
     Ok(Json(QueryResponse { result, ok: true }))

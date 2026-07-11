@@ -1905,6 +1905,20 @@ async fn setup_backfill() -> Option<(tidx::db::Pool, SinkSet, TestClickHouse)> {
         .await
         .expect("Failed to truncate PG tables");
 
+    // Tests below write via `writer::` directly (bypassing SinkSet partition
+    // provisioning); pre-create partitions covering the fixed test timestamps.
+    {
+        use chrono::TimeZone;
+        let ts0 = chrono::Utc.with_ymd_and_hms(2025, 1, 15, 0, 0, 0).unwrap();
+        tidx::db::partitions::ensure_partitions_covering(
+            &pool,
+            ts0,
+            ts0 + chrono::Duration::days(7),
+        )
+        .await
+        .expect("Failed to ensure partitions");
+    }
+
     let sinks = SinkSet::new(pool.clone()).with_clickhouse(ch_sink);
     Some((pool, sinks, ch))
 }

@@ -106,15 +106,9 @@ pub struct ChainConfig {
     #[serde(default)]
     pub rpc_auth_env: Option<String>,
 
-    /// Database connection URL for this chain.
-    /// If `pg_password_env` is set, the password in this URL will be replaced
-    /// with the value from that environment variable.
-    pub pg_url: String,
-
-    /// Environment variable name containing the PostgreSQL password.
-    /// When set, the password portion of `pg_url` is replaced with this value.
+    /// PostgreSQL settings for this chain.
     #[serde(default)]
-    pub pg_password_env: Option<String>,
+    pub postgres: Option<PostgresConfig>,
 
     /// Enable backfill to genesis (default: true)
     #[serde(default = "default_backfill")]
@@ -140,21 +134,101 @@ pub struct ChainConfig {
     #[serde(default)]
     pub trust_rpc: bool,
 
-    /// Separate PostgreSQL URL for the HTTP API (e.g., a CNPG `-r` read replica).
-    /// When set, the API connection pool connects to this URL instead of `pg_url`.
-    /// If `api_pg_password_env` is also set, the password is injected into this URL.
-    #[serde(default)]
-    pub api_pg_url: Option<String>,
-
-    /// Environment variable name containing the API PostgreSQL password.
-    /// When set, replaces the password in `api_pg_url` with the env var value.
-    /// Has no effect without `api_pg_url`.
-    #[serde(default)]
-    pub api_pg_password_env: Option<String>,
-
     /// ClickHouse OLAP settings (for analytical queries)
     #[serde(default)]
     pub clickhouse: Option<ClickHouseConfig>,
+
+    /// Tiered-storage retention: keep a hot window in Postgres, prune the
+    /// rest once durable in ClickHouse. Requires `[chains.clickhouse]` enabled.
+    #[serde(default)]
+    pub retention: Option<RetentionConfig>,
+}
+
+/// Tiered-storage retention settings (Postgres hot window).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RetentionConfig {
+    /// How much recent data to keep in Postgres, e.g. "30d" or "36h".
+    pub pg_keep: String,
+
+    /// How often the pruner runs (default "1h").
+    #[serde(default = "default_prune_interval")]
+    pub prune_interval: String,
+
+    /// Refuse to prune unless the ClickHouse archive has durably consumed
+    /// the data (default true). `false` is an explicit opt-in to a rolling
+    /// window where pruned history is gone forever.
+    #[serde(default = "default_require_clickhouse")]
+    pub require_clickhouse: bool,
+}
+
+impl RetentionConfig {
+    pub fn pg_keep_duration(&self) -> Result<chrono::Duration> {
+        parse_duration(&self.pg_keep)
+            .with_context(|| format!("Invalid retention.pg_keep: '{}'", self.pg_keep))
+    }
+
+    pub fn prune_interval_duration(&self) -> Result<std::time::Duration> {
+        let d = parse_duration(&self.prune_interval).with_context(|| {
+            format!(
+                "Invalid retention.prune_interval: '{}'",
+                self.prune_interval
+            )
+        })?;
+        Ok(d.to_std()?)
+    }
+}
+
+fn default_prune_interval() -> String {
+    "1h".to_string()
+}
+
+fn default_require_clickhouse() -> bool {
+    true
+}
+
+/// Parse durations like "30d", "36h", "90m", "45s".
+fn parse_duration(s: &str) -> Result<chrono::Duration> {
+    let s = s.trim();
+    if s.len() < 2 || !s.is_ascii() {
+        anyhow::bail!("expected a duration like '30d', '12h', '30m', or '45s'");
+    }
+    let (num, unit) = s.split_at(s.len() - 1);
+    let n: i64 = num
+        .parse()
+        .map_err(|_| anyhow::anyhow!("invalid number '{num}'"))?;
+    if n <= 0 {
+        anyhow::bail!("duration must be positive");
+    }
+    match unit {
+        "d" => Ok(chrono::Duration::days(n)),
+        "h" => Ok(chrono::Duration::hours(n)),
+        "m" => Ok(chrono::Duration::minutes(n)),
+        "s" => Ok(chrono::Duration::seconds(n)),
+        _ => anyhow::bail!("unknown duration unit '{unit}' (use d, h, m, or s)"),
+    }
+}
+
+/// PostgreSQL settings for a chain.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PostgresConfig {
+    /// Connection URL used by the indexer and, unless `api_url` is set, the HTTP API.
+    /// If `password_env` is set, the password in this URL is replaced with its value.
+    pub url: String,
+
+    /// Environment variable name containing the PostgreSQL password.
+    /// When set, the password portion of `url` is replaced with this value.
+    #[serde(default)]
+    pub password_env: Option<String>,
+
+    /// Separate PostgreSQL URL for the HTTP API (e.g., a CNPG `-r` read replica).
+    /// When set, the API connection pool connects to this URL instead of `url`.
+    #[serde(default)]
+    pub api_url: Option<String>,
+
+    /// Environment variable name containing the API PostgreSQL password.
+    /// When set, replaces the password in `api_url`. Has no effect without `api_url`.
+    #[serde(default)]
+    pub api_password_env: Option<String>,
 }
 
 /// Configuration for ClickHouse OLAP engine
@@ -190,6 +264,12 @@ pub struct ClickHouseConfig {
     /// Scan and repair historical derived-table gaps on startup (default: true).
     #[serde(default = "default_true")]
     pub repair_derived_on_startup: bool,
+
+    /// ClickHouse URL as reachable from the PostgreSQL server itself, used by
+    /// the pg_clickhouse FDW for tiered queries (default: `url`).
+    /// Set when PostgreSQL reaches ClickHouse via a different host than tidx.
+    #[serde(default)]
+    pub fdw_url: Option<String>,
 
     /// Create the database with `ENGINE = Replicated` and MergeTree-family
     /// tables as their `Replicated*` counterparts (default: false).
@@ -238,6 +318,7 @@ impl Default for ClickHouseConfig {
             user: None,
             password_env: None,
             repair_derived_on_startup: true,
+            fdw_url: None,
             replicated_database: false,
         }
     }
@@ -282,51 +363,61 @@ impl ChainConfig {
         redact_url_credentials(&self.rpc_url)
     }
 
+    /// PostgreSQL settings from `[chains.postgres]`.
+    pub fn postgres(&self) -> Result<PostgresConfig> {
+        self.postgres.clone().with_context(|| {
+            format!(
+                "chain '{}': missing [chains.postgres] section (set postgres.url; \
+                 the root-level pg_url field was removed)",
+                self.name
+            )
+        })
+    }
+
     /// Returns the PostgreSQL connection URL with password resolved from environment if configured.
-    /// If `pg_password_env` is set, replaces the password in `pg_url` with the env var value.
+    /// If `postgres.password_env` is set, replaces the password in `postgres.url` with the env var value.
     pub fn resolved_pg_url(&self) -> Result<String> {
-        match &self.pg_password_env {
-            Some(env_var) => {
-                let password = std::env::var(env_var).with_context(|| {
-                    format!("pg_password_env '{env_var}' is set but environment variable not found")
-                })?;
-
-                let mut url = url::Url::parse(&self.pg_url)
-                    .with_context(|| format!("Invalid pg_url: {}", self.pg_url))?;
-
-                url.set_password(Some(&password))
-                    .map_err(|()| anyhow::anyhow!("Failed to set password in pg_url"))?;
-
-                Ok(url.to_string())
-            }
-            None => Ok(self.pg_url.clone()),
+        let pg = self.postgres()?;
+        match &pg.password_env {
+            Some(env_var) => inject_password_from_env(&pg.url, env_var, "url", "password_env"),
+            None => Ok(pg.url),
         }
     }
 
     /// Returns a separate API database URL for read-only queries.
-    /// Returns `None` if `api_pg_url` is not set (API uses the main pool).
+    /// Returns `None` if `postgres.api_url` is not set (API uses the main pool).
     pub fn resolved_api_pg_url(&self) -> Result<Option<String>> {
-        let api_url = match &self.api_pg_url {
-            Some(url) => url,
-            None => return Ok(None),
+        let pg = self.postgres()?;
+        let Some(api_url) = pg.api_url else {
+            return Ok(None);
         };
-
-        match &self.api_pg_password_env {
-            Some(pass_env) => {
-                let password = std::env::var(pass_env).with_context(|| {
-                    format!(
-                        "api_pg_password_env '{pass_env}' is set but environment variable not found"
-                    )
-                })?;
-                let mut url = url::Url::parse(api_url)
-                    .with_context(|| format!("Invalid api_pg_url: {api_url}"))?;
-                url.set_password(Some(&password))
-                    .map_err(|()| anyhow::anyhow!("Failed to set password in api_pg_url"))?;
-                Ok(Some(url.to_string()))
-            }
-            None => Ok(Some(api_url.clone())),
+        match &pg.api_password_env {
+            Some(env_var) => Ok(Some(inject_password_from_env(
+                &api_url,
+                env_var,
+                "api_url",
+                "api_password_env",
+            )?)),
+            None => Ok(Some(api_url)),
         }
     }
+}
+
+/// Replaces the password in `raw_url` with the value of `env_var`.
+fn inject_password_from_env(
+    raw_url: &str,
+    env_var: &str,
+    url_field: &str,
+    env_field: &str,
+) -> Result<String> {
+    let password = std::env::var(env_var).with_context(|| {
+        format!("postgres {env_field} '{env_var}' is set but environment variable not found")
+    })?;
+    let mut url = url::Url::parse(raw_url)
+        .with_context(|| format!("Invalid postgres {url_field}: {raw_url}"))?;
+    url.set_password(Some(&password))
+        .map_err(|()| anyhow::anyhow!("Failed to set password in postgres {url_field}"))?;
+    Ok(url.to_string())
 }
 
 pub fn redact_url_credentials(raw_url: &str) -> String {
@@ -363,6 +454,33 @@ impl Config {
             anyhow::bail!("No chains configured. Add at least one [[chains]] section.");
         }
 
+        for chain in &config.chains {
+            chain
+                .postgres()
+                .with_context(|| format!("chain '{}': invalid PostgreSQL config", chain.name))?;
+            if let Some(retention) = &chain.retention {
+                let keep = retention.pg_keep_duration().with_context(|| {
+                    format!("chain '{}': invalid [chains.retention]", chain.name)
+                })?;
+                retention.prune_interval_duration().with_context(|| {
+                    format!("chain '{}': invalid [chains.retention]", chain.name)
+                })?;
+                anyhow::ensure!(
+                    keep >= chrono::Duration::days(1),
+                    "chain '{}': retention.pg_keep must be at least 1d",
+                    chain.name
+                );
+                let ch_enabled = chain.clickhouse.as_ref().is_some_and(|c| c.enabled);
+                anyhow::ensure!(
+                    ch_enabled || !retention.require_clickhouse,
+                    "chain '{}': [chains.retention] requires [chains.clickhouse] with enabled = true \
+                     (pruned data must remain queryable in the ClickHouse archive). \
+                     Set retention.require_clickhouse = false to run a rolling window without an archive",
+                    chain.name
+                );
+            }
+        }
+
         Ok(config)
     }
 }
@@ -377,7 +495,9 @@ mod tests {
             name = "test"
             chain_id = 1
             rpc_url = "http://localhost:8545"
-            pg_url = "postgres://localhost/test"
+
+            [postgres]
+            url = "postgres://localhost/test"
         "#;
 
         let config: ChainConfig = toml::from_str(toml_str).unwrap();
@@ -402,13 +522,17 @@ mod tests {
             name = "chain1"
             chain_id = 1
             rpc_url = "http://localhost:8545"
-            pg_url = "postgres://localhost/chain1"
+
+            [chains.postgres]
+            url = "postgres://localhost/chain1"
             
             [[chains]]
             name = "chain2"
             chain_id = 2
             rpc_url = "http://localhost:8546"
-            pg_url = "postgres://localhost/chain2"
+
+            [chains.postgres]
+            url = "postgres://localhost/chain2"
         "#;
 
         let config: Config = toml::from_str(toml_str).unwrap();
@@ -422,7 +546,9 @@ mod tests {
             name = "test"
             chain_id = 1
             rpc_url = "http://localhost:8545"
-            pg_url = "postgres://localhost/test"
+
+            [postgres]
+            url = "postgres://localhost/test"
 
             [clickhouse]
             enabled = true
@@ -454,7 +580,9 @@ mod tests {
             name = "test"
             chain_id = 1
             rpc_url = "http://localhost:8545"
-            pg_url = "postgres://localhost/test"
+
+            [postgres]
+            url = "postgres://localhost/test"
 
             [clickhouse]
             enabled = true
@@ -472,7 +600,9 @@ mod tests {
             name = "test"
             chain_id = 1
             rpc_url = "http://localhost:8545"
-            pg_url = "postgres://localhost/test"
+
+            [postgres]
+            url = "postgres://localhost/test"
 
             [clickhouse]
             enabled = true
@@ -493,7 +623,9 @@ mod tests {
             name = "test"
             chain_id = 1
             rpc_url = "http://localhost:8545"
-            pg_url = "postgres://localhost/test"
+
+            [postgres]
+            url = "postgres://localhost/test"
 
             [clickhouse]
             enabled = true
@@ -506,24 +638,78 @@ mod tests {
         assert!(!ch.repair_derived_on_startup);
     }
 
-    #[test]
-    fn test_resolved_pg_url_without_env() {
-        let config = ChainConfig {
+    fn test_chain(postgres: Option<PostgresConfig>) -> ChainConfig {
+        ChainConfig {
             name: "test".to_string(),
             chain_id: 1,
             rpc_url: "http://localhost:8545".to_string(),
             rpc_auth_env: None,
-            pg_url: "postgres://user:pass@localhost/db".to_string(),
-            pg_password_env: None,
+            postgres,
             backfill: true,
             batch_size: 100,
             concurrency: 4,
             backfill_first: false,
             trust_rpc: false,
-            api_pg_url: None,
-            api_pg_password_env: None,
             clickhouse: None,
-        };
+            retention: None,
+        }
+    }
+
+    fn pg(url: &str) -> PostgresConfig {
+        PostgresConfig {
+            url: url.to_string(),
+            password_env: None,
+            api_url: None,
+            api_password_env: None,
+        }
+    }
+
+    #[test]
+    fn test_postgres_section_parses() {
+        let toml_str = r#"
+            name = "test"
+            chain_id = 1
+            rpc_url = "http://localhost:8545"
+
+            [postgres]
+            url = "postgres://localhost/test"
+            api_url = "postgres://localhost/test_r"
+        "#;
+
+        let config: ChainConfig = toml::from_str(toml_str).unwrap();
+        assert_eq!(
+            config.resolved_pg_url().unwrap(),
+            "postgres://localhost/test"
+        );
+        assert_eq!(
+            config.resolved_api_pg_url().unwrap().unwrap(),
+            "postgres://localhost/test_r"
+        );
+    }
+
+    #[test]
+    fn test_missing_postgres_config_errors() {
+        let config = test_chain(None);
+        assert!(config.resolved_pg_url().is_err());
+    }
+
+    #[test]
+    fn test_removed_root_pg_url_errors() {
+        let toml_str = r#"
+            name = "test"
+            chain_id = 1
+            rpc_url = "http://localhost:8545"
+            pg_url = "postgres://user:pass@localhost/db"
+        "#;
+
+        let config: ChainConfig = toml::from_str(toml_str).unwrap();
+        let err = config.resolved_pg_url().unwrap_err().to_string();
+        assert!(err.contains("missing [chains.postgres]"), "{err}");
+    }
+
+    #[test]
+    fn test_resolved_pg_url_without_env() {
+        let config = test_chain(Some(pg("postgres://user:pass@localhost/db")));
 
         assert_eq!(
             config.resolved_pg_url().unwrap(),
@@ -534,22 +720,10 @@ mod tests {
     #[test]
     fn test_resolved_pg_url_with_env() {
         // PATH is always set, use it to test env var substitution
-        let config = ChainConfig {
-            name: "test".to_string(),
-            chain_id: 1,
-            rpc_url: "http://localhost:8545".to_string(),
-            rpc_auth_env: None,
-            pg_url: "postgres://user:placeholder@localhost/db".to_string(),
-            pg_password_env: Some("PATH".to_string()),
-            backfill: true,
-            batch_size: 100,
-            concurrency: 4,
-            backfill_first: false,
-            trust_rpc: false,
-            api_pg_url: None,
-            api_pg_password_env: None,
-            clickhouse: None,
-        };
+        let config = test_chain(Some(PostgresConfig {
+            password_env: Some("PATH".to_string()),
+            ..pg("postgres://user:placeholder@localhost/db")
+        }));
 
         let resolved = config.resolved_pg_url().unwrap();
         assert!(resolved.starts_with("postgres://user:"));
@@ -559,44 +733,19 @@ mod tests {
 
     #[test]
     fn test_resolved_pg_url_missing_env() {
-        let config = ChainConfig {
-            name: "test".to_string(),
-            chain_id: 1,
-            rpc_url: "http://localhost:8545".to_string(),
-            rpc_auth_env: None,
-            pg_url: "postgres://user:placeholder@localhost/db".to_string(),
-            pg_password_env: Some("NONEXISTENT_VAR_XYZ_999".to_string()),
-            backfill: true,
-            batch_size: 100,
-            concurrency: 4,
-            backfill_first: false,
-            trust_rpc: false,
-            api_pg_url: None,
-            api_pg_password_env: None,
-            clickhouse: None,
-        };
+        let config = test_chain(Some(PostgresConfig {
+            password_env: Some("NONEXISTENT_VAR_XYZ_999".to_string()),
+            ..pg("postgres://user:placeholder@localhost/db")
+        }));
 
         assert!(config.resolved_pg_url().is_err());
     }
 
     #[test]
     fn test_resolved_rpc_url_with_auth_env() {
-        let config = ChainConfig {
-            name: "test".to_string(),
-            chain_id: 1,
-            rpc_url: "https://rpc.example.com".to_string(),
-            rpc_auth_env: Some("PATH".to_string()),
-            pg_url: "postgres://user:pass@localhost/db".to_string(),
-            pg_password_env: None,
-            backfill: true,
-            batch_size: 100,
-            concurrency: 4,
-            backfill_first: false,
-            trust_rpc: false,
-            api_pg_url: None,
-            api_pg_password_env: None,
-            clickhouse: None,
-        };
+        let mut config = test_chain(Some(pg("postgres://user:pass@localhost/db")));
+        config.rpc_url = "https://rpc.example.com".to_string();
+        config.rpc_auth_env = Some("PATH".to_string());
 
         let resolved = config.resolved_rpc_url().unwrap();
         assert!(resolved.starts_with("https://"));

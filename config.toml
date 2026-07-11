@@ -14,10 +14,15 @@ name = "moderato"
 chain_id = 42431
 rpc_url = "https://rpc.testnet.tempo.xyz"
 rpc_auth_env = "TEMPO_RPC_AUTH_MODERATO"
-pg_url = "postgres://tidx:tidx@postgres:5432/tidx_moderato"
 backfill = true
 batch_size = 500
 concurrency = 8
+
+[chains.postgres]
+url = "postgres://tidx:tidx@postgres:5432/tidx_moderato"
+# password_env = "TIDX_PG_PASSWORD"
+# api_url = "postgres://tidx:tidx@postgres-replica:5432/tidx_moderato"
+# api_password_env = "TIDX_API_PG_PASSWORD"
 
 # ClickHouse OLAP engine (optional)
 # Data is written directly via HTTP batch inserts (JSONEachRow).
@@ -40,10 +45,15 @@ name = "mainnet"
 chain_id = 4217
 rpc_url = "https://rpc.tempo.xyz"
 rpc_auth_env = "TEMPO_RPC_AUTH_MAINNET"
-pg_url = "postgres://tidx:tidx@postgres:5432/tidx_mainnet"
 backfill = true
 batch_size = 500
 concurrency = 8
+
+[chains.postgres]
+url = "postgres://tidx:tidx@postgres:5432/tidx_mainnet"
+# password_env = "TIDX_PG_PASSWORD"
+# api_url = "postgres://tidx:tidx@postgres-replica:5432/tidx_mainnet"
+# api_password_env = "TIDX_API_PG_PASSWORD"
 
 # ClickHouse OLAP engine (optional)
 [chains.clickhouse]

@@ -192,6 +192,87 @@ impl EventSignature {
         )
     }
 
+    /// Generate tiered-view CTE SQL (includes all decoded columns).
+    pub fn to_cte_sql_tiered(&self) -> String {
+        self.to_cte_sql_tiered_with_pushdown(None, &[])
+    }
+
+    /// Generate CTE SQL for the tiered engine: PostgreSQL executes it, but
+    /// the `tiered.*` views expose ClickHouse's representation ('0x…' hex
+    /// text), so raw columns pass through and decoding goes text → bytea →
+    /// `abi_*`. Predicates stay in text form so they push down to the
+    /// ClickHouse arm of the view.
+    pub fn to_cte_sql_tiered_with_pushdown(
+        &self,
+        used_columns: Option<&HashSet<String>>,
+        pushdown_predicates: &[String],
+    ) -> String {
+        let selects = self.build_select_expressions_tiered(used_columns);
+
+        let select_clause = if selects.is_empty() {
+            String::new()
+        } else {
+            format!(", {}", selects.join(", "))
+        };
+
+        let extra_where = if pushdown_predicates.is_empty() {
+            String::new()
+        } else {
+            format!(" AND {}", pushdown_predicates.join(" AND "))
+        };
+
+        format!(
+            r#"{name} AS (
+    SELECT block_num, block_timestamp, log_idx, tx_idx, tx_hash, address, selector, topic1, topic2, topic3, data{select_clause}
+    FROM logs
+    WHERE selector = '0x{topic0}'{extra_where}
+)"#,
+            name = self.name,
+            select_clause = select_clause,
+            topic0 = self.topic0_hex(),
+            extra_where = extra_where,
+        )
+    }
+
+    /// Build SELECT expressions for tiered decoded columns.
+    fn build_select_expressions_tiered(
+        &self,
+        used_columns: Option<&HashSet<String>>,
+    ) -> Vec<String> {
+        let mut selects = Vec::new();
+        let mut topic_idx = 2;
+        let mut data_offset = 0;
+
+        for (i, param) in self.params.iter().enumerate() {
+            let col_name = param
+                .name
+                .as_deref()
+                .map_or_else(|| format!("arg{i}"), |n| n.to_string());
+
+            let (decode_expr, new_topic_idx, new_data_offset) = if param.indexed {
+                let expr = param.ty.topic_decode_sql_tiered(topic_idx);
+                (expr, topic_idx + 1, data_offset)
+            } else {
+                let expr = param.ty.data_decode_sql_tiered(data_offset);
+                (expr, topic_idx, data_offset + 32)
+            };
+
+            topic_idx = new_topic_idx;
+            data_offset = new_data_offset;
+
+            let include = match used_columns {
+                None => true,
+                Some(cols) => cols.contains(&col_name) || cols.contains(&col_name.to_lowercase()),
+            };
+
+            if include {
+                selects.push(format!("{decode_expr} AS \"{col_name}\""));
+            }
+        }
+
+        selects
+    }
+
     /// Build SELECT expressions for ClickHouse decoded columns.
     fn build_select_expressions_clickhouse(
         &self,
@@ -424,16 +505,27 @@ pub fn apply_event_signature_ctes_clickhouse(sql: &str, signatures: &[&str]) -> 
     apply_event_signature_ctes(sql, signatures, EventCteDialect::ClickHouse)
 }
 
+/// Apply event-signature CTEs to a tiered (PostgreSQL over tiered views)
+/// user query.
+///
+/// See [`apply_event_signature_ctes_postgres`] for merge semantics.
+pub fn apply_event_signature_ctes_tiered(sql: &str, signatures: &[&str]) -> Result<String> {
+    apply_event_signature_ctes(sql, signatures, EventCteDialect::Tiered)
+}
+
 #[derive(Clone, Copy)]
 enum EventCteDialect {
     Postgres,
     ClickHouse,
+    /// PostgreSQL executing over `tiered.*` views (ClickHouse text
+    /// representation, PostgreSQL syntax and functions).
+    Tiered,
 }
 
 impl EventCteDialect {
     fn parser_dialect(self) -> Box<dyn Dialect> {
         match self {
-            Self::Postgres => Box::new(GenericDialect {}),
+            Self::Postgres | Self::Tiered => Box::new(GenericDialect {}),
             Self::ClickHouse => Box::new(ClickHouseDialect {}),
         }
     }
@@ -486,6 +578,17 @@ fn apply_event_signature_ctes(
             .iter()
             .map(|sig| sig.to_cte_sql_clickhouse_with_pushdown(None, &pushdown))
             .collect(),
+        EventCteDialect::Tiered => {
+            let used_columns = extract_column_references(&rewritten_sql);
+            let filter = if used_columns.is_empty() {
+                None
+            } else {
+                Some(&used_columns)
+            };
+            sigs.iter()
+                .map(|sig| sig.to_cte_sql_tiered_with_pushdown(filter, &pushdown))
+                .collect()
+        }
     };
 
     merge_event_ctes(&rewritten_sql, &ctes, &event_names, dialect)
@@ -1215,11 +1318,69 @@ impl AbiType {
             AbiType::Bytes(Some(_) | None) => {
                 format!("concat('0x', lower(substring(data, {hex_start}, 64)))")
             }
-            // String: dynamic, not fully supported yet
+            // String: offset word → length word → UTF-8 bytes, mirroring
+            // PostgreSQL's abi_string (db/functions.sql). Offsets/lengths fit
+            // u64, so read each word's last 8 bytes (16 hex chars).
             AbiType::String => {
-                format!("concat('0x', lower(substring(data, {hex_start}, 64)))")
+                let off = format!(
+                    "reinterpretAsUInt64(reverse(unhex(substring(data, {}, 16))))",
+                    hex_start + 48
+                );
+                let len = format!(
+                    "reinterpretAsUInt64(reverse(unhex(substring(data, 51 + 2 * {off}, 16))))"
+                );
+                format!("unhex(substring(data, 67 + 2 * {off}, 2 * {len}))")
             }
             _ => format!("concat('0x', lower(substring(data, {hex_start}, 64)))"),
+        }
+    }
+
+    // Tiered decode functions: PostgreSQL executes them, but the tiered
+    // views expose '0x'-prefixed hex text (ClickHouse's representation).
+    // Numeric/bool decoding round-trips text → bytea (decode) → abi_*.
+
+    pub fn topic_decode_sql_tiered(&self, topic_idx: usize) -> String {
+        // topic_idx is 1-based from the signature parser, maps to topic0, topic1, etc.
+        let col = format!("topic{}", topic_idx.saturating_sub(1));
+        match self {
+            // Address: last 20 bytes = last 40 hex chars, keep 0x-text form
+            AbiType::Address => format!("'0x' || lower(substring({col} FROM 27))"),
+            AbiType::Uint(_) | AbiType::Int(_) => {
+                format!("abi_uint(decode(substring({col} FROM 3), 'hex'))")
+            }
+            AbiType::Bool => format!("abi_bool(decode(substring({col} FROM 3), 'hex'))"),
+            AbiType::Bytes(Some(_) | None) => col,
+            _ => col,
+        }
+    }
+
+    pub fn data_decode_sql_tiered(&self, offset: usize) -> String {
+        // data is '0x' + hex text; +3 skips the prefix (1-based), bytes are
+        // 2 hex chars each.
+        let hex_start = 3 + offset * 2;
+        match self {
+            AbiType::Address => {
+                format!(
+                    "'0x' || lower(substring(data FROM {} FOR 40))",
+                    hex_start + 24
+                )
+            }
+            AbiType::Uint(_) => {
+                format!("abi_uint(decode(substring(data FROM {hex_start} FOR 64), 'hex'))")
+            }
+            AbiType::Int(_) => {
+                format!("abi_int(decode(substring(data FROM {hex_start} FOR 64), 'hex'))")
+            }
+            AbiType::Bool => {
+                format!("abi_bool(decode(substring(data FROM {hex_start} FOR 64), 'hex'))")
+            }
+            AbiType::Bytes(Some(_) | None) => {
+                format!("'0x' || lower(substring(data FROM {hex_start} FOR 64))")
+            }
+            AbiType::String => {
+                format!("abi_string(decode(substring(data FROM 3), 'hex'), {offset})")
+            }
+            _ => format!("'0x' || lower(substring(data FROM {hex_start} FOR 64))"),
         }
     }
 }

@@ -14,9 +14,11 @@ name = "moderato"
 chain_id = 42431
 rpc_url = "https://rpc.testnet.tempo.xyz"
 rpc_auth_env = "TEMPO_RPC_AUTH_MODERATO"
-pg_url = "postgres://tidx:tidx@postgres:5432/tidx_moderato"
 backfill = true
 batch_size = 100
+
+[chains.postgres]
+url = "postgres://tidx:tidx@postgres:5432/tidx_moderato"
 
 # ClickHouse OLAP engine (optional)
 [chains.clickhouse]
@@ -28,9 +30,11 @@ name = "mainnet"
 chain_id = 4217
 rpc_url = "https://rpc.tempo.xyz"
 rpc_auth_env = "TEMPO_RPC_AUTH_MAINNET"
-pg_url = "postgres://tidx:tidx@postgres:5432/tidx_mainnet"
 backfill = true
 batch_size = 100
+
+[chains.postgres]
+url = "postgres://tidx:tidx@postgres:5432/tidx_mainnet"
 
 # ClickHouse OLAP engine (optional)
 [chains.clickhouse]

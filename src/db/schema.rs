@@ -64,14 +64,37 @@ pub async fn run_migrations(pool: &Pool) -> Result<()> {
     conn.batch_execute(include_str!("../../db/extensions.sql"))
         .await?;
 
+    drop(conn);
+
+    // Pre-create weekly partitions around now (partitioned installs only)
+    // so realtime writes never wait on partition DDL.
+    let now = chrono::Utc::now();
+    super::partitions::ensure_partitions_covering(
+        pool,
+        now - chrono::Duration::days(7),
+        now + chrono::Duration::days(35),
+    )
+    .await?;
+
     Ok(())
 }
 
 pub async fn run_post_startup_migrations(pool: &Pool) -> Result<()> {
-    let conn = pool.get().await?;
+    // CONCURRENTLY is not supported on partitioned tables; plain creation is
+    // fine there (runs in the background task, partitions indexed one by one).
+    let strip_concurrently = super::partitions::is_partitioned(pool).await?;
+    let adapt = |sql: &str| {
+        if strip_concurrently {
+            sql.replace("CONCURRENTLY ", "")
+        } else {
+            sql.to_string()
+        }
+    };
 
-    conn.batch_execute(VIRTUAL_FORWARD_INDEX_SQL).await?;
-    conn.batch_execute(VIRTUAL_FORWARD_TX_HASH_INDEX_SQL)
+    let conn = pool.get().await?;
+    conn.batch_execute(&adapt(VIRTUAL_FORWARD_INDEX_SQL))
+        .await?;
+    conn.batch_execute(&adapt(VIRTUAL_FORWARD_TX_HASH_INDEX_SQL))
         .await?;
 
     Ok(())

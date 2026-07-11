@@ -17,6 +17,7 @@ use tidx::config::{ChainConfig, Config, ConfigWatcher, NewChainEvent};
 use tidx::db::{self, ThrottledPool};
 use tidx::sync::ch_sink::ClickHouseSink;
 use tidx::sync::engine::SyncEngine;
+use tidx::sync::pruner::Pruner;
 use tidx::sync::sink::SinkSet;
 
 const CLICKHOUSE_BACKFILL_RETRY_MAX_SECS: u64 = 10;
@@ -367,6 +368,40 @@ fn spawn_sync_engine(
                                 }
                                 seed_metrics_from_clickhouse(&ch_sink).await;
                                 sinks = sinks.with_clickhouse(ch_sink);
+
+                                // Tiered storage: pg_clickhouse foreign tables
+                                // + tiered.* views over hot PG and the CH
+                                // archive. Requires retention (the boundary
+                                // maintenance) and the pg_clickhouse extension.
+                                if chain.retention.is_some() {
+                                    let fdw_url =
+                                        ch_config.fdw_url.as_deref().unwrap_or(&ch_config.url);
+                                    let target = db::tiered::FdwTarget::new(
+                                        fdw_url,
+                                        database.clone(),
+                                        ch_config.user.clone(),
+                                        ch_password.clone(),
+                                    );
+                                    let result = match target {
+                                        Ok(target) => {
+                                            db::tiered::bootstrap(
+                                                throttled_pool.inner(),
+                                                &target,
+                                                chain.chain_id,
+                                            )
+                                            .await
+                                        }
+                                        Err(e) => Err(e),
+                                    };
+                                    if let Err(e) = result {
+                                        warn!(
+                                            error = %e,
+                                            chain = %chain.name,
+                                            "Tiered storage bootstrap failed; engine=tiered unavailable \
+                                             (is the pg_clickhouse extension installed in PostgreSQL?)"
+                                        );
+                                    }
+                                }
                             }
                             Err(e) => {
                                 error!(
@@ -422,6 +457,26 @@ fn spawn_sync_engine(
                         .await;
                 }
             });
+        }
+
+        // Tiered-storage pruner: drops PG partitions outside the retention
+        // window once the ClickHouse archive durably holds their data.
+        if let Some(ref retention) = chain.retention {
+            match Pruner::new(sinks.clone(), chain.chain_id, retention) {
+                Ok(pruner) => {
+                    info!(
+                        chain = %chain.name,
+                        pg_keep = %retention.pg_keep,
+                        prune_interval = %retention.prune_interval,
+                        require_clickhouse = retention.require_clickhouse,
+                        "Retention pruner enabled"
+                    );
+                    tokio::spawn(pruner.run(shutdown_rx.resubscribe()));
+                }
+                Err(e) => {
+                    error!(error = %e, chain = %chain.name, "Invalid retention config; pruner disabled");
+                }
+            }
         }
 
         // Create sync engine with throttled pool and configured sinks (retry on transient RPC failures)

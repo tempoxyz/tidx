@@ -13,7 +13,8 @@ use tracing::{error, warn};
 
 use crate::config::ClickHouseConfig;
 use crate::query::{
-    HARD_LIMIT_MAX, apply_event_signature_ctes_clickhouse, validate_clickhouse_query,
+    HARD_LIMIT_MAX, apply_event_signature_ctes_clickhouse, convert_timestamp_literals_clickhouse,
+    validate_clickhouse_query,
 };
 
 const MAX_QUERY_RESULT_BYTES: usize = 10 * 1024 * 1024;
@@ -107,10 +108,26 @@ impl ClickHouseEngine {
         timeout_ms: u64,
         limit: i64,
     ) -> Result<QueryResult> {
+        self.query_user_with_settings(sql, signatures, timeout_ms, limit, &[])
+            .await
+    }
+
+    /// [`Self::query_user`] with extra ClickHouse settings appended to the
+    /// request URL (e.g. output formatting for the tiered cold arm). Keys and
+    /// values must be URL-safe tokens.
+    pub async fn query_user_with_settings(
+        &self,
+        sql: &str,
+        signatures: &[&str],
+        timeout_ms: u64,
+        limit: i64,
+        settings: &[(&str, &str)],
+    ) -> Result<QueryResult> {
         let sql = Self::prepare_query(sql, signatures)?;
         validate_clickhouse_query(&sql)?;
         let sql = Self::wrap_user_query_with_limit(&sql, limit.clamp(1, HARD_LIMIT_MAX));
-        self.execute_prepared_query(&sql, Some(timeout_ms)).await
+        self.execute_prepared_query_with_settings(&sql, Some(timeout_ms), settings)
+            .await
     }
 
     pub async fn query_with_timeout(
@@ -124,7 +141,8 @@ impl ClickHouseEngine {
     }
 
     fn prepare_query(sql: &str, signatures: &[&str]) -> Result<String> {
-        apply_event_signature_ctes_clickhouse(sql, signatures)
+        let sql = convert_timestamp_literals_clickhouse(sql);
+        apply_event_signature_ctes_clickhouse(&sql, signatures)
     }
 
     fn wrap_user_query_with_limit(sql: &str, limit: i64) -> String {
@@ -138,6 +156,16 @@ impl ClickHouseEngine {
         sql: &str,
         timeout_ms: Option<u64>,
     ) -> Result<QueryResult> {
+        self.execute_prepared_query_with_settings(sql, timeout_ms, &[])
+            .await
+    }
+
+    async fn execute_prepared_query_with_settings(
+        &self,
+        sql: &str,
+        timeout_ms: Option<u64>,
+        settings: &[(&str, &str)],
+    ) -> Result<QueryResult> {
         let start = std::time::Instant::now();
         let n = self.instances.len();
         let starting = self.active.load(Ordering::Relaxed);
@@ -146,7 +174,7 @@ impl ClickHouseEngine {
             let idx = (starting + attempt) % n;
             let inst = &self.instances[idx];
 
-            match self.try_query(inst, sql, start, timeout_ms).await {
+            match self.try_query(inst, sql, start, timeout_ms, settings).await {
                 Ok(result) => {
                     if attempt > 0 {
                         self.active.store(idx, Ordering::Relaxed);
@@ -174,19 +202,28 @@ impl ClickHouseEngine {
         Err(anyhow!("All ClickHouse instances unreachable"))
     }
 
-    fn query_url(&self, inst: &Instance, timeout_ms: Option<u64>) -> String {
-        let base = format!(
-            "{}/?database={}&default_format=JSON&max_result_bytes={}&result_overflow_mode=throw",
+    fn query_url(
+        &self,
+        inst: &Instance,
+        timeout_ms: Option<u64>,
+        settings: &[(&str, &str)],
+    ) -> String {
+        // union_default_mode: bare UNION behaves as UNION DISTINCT
+        // (PostgreSQL semantics); ClickHouse otherwise rejects it.
+        let mut url = format!(
+            "{}/?database={}&default_format=JSON&max_result_bytes={}&result_overflow_mode=throw&union_default_mode=DISTINCT",
             inst.url.trim_end_matches('/'),
             self.database,
             MAX_QUERY_RESULT_BYTES
         );
         if let Some(timeout_ms) = timeout_ms {
             let max_execution_time = timeout_ms.div_ceil(1000).max(1);
-            format!("{base}&max_execution_time={max_execution_time}")
-        } else {
-            base
+            url.push_str(&format!("&max_execution_time={max_execution_time}"));
         }
+        for (key, value) in settings {
+            url.push_str(&format!("&{key}={value}"));
+        }
+        url
     }
 
     async fn try_query(
@@ -195,8 +232,9 @@ impl ClickHouseEngine {
         sql: &str,
         start: std::time::Instant,
         timeout_ms: Option<u64>,
+        settings: &[(&str, &str)],
     ) -> Result<QueryResult> {
-        let url = self.query_url(inst, timeout_ms);
+        let url = self.query_url(inst, timeout_ms, settings);
 
         let request_timeout = timeout_ms.map(clickhouse_request_timeout);
         let mut req = inst.http_client.post(&url).body(sql.to_string());
@@ -230,6 +268,7 @@ impl ClickHouseEngine {
         if json_response.trim().is_empty() {
             return Ok(QueryResult {
                 columns: vec![],
+                column_types: vec![],
                 rows: vec![],
                 row_count: 0,
                 engine: Some("clickhouse".to_string()),
@@ -247,6 +286,19 @@ impl ClickHouseEngine {
             .map(|m| {
                 m.iter()
                     .filter_map(|col| col.get("name").and_then(|n| n.as_str()).map(String::from))
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        let column_types: Vec<String> = meta
+            .map(|m| {
+                m.iter()
+                    .map(|col| {
+                        col.get("type")
+                            .and_then(|t| t.as_str())
+                            .unwrap_or_default()
+                            .to_string()
+                    })
                     .collect()
             })
             .unwrap_or_default();
@@ -269,6 +321,7 @@ impl ClickHouseEngine {
 
         Ok(QueryResult {
             columns,
+            column_types,
             rows,
             row_count,
             engine: Some("clickhouse".to_string()),
@@ -321,7 +374,7 @@ async fn read_limited_response(mut resp: reqwest::Response) -> Result<String> {
 /// Returns true for errors that indicate the ClickHouse instance is unreachable
 /// (connection refused, timeout, DNS failure, etc.) — as opposed to query-level
 /// errors that would happen on any instance.
-fn is_connection_error(err: &anyhow::Error) -> bool {
+pub(crate) fn is_connection_error(err: &anyhow::Error) -> bool {
     let msg = err.to_string();
     msg.contains("HTTP request failed")
         || msg.contains("connection refused")
@@ -336,6 +389,8 @@ fn is_connection_error(err: &anyhow::Error) -> bool {
 #[derive(Debug, Clone)]
 pub struct QueryResult {
     pub columns: Vec<String>,
+    /// ClickHouse type per column (JSON `meta`), e.g. `Int64`, `Nullable(String)`.
+    pub column_types: Vec<String>,
     pub rows: Vec<Vec<serde_json::Value>>,
     pub row_count: usize,
     pub engine: Option<String>,
@@ -465,11 +520,11 @@ mod tests {
         };
 
         let engine = ClickHouseEngine::new(&config, 4217).unwrap();
-        let url = engine.query_url(&engine.instances[0], None);
+        let url = engine.query_url(&engine.instances[0], None, &[]);
 
         assert_eq!(
             url,
-            "http://clickhouse-1:8123/?database=tidx_4217&default_format=JSON&max_result_bytes=10485760&result_overflow_mode=throw"
+            "http://clickhouse-1:8123/?database=tidx_4217&default_format=JSON&max_result_bytes=10485760&result_overflow_mode=throw&union_default_mode=DISTINCT"
         );
         assert!(!url.contains("max_execution_time"));
     }
@@ -485,11 +540,11 @@ mod tests {
         };
 
         let engine = ClickHouseEngine::new(&config, 4217).unwrap();
-        let url = engine.query_url(&engine.instances[0], Some(1_001));
+        let url = engine.query_url(&engine.instances[0], Some(1_001), &[]);
 
         assert_eq!(
             url,
-            "http://clickhouse-1:8123/?database=tidx_4217&default_format=JSON&max_result_bytes=10485760&result_overflow_mode=throw&max_execution_time=2"
+            "http://clickhouse-1:8123/?database=tidx_4217&default_format=JSON&max_result_bytes=10485760&result_overflow_mode=throw&union_default_mode=DISTINCT&max_execution_time=2"
         );
     }
 
