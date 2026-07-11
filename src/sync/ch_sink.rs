@@ -14,7 +14,7 @@ use tracing::{debug, error, info, warn};
 
 use crate::clickhouse_schema::{
     BackfillPolicy, ClickHouseObject, ClickHouseObjectKind, base_objects, derived_backfills,
-    derived_objects, migrations, post_derived_migrations, reorg_tables,
+    derived_objects, migrations, post_derived_migrations, reorg_tables, retired_object_drops,
 };
 use crate::metrics;
 use crate::types::{BlockRow, LogRow, ReceiptRow, TxRow};
@@ -134,7 +134,8 @@ impl ClickHouseSink {
     /// 3. Reconcile derived views / materialized views: if a definition's
     ///    checksum has changed since the last `ensure_schema()`, drop and
     ///    recreate it so SELECT-body edits actually take effect.
-    /// 4. Backfill any detected gaps in derived tables.
+    /// 4. Remove retired objects, including anything recreated by older code.
+    /// 5. Backfill any detected gaps in derived tables.
     pub async fn ensure_schema(&self) -> Result<()> {
         self.ensure_schema_only().await?;
         self.repair_derived_backfill_gaps().await
@@ -185,7 +186,21 @@ impl ClickHouseSink {
             self.apply_migration(migration, &mut tracking).await?;
         }
 
+        self.ensure_retired_objects_absent().await?;
+
         info!(database = %self.database, "ClickHouse schema ready");
+        Ok(())
+    }
+
+    async fn ensure_retired_objects_absent(&self) -> Result<()> {
+        for ddl in retired_object_drops() {
+            self.client.query(ddl).execute().await.map_err(|e| {
+                anyhow!(
+                    "Failed to run retired ClickHouse cleanup `{}`: {e}",
+                    ddl.trim()
+                )
+            })?;
+        }
         Ok(())
     }
 
@@ -1232,8 +1247,8 @@ mod tests {
     #[test]
     fn test_bounded_backfill_sql_wraps_select_with_range() {
         let plan = DerivedBackfillPlan {
-            target: "address_txs",
-            select_sql: "SELECT block_num, tx_hash FROM txs\n",
+            target: "token_transfers",
+            select_sql: "SELECT block_num, tx_hash FROM logs\n",
             block_column: "block_num",
             from_block: 100,
             to_block_exclusive: 200,
@@ -1243,7 +1258,7 @@ mod tests {
 
         assert_eq!(
             bounded_backfill_sql(&plan),
-            "INSERT INTO address_txs SELECT DISTINCT * FROM (SELECT block_num, tx_hash FROM txs) WHERE block_num >= 100 AND block_num < 200"
+            "INSERT INTO token_transfers SELECT DISTINCT * FROM (SELECT block_num, tx_hash FROM logs) WHERE block_num >= 100 AND block_num < 200"
         );
     }
 
@@ -1251,16 +1266,16 @@ mod tests {
     fn test_derived_backfill_count_sql_uses_distinct_source_and_final_target() {
         assert_eq!(
             source_count_sql(
-                "SELECT block_num, tx_hash FROM txs\n",
+                "SELECT block_num, tx_hash FROM logs\n",
                 "block_num",
                 100,
                 200
             ),
-            "SELECT count() FROM (SELECT DISTINCT * FROM (SELECT block_num, tx_hash FROM txs) WHERE block_num >= 100 AND block_num < 200)"
+            "SELECT count() FROM (SELECT DISTINCT * FROM (SELECT block_num, tx_hash FROM logs) WHERE block_num >= 100 AND block_num < 200)"
         );
         assert_eq!(
-            target_count_sql("address_txs", "block_num", 100, 200),
-            "SELECT count() FROM address_txs FINAL WHERE block_num >= 100 AND block_num < 200"
+            target_count_sql("token_transfers", "block_num", 100, 200),
+            "SELECT count() FROM token_transfers FINAL WHERE block_num >= 100 AND block_num < 200"
         );
     }
 

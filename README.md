@@ -505,7 +505,7 @@ Three families of tables are queryable through `/query`:
 
 - **[Base Tables](#base-tables)** — raw chain data written by the sync engine, available in both PostgreSQL and ClickHouse.
 - **[Event Tables](#event-tables)** — virtual, decoded-at-query-time tables generated from `?signature=Event(...)`. Available in both engines.
-- **[Materialized Tables](#materialized-tables)** — precomputed, address- and token-keyed views maintained by ClickHouse on insert. Available only with `engine=clickhouse`. Includes built-ins (token transfers/balances/supply/approvals/metadata, address transfers/balances/txs, contract creations) plus any user-defined views registered through the [`/views` API](#views-api).
+- **[Materialized Tables](#materialized-tables)** — precomputed token, holder, and DEX analytics maintained by ClickHouse. Available only with `engine=clickhouse`, alongside user-defined views registered through the [`/views` API](#views-api).
 
 ### Base Tables
 
@@ -619,7 +619,7 @@ For Transfer logs specifically, [`token_transfers`](#token_transfers) is pre-dec
 > [!NOTE]
 > All tables in this section are ClickHouse-only. Query them with `engine=clickhouse`.
 
-ClickHouse maintains these on insert and prunes them on reorg. Token-keyed tables answer "for this token, …"; address-keyed tables answer "for this account, …". Both families read from the same underlying Transfer/tx/receipt streams — the duplication exists so that either filter resolves via a sort-key seek instead of a full scan.
+ClickHouse maintains insert-time derived tables and scheduled snapshots, pruning block-scoped rows on reorg. Token-first and holder-first balance data use separate sort keys for their inverse access patterns.
 
 On startup, tidx verifies built-in materialized tables after base ClickHouse backfill is caught up. It compares each table against its source SELECT in bounded block ranges, logs detected gaps, and replays only the missing ranges in chunks while realtime sync continues. Failed derived repairs are retried with backoff. Set `repair_derived_on_startup = false` under `[chains.clickhouse]` only if an operator needs to suppress historical repair work temporarily.
 
@@ -630,16 +630,11 @@ For self-hosted multi-replica ClickHouse (coordinated by Keeper/ZooKeeper), set 
 | [`address_balances`](#address_balances) | Current positive balance per `(holder, token)`. |
 | [`address_balances_snapshot`](#address_balances_snapshot) | Pre-aggregated `address_balances`, refreshed on a schedule. |
 | [`address_holder_deltas`](#address_holder_deltas) | Holder-first mirror of `token_holder_deltas`. |
-| [`address_transfers`](#address_transfers) | Transfer feed keyed by account; `'in'`/`'out'`. |
-| [`address_txs`](#address_txs) | Tx feed keyed by account; `'from'`/`'to'`. |
-| [`contract_creations`](#contract_creations) | One row per contract deployment. |
 | [`dex_fills`](#dex_fills) | Decoded stablecoin-DEX `OrderFilled` events. |
 | [`dex_ohlc_1m`](#dex_ohlc_1m) | 1-minute OHLC candles per pair, refreshed on a schedule. |
 | [`dex_orders`](#dex_orders) | Decoded stablecoin-DEX `OrderPlaced` events. |
 | [`dex_pair_liquidity`](#dex_pair_liquidity) | Pairs joined to their on-DEX base liquidity. |
 | [`dex_pairs`](#dex_pairs) | Decoded stablecoin-DEX `PairCreated` events. |
-| [`token_approvals`](#token_approvals) | Decoded `Approval` events. |
-| [`token_approvals_current`](#token_approvals_current) | Latest allowance per `(token, owner, spender)`. |
 | [`token_balances`](#token_balances) | Current positive balance per `(token, holder)`. |
 | [`token_balances_snapshot`](#token_balances_snapshot) | Pre-aggregated `token_balances`, refreshed on a schedule. |
 | [`token_holder_counts`](#token_holder_counts) | Holder count per token, refreshed on a schedule. |
@@ -716,92 +711,6 @@ Same deltas as `token_holder_deltas` but ordered `(holder, token, block_num, …
 | `leg` | `Int8` | `+1` for credit, `-1` for debit |
 | `balance_delta` | `Int256` | Signed delta applied to `(holder, token)` |
 
-#### address_transfers
-
-> [!NOTE]
-> Materialized view over `token_transfers`, kept in sync on reorg.
-
-Address-keyed Transfer feed. Each `Transfer` produces up to two rows (one per non-zero side): an `'in'` row for the recipient and an `'out'` row for the sender. `ReplacingMergeTree` ordered by `(address, block_num, log_idx, tx_hash, direction)` so per-address pagination is a sort-key seek instead of a full scan. Zero-address legs are dropped — mints show up only on the recipient's `'in'` side, burns only on the sender's `'out'` side.
-
-| Column | Type | Description |
-|--------|------|-------------|
-| `block_num` | `Int64` | Block number |
-| `block_timestamp` | `DateTime64(3, 'UTC')` | Block timestamp |
-| `tx_idx` | `Int32` | Transaction index |
-| `log_idx` | `Int32` | Log index |
-| `tx_hash` | `String` | Transaction hash |
-| `address` | `String` | The account this row is scoped to |
-| `direction` | `LowCardinality(String)` | `'in'` or `'out'` from `address`'s perspective |
-| `counterparty` | `String` | The other side of the transfer (may be `0x0`) |
-| `token` | `String` | Emitting token contract |
-| `amount` | `UInt256` | Transfer amount |
-
-```bash
-curl -G "https://indexer.testnet.tempo.xyz/query" \
-  --data-urlencode "chainId=42431" \
-  --data-urlencode "engine=clickhouse" \
-  --data-urlencode "sql=SELECT block_num, direction, counterparty, token, toString(amount) AS amount
-    FROM address_transfers
-    WHERE address = '0x70997970c51812dc3a010c7d01b50e0d17dc79c8'
-    ORDER BY block_num DESC, log_idx DESC
-    LIMIT 5"
-```
-
-#### address_txs
-
-> [!NOTE]
-> Materialized view over `txs`, kept in sync on reorg.
-
-Address-keyed transaction feed. Each tx produces one row per non-null side (sender always emits an `'from'` row; recipient emits a `'to'` row when `to` is non-null). `ReplacingMergeTree` ordered by `(address, block_num, tx_idx, direction)` so `/addresses/:address/transactions` and the `direction=from|to|both` filter resolve via a sort-key seek.
-
-| Column | Type | Description |
-|--------|------|-------------|
-| `block_num` | `Int64` | Block number |
-| `block_timestamp` | `DateTime64(3, 'UTC')` | Block timestamp |
-| `tx_idx` | `Int32` | Transaction index |
-| `tx_hash` | `String` | Transaction hash |
-| `address` | `String` | The account this row is scoped to |
-| `direction` | `LowCardinality(String)` | `'from'` (this address sent) or `'to'` (this address was the recipient) |
-| `counterparty` | `Nullable(String)` | The other side, NULL when the source tx had no `to` (contract deploy) |
-
-```bash
-curl -G "https://indexer.testnet.tempo.xyz/query" \
-  --data-urlencode "chainId=42431" \
-  --data-urlencode "engine=clickhouse" \
-  --data-urlencode "sql=SELECT block_num, direction, tx_hash, counterparty
-    FROM address_txs
-    WHERE address = '0x70997970c51812dc3a010c7d01b50e0d17dc79c8'
-      AND direction = 'from'
-    ORDER BY block_num DESC, tx_idx DESC
-    LIMIT 5"
-```
-
-#### contract_creations
-
-> [!NOTE]
-> Materialized view over `receipts`, kept in sync on reorg.
-
-One row per contract deployment, derived from receipts where `contract_address` is set. Ordered by `(creator, block_num, tx_idx)` so "what contracts did this address deploy?" is a sort-key seek.
-
-| Column | Type | Description |
-|--------|------|-------------|
-| `block_num` | `Int64` | Block number |
-| `block_timestamp` | `DateTime64(3, 'UTC')` | Block timestamp |
-| `tx_idx` | `Int32` | Transaction index |
-| `tx_hash` | `String` | Transaction hash |
-| `creator` | `String` | Deployer address (`receipts.from`) |
-| `contract` | `String` | Deployed contract address |
-
-```bash
-curl -G "https://indexer.testnet.tempo.xyz/query" \
-  --data-urlencode "chainId=42431" \
-  --data-urlencode "engine=clickhouse" \
-  --data-urlencode "sql=SELECT contract, block_num, tx_hash
-    FROM contract_creations
-    WHERE creator = '0x70997970c51812dc3a010c7d01b50e0d17dc79c8'
-    ORDER BY block_num DESC, tx_idx DESC
-    LIMIT 5"
-```
 
 #### dex_pairs
 
@@ -939,71 +848,6 @@ curl -G "https://indexer.testnet.tempo.xyz/query" \
     LIMIT 20"
 ```
 
-#### token_approvals
-
-> [!NOTE]
-> Materialized view over `logs`, kept in sync on reorg.
-
-One row per canonical `Approval(address,address,uint256)` log, decoded at insert time. `ReplacingMergeTree` keyed on `(token, block_num, log_idx, tx_hash)`. Stores raw approval events — to get the latest allowance per `(token, owner, spender)`, query with `ORDER BY block_num DESC, log_idx DESC LIMIT 1`.
-
-| Column | Type | Description |
-|--------|------|-------------|
-| `block_num` | `Int64` | Block number |
-| `block_timestamp` | `DateTime64(3, 'UTC')` | Block timestamp |
-| `tx_idx` | `Int32` | Transaction index |
-| `log_idx` | `Int32` | Log index |
-| `tx_hash` | `String` | Transaction hash |
-| `token` | `String` | Emitting token contract |
-| `owner` | `String` | Approving address (token holder) |
-| `spender` | `String` | Approved spender |
-| `amount` | `UInt256` | Allowance set on this event |
-
-```bash
-curl -G "https://indexer.testnet.tempo.xyz/query" \
-  --data-urlencode "chainId=42431" \
-  --data-urlencode "engine=clickhouse" \
-  --data-urlencode "sql=SELECT owner, spender, toString(amount) AS amount, block_num
-    FROM token_approvals
-    WHERE token = '0x20c000000000000000000000e65cb5a40b7885ae'
-    ORDER BY block_num DESC, log_idx DESC
-    LIMIT 3"
-```
-
-```json
-{"ok":true,"columns":["owner","spender","amount","block_num"],"rows":[
-  ["0x70997970c51812dc3a010c7d01b50e0d17dc79c8","0x3c44cdddb6a900fa2b585dd299e03d12fa4293bc","115792089237316195423570985008687907853269984665640564039457584007913129639935",1083],
-  ["0x70997970c51812dc3a010c7d01b50e0d17dc79c8","0x3c44cdddb6a900fa2b585dd299e03d12fa4293bc","0",1071],
-  ["0x3c44cdddb6a900fa2b585dd299e03d12fa4293bc","0x15d34aaf54267db7d7c367839aaf71a00a2c6a65","500",1042]
-]}
-```
-
-#### token_approvals_current
-
-> [!NOTE]
-> View over `token_approvals FINAL`, `argMax` per `(token, owner, spender)`.
-
-Current allowance per `(token, owner, spender)` — collapses `token_approvals` history down to the last set value, filtered to `amount > 0`. Cheap lookup for "what can `spender` move on behalf of `owner`?"
-
-| Column | Type | Description |
-|--------|------|-------------|
-| `token` | `String` | Token contract |
-| `owner` | `String` | Approving address |
-| `spender` | `String` | Approved spender |
-| `amount` | `UInt256` | Latest allowance for the pair |
-| `last_block_num` | `Int64` | Block of the latest `Approval` event |
-| `last_block_timestamp` | `DateTime64(3, 'UTC')` | Timestamp of that event |
-| `last_tx_hash` | `String` | Transaction hash of that event |
-
-```bash
-curl -G "https://indexer.testnet.tempo.xyz/query" \
-  --data-urlencode "chainId=42431" \
-  --data-urlencode "engine=clickhouse" \
-  --data-urlencode "sql=SELECT spender, toString(amount) AS amount, last_block_num
-    FROM token_approvals_current
-    WHERE token = '0x20c000000000000000000000e65cb5a40b7885ae'
-      AND owner = '0x70997970c51812dc3a010c7d01b50e0d17dc79c8'
-    ORDER BY amount DESC"
-```
 
 #### token_balances
 
