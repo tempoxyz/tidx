@@ -1,12 +1,7 @@
 mod address_balances;
-mod address_transfers;
-mod address_txs;
 mod base;
 mod catalog;
-mod contract_creations;
 mod dex;
-mod token_approvals;
-mod token_approvals_current;
 mod token_balances;
 mod token_metadata;
 mod token_supply;
@@ -23,6 +18,10 @@ pub fn migrations() -> &'static [ClickHouseObject] {
     base::MIGRATIONS
 }
 
+pub(crate) fn retired_object_drops() -> &'static [&'static str] {
+    base::RETIRED_OBJECT_DROPS
+}
+
 /// One-shot migrations applied after `derived_objects()`, since they mutate
 /// derived tables.
 pub fn post_derived_migrations() -> &'static [ClickHouseObject] {
@@ -37,14 +36,9 @@ pub fn derived_objects() -> impl DoubleEndedIterator<Item = &'static ClickHouseO
         .iter()
         .chain(token_balances::OBJECTS.iter())
         .chain(token_supply::OBJECTS.iter())
-        .chain(token_approvals::OBJECTS.iter())
-        .chain(token_approvals_current::OBJECTS.iter())
         .chain(token_metadata::OBJECTS.iter())
         .chain(token_transfer_stats::OBJECTS.iter())
-        .chain(address_transfers::OBJECTS.iter())
         .chain(address_balances::OBJECTS.iter())
-        .chain(address_txs::OBJECTS.iter())
-        .chain(contract_creations::OBJECTS.iter())
         .chain(dex::OBJECTS.iter())
 }
 
@@ -114,10 +108,7 @@ mod tests {
     #[test]
     fn aggregate_objects_are_registered_for_public_query() {
         assert!(is_public_query_table("token_supply"));
-        assert!(is_public_query_table("token_approvals"));
-        assert_eq!(block_column("token_approvals"), Some("block_num"));
         assert!(is_public_query_table("token_transfer_stats"));
-        assert!(is_public_query_table("token_approvals_current"));
         assert!(is_public_query_table("token_metadata"));
         // Per-token holder counts, refreshed on a schedule — public so Cadent
         // reads one summed row per token instead of counting snapshot rows.
@@ -126,16 +117,10 @@ mod tests {
 
     #[test]
     fn address_keyed_objects_are_registered_for_public_query() {
-        assert!(is_public_query_table("address_transfers"));
-        assert_eq!(block_column("address_transfers"), Some("block_num"));
         assert!(is_public_query_table("address_holder_deltas"));
         assert_eq!(block_column("address_holder_deltas"), Some("block_num"));
         assert!(is_public_query_table("address_balances"));
         assert!(is_public_query_table("address_balances_snapshot"));
-        assert!(is_public_query_table("address_txs"));
-        assert_eq!(block_column("address_txs"), Some("block_num"));
-        assert!(is_public_query_table("contract_creations"));
-        assert_eq!(block_column("contract_creations"), Some("block_num"));
     }
 
     #[test]
@@ -159,11 +144,7 @@ mod tests {
         for mv in [
             "token_transfers_mv",
             "token_holder_deltas_mv",
-            "token_approvals_mv",
-            "address_transfers_mv",
             "address_holder_deltas_mv",
-            "address_txs_mv",
-            "contract_creations_mv",
             "dex_pairs_mv",
             "dex_orders_mv",
             "dex_fills_mv",
@@ -184,28 +165,57 @@ mod tests {
         };
         // Derived tables that read from token_transfers must be pruned first.
         let logs = position("logs");
-        let txs = position("txs");
-        let receipts = position("receipts");
         let token_transfers = position("token_transfers");
         let token_holder_deltas = position("token_holder_deltas");
-        let token_approvals = position("token_approvals");
-        let address_transfers = position("address_transfers");
         let address_holder_deltas = position("address_holder_deltas");
-        let address_txs = position("address_txs");
-        let contract_creations = position("contract_creations");
 
         // token_transfers consumers prune before it
         assert!(token_holder_deltas < token_transfers);
-        assert!(address_transfers < token_transfers);
         assert!(address_holder_deltas < token_transfers);
 
-        // token_transfers and token_approvals prune before their source `logs`
+        // token_transfers prunes before its source `logs`.
         assert!(token_transfers < logs);
-        assert!(token_approvals < logs);
+    }
 
-        // Address-keyed tx feed prunes before `txs`; contract_creations before `receipts`.
-        assert!(address_txs < txs);
-        assert!(contract_creations < receipts);
+    #[test]
+    fn removed_objects_are_not_registered() {
+        for name in [
+            "address_transfers",
+            "address_transfers_mv",
+            "address_txs",
+            "address_txs_mv",
+            "contract_creations",
+            "contract_creations_mv",
+            "token_approvals",
+            "token_approvals_current",
+            "token_approvals_mv",
+        ] {
+            assert!(!is_known_table(name), "{name} should be removed");
+            assert!(!is_public_query_table(name), "{name} should not be public");
+        }
+    }
+
+    #[test]
+    fn retired_objects_drop_dependents_first() {
+        let drops: Vec<_> = retired_object_drops()
+            .iter()
+            .map(|ddl| ddl.trim())
+            .collect();
+
+        assert_eq!(
+            drops,
+            [
+                "DROP VIEW IF EXISTS token_approvals_current SYNC",
+                "DROP VIEW IF EXISTS token_approvals_mv SYNC",
+                "DROP TABLE IF EXISTS token_approvals SYNC",
+                "DROP VIEW IF EXISTS address_transfers_mv SYNC",
+                "DROP TABLE IF EXISTS address_transfers SYNC",
+                "DROP VIEW IF EXISTS address_txs_mv SYNC",
+                "DROP TABLE IF EXISTS address_txs SYNC",
+                "DROP VIEW IF EXISTS contract_creations_mv SYNC",
+                "DROP TABLE IF EXISTS contract_creations SYNC",
+            ]
+        );
     }
 
     #[test]

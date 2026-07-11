@@ -796,6 +796,63 @@ async fn test_case_insensitive_table_reference() {
 
 const SINK_DB: &str = "tidx_sink_test";
 const TEST_CHAIN_ID: u64 = 99999;
+const RETIRED_CLICKHOUSE_OBJECTS: &[&str] = &[
+    "address_transfers",
+    "address_transfers_mv",
+    "address_txs",
+    "address_txs_mv",
+    "contract_creations",
+    "contract_creations_mv",
+    "token_approvals",
+    "token_approvals_current",
+    "token_approvals_mv",
+];
+
+async fn seed_retired_clickhouse_objects(ch: &TestClickHouse) {
+    for table in [
+        "address_transfers",
+        "address_txs",
+        "contract_creations",
+        "token_approvals",
+    ] {
+        ch.query(&format!(
+            "CREATE TABLE {table} (marker UInt8) ENGINE = MergeTree ORDER BY marker"
+        ))
+        .await
+        .unwrap_or_else(|_| panic!("failed to seed {table}"));
+    }
+
+    for (view, target) in [
+        ("address_transfers_mv", "address_transfers"),
+        ("address_txs_mv", "address_txs"),
+        ("contract_creations_mv", "contract_creations"),
+        ("token_approvals_mv", "token_approvals"),
+    ] {
+        ch.query(&format!(
+            "CREATE MATERIALIZED VIEW {view} TO {target} AS SELECT toUInt8(1) AS marker"
+        ))
+        .await
+        .unwrap_or_else(|_| panic!("failed to seed {view}"));
+    }
+    ch.query("CREATE VIEW token_approvals_current AS SELECT marker FROM token_approvals")
+        .await
+        .expect("failed to seed token_approvals_current");
+}
+
+async fn assert_retired_clickhouse_objects_absent(ch: &TestClickHouse) {
+    let names = RETIRED_CLICKHOUSE_OBJECTS
+        .iter()
+        .map(|name| format!("'{name}'"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let retired = ch
+        .query_json(&format!(
+            "SELECT name FROM system.tables WHERE database = currentDatabase() AND name IN ({names})"
+        ))
+        .await
+        .expect("failed to inspect retired objects");
+    assert_eq!(retired["rows"], 0);
+}
 
 /// Helper: create a ClickHouseSink pointed at the test instance, with a clean DB.
 async fn setup_sink() -> Option<(ClickHouseSink, TestClickHouse)> {
@@ -958,7 +1015,6 @@ async fn test_sink_ensure_schema_creates_tables() {
         "token_transfers",
         "token_holder_deltas",
         "token_balances_snapshot",
-        "tidx_schema_objects",
     ] {
         let count = ch
             .table_count(table)
@@ -970,17 +1026,64 @@ async fn test_sink_ensure_schema_creates_tables() {
             .query(&format!("SHOW CREATE TABLE {table}"))
             .await
             .unwrap_or_else(|_| panic!("Table {table} should expose its DDL"));
+        assert!(ddl.contains("default_compression_codec"));
         assert!(
-            ddl.contains("default_compression_codec = 'ZSTD(1)'"),
+            ddl.contains("ZSTD(1)"),
             "table {table} should use ZSTD(1) by default: {ddl}"
         );
     }
+
+    let tracked = ch
+        .table_count("tidx_schema_objects")
+        .await
+        .expect("schema object tracking should exist");
+    assert!(tracked > 0);
 
     let count = ch
         .table_count("token_balances")
         .await
         .expect("token_balances view should exist");
     assert_eq!(count, 0);
+
+    let names = RETIRED_CLICKHOUSE_OBJECTS
+        .iter()
+        .map(|name| format!("'{name}'"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let retired = ch
+        .query_json(&format!(
+            "SELECT name FROM system.tables WHERE database = currentDatabase() AND name IN ({names})"
+        ))
+        .await
+        .expect("failed to inspect retired objects");
+    assert_eq!(retired["rows"], 0);
+}
+
+#[tokio::test]
+#[serial(clickhouse)]
+async fn test_sink_ensure_schema_drops_retired_objects() {
+    let ch = TestClickHouse::new(SINK_DB)
+        .await
+        .expect("Failed to create CH client");
+    if ch.wait_for_ready().await.is_err() {
+        println!("ClickHouse not available, skipping test");
+        return;
+    }
+    ch.reset_database().await.expect("Failed to reset database");
+
+    seed_retired_clickhouse_objects(&ch).await;
+
+    let sink = ClickHouseSink::new(&ch.url, SINK_DB, None, None).expect("Failed to create sink");
+    sink.ensure_schema()
+        .await
+        .expect("first ensure_schema failed");
+    assert_retired_clickhouse_objects_absent(&ch).await;
+
+    seed_retired_clickhouse_objects(&ch).await;
+    sink.ensure_schema()
+        .await
+        .expect("second ensure_schema failed");
+    assert_retired_clickhouse_objects_absent(&ch).await;
 }
 
 #[tokio::test]

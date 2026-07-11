@@ -80,6 +80,37 @@ const REFRESH_ADDRESS_BALANCES_SNAPSHOT_20260704: &str =
     include_str!("../../db/clickhouse/migrations/20260704_refresh_address_balances_snapshot.sql");
 const WAIT_ADDRESS_BALANCES_SNAPSHOT_20260704: &str =
     include_str!("../../db/clickhouse/migrations/20260704_wait_address_balances_snapshot.sql");
+const DROP_TOKEN_APPROVALS_CURRENT_20260711: &str =
+    include_str!("../../db/clickhouse/migrations/20260711_drop_token_approvals_current.sql");
+const DROP_TOKEN_APPROVALS_MV_20260711: &str =
+    include_str!("../../db/clickhouse/migrations/20260711_drop_token_approvals_mv.sql");
+const DROP_TOKEN_APPROVALS_20260711: &str =
+    include_str!("../../db/clickhouse/migrations/20260711_drop_token_approvals.sql");
+const DROP_ADDRESS_TRANSFERS_MV_20260711: &str =
+    include_str!("../../db/clickhouse/migrations/20260711_drop_address_transfers_mv.sql");
+const DROP_ADDRESS_TRANSFERS_20260711: &str =
+    include_str!("../../db/clickhouse/migrations/20260711_drop_address_transfers.sql");
+const DROP_ADDRESS_TXS_MV_20260711: &str =
+    include_str!("../../db/clickhouse/migrations/20260711_drop_address_txs_mv.sql");
+const DROP_ADDRESS_TXS_20260711: &str =
+    include_str!("../../db/clickhouse/migrations/20260711_drop_address_txs.sql");
+const DROP_CONTRACT_CREATIONS_MV_20260711: &str =
+    include_str!("../../db/clickhouse/migrations/20260711_drop_contract_creations_mv.sql");
+const DROP_CONTRACT_CREATIONS_20260711: &str =
+    include_str!("../../db/clickhouse/migrations/20260711_drop_contract_creations.sql");
+
+/// Idempotent cleanup for objects removed from the managed catalog.
+pub(super) const RETIRED_OBJECT_DROPS: &[&str] = &[
+    DROP_TOKEN_APPROVALS_CURRENT_20260711,
+    DROP_TOKEN_APPROVALS_MV_20260711,
+    DROP_TOKEN_APPROVALS_20260711,
+    DROP_ADDRESS_TRANSFERS_MV_20260711,
+    DROP_ADDRESS_TRANSFERS_20260711,
+    DROP_ADDRESS_TXS_MV_20260711,
+    DROP_ADDRESS_TXS_20260711,
+    DROP_CONTRACT_CREATIONS_MV_20260711,
+    DROP_CONTRACT_CREATIONS_20260711,
+];
 
 pub const TABLES: &[ClickHouseObject] = &[
     ClickHouseObject {
