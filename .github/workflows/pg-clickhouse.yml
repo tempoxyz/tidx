@@ -1,10 +1,10 @@
-name: Publish pg_clickhouse
+name: Publish pg_clickhouse for CloudNativePG
 
-# Builds ClickHouse/pg_clickhouse at a pinned commit and publishes it as
-# ghcr.io/tempoxyz/pg_clickhouse. Upstream only publishes images on release
-# tags, and the fix for LATERAL / correlated-subquery crashes over foreign
-# tables (ClickHouse/pg_clickhouse#296) is only on main (unreleased 0.4).
-# Drop this workflow once upstream releases 0.4.
+# Adds ClickHouse/pg_clickhouse to the CloudNativePG PostgreSQL 18.3 minimal
+# Trixie operand image and publishes the result as ghcr.io/tempoxyz/pg_clickhouse.
+# The extension is pinned because the fix for LATERAL / correlated-subquery
+# crashes over foreign tables (ClickHouse/pg_clickhouse#296) is only on main
+# (unreleased 0.4).
 
 on:
   workflow_dispatch:
@@ -14,18 +14,16 @@ on:
         required: true
         default: '02505c48130e3fd7d13bf4ffb2de6bfeca76a84b'
         type: string
-      pg_major:
-        description: 'PostgreSQL major version'
-        required: true
-        default: '16'
-        type: string
   push:
     paths:
       - '.github/workflows/pg-clickhouse.yml'
+      - 'docker/pg-clickhouse/**'
 
 env:
+  CNPG_BASE: ghcr.io/cloudnative-pg/postgresql:18.3-minimal-trixie
   UPSTREAM_REF: ${{ inputs.ref || '02505c48130e3fd7d13bf4ffb2de6bfeca76a84b' }}
-  PG_MAJOR: ${{ inputs.pg_major || '16' }}
+  PG_MAJOR: '18'
+  PG_VERSION: '18.3'
 
 jobs:
   docker:
@@ -36,11 +34,15 @@ jobs:
       packages: write
 
     steps:
+      - name: Checkout tidx
+        uses: actions/checkout@v4
+
       - name: Checkout ClickHouse/pg_clickhouse
         uses: actions/checkout@v4
         with:
           repository: ClickHouse/pg_clickhouse
           ref: ${{ env.UPSTREAM_REF }}
+          path: docker/pg-clickhouse/src
           submodules: recursive
 
       - name: Compute tags
@@ -48,7 +50,7 @@ jobs:
         run: |
           short_sha=$(printf '%s' "$UPSTREAM_REF" | cut -c1-7)
           image=ghcr.io/${{ github.repository_owner }}/pg_clickhouse
-          echo "tags=${image}:${PG_MAJOR}-${short_sha},${image}:${PG_MAJOR}" >> "$GITHUB_OUTPUT"
+          echo "tags=${image}:${PG_VERSION}-minimal-trixie-${short_sha},${image}:${PG_VERSION}-minimal-trixie" >> "$GITHUB_OUTPUT"
 
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v3
@@ -66,15 +68,18 @@ jobs:
       - name: Build and push
         uses: docker/build-push-action@v6
         with:
-          context: .
+          context: docker/pg-clickhouse
+          file: docker/pg-clickhouse/Dockerfile
           platforms: linux/amd64,linux/arm64
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           build-args: |
+            CNPG_BASE=${{ env.CNPG_BASE }}
             PG_MAJOR=${{ env.PG_MAJOR }}
           labels: |
             org.opencontainers.image.source=https://github.com/${{ github.repository }}
-            org.opencontainers.image.description=pg_clickhouse (PostgreSQL ${{ env.PG_MAJOR }}) built from ClickHouse/pg_clickhouse@${{ env.UPSTREAM_REF }}
+            org.opencontainers.image.base.name=${{ env.CNPG_BASE }}
+            org.opencontainers.image.description=CloudNativePG PostgreSQL ${{ env.PG_VERSION }} minimal Trixie with pg_clickhouse built from ClickHouse/pg_clickhouse@${{ env.UPSTREAM_REF }}
             org.opencontainers.image.revision=${{ env.UPSTREAM_REF }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
