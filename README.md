@@ -17,18 +17,21 @@
 
 ---
 
-**tidx** indexes [Tempo](https://tempo.xyz) chain data into a hybrid PostgreSQL + ClickHouse architecture for fast point lookups (OLTP) and lightning-fast analytics (OLAP). 
+**tidx** is [Tempo](https://tempo.xyz)'s chain indexer. It ingests blocks, transactions, and logs from a Tempo node, then makes them queryable through SQL, an HTTP API, and a CLI. Its hybrid PostgreSQL and ClickHouse architecture supports fast point lookups (OLTP) and large analytical queries (OLAP).
+
+Use tidx when you need structured Tempo chain data without building an indexing pipeline from scratch. Common use cases include analytics dashboards, block explorers, wallet balance lookups, token analytics, and DEX activity tracking.
 
 ## Features
 
-- **Tiered Storage** — hot window in PostgreSQL (OLTP), full archive in ClickHouse (OLAP), queried as one
-- **Event/Function Decoding** — Query decoded events or function calldata by ABI signature (no pre-registration)
-- **HTTP API + CLI** — Query data via REST, SQL, or command line
+- **Tiered Storage:** hot window in PostgreSQL (OLTP), full archive in ClickHouse (OLAP), queried as one
+- **Event/Function Decoding:** Query decoded events or function calldata by ABI signature (no pre-registration)
+- **HTTP API + CLI:** Query data via REST, SQL, or command line
 
 ## Table of Contents
 
 - [Quickstart](#quickstart)
 - [Overview](#overview)
+- [Learn more](#learn-more)
 - [Installation](#installation)
 - [Configuration](#configuration)
 - [CLI](#cli)
@@ -45,6 +48,8 @@ curl -L https://tidx.vercel.app/docker | bash
 ```
 
 ## Overview
+
+Tidx sits between a Tempo node and applications that need structured chain data. The Tempo block explorer in `tempo-apps` is a downstream example of an application that uses the same kind of indexed chain data. The same architecture can support explorers, analytics dashboards, and data services for other applications built on Tempo.
 
 The sync engine writes to both PostgreSQL and ClickHouse in parallel. With `[chains.retention]` enabled, PostgreSQL keeps only a hot window of recent blocks (e.g. `pg_keep = "30d"`) and prunes the rest once it is durable in ClickHouse, which holds the full archive. Without retention, both stores hold full history. Queries route across the tiers via the `engine` and `source` parameters:
 
@@ -81,16 +86,16 @@ The sync engine writes to both PostgreSQL and ClickHouse in parallel. With `[cha
                                      └───────────────┘
 ```
 
-`†` — sampled from Tempo mainnet (chain `4217`): full archive ≈ 29.3M blocks, 30d hot window ≈ 5.8M blocks.
+`†`: sampled from Tempo mainnet (chain `4217`): full archive ≈ 29.3M blocks, 30d hot window ≈ 5.8M blocks.
 
 | `engine` | `source` | Route |
 |----------|----------|-------|
-| `postgres`* | `postgres-clickhouse`* | **Tiered** — hot reads on PostgreSQL, cold/analytical reads on native ClickHouse; provably-safe shapes split at the prune boundary, everything else falls back to `pg_clickhouse` (FDW) |
+| `postgres`* | `postgres-clickhouse`* | **Tiered:** hot reads on PostgreSQL, cold/analytical reads on native ClickHouse; provably-safe shapes split at the prune boundary, everything else falls back to `pg_clickhouse` (FDW) |
 | `postgres`* | `postgres` | Plain PostgreSQL (hot window only when retention is enabled) |
 | `postgres`* | `clickhouse` | PostgreSQL planner over the full ClickHouse archive via `pg_clickhouse` foreign tables |
 | `clickhouse` | `clickhouse`* | Native ClickHouse (full archive + materialized views) |
 
-`*` — default when omitted. `engine=tiered` is accepted as a legacy alias for `engine=postgres&source=postgres-clickhouse`.
+`*`: default when omitted. `engine=tiered` is accepted as a legacy alias for `engine=postgres&source=postgres-clickhouse`.
 
 > [!NOTE]
 > FDW routes require a `pg_clickhouse` build with [ClickHouse/pg_clickhouse#296](https://github.com/ClickHouse/pg_clickhouse/pull/296) (unreleased 0.4): 0.3.2 crashes PostgreSQL on LATERAL / correlated subqueries over foreign tables. `ghcr.io/tempoxyz/pg_clickhouse:16-02505c4` ships a pinned build (see `.github/workflows/pg-clickhouse.yml`). Aggregates pushed to ClickHouse (e.g. `avg`) compute in Float64 and can differ from PostgreSQL `numeric` in the last decimal.
@@ -119,6 +124,12 @@ curl "https://indexer.tempo.xyz/query \
   &engine=clickhouse \
   &sql=SELECT * FROM top_holders WHERE token = '0x...' LIMIT 10"
 ```
+
+## Learn more
+
+- [Tempo developer documentation](https://tempo.xyz/developers/docs): guides for building on Tempo
+- [tempoxyz/tempo](https://github.com/tempoxyz/tempo): Tempo node and protocol implementation
+- [tempoxyz/tempo-apps](https://github.com/tempoxyz/tempo-apps): Tempo applications, including the block explorer
 
 ## Installation
 
@@ -503,9 +514,9 @@ curl "https://indexer.testnet.tempo.xyz/query?chainId=42431&engine=clickhouse&sq
 
 Three families of tables are queryable through `/query`:
 
-- **[Base Tables](#base-tables)** — raw chain data written by the sync engine, available in both PostgreSQL and ClickHouse.
-- **[Event Tables](#event-tables)** — virtual, decoded-at-query-time tables generated from `?signature=Event(...)`. Available in both engines.
-- **[Materialized Tables](#materialized-tables)** — precomputed token, holder, and DEX analytics maintained by ClickHouse. Available only with `engine=clickhouse`, alongside user-defined views registered through the [`/views` API](#views-api).
+- **[Base Tables](#base-tables):** raw chain data written by the sync engine, available in both PostgreSQL and ClickHouse.
+- **[Event Tables](#event-tables):** virtual, decoded-at-query-time tables generated from `?signature=Event(...)`. Available in both engines.
+- **[Materialized Tables](#materialized-tables):** precomputed token, holder, and DEX analytics maintained by ClickHouse. Available only with `engine=clickhouse`, alongside user-defined views registered through the [`/views` API](#views-api).
 
 ### Base Tables
 
@@ -623,7 +634,7 @@ ClickHouse maintains insert-time derived tables and scheduled snapshots, pruning
 
 On startup, tidx verifies built-in materialized tables after base ClickHouse backfill is caught up. It compares each table against its source SELECT in bounded block ranges, logs detected gaps, and replays only the missing ranges in chunks while realtime sync continues. Failed derived repairs are retried with backoff. Set `repair_derived_on_startup = false` under `[chains.clickhouse]` only if an operator needs to suppress historical repair work temporarily.
 
-For self-hosted multi-replica ClickHouse (coordinated by Keeper/ZooKeeper), set `replicated_database = true` under `[chains.clickhouse]`. The sink then creates the database with `ENGINE = Replicated` and rewrites MergeTree-family table engines to their `Replicated*` counterparts, so both DDL and data reach every replica. Leave it off for ClickHouse Cloud (replication is implicit) and single-node instances. The flag only affects newly created objects — point it at a fresh database when enabling replication for an existing chain.
+For self-hosted multi-replica ClickHouse (coordinated by Keeper/ZooKeeper), set `replicated_database = true` under `[chains.clickhouse]`. The sink then creates the database with `ENGINE = Replicated` and rewrites MergeTree-family table engines to their `Replicated*` counterparts, so both DDL and data reach every replica. Leave it off for ClickHouse Cloud (replication is implicit) and single-node instances. The flag only affects newly created objects. Point it at a fresh database when enabling replication for an existing chain.
 
 | Name | Purpose |
 |------|---------|
@@ -651,7 +662,7 @@ User-defined views registered through the [`/views` API](#views-api) live alongs
 > [!NOTE]
 > View over `address_holder_deltas FINAL`, grouped by `(holder, token)`.
 
-Current positive balances grouped by holder first — answers "what does this address hold?" in one sort-key range. `token_balances` answers the inverse "who holds this token?" — same underlying transfer events, two different sort orders.
+Current positive balances grouped by holder first answer "what does this address hold?" in one sort-key range. `token_balances` answers the inverse, "who holds this token?" Both use the same underlying transfer events with different sort orders.
 
 | Column | Type | Description |
 |--------|------|-------------|
@@ -760,7 +771,7 @@ Decoded `OrderPlaced(uint128 indexed orderId, address indexed maker, address ind
 > [!NOTE]
 > Materialized view over `logs`, kept in sync on reorg.
 
-Decoded `OrderFilled(uint128 indexed orderId, address indexed maker, address indexed taker, uint128 amountFilled, bool partialFill)` events. The pair (`token`/`isBid`/`tick`) is not on this event — join `orderId` to [`dex_orders`](#dex_orders). `ReplacingMergeTree` ordered by `(orderId, block_num, log_idx)` so the join probes by sort key, with bloom indexes on `maker`/`taker`/`tx_hash`.
+Decoded `OrderFilled(uint128 indexed orderId, address indexed maker, address indexed taker, uint128 amountFilled, bool partialFill)` events. The pair (`token`/`isBid`/`tick`) is not on this event. Join `orderId` to [`dex_orders`](#dex_orders). `ReplacingMergeTree` ordered by `(orderId, block_num, log_idx)` so the join probes by sort key, with bloom indexes on `maker`/`taker`/`tx_hash`.
 
 | Column | Type | Description |
 |--------|------|-------------|
@@ -795,7 +806,7 @@ curl -G "https://indexer.testnet.tempo.xyz/query" \
 
 1-minute OHLC (candlestick) buckets per trading pair, stored in a `MergeTree` ordered by `(token, bucket)`. Replaces scanning up to ~1000 raw fills and bucketing in memory on every chart request: a read becomes a primary-key range scan over candles, and long windows are no longer truncated. Coarser intervals (5m, 1h, …) re-bucket these 1m candles client-side (`high = max(high)`, `low = min(low)`, `open` = first bucket's open, `close` = last bucket's close, volumes summed); historical ranges beyond the retention window fall back to scanning `dex_fills`.
 
-Refreshable (full recompute + atomic swap) because candles are keyed by `(token, bucket)` with no `block_num`, so an incremental aggregate couldn't be reorg-pruned — same reasoning as `token_balances_snapshot`. Price math mirrors the API: `priceScale = 100000`, rate = `(priceScale + tick) / priceScale` for bids and its inverse for asks. Tune `REFRESH EVERY` and the retention window to fill volume.
+Refreshable (full recompute + atomic swap) because candles are keyed by `(token, bucket)` with no `block_num`, so an incremental aggregate couldn't be reorg-pruned. This uses the same reasoning as `token_balances_snapshot`. Price math mirrors the API: `priceScale = 100000`, rate = `(priceScale + tick) / priceScale` for bids and its inverse for asks. Tune `REFRESH EVERY` and the retention window to fill volume.
 
 | Column | Type | Description |
 |--------|------|-------------|
@@ -1144,7 +1155,7 @@ Gap sync finds discontinuities via SQL and adds the gap from genesis to the firs
 ### Prerequisites
 
 - [Rust 1.75+](https://rustup.rs/)
-- [Docker](https://docs.docker.com/get-docker/)
+- [Docker](https://docs.docker.com/get-started/get-docker/)
 - [PostgreSQL](https://www.postgresql.org/download/)
 - [ClickHouse 25.4+](https://clickhouse.com/docs/install) when ClickHouse OLAP is enabled
 
@@ -1170,4 +1181,4 @@ make clean             Stop services and clean
 
 ## Acknowledgments
 
-- [golden-axe](https://github.com/indexsupply/golden-axe) — Inspiration for everything.
+- [golden-axe](https://github.com/indexsupply/golden-axe): Inspiration for everything.
