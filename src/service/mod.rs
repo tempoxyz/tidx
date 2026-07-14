@@ -25,14 +25,6 @@ pub struct SyncStatus {
     pub gaps: Vec<(i64, i64)>,
     pub backfill_num: Option<i64>,
     pub backfill_remaining: i64,
-    /// Lowest block in the contiguous ClickHouse archive interval.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub archive_backfill_num: Option<i64>,
-    /// Highest block in the contiguous ClickHouse archive interval.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub archive_tip_num: Option<i64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub archive_backfill_remaining: Option<i64>,
     pub sync_rate: Option<f64>,
     pub eta_secs: Option<f64>,
     pub updated_at: DateTime<Utc>,
@@ -70,7 +62,7 @@ pub async fn get_all_status(pool: &Pool) -> Result<Vec<SyncStatus>> {
 
     let rows = conn
         .query(
-            "SELECT chain_id, head_num, synced_num, tip_num, backfill_num, started_at, updated_at, pruned_below, archive_tip_num, archive_backfill_num FROM sync_state ORDER BY chain_id",
+            "SELECT chain_id, head_num, synced_num, tip_num, backfill_num, started_at, updated_at, pruned_below FROM sync_state ORDER BY chain_id",
             &[],
         )
         .await?;
@@ -83,8 +75,6 @@ pub async fn get_all_status(pool: &Pool) -> Result<Vec<SyncStatus>> {
             let backfill_num: Option<i64> = row.get(4);
             let started_at: Option<DateTime<Utc>> = row.get(5);
             let pruned_below: i64 = row.get(7);
-            let archive_tip_num: i64 = row.get(8);
-            let archive_backfill_num: Option<i64> = row.get(9);
 
             // Blocks at or below the prune floor were intentionally dropped.
             let backfill_remaining = match backfill_num {
@@ -136,9 +126,6 @@ pub async fn get_all_status(pool: &Pool) -> Result<Vec<SyncStatus>> {
                 gaps,
                 backfill_num,
                 backfill_remaining,
-                archive_backfill_num,
-                archive_tip_num: archive_backfill_num.map(|_| archive_tip_num),
-                archive_backfill_remaining: archive_backfill_num.map(|n| n.saturating_sub(1)),
                 sync_rate,
                 eta_secs,
                 updated_at: row.get(6),
@@ -227,9 +214,9 @@ const TIERED_COLD_CH_SETTINGS: &[(&str, &str)] = &[
 ///
 /// - `Int64`/`UInt64`: quoted string → JSON number (PG int8 is a number);
 /// - `DateTime*`: ISO string → chrono RFC 3339 (PG timestamptz formatting);
-/// - `(U)Int128`/`(U)Int256`: PG NUMERIC parity — decimal string when the
-///   value fits [`rust_decimal::Decimal`], else NULL (PG's formatter nulls
-///   values past Decimal's 96-bit mantissa, see [`try_format_column_json`]);
+/// - `(U)Int128`/`(U)Int256`: PG NUMERIC parity — kept as the exact decimal
+///   string ClickHouse returns, matching the full-precision PostgreSQL NUMERIC
+///   path (see [`try_format_column_json`]);
 /// - `selector_null_cols` (projection indexes): '' → NULL, undoing the
 ///   ClickHouse sink's empty-string encoding of PG NULL selectors.
 fn normalize_cold_result(
@@ -280,10 +267,11 @@ fn normalize_cold_result(
                     }
                 }
                 Kind::BigNum => {
-                    *cell = match s.parse::<rust_decimal::Decimal>() {
-                        Ok(v) => serde_json::Value::String(v.to_string()),
-                        Err(_) => serde_json::Value::Null,
-                    };
+                    // ClickHouse already returns (U)Int128/256 as an exact
+                    // decimal string; keep it verbatim for full-precision
+                    // parity with the PostgreSQL NUMERIC path. (Previously this
+                    // round-tripped through rust_decimal and nulled anything
+                    // past its ~28-digit range.)
                 }
                 Kind::DateTime => {
                     if let Ok(v) = DateTime::parse_from_rfc3339(s) {
@@ -760,6 +748,92 @@ pub fn format_column_json(row: &tokio_postgres::Row, idx: usize) -> serde_json::
     try_format_column_json(row, idx).unwrap_or(serde_json::Value::Null)
 }
 
+/// Full-precision decoder for PostgreSQL `NUMERIC`, rendered to its decimal
+/// string. `rust_decimal::Decimal` caps at ~28 significant digits and *panics*
+/// beyond that, so decoding large values (e.g. `abi_uint()` on a uint256 is up
+/// to 78 digits) through it forced them to JSON `null`. Reading the wire format
+/// directly preserves every digit.
+///
+/// Binary layout (all integers big-endian): `ndigits: i16`, `weight: i16`,
+/// `sign: u16`, `dscale: u16`, then `ndigits` base-10000 groups (`i16`).
+struct PgNumeric(String);
+
+impl<'a> tokio_postgres::types::FromSql<'a> for PgNumeric {
+    fn from_sql(
+        _ty: &tokio_postgres::types::Type,
+        raw: &'a [u8],
+    ) -> std::result::Result<Self, Box<dyn std::error::Error + Sync + Send>> {
+        let be16 = |b: &[u8]| i16::from_be_bytes([b[0], b[1]]);
+        if raw.len() < 8 {
+            return Err("numeric: header too short".into());
+        }
+        let ndigits = be16(&raw[0..2]);
+        let weight = be16(&raw[2..4]);
+        let sign = u16::from_be_bytes([raw[4], raw[5]]);
+        let dscale = u16::from_be_bytes([raw[6], raw[7]]) as usize;
+
+        match sign {
+            0x4000 | 0x0000 => {}
+            0xC000 => return Ok(PgNumeric("NaN".to_string())),
+            0xD000 => return Ok(PgNumeric("Infinity".to_string())),
+            0xF000 => return Ok(PgNumeric("-Infinity".to_string())),
+            _ => return Err("numeric: bad sign".into()),
+        }
+
+        let ndigits = ndigits.max(0) as usize;
+        if raw.len() < 8 + ndigits * 2 {
+            return Err("numeric: truncated digits".into());
+        }
+        let digits: Vec<i16> = (0..ndigits)
+            .map(|i| be16(&raw[8 + i * 2..10 + i * 2]))
+            .collect();
+
+        let mut out = String::new();
+        if sign == 0x4000 {
+            out.push('-');
+        }
+
+        // Integer part: digit groups i = 0..=weight (missing trailing groups
+        // are implicit zeros). Fractional part: group at decimal position p is
+        // digit index weight + p; indices out of range contribute "0000".
+        if weight < 0 {
+            out.push('0');
+        } else {
+            for i in 0..=weight as usize {
+                let d = digits.get(i).copied().unwrap_or(0);
+                if i == 0 {
+                    out.push_str(&d.to_string());
+                } else {
+                    out.push_str(&format!("{d:04}"));
+                }
+            }
+        }
+
+        if dscale > 0 {
+            out.push('.');
+            let mut frac = String::new();
+            let mut group_idx = weight as isize + 1;
+            while frac.len() < dscale {
+                let d = if group_idx < 0 {
+                    0
+                } else {
+                    digits.get(group_idx as usize).copied().unwrap_or(0)
+                };
+                frac.push_str(&format!("{d:04}"));
+                group_idx += 1;
+            }
+            frac.truncate(dscale);
+            out.push_str(&frac);
+        }
+
+        Ok(PgNumeric(out))
+    }
+
+    fn accepts(ty: &tokio_postgres::types::Type) -> bool {
+        *ty == tokio_postgres::types::Type::NUMERIC
+    }
+}
+
 fn try_format_column_json(row: &tokio_postgres::Row, idx: usize) -> Result<serde_json::Value> {
     let col = &row.columns()[idx];
 
@@ -782,17 +856,13 @@ fn try_format_column_json(row: &tokio_postgres::Row, idx: usize) -> Result<serde
             .map_or(serde_json::Value::Null, |v| {
                 serde_json::Value::Number(v.into())
             }),
-        "numeric" => {
-            // rust_decimal::Decimal panics (not errors) for values exceeding its
-            // 96-bit mantissa (~28 digits). Postgres NUMERIC is arbitrary precision
-            // (e.g. abi_uint() on uint256 = 78 digits), so catch the panic.
-            match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                row.try_get::<_, rust_decimal::Decimal>(idx)
-            })) {
-                Ok(Ok(v)) => serde_json::Value::String(v.to_string()),
-                _ => serde_json::Value::Null,
-            }
-        }
+        "numeric" => row
+            .try_get::<_, Option<PgNumeric>>(idx)
+            .ok()
+            .flatten()
+            .map_or(serde_json::Value::Null, |n| {
+                serde_json::Value::String(n.0)
+            }),
         "float4" | "float8" => row
             .try_get::<_, f64>(idx)
             .ok()
@@ -939,10 +1009,45 @@ mod tests {
         assert_eq!(r.rows[0][2], json!(18_446_744_073_709_551_615_u64));
         // RFC 3339 in UTC, matching PG timestamptz serialization.
         assert_eq!(r.rows[0][3], json!("2025-06-01T12:30:45.123+00:00"));
-        // Fits rust_decimal: decimal string, like PG NUMERIC.
+        // Big integers are kept as their exact decimal string, matching the
+        // full-precision PG NUMERIC path (no rust_decimal round-trip).
         assert_eq!(r.rows[0][4], json!("1000000000000000000"));
-        // Exceeds Decimal's 96-bit mantissa: NULL, matching PG's formatter.
-        assert_eq!(r.rows[0][5], J::Null);
+        assert_eq!(
+            r.rows[0][5],
+            json!("115792089237316195423570985008687907853269984665640564039457584007913129639935")
+        );
+    }
+
+    #[test]
+    fn pg_numeric_decodes_full_precision() {
+        use tokio_postgres::types::{FromSql, Type};
+
+        // Encode PG NUMERIC binary wire format from base-10000 groups.
+        fn encode(weight: i16, sign: u16, dscale: u16, groups: &[i16]) -> Vec<u8> {
+            let mut b = Vec::new();
+            b.extend_from_slice(&(groups.len() as i16).to_be_bytes());
+            b.extend_from_slice(&weight.to_be_bytes());
+            b.extend_from_slice(&sign.to_be_bytes());
+            b.extend_from_slice(&dscale.to_be_bytes());
+            for g in groups {
+                b.extend_from_slice(&g.to_be_bytes());
+            }
+            b
+        }
+        fn decode(bytes: &[u8]) -> String {
+            PgNumeric::from_sql(&Type::NUMERIC, bytes).unwrap().0
+        }
+
+        // 10^30 = 100 * 10000^7 — well past rust_decimal's ~28-digit range,
+        // which previously forced this value to JSON null.
+        let big = encode(7, 0x0000, 0, &[100, 0, 0, 0, 0, 0, 0, 0]);
+        assert_eq!(decode(&big), "1".to_string() + &"0".repeat(30));
+
+        assert_eq!(decode(&encode(0, 0x0000, 0, &[])), "0"); // zero
+        assert_eq!(decode(&encode(1, 0x0000, 0, &[1])), "10000"); // trailing group implicit
+        assert_eq!(decode(&encode(0, 0x4000, 0, &[100])), "-100"); // negative
+        assert_eq!(decode(&encode(0, 0x0000, 1, &[1, 5000])), "1.5"); // fractional, truncated to dscale
+        assert_eq!(decode(&encode(-1, 0x0000, 4, &[5000])), "0.5000"); // weight < 0
     }
 
     #[test]
