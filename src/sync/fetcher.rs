@@ -173,7 +173,13 @@ impl RpcClient {
                 serde_json::json!([format!("0x{:x}", block_num)]),
             )
             .await?;
-        Ok(resp.result.unwrap_or_default())
+        // Empty array = block with no txs (fine); error/null = node could not
+        // serve it. Do not silently degrade the latter to "no receipts".
+        if let Some(err) = resp.error {
+            anyhow::bail!("Receipts for block {block_num} failed: {}", err.message);
+        }
+        resp.result
+            .ok_or_else(|| anyhow!("Receipts for block {block_num} returned null"))
     }
 
     /// Fetch receipts for multiple blocks in a batch
@@ -239,9 +245,26 @@ impl RpcClient {
                 anyhow!("Failed to decode receipts response: {}", e)
             })?;
 
+        // A block with no transactions legitimately returns `result: []`
+        // (an empty array, i.e. `Some(vec![])`). A per-item `error` object or a
+        // `null` result instead means the node could not serve that block
+        // (execution timeout, overload, a lagging replica behind a load
+        // balancer). Treating those as "no receipts" — as the previous
+        // `unwrap_or_default()` did — commits the block with its txs but zero
+        // logs/receipts and closes the PG gap, so nothing ever revisits it and
+        // every log-derived table silently misses the block's events. Surface
+        // the failure so the batch is retried instead.
         responses
             .into_iter()
-            .map(|r| Ok(r.result.unwrap_or_default()))
+            .enumerate()
+            .map(|(i, r)| {
+                let block = range.start() + i as u64;
+                if let Some(err) = r.error {
+                    anyhow::bail!("Receipts for block {block} failed: {}", err.message);
+                }
+                r.result
+                    .ok_or_else(|| anyhow!("Receipts for block {block} returned null"))
+            })
             .collect()
     }
 
@@ -495,6 +518,48 @@ mod tests {
 
         let sizes = request_sizes.lock().await.clone();
         assert_eq!(sizes, vec![5, 3, 2, 1, 2]);
+
+        server.abort();
+    }
+
+    async fn faulty_receipts_handler(Json(body): Json<Value>) -> impl IntoResponse {
+        let requests = body.as_array().expect("expected batch request");
+        // First block errors, second returns null, rest return an empty array.
+        // The old unwrap_or_default() masked the first two as "no receipts".
+        let responses: Vec<Value> = requests
+            .iter()
+            .enumerate()
+            .map(|(i, req)| {
+                let id = req["id"].clone();
+                match i {
+                    0 => json!({"jsonrpc": "2.0", "id": id, "error": {"code": -32000, "message": "execution timeout"}}),
+                    1 => json!({"jsonrpc": "2.0", "id": id, "result": Value::Null}),
+                    _ => json!({"jsonrpc": "2.0", "id": id, "result": []}),
+                }
+            })
+            .collect();
+        Json(Value::Array(responses))
+    }
+
+    #[tokio::test]
+    async fn test_get_receipts_batch_errors_on_per_item_failure() {
+        let app = Router::new().route("/", post(faulty_receipts_handler));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("Failed to bind test RPC server");
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("RPC server failed");
+        });
+
+        let client = RpcClient::new(&format!("http://127.0.0.1:{}", addr.port()));
+        let result = client.get_receipts_batch(10..=12).await;
+        assert!(
+            result.is_err(),
+            "a per-item error/null must fail the batch, not be swallowed as empty receipts"
+        );
+        // The block number in the message is derived from the range offset.
+        assert!(result.unwrap_err().to_string().contains("block 10"));
 
         server.abort();
     }
