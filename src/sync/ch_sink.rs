@@ -552,27 +552,43 @@ impl ClickHouseSink {
              extra_data, consensus_proposer FROM blocks FINAL \
              WHERE num >= {from} AND num <= {to} ORDER BY num"
         );
+        // Fetch blocks first so their canonical timestamps can constrain the
+        // monthly partitions used by the denormalized child tables. This also
+        // avoids launching three archive reads when the checkpoint is corrupt
+        // and the requested block range is absent.
+        let blocks = self
+            .fetch_archive_rows::<ChBlockWire>(&blocks_sql, "blocks")
+            .await?;
+        let Some(from_timestamp_ms) = blocks.iter().map(|block| block.timestamp_ms).min() else {
+            return Ok(ArchiveBatch::default());
+        };
+        let to_timestamp_ms = blocks
+            .iter()
+            .map(|block| block.timestamp_ms)
+            .max()
+            .expect("non-empty blocks have a maximum timestamp");
+        let range_predicate = archive_range_predicate(from, to, from_timestamp_ms, to_timestamp_ms);
+
         let txs_sql = format!(
             "SELECT block_num, block_timestamp, idx, hash, `type`, `from`, `to`, value, input, \
              gas_limit, max_fee_per_gas, max_priority_fee_per_gas, gas_used, nonce_key, nonce, \
              fee_token, fee_payer, calls, call_count, valid_before, valid_after, signature_type \
-             FROM txs FINAL WHERE block_num >= {from} AND block_num <= {to} \
+             FROM txs FINAL WHERE {range_predicate} \
              ORDER BY block_num, idx"
         );
         let logs_sql = format!(
             "SELECT block_num, block_timestamp, log_idx, tx_idx, tx_hash, address, selector, \
              topic0, topic1, topic2, topic3, data, is_virtual_forward FROM logs FINAL \
-             WHERE block_num >= {from} AND block_num <= {to} ORDER BY block_num, log_idx"
+             WHERE {range_predicate} ORDER BY block_num, log_idx"
         );
         let receipts_sql = format!(
             "SELECT block_num, block_timestamp, tx_idx, tx_hash, `from`, `to`, contract_address, \
              gas_used, cumulative_gas_used, effective_gas_price, status, fee_payer, `type`, \
-             fee_token FROM receipts FINAL WHERE block_num >= {from} AND block_num <= {to} \
+             fee_token FROM receipts FINAL WHERE {range_predicate} \
              ORDER BY block_num, tx_idx"
         );
 
-        let (blocks, txs, logs, receipts) = tokio::try_join!(
-            self.fetch_archive_rows::<ChBlockWire>(&blocks_sql, "blocks"),
+        let (txs, logs, receipts) = tokio::try_join!(
             self.fetch_archive_rows::<ChTxWire>(&txs_sql, "txs"),
             self.fetch_archive_rows::<ChLogWire>(&logs_sql, "logs"),
             self.fetch_archive_rows::<ChReceiptWire>(&receipts_sql, "receipts"),
@@ -1283,6 +1299,19 @@ fn is_valid_identifier(name: &str) -> bool {
         && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
+fn archive_range_predicate(
+    from: i64,
+    to: i64,
+    from_timestamp_ms: i64,
+    to_timestamp_ms: i64,
+) -> String {
+    format!(
+        "block_num >= {from} AND block_num <= {to} \
+         AND block_timestamp >= fromUnixTimestamp64Milli({from_timestamp_ms}, 'UTC') \
+         AND block_timestamp <= fromUnixTimestamp64Milli({to_timestamp_ms}, 'UTC')"
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1474,6 +1503,16 @@ mod tests {
         assert!(!is_valid_identifier("db; DROP TABLE x"));
         assert!(!is_valid_identifier("db name"));
         assert!(!is_valid_identifier(&"a".repeat(65)));
+    }
+
+    #[test]
+    fn archive_range_predicate_prunes_block_and_timestamp_ranges() {
+        assert_eq!(
+            archive_range_predicate(100, 199, 1_750_000_000_000, 1_750_000_099_000),
+            "block_num >= 100 AND block_num <= 199 \
+             AND block_timestamp >= fromUnixTimestamp64Milli(1750000000000, 'UTC') \
+             AND block_timestamp <= fromUnixTimestamp64Milli(1750000099000, 'UTC')"
+        );
     }
 
     #[test]

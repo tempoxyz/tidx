@@ -255,6 +255,30 @@ mod tests {
     }
 
     #[test]
+    fn logs_block_range_index_is_created_and_materialized() {
+        let logs = base_objects()
+            .iter()
+            .find(|object| object.name == "logs")
+            .expect("logs table should be registered")
+            .ddl();
+        assert!(logs.contains("INDEX idx_block_num block_num TYPE minmax GRANULARITY 1"));
+
+        let add = migrations()
+            .iter()
+            .find(|object| object.name == "logs_20260714_block_num_index")
+            .expect("logs block number index migration should be registered")
+            .ddl();
+        assert!(add.contains("ADD INDEX IF NOT EXISTS idx_block_num"));
+
+        let materialize = migrations()
+            .iter()
+            .find(|object| object.name == "logs_20260714_materialize_block_num_index")
+            .expect("logs block number index materialization should be registered")
+            .ddl();
+        assert!(materialize.contains("MATERIALIZE INDEX idx_block_num"));
+    }
+
+    #[test]
     fn post_derived_migrations_run_after_their_target_tables() {
         // all_objects() is the apply order; each migration must come after the
         // table it mutates.

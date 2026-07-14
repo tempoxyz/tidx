@@ -42,6 +42,10 @@ const MATERIALIZE_TXS_INDEXES_20260710: &str =
 const MATERIALIZE_RECEIPTS_INDEX_20260710: &str = include_str!(
     "../../db/clickhouse/migrations/20260710_materialize_receipts_contract_address_index.sql"
 );
+const LOGS_MIGRATION_20260714: &str =
+    include_str!("../../db/clickhouse/migrations/20260714_add_logs_block_num_index.sql");
+const MATERIALIZE_LOGS_INDEX_20260714: &str =
+    include_str!("../../db/clickhouse/migrations/20260714_materialize_logs_block_num_index.sql");
 const TOKEN_HOLDER_DELTAS_MIGRATION_20260618: &str =
     include_str!("../../db/clickhouse/migrations/20260618_delete_guard_token_holder_deltas.sql");
 const ADDRESS_HOLDER_DELTAS_MIGRATION_20260618: &str =
@@ -288,6 +292,22 @@ pub const MIGRATIONS: &[ClickHouseObject] = &[
         name: "receipts_20260710_materialize_contract_address_index",
         kind: ClickHouseObjectKind::Migration(MATERIALIZE_RECEIPTS_INDEX_20260710),
         depends_on: &["receipts"],
+        public_query: false,
+        block_column: None,
+        backfill: None,
+    },
+    ClickHouseObject {
+        name: "logs_20260714_block_num_index",
+        kind: ClickHouseObjectKind::Migration(LOGS_MIGRATION_20260714),
+        depends_on: &["logs"],
+        public_query: false,
+        block_column: None,
+        backfill: None,
+    },
+    ClickHouseObject {
+        name: "logs_20260714_materialize_block_num_index",
+        kind: ClickHouseObjectKind::Migration(MATERIALIZE_LOGS_INDEX_20260714),
+        depends_on: &["logs_20260714_block_num_index"],
         public_query: false,
         block_column: None,
         backfill: None,
