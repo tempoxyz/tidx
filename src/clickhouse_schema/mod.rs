@@ -348,7 +348,7 @@ mod tests {
     fn managed_merge_tree_storage_uses_zstd_by_default() {
         for object in base_objects().iter().chain(derived_objects()) {
             let ddl = object.ddl();
-            if object.is_table() || object.is_refreshable_materialized_view() {
+            if object.owns_storage() {
                 assert!(
                     ddl.contains("SETTINGS default_compression_codec = 'ZSTD(1)'"),
                     "physical table {} does not set the default ZSTD codec",

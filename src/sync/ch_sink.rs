@@ -196,6 +196,7 @@ impl ClickHouseSink {
         }
 
         self.ensure_retired_objects_absent().await?;
+        self.reconcile_pending_balance_reorgs().await?;
 
         info!(database = %self.database, "ClickHouse schema ready");
         Ok(())
@@ -296,6 +297,15 @@ impl ClickHouseSink {
 
     async fn ensure_derived_objects(&self, tracking: &mut HashMap<String, String>) -> Result<()> {
         for object in derived_objects() {
+            // A derived-table bootstrap may need to run between its source
+            // objects and the public views that consume it. Treat migrations
+            // embedded in dependency order exactly like the regular migration
+            // lists: execute once and never drop/recreate them on startup.
+            if matches!(object.kind, ClickHouseObjectKind::Migration(_)) {
+                self.apply_migration(object, tracking).await?;
+                continue;
+            }
+
             let ddl = object.ddl();
             let checksum = checksum_of(&ddl);
             let needs_recreate = match tracking.get(object.name) {
@@ -796,6 +806,11 @@ impl ClickHouseSink {
     /// completion but a replica still serves stale rows) — without the
     /// assertion, replay would happily start atop ghost rows.
     pub async fn delete_from(&self, block_num: u64) -> Result<()> {
+        // Incremental materialized views do not observe ALTER DELETE. Persist
+        // the affected balance keys before touching block-scoped tables so a
+        // crash cannot lose the information needed to repair current state.
+        self.capture_balance_reorg_keys(block_num).await?;
+
         for table in reorg_tables() {
             let sql = format!(
                 "ALTER TABLE {} DELETE WHERE {} >= {}",
@@ -835,8 +850,103 @@ impl ClickHouseSink {
             }
         }
 
+        self.finalize_balance_reorg(block_num).await?;
+        self.refresh_balance_state().await?;
+
         debug!(from_block = block_num, "ClickHouse reorg delete complete");
         Ok(())
+    }
+
+    async fn capture_balance_reorg_keys(&self, block_num: u64) -> Result<()> {
+        let block_num = i64::try_from(block_num).context("reorg block exceeds Int64")?;
+        let sql = format!(
+            "INSERT INTO balance_reorg_keys \
+             WITH (SELECT min(timestamp) FROM blocks FINAL WHERE num >= {block_num}) AS cutoff \
+             SELECT {block_num}, token, holder, CAST(1 AS UInt8), now64(9, 'UTC') \
+             FROM token_holder_deltas FINAL \
+             WHERE block_timestamp >= cutoff AND block_num >= {block_num} \
+             GROUP BY token, holder"
+        );
+        self.execute_derived_query_with_retry(&sql, "ClickHouse balance reorg key capture")
+            .await
+    }
+
+    async fn finalize_balance_reorg(&self, block_num: u64) -> Result<()> {
+        let block_num = i64::try_from(block_num).context("reorg block exceeds Int64")?;
+        self.execute_derived_query_with_retry(
+            &format!(
+                "INSERT INTO balance_dirty_keys \
+                 SELECT token, holder, CAST(1 AS UInt8), now64(9, 'UTC') \
+                 FROM balance_reorg_keys FINAL \
+                 WHERE from_block = {block_num} AND pending = 1 \
+                 GROUP BY token, holder"
+            ),
+            "ClickHouse balance reorg dirty-key publish",
+        )
+        .await?;
+
+        self.execute_derived_query_with_retry(
+            &format!(
+                "INSERT INTO balance_reorg_keys \
+                 SELECT from_block, token, holder, CAST(0 AS UInt8), now64(9, 'UTC') \
+                 FROM balance_reorg_keys FINAL \
+                 WHERE from_block = {block_num} AND pending = 1"
+            ),
+            "ClickHouse balance reorg journal finalize",
+        )
+        .await
+    }
+
+    /// Recover a reorg that crashed after block deletion but before its dirty
+    /// keys were republished. Balance-derived tables are pruned before blocks;
+    /// an empty block suffix therefore proves that balance cleanup completed.
+    async fn reconcile_pending_balance_reorgs(&self) -> Result<()> {
+        let pending: Vec<ChPendingReorgRow> = self
+            .client
+            .query(
+                "SELECT DISTINCT from_block FROM balance_reorg_keys FINAL \
+                 WHERE pending = 1 ORDER BY from_block",
+            )
+            .fetch_all()
+            .await
+            .map_err(|e| anyhow!("Failed to load pending ClickHouse balance reorgs: {e}"))?;
+
+        let mut recovered = false;
+        for row in pending {
+            let remaining: u64 = self
+                .client
+                .query(&format!(
+                    "SELECT count() FROM blocks FINAL WHERE num >= {}",
+                    row.from_block
+                ))
+                .fetch_one()
+                .await
+                .map_err(|e| anyhow!("Failed to inspect pending balance reorg: {e}"))?;
+            if remaining == 0 {
+                let from_block = u64::try_from(row.from_block)
+                    .context("pending ClickHouse balance reorg block is negative")?;
+                self.finalize_balance_reorg(from_block).await?;
+                recovered = true;
+            }
+        }
+
+        if recovered {
+            self.refresh_balance_state().await?;
+        }
+        Ok(())
+    }
+
+    async fn refresh_balance_state(&self) -> Result<()> {
+        self.execute_derived_query_with_retry(
+            "SYSTEM REFRESH VIEW balance_state_refresh",
+            "ClickHouse balance state refresh trigger",
+        )
+        .await?;
+        self.execute_derived_query_with_retry(
+            "SYSTEM WAIT VIEW balance_state_refresh",
+            "ClickHouse balance state refresh wait",
+        )
+        .await
     }
 
     /// Chunk source rows, convert each chunk to wire format, and insert with retry logic.
@@ -901,6 +1011,11 @@ impl ClickHouseSink {
 struct ChSchemaObjectRow {
     name: String,
     checksum: String,
+}
+
+#[derive(Row, Deserialize)]
+struct ChPendingReorgRow {
+    from_block: i64,
 }
 
 #[derive(Row, Serialize, Deserialize)]

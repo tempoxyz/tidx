@@ -8,10 +8,10 @@
 -- balance reads hit a holder-keyed primary range instead of re-aggregating the
 -- event history.
 --
--- Each refresh recomputes from `address_holder_deltas FINAL` and atomically
--- swaps the result, so reads are reorg-correct but can be up to one refresh
--- interval stale. This mirrors `token_balances_snapshot` with the access
--- pattern inverted for address-held token lookups.
+-- Each refresh atomically publishes the current incremental balance state in
+-- holder order. Dirty pairs are resolved by address_balances from the
+-- canonical FINAL ledger, preserving reorg correctness without re-aggregating
+-- every historical delta.
 --
 -- ORDER BY (holder, balance, token) so address balance pages/counts filtered by
 -- holder can prune to one account before sorting by balance.
@@ -20,23 +20,13 @@
 -- (still experimental as of ClickHouse 25.x); the sink sets it when applying
 -- this DDL.
 CREATE MATERIALIZED VIEW IF NOT EXISTS address_balances_snapshot
-REFRESH EVERY 15 MINUTE
+REFRESH AFTER 15 MINUTE
 ENGINE = MergeTree
 ORDER BY (holder, balance, token)
 SETTINGS default_compression_codec = 'ZSTD(1)'
 AS
-SELECT
-    holder,
-    token,
-    if(
-        sumIf(balance_delta, leg = 1) >= sumIf(balance_delta, leg = -1),
-        toUInt256(sumIf(balance_delta, leg = 1) - sumIf(balance_delta, leg = -1)),
-        toUInt256(0)
-    ) AS balance
-FROM address_holder_deltas FINAL
-GROUP BY holder, token
-HAVING balance > 0
--- The full-history GROUP BY spans hundreds of millions of delta rows. Spill
--- to disk past this threshold so the periodic refresh completes instead of
--- failing with a memory-limit error. Tune to the box.
-SETTINGS max_bytes_before_external_group_by = 2000000000
+SELECT holder, token, balance
+FROM address_balances
+SETTINGS
+    max_threads = 8,
+    max_memory_usage = 34359738368
