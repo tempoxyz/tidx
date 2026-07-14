@@ -188,10 +188,16 @@ tidx upgrade    Self-update to latest version
 
 ## Sync Architecture
 
-tidx runs two concurrent sync operations:
+Without retention, tidx runs two concurrent sync operations:
 
 - **Realtime** — follows chain head with ~0 lag
-- **Gap Sync** — fills all missing blocks from most recent to earliest
+- **Gap Sync** — fills PostgreSQL (and optional ClickHouse) gaps from most recent to earliest
+
+With `[chains.retention]`, historical storage is split into independent paths:
+
+- **Realtime** writes new blocks to both stores.
+- **ClickHouse archive backfill** syncs full history directly from RPC to ClickHouse.
+- **PostgreSQL hot reconciliation** fills only the configured `pg_keep` window. It can restore older weeks when `pg_keep` increases and prune weeks when it decreases.
 
 ```
 Block Numbers:  0                                                    HEAD
@@ -201,7 +207,7 @@ Block Numbers:  0                                                    HEAD
                        gap 2       gap 1                tip_num   head_num
                      (fills 2nd) (fills 1st)
 
-    Gap Sync fills ALL gaps, most recent first.
+    Gap Sync fills ALL gaps, most recent first (non-retention mode).
     Realtime follows head immediately.
 ```
 
