@@ -176,7 +176,6 @@ async fn test_status_uses_in_memory_gap_results() {
     )
     .await
     .expect("failed to seed sync state");
-
     let broadcaster = Arc::new(Broadcaster::new());
     let (pools, chain_id) = make_pools(db.pool.clone());
     let mut app = make_test_service(pools, chain_id, broadcaster).await;
@@ -232,6 +231,9 @@ async fn test_get_all_status_uses_single_pool_connection() {
     )
     .await
     .expect("failed to seed sync state");
+    tidx::sync::writer::save_archive_state(&db.pool, 1, 5, 20)
+        .await
+        .expect("failed to seed archive state");
 
     let url = std::env::var("DATABASE_URL").expect("DATABASE_URL must be set");
     let pool = tidx::db::create_pool_with_size(&url, 1)
@@ -248,6 +250,9 @@ async fn test_get_all_status_uses_single_pool_connection() {
 
     assert_eq!(statuses.len(), 1);
     assert_eq!(statuses[0].chain_id, 1);
+    assert_eq!(statuses[0].archive_backfill_num, Some(5));
+    assert_eq!(statuses[0].archive_tip_num, Some(20));
+    assert_eq!(statuses[0].archive_backfill_remaining, Some(4));
     assert!(statuses[0].gaps.is_empty());
 }
 

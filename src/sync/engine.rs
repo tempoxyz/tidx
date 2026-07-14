@@ -17,7 +17,7 @@ use super::decoder::{
     enrich_txs_from_receipts, timestamp_from_secs,
 };
 use super::fetcher::RpcClient;
-use super::sink::SinkSet;
+use super::sink::{SinkSet, WriteTarget};
 use super::writer::{
     detect_all_gaps, detect_blocks_missing_receipts, find_fork_point, get_block_hash, has_gaps,
     load_sync_state, save_sync_state, update_sync_rate, update_synced_num, update_tip_num,
@@ -45,6 +45,7 @@ pub struct SyncEngine {
     batch_size: u64,
     concurrency: usize,
     backfill_first: bool,
+    gapfill_enabled: bool,
     /// Skip parent hash validation (trust RPC for reorg handling)
     trust_rpc: bool,
 }
@@ -74,6 +75,7 @@ impl SyncEngine {
             batch_size: 100,
             concurrency: 4,
             backfill_first: false,
+            gapfill_enabled: true,
             trust_rpc: false,
         })
     }
@@ -95,6 +97,15 @@ impl SyncEngine {
 
     pub fn with_backfill_first(mut self, backfill_first: bool) -> Self {
         self.backfill_first = backfill_first;
+        self
+    }
+
+    /// Disable the PostgreSQL-driven historical gap-fill loop.
+    ///
+    /// Tiered deployments run independent ClickHouse archive and PostgreSQL
+    /// hot-window reconcilers instead.
+    pub fn with_gapfill_enabled(mut self, enabled: bool) -> Self {
+        self.gapfill_enabled = enabled;
         self
     }
 
@@ -241,17 +252,19 @@ impl SyncEngine {
         let gapfill_chain_id = self.chain_id;
         let gapfill_batch_size = self.batch_size;
         let gapfill_concurrency = self.concurrency;
-        let gapfill_handle = tokio::spawn(async move {
-            run_gapfill_loop(
-                gapfill_sinks,
-                gapfill_semaphore,
-                gapfill_rpc,
-                gapfill_chain_id,
-                gapfill_batch_size,
-                gapfill_concurrency,
-                gapfill_shutdown,
-            )
-            .await
+        let gapfill_handle = self.gapfill_enabled.then(|| {
+            tokio::spawn(async move {
+                run_gapfill_loop(
+                    gapfill_sinks,
+                    gapfill_semaphore,
+                    gapfill_rpc,
+                    gapfill_chain_id,
+                    gapfill_batch_size,
+                    gapfill_concurrency,
+                    gapfill_shutdown,
+                )
+                .await
+            })
         });
 
         // Spawn receipt backfill as a separate background task
@@ -286,7 +299,9 @@ impl SyncEngine {
         }
 
         // Abort background tasks
-        gapfill_handle.abort();
+        if let Some(gapfill_handle) = gapfill_handle {
+            gapfill_handle.abort();
+        }
         receipt_handle.abort();
         Ok(())
     }
@@ -1352,7 +1367,13 @@ async fn is_fully_synced(pool: &Pool, floor: u64, tip_num: u64) -> Result<bool> 
 }
 
 /// Standalone sync_range for gap-fill (doesn't need SyncEngine self)
-async fn sync_range_standalone(sinks: &SinkSet, rpc: &RpcClient, from: u64, to: u64) -> Result<()> {
+pub(crate) async fn sync_range_standalone_to(
+    sinks: &SinkSet,
+    rpc: &RpcClient,
+    from: u64,
+    to: u64,
+    target: WriteTarget,
+) -> Result<()> {
     use super::decoder::{
         decode_block, decode_log, decode_receipt, decode_transaction, enrich_receipts_from_txs,
         enrich_txs_from_receipts, timestamp_from_secs,
@@ -1421,11 +1442,29 @@ async fn sync_range_standalone(sinks: &SinkSet, rpc: &RpcClient, from: u64, to: 
         log.is_virtual_forward = is_forward;
     }
 
-    sinks
-        .write_all(&block_rows, &all_txs, &all_logs, &all_receipts)
-        .await?;
+    match target {
+        WriteTarget::All => {
+            sinks
+                .write_all(&block_rows, &all_txs, &all_logs, &all_receipts)
+                .await?;
+        }
+        WriteTarget::Postgres => {
+            sinks
+                .write_all_postgres(&block_rows, &all_txs, &all_logs, &all_receipts)
+                .await?;
+        }
+        WriteTarget::ClickHouse => {
+            sinks
+                .write_all_clickhouse(&block_rows, &all_txs, &all_logs, &all_receipts)
+                .await?;
+        }
+    }
 
     Ok(())
+}
+
+async fn sync_range_standalone(sinks: &SinkSet, rpc: &RpcClient, from: u64, to: u64) -> Result<()> {
+    sync_range_standalone_to(sinks, rpc, from, to, WriteTarget::All).await
 }
 
 /// Receipt backfill loop: repairs any blocks missing receipts/logs.

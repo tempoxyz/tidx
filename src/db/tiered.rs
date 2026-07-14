@@ -13,7 +13,7 @@
 //!   keeps predicates (`address = '0x…'`) pushable to ClickHouse's bloom
 //!   indexes on the big cold side.
 //!
-//! Boundary `B` = `sync_state.pruned_below` (highest block dropped from PG):
+//! Boundary `B` = `sync_state.pruned_below` (current PostgreSQL hot floor):
 //! - cold arm: `WHERE block_num <= B` (enforces no duplicates)
 //! - hot arm: `WHERE block_num > B` (hardens the crash window where the
 //!   watermark advanced but partitions are not yet dropped)
@@ -22,8 +22,9 @@
 //!   `constraint_exclusion = partition` covers UNION ALL arms) plans away
 //!   the ClickHouse round trip for hot-window-bounded queries.
 //!
-//! The pruner refreshes the boundary right after advancing `pruned_below`
-//! and **before** dropping partitions, so the views never expose a hole.
+//! The hot-window reconciler refreshes the boundary only after PostgreSQL
+//! expansion is complete (or before shrinking partitions are dropped), so
+//! the views never expose a hole.
 //!
 //! All cold reads (native and FDW) run without `final`: unmerged
 //! ReplacingMergeTree duplicates are possible but rare (crash replay only;
@@ -307,10 +308,10 @@ fn tiered_view_sql(t: &Table, boundary: i64) -> String {
     )
 }
 
-/// Prune watermark plus the sync tip, read together from `sync_state`.
+/// Hot-tier boundary plus the sync tip, read together from `sync_state`.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct PruneBoundary {
-    /// Highest block pruned from PostgreSQL (0 = nothing pruned).
+    /// Highest block routed to the ClickHouse/cold tier (0 = hot-only).
     pub boundary: i64,
     /// Exclusive upper timestamp bound of pruned rows.
     pub boundary_ts: Option<DateTime<Utc>>,
@@ -318,7 +319,7 @@ pub struct PruneBoundary {
     pub tip: i64,
 }
 
-/// Read the prune watermark, its partition-boundary timestamp, and the sync
+/// Read the hot boundary, its partition-boundary timestamp, and the sync
 /// tip. Returns the default (all zero/None) when the chain has no state row.
 pub async fn fetch_prune_boundary(pool: &Pool, chain_id: u64) -> Result<PruneBoundary> {
     let conn = pool.get().await?;
@@ -395,8 +396,8 @@ pub async fn bootstrap(pool: &Pool, target: &FdwTarget, chain_id: u64) -> Result
     Ok(boundary)
 }
 
-/// Rebake the boundary constraints and tiered views at the current
-/// `pruned_below` watermark. No-op (returns -1) when not bootstrapped.
+/// Rebake the boundary constraints and tiered views at the current hot-tier
+/// boundary. No-op (returns -1) when not bootstrapped.
 pub async fn refresh_boundary(pool: &Pool, chain_id: u64) -> Result<i64> {
     if !is_bootstrapped(pool).await? {
         debug!(

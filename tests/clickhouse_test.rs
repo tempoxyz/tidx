@@ -1966,8 +1966,9 @@ async fn test_hex_filter_against_sink_data() {
 // ============================================================================
 
 /// Helper: set up both PG (TestDb) and CH (ClickHouseSink) for backfill tests.
-/// Returns (PG pool, SinkSet with CH, TestClickHouse) or None if infra unavailable.
-async fn setup_backfill() -> Option<(tidx::db::Pool, SinkSet, TestClickHouse)> {
+/// Returns (PG pool, SinkSet with CH, ClickHouseSink, TestClickHouse) or None
+/// if infrastructure is unavailable.
+async fn setup_backfill() -> Option<(tidx::db::Pool, SinkSet, ClickHouseSink, TestClickHouse)> {
     // Set up CH
     let ch = TestClickHouse::new(SINK_DB)
         .await
@@ -2022,8 +2023,8 @@ async fn setup_backfill() -> Option<(tidx::db::Pool, SinkSet, TestClickHouse)> {
         .expect("Failed to ensure partitions");
     }
 
-    let sinks = SinkSet::new(pool.clone()).with_clickhouse(ch_sink);
-    Some((pool, sinks, ch))
+    let sinks = SinkSet::new(pool.clone()).with_clickhouse(ch_sink.clone());
+    Some((pool, sinks, ch_sink, ch))
 }
 
 async fn set_ch_backfill_cursor(pool: &tidx::db::Pool, chain_id: u64, block: i64) {
@@ -2042,11 +2043,99 @@ async fn set_ch_backfill_cursor(pool: &tidx::db::Pool, chain_id: u64, block: i64
     .expect("Failed to set CH backfill cursor");
 }
 
+/// PostgreSQL hot-tier hydration reads canonical base rows from ClickHouse,
+/// preserves encoded fields, and refuses a range that its archive cannot fill.
+#[tokio::test]
+#[serial(clickhouse)]
+async fn test_hydrate_postgres_from_clickhouse() {
+    let Some((pool, sinks, ch_sink, _ch)) = setup_backfill().await else {
+        return;
+    };
+
+    let blocks: Vec<BlockRow> = (1..=5).map(make_block).collect();
+    let mut txs: Vec<TxRow> = (1..=5)
+        .flat_map(|b| (0..2).map(move |i| make_tx(b, i)))
+        .collect();
+    txs.iter_mut()
+        .find(|tx| tx.block_num == 2 && tx.idx == 0)
+        .unwrap()
+        .calls = Some(serde_json::json!([{"to": "0x1234"}]));
+    let mut logs: Vec<LogRow> = (1..=5).map(|b| make_log(b, 0)).collect();
+    logs.iter_mut()
+        .find(|log| log.block_num == 3)
+        .unwrap()
+        .is_virtual_forward = true;
+    let receipts: Vec<ReceiptRow> = (1..=5).map(|b| make_receipt(b, 0)).collect();
+
+    tokio::try_join!(
+        ch_sink.write_blocks(&blocks),
+        ch_sink.write_txs(&txs),
+        ch_sink.write_logs(&logs),
+        ch_sink.write_receipts(&receipts),
+    )
+    .expect("failed to seed ClickHouse archive");
+    // Crash replay can leave identical ReplacingMergeTree rows. The archive
+    // reader must collapse them before checking completeness and hydrating PG.
+    ch_sink
+        .write_blocks(&blocks)
+        .await
+        .expect("failed to seed replayed ClickHouse blocks");
+
+    let err = sinks
+        .hydrate_postgres_from_clickhouse(1, 6)
+        .await
+        .expect_err("incomplete ClickHouse range must be rejected");
+    assert!(err.to_string().contains("returned 5 of 6 blocks"));
+
+    sinks
+        .hydrate_postgres_from_clickhouse(2, 4)
+        .await
+        .expect("ClickHouse to PostgreSQL hydration failed");
+
+    let conn = pool.get().await.unwrap();
+    let counts = conn
+        .query_one(
+            "SELECT (SELECT count(*) FROM blocks), (SELECT count(*) FROM txs), \
+             (SELECT count(*) FROM logs), (SELECT count(*) FROM receipts)",
+            &[],
+        )
+        .await
+        .unwrap();
+    assert_eq!(counts.get::<_, i64>(0), 3);
+    assert_eq!(counts.get::<_, i64>(1), 6);
+    assert_eq!(counts.get::<_, i64>(2), 3);
+    assert_eq!(counts.get::<_, i64>(3), 3);
+
+    let block = conn
+        .query_one("SELECT hash FROM blocks WHERE num = 2", &[])
+        .await
+        .unwrap();
+    assert_eq!(block.get::<_, Vec<u8>>(0), vec![2; 32]);
+
+    let tx = conn
+        .query_one("SELECT calls FROM txs WHERE block_num = 2 AND idx = 0", &[])
+        .await
+        .unwrap();
+    assert_eq!(
+        tx.get::<_, Option<serde_json::Value>>(0),
+        Some(serde_json::json!([{"to": "0x1234"}]))
+    );
+
+    let log = conn
+        .query_one(
+            "SELECT is_virtual_forward FROM logs WHERE block_num = 3",
+            &[],
+        )
+        .await
+        .unwrap();
+    assert!(log.get::<_, bool>(0));
+}
+
 /// Backfill should copy all blocks/txs/logs/receipts from PG to an empty CH.
 #[tokio::test]
 #[serial(clickhouse)]
 async fn test_backfill_pg_to_empty_clickhouse() {
-    let Some((pool, sinks, ch)) = setup_backfill().await else {
+    let Some((pool, sinks, _ch_sink, ch)) = setup_backfill().await else {
         return;
     };
 
@@ -2094,7 +2183,7 @@ async fn test_backfill_pg_to_empty_clickhouse() {
 #[tokio::test]
 #[serial(clickhouse)]
 async fn test_backfill_pg_to_clickhouse_preserves_virtual_forward_flag() {
-    let Some((pool, sinks, ch)) = setup_backfill().await else {
+    let Some((pool, sinks, _ch_sink, ch)) = setup_backfill().await else {
         return;
     };
 
@@ -2125,7 +2214,7 @@ async fn test_backfill_pg_to_clickhouse_preserves_virtual_forward_flag() {
 #[tokio::test]
 #[serial(clickhouse)]
 async fn test_backfill_resumes_from_highwater_mark() {
-    let Some((pool, sinks, ch)) = setup_backfill().await else {
+    let Some((pool, sinks, _ch_sink, ch)) = setup_backfill().await else {
         return;
     };
 
@@ -2168,7 +2257,7 @@ async fn test_backfill_resumes_from_highwater_mark() {
 #[tokio::test]
 #[serial(clickhouse)]
 async fn test_backfill_noop_when_up_to_date() {
-    let Some((pool, sinks, ch)) = setup_backfill().await else {
+    let Some((pool, sinks, _ch_sink, ch)) = setup_backfill().await else {
         return;
     };
 
@@ -2198,7 +2287,7 @@ async fn test_backfill_noop_when_up_to_date() {
 #[tokio::test]
 #[serial(clickhouse)]
 async fn test_backfill_noop_when_pg_empty() {
-    let Some((_pool, sinks, ch)) = setup_backfill().await else {
+    let Some((_pool, sinks, _ch_sink, ch)) = setup_backfill().await else {
         return;
     };
 
@@ -2216,7 +2305,7 @@ async fn test_backfill_noop_when_pg_empty() {
 #[tokio::test]
 #[serial(clickhouse)]
 async fn test_backfill_per_table_independent_highwater() {
-    let Some((pool, sinks, ch)) = setup_backfill().await else {
+    let Some((pool, sinks, _ch_sink, ch)) = setup_backfill().await else {
         return;
     };
 
@@ -2269,7 +2358,7 @@ async fn test_backfill_per_table_independent_highwater() {
 #[tokio::test]
 #[serial(clickhouse)]
 async fn test_backfill_multi_batch_pagination() {
-    let Some((pool, sinks, ch)) = setup_backfill().await else {
+    let Some((pool, sinks, _ch_sink, ch)) = setup_backfill().await else {
         return;
     };
 
@@ -2317,7 +2406,7 @@ async fn test_backfill_multi_batch_pagination() {
 #[tokio::test]
 #[serial(clickhouse)]
 async fn test_backfill_idempotent() {
-    let Some((pool, sinks, ch)) = setup_backfill().await else {
+    let Some((pool, sinks, _ch_sink, ch)) = setup_backfill().await else {
         return;
     };
 

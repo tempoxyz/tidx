@@ -99,8 +99,8 @@ pub struct SyncState {
     /// When sync started (for ETA calculations)
     #[serde(default)]
     pub started_at: Option<chrono::DateTime<chrono::Utc>>,
-    /// Highest block intentionally pruned from Postgres (0 = nothing pruned).
-    /// Gap detection and backfill ignore blocks at or below this.
+    /// Current PostgreSQL hot-tier boundary (0 = hot-only).
+    /// Gap detection ignores blocks routed to ClickHouse at or below this.
     #[serde(default)]
     pub pruned_below: u64,
 }

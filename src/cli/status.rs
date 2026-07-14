@@ -6,7 +6,7 @@ use tidx::config::Config;
 use tidx::db;
 use tidx::sync::ch_sink::ClickHouseSink;
 use tidx::sync::fetcher::RpcClient;
-use tidx::sync::writer::{detect_all_gaps, load_sync_state};
+use tidx::sync::writer::{detect_all_gaps, load_archive_state, load_sync_state};
 
 #[derive(ClapArgs)]
 pub struct Args {
@@ -255,18 +255,19 @@ async fn print_json_status(config: &Config) -> Result<()> {
             Err(_) => None,
         };
 
-        let (state, gaps) = match chain.resolved_pg_url() {
+        let (state, archive, gaps) = match chain.resolved_pg_url() {
             Ok(pg_url) => match db::create_pool(&pg_url).await {
                 Ok(pool) => {
                     let state = load_sync_state(&pool, chain.chain_id).await.ok().flatten();
+                    let archive = load_archive_state(&pool, chain.chain_id).await.ok();
                     let tip = state.as_ref().map(|s| s.tip_num).unwrap_or(0);
                     let floor = state.as_ref().map(|s| s.prune_floor()).unwrap_or(1);
                     let gaps = detect_all_gaps(&pool, floor, tip).await.unwrap_or_default();
-                    (state, gaps)
+                    (state, archive, gaps)
                 }
-                Err(_) => (None, vec![]),
+                Err(_) => (None, None, vec![]),
             },
-            Err(_) => (None, vec![]),
+            Err(_) => (None, None, vec![]),
         };
 
         let gaps_json: Vec<_> = gaps
@@ -291,6 +292,9 @@ async fn print_json_status(config: &Config) -> Result<()> {
             "backfill_complete": state.as_ref().map(|s| s.backfill_complete()).unwrap_or(false),
             "sync_rate": state.as_ref().and_then(|s| s.current_rate()),
             "backfill_eta_secs": state.as_ref().and_then(|s| s.backfill_eta_secs()),
+            "archive_tip_num": archive.as_ref().map(|s| s.tip_num),
+            "archive_backfill_num": archive.as_ref().and_then(|s| s.backfill_num),
+            "archive_backfill_complete": archive.as_ref().is_some_and(|s| s.backfill_num == Some(1)),
         });
 
         // Add ClickHouse status if configured

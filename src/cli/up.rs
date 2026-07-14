@@ -19,6 +19,7 @@ use tidx::sync::ch_sink::ClickHouseSink;
 use tidx::sync::engine::SyncEngine;
 use tidx::sync::pruner::Pruner;
 use tidx::sync::sink::SinkSet;
+use tidx::sync::tiered_sync::TieredSync;
 
 const CLICKHOUSE_BACKFILL_RETRY_MAX_SECS: u64 = 10;
 const CLICKHOUSE_DERIVED_REPAIR_RETRY_MAX_SECS: u64 = 300;
@@ -423,10 +424,10 @@ fn spawn_sync_engine(
             }
         }
 
-        // Auto-backfill ClickHouse from PostgreSQL in background (non-blocking).
-        // SyncEngine starts immediately so new blocks are indexed while CH catches up.
-        // Retries indefinitely with exponential backoff on failure.
-        {
+        // Non-retention deployments retain the legacy PG→CH catch-up path.
+        // Tiered deployments use the RPC→CH archive worker below instead, so
+        // historical rows never need to pass through PostgreSQL.
+        if chain.retention.is_none() {
             let backfill_sinks = sinks.clone();
             let backfill_chain_name = chain.name.clone();
             let backfill_chain_id = chain.chain_id;
@@ -457,6 +458,38 @@ fn spawn_sync_engine(
                         .await;
                 }
             });
+        } else if let Some(derived_repair_sink) = derived_repair_sink {
+            let chain_name = chain.name.clone();
+            tokio::spawn(async move {
+                run_clickhouse_derived_repair_loop(derived_repair_sink, chain_name).await;
+            });
+        }
+
+        // Retention-enabled deployments archive full history from RPC into
+        // ClickHouse, then hydrate only the configured PostgreSQL hot window
+        // from checkpointed archive ranges. The hot boundary can move in
+        // either direction when pg_keep changes.
+        if let Some(ref retention) = chain.retention {
+            match TieredSync::new(
+                sinks.clone(),
+                &rpc_url,
+                chain.chain_id,
+                retention,
+                chain.batch_size,
+                chain.concurrency,
+            ) {
+                Ok(tiered_sync) => {
+                    info!(
+                        chain = %chain.name,
+                        pg_keep = %retention.pg_keep,
+                        "ClickHouse archive + PostgreSQL hot-window sync enabled"
+                    );
+                    tokio::spawn(tiered_sync.run(shutdown_rx.resubscribe()));
+                }
+                Err(e) => {
+                    error!(error = %e, chain = %chain.name, "Invalid tiered sync config");
+                }
+            }
         }
 
         // Tiered-storage pruner: drops PG partitions outside the retention
@@ -487,7 +520,8 @@ fn spawn_sync_engine(
                         .with_broadcaster(broadcaster)
                         .with_batch_size(chain.batch_size)
                         .with_concurrency(chain.concurrency)
-                        .with_backfill_first(backfill_first)
+                        .with_backfill_first(backfill_first && chain.retention.is_none())
+                        .with_gapfill_enabled(chain.retention.is_none())
                         .with_trust_rpc(trust_rpc);
                 }
                 Err(e) => {

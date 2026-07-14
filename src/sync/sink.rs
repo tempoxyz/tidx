@@ -10,6 +10,18 @@ use crate::types::{BlockRow, LogRow, ReceiptRow, TxRow};
 use super::ch_sink::ClickHouseSink;
 use super::writer;
 
+/// Storage target for a decoded sync batch.
+///
+/// Realtime writes use `All`. Tiered deployments use `ClickHouse` for the
+/// full archive backfill and `Postgres` only as the no-ClickHouse fallback for
+/// hot-window materialization.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum WriteTarget {
+    All,
+    Postgres,
+    ClickHouse,
+}
+
 /// Number of blocks worth of data to fetch per query during backfill.
 /// Uses block-range pagination (no long-lived transactions).
 const BACKFILL_BLOCK_BATCH: i64 = 5_000;
@@ -130,7 +142,59 @@ impl SinkSet {
         logs: &[LogRow],
         receipts: &[ReceiptRow],
     ) -> Result<()> {
-        self.write_all_inner(blocks, txs, logs, receipts, None)
+        self.write_all_to(blocks, txs, logs, receipts, None, WriteTarget::All)
+            .await
+    }
+
+    pub(crate) async fn write_all_postgres(
+        &self,
+        blocks: &[BlockRow],
+        txs: &[TxRow],
+        logs: &[LogRow],
+        receipts: &[ReceiptRow],
+    ) -> Result<()> {
+        self.write_all_to(
+            blocks,
+            txs,
+            logs,
+            receipts,
+            Some("tidx postgres hot backfill"),
+            WriteTarget::Postgres,
+        )
+        .await
+    }
+
+    pub(crate) async fn write_all_clickhouse(
+        &self,
+        blocks: &[BlockRow],
+        txs: &[TxRow],
+        logs: &[LogRow],
+        receipts: &[ReceiptRow],
+    ) -> Result<()> {
+        self.write_all_to(blocks, txs, logs, receipts, None, WriteTarget::ClickHouse)
+            .await
+    }
+
+    /// Hydrate a PostgreSQL block range from the canonical ClickHouse archive.
+    ///
+    /// The caller is responsible for checking the durable archive watermark
+    /// before requesting the range. A missing block is treated as checkpoint
+    /// corruption and aborts the write rather than creating a PostgreSQL gap.
+    pub async fn hydrate_postgres_from_clickhouse(&self, from: u64, to: u64) -> Result<()> {
+        let ch = self
+            .ch
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("PostgreSQL archive hydration requires ClickHouse"))?;
+        let batch = ch.read_archive_range(from, to).await?;
+        let expected = to.saturating_sub(from).saturating_add(1);
+        if batch.blocks.len() as u64 != expected {
+            anyhow::bail!(
+                "ClickHouse archive checkpoint claimed {from}..={to}, but returned {} of {expected} blocks",
+                batch.blocks.len()
+            );
+        }
+
+        self.write_all_postgres(&batch.blocks, &batch.txs, &batch.logs, &batch.receipts)
             .await
     }
 
@@ -142,61 +206,70 @@ impl SinkSet {
         receipts: &[ReceiptRow],
         application_name: &str,
     ) -> Result<()> {
-        self.write_all_inner(blocks, txs, logs, receipts, Some(application_name))
-            .await
+        self.write_all_to(
+            blocks,
+            txs,
+            logs,
+            receipts,
+            Some(application_name),
+            WriteTarget::All,
+        )
+        .await
     }
 
-    async fn write_all_inner(
+    async fn write_all_to(
         &self,
         blocks: &[BlockRow],
         txs: &[TxRow],
         logs: &[LogRow],
         receipts: &[ReceiptRow],
         application_name: Option<&str>,
+        target: WriteTarget,
     ) -> Result<()> {
-        self.ensure_partitions(
-            blocks
-                .iter()
-                .map(|b| b.timestamp)
-                .chain(txs.iter().map(|t| t.block_timestamp))
-                .chain(logs.iter().map(|l| l.block_timestamp))
-                .chain(receipts.iter().map(|r| r.block_timestamp)),
-        )
-        .await?;
-        if let Some(ch) = &self.ch {
-            tokio::try_join!(
-                async {
-                    if let Some(application_name) = application_name {
-                        writer::write_batch_with_application_name(
-                            &self.pool,
-                            blocks,
-                            txs,
-                            logs,
-                            receipts,
-                            application_name,
-                        )
-                        .await
-                    } else {
-                        writer::write_batch(&self.pool, blocks, txs, logs, receipts).await
-                    }
-                },
-                ch.write_blocks(blocks),
-                ch.write_txs(txs),
-                ch.write_logs(logs),
-                ch.write_receipts(receipts),
-            )?;
-        } else if let Some(application_name) = application_name {
-            writer::write_batch_with_application_name(
-                &self.pool,
-                blocks,
-                txs,
-                logs,
-                receipts,
-                application_name,
+        if target != WriteTarget::ClickHouse {
+            self.ensure_partitions(
+                blocks
+                    .iter()
+                    .map(|b| b.timestamp)
+                    .chain(txs.iter().map(|t| t.block_timestamp))
+                    .chain(logs.iter().map(|l| l.block_timestamp))
+                    .chain(receipts.iter().map(|r| r.block_timestamp)),
             )
             .await?;
-        } else {
-            writer::write_batch(&self.pool, blocks, txs, logs, receipts).await?;
+        }
+
+        let write_postgres = || async {
+            if let Some(application_name) = application_name {
+                writer::write_batch_with_application_name(
+                    &self.pool,
+                    blocks,
+                    txs,
+                    logs,
+                    receipts,
+                    application_name,
+                )
+                .await
+            } else {
+                writer::write_batch(&self.pool, blocks, txs, logs, receipts).await
+            }
+        };
+
+        match (target, &self.ch) {
+            (WriteTarget::All, Some(ch)) => {
+                tokio::try_join!(
+                    write_postgres(),
+                    write_clickhouse_batch(ch, blocks, txs, logs, receipts)
+                )?;
+            }
+            (WriteTarget::All | WriteTarget::Postgres, _) => {
+                write_postgres().await?;
+            }
+            (WriteTarget::ClickHouse, Some(ch)) => {
+                write_clickhouse_batch(ch, blocks, txs, logs, receipts).await?;
+            }
+            (WriteTarget::ClickHouse, None) => {
+                anyhow::bail!("ClickHouse archive backfill requested without an active sink");
+            }
         }
         Ok(())
     }
@@ -376,6 +449,22 @@ impl SinkSet {
 
         Ok(())
     }
+}
+
+async fn write_clickhouse_batch(
+    ch: &ClickHouseSink,
+    blocks: &[BlockRow],
+    txs: &[TxRow],
+    logs: &[LogRow],
+    receipts: &[ReceiptRow],
+) -> Result<()> {
+    tokio::try_join!(
+        ch.write_blocks(blocks),
+        ch.write_txs(txs),
+        ch.write_logs(logs),
+        ch.write_receipts(receipts),
+    )?;
+    Ok(())
 }
 
 /// Get the max block number in PostgreSQL, or None if empty.

@@ -51,7 +51,7 @@ curl -L https://tidx.vercel.app/docker | bash
 
 Tidx sits between a Tempo node and applications that need structured chain data. The Tempo block explorer in `tempo-apps` is a downstream example of an application that uses the same kind of indexed chain data. The same architecture can support explorers, analytics dashboards, and data services for other applications built on Tempo.
 
-The sync engine writes to both PostgreSQL and ClickHouse in parallel. With `[chains.retention]` enabled, PostgreSQL keeps only a hot window of recent blocks (e.g. `pg_keep = "30d"`) and prunes the rest once it is durable in ClickHouse, which holds the full archive. Without retention, both stores hold full history. Queries route across the tiers via the `engine` and `source` parameters:
+Realtime ingestion writes to both PostgreSQL and ClickHouse. With `[chains.retention]` enabled, historical backfill writes directly from RPC to ClickHouse, then a reconciler hydrates only the configured PostgreSQL hot window from checkpointed ClickHouse archive ranges (for example `pg_keep = "30d"`). Increasing `pg_keep` restores the newly requested range from ClickHouse before moving the tier boundary; decreasing it moves the boundary first and then drops expired partitions. PostgreSQL therefore never needs enough space for the initial full-chain sync, and historical blocks are fetched and decoded from RPC only once. Without retention, both stores hold full history. Queries route across the tiers via the `engine` and `source` parameters:
 
 ```
                         ┌───────────────────────────────────────┐
@@ -74,15 +74,13 @@ The sync engine writes to both PostgreSQL and ClickHouse in parallel. With `[cha
           │    30d hot ≈ 8 GB †      │                │   full chain ≈ 26 GB †   │
           └────────────┬─────────────┘                └────────────┬─────────────┘
                        ▲                                           ▲
-                       │                                           │
+                       │ hot-window reconcile                      │ full archive
+                       │                                           │ backfill
                        └─────────────────────┬─────────────────────┘
                                              │
                                      ┌───────┴───────┐
-                                     │   Dual Sink   │
-                                     └───────┬───────┘
-                                             │
-                                     ┌───────┴───────┐
                                      │  Sync Engine  │
+                                     │ realtime→both │
                                      └───────────────┘
 ```
 
@@ -184,8 +182,8 @@ url = "http://clickhouse:8123"
 # Historical materialized-table repair runs after base ClickHouse backfill by default.
 repair_derived_on_startup = true
 
-# Optional: tiered storage. Keeps a 30d hot window in PostgreSQL and prunes
-# older rows once they are durable in the ClickHouse archive.
+# Optional: tiered storage. Backfills full history directly to ClickHouse, then
+# materializes a reversible 30d PostgreSQL hot window from that archive.
 [chains.retention]
 pg_keep = "30d"
 
@@ -605,6 +603,10 @@ Written by the sync engine to both PostgreSQL and ClickHouse. Schemas are identi
 | `synced_num` | `INT8` | Highest contiguous block (no gaps from backfill_num to here) |
 | `tip_num` | `INT8` | Highest block near chain head (realtime follows this) |
 | `backfill_num` | `INT8` | Lowest synced block going backwards (NULL=not started, 0=complete) |
+| `archive_tip_num` | `INT8` | Highest block in the contiguous ClickHouse archive interval |
+| `archive_backfill_num` | `INT8` | Lowest block in the contiguous ClickHouse archive interval (NULL=not started) |
+| `pruned_below` | `INT8` | Current PostgreSQL hot-tier boundary; rows at or below it route to ClickHouse |
+| `pruned_below_ts` | `TIMESTAMPTZ` | Timestamp boundary used for tiered constraint exclusion |
 | `started_at` | `TIMESTAMPTZ` | Sync start time |
 | `updated_at` | `TIMESTAMPTZ` | Last update time |
 
