@@ -852,7 +852,8 @@ pub async fn save_sync_state(pool: &Pool, state: &SyncState) -> Result<()> {
             tip_num = GREATEST(sync_state.tip_num, EXCLUDED.tip_num),
             backfill_num = COALESCE(EXCLUDED.backfill_num, sync_state.backfill_num),
             started_at = COALESCE(sync_state.started_at, EXCLUDED.started_at),
-            updated_at = NOW()
+            updated_at = NOW(),
+            pruned_below = GREATEST(sync_state.pruned_below, EXCLUDED.pruned_below)
         "#,
         &[
             &(state.chain_id as i64),
@@ -907,90 +908,28 @@ pub async fn update_synced_num(pool: &Pool, chain_id: u64, synced_num: u64) -> R
     Ok(())
 }
 
-/// ClickHouse interval known to be complete across all base tables.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub struct ArchiveState {
-    pub tip_num: u64,
-    pub backfill_num: Option<u64>,
-}
-
-impl ArchiveState {
-    pub fn covers(&self, from: u64, to: u64) -> bool {
-        self.backfill_num.is_some_and(|low| low <= from) && self.tip_num >= to
-    }
-}
-
-pub async fn load_archive_state(pool: &Pool, chain_id: u64) -> Result<ArchiveState> {
-    let conn = pool.get().await?;
-    let row = conn
-        .query_opt(
-            "SELECT archive_tip_num, archive_backfill_num FROM sync_state WHERE chain_id = $1",
-            &[&(chain_id as i64)],
-        )
-        .await?;
-    Ok(row
-        .map(|r| ArchiveState {
-            tip_num: r.get::<_, i64>(0).max(0) as u64,
-            backfill_num: r.get::<_, Option<i64>>(1).map(|n| n.max(0) as u64),
-        })
-        .unwrap_or_default())
-}
-
-/// Persist a contiguous ClickHouse archive interval. The low watermark only
-/// moves toward genesis and the high watermark only moves toward chain head.
-pub async fn save_archive_state(
+/// Record that Postgres history up to `pruned_below` was intentionally
+/// pruned (tiered storage). Monotonic: only ever advances.
+/// `pruned_below_ts` is the partition-boundary timestamp: every pruned row
+/// has block_timestamp strictly below it.
+pub async fn update_pruned_below(
     pool: &Pool,
     chain_id: u64,
-    backfill_num: u64,
-    tip_num: u64,
+    pruned_below: u64,
+    pruned_below_ts: Option<chrono::DateTime<chrono::Utc>>,
 ) -> Result<()> {
     let conn = pool.get().await?;
+
     conn.execute(
         r#"
-        INSERT INTO sync_state (chain_id, archive_tip_num, archive_backfill_num)
+        INSERT INTO sync_state (chain_id, pruned_below, pruned_below_ts)
         VALUES ($1, $2, $3)
         ON CONFLICT (chain_id) DO UPDATE SET
-            archive_tip_num = GREATEST(sync_state.archive_tip_num, EXCLUDED.archive_tip_num),
-            archive_backfill_num = CASE
-                WHEN sync_state.archive_backfill_num IS NULL THEN EXCLUDED.archive_backfill_num
-                ELSE LEAST(sync_state.archive_backfill_num, EXCLUDED.archive_backfill_num)
-            END,
+            pruned_below = GREATEST(sync_state.pruned_below, EXCLUDED.pruned_below),
+            pruned_below_ts = GREATEST(sync_state.pruned_below_ts, EXCLUDED.pruned_below_ts),
             updated_at = NOW()
         "#,
-        &[
-            &(chain_id as i64),
-            &(tip_num as i64),
-            &(backfill_num as i64),
-        ],
-    )
-    .await?;
-    Ok(())
-}
-
-/// Set the current PostgreSQL hot-tier boundary.
-///
-/// Unlike the old prune watermark, this value is intentionally reversible:
-/// increasing `pg_keep` first restores the missing PostgreSQL range and then
-/// moves the boundary toward genesis.
-pub async fn set_hot_boundary(
-    pool: &Pool,
-    chain_id: u64,
-    boundary: u64,
-    boundary_ts: Option<chrono::DateTime<chrono::Utc>>,
-) -> Result<()> {
-    let conn = pool.get().await?;
-
-    conn.execute(
-        r#"
-        INSERT INTO sync_state (chain_id, pruned_below, pruned_below_ts, backfill_num)
-        VALUES ($1, $2, $3, $2)
-        ON CONFLICT (chain_id) DO UPDATE SET
-            pruned_below = EXCLUDED.pruned_below,
-            pruned_below_ts = EXCLUDED.pruned_below_ts,
-            backfill_num = EXCLUDED.backfill_num,
-            updated_at = NOW()
-        "#,
-        &[&(chain_id as i64), &(boundary as i64), &boundary_ts],
+        &[&(chain_id as i64), &(pruned_below as i64), &pruned_below_ts],
     )
     .await?;
 
@@ -1077,9 +1016,15 @@ pub async fn detect_gaps(pool: &Pool, below: u64) -> Result<Vec<(u64, u64)>> {
         .collect())
 }
 
-/// Detect blocks that have no receipts (for deferred receipt backfill).
-/// Returns block numbers that exist in blocks table but have no receipts.
-/// Limited to a batch size and ordered by block_num DESC (most recent first).
+/// Detect blocks that have transactions but no receipts (for deferred receipt
+/// backfill). Returns block numbers ordered by block_num DESC (most recent
+/// first), limited to a batch size.
+///
+/// The `EXISTS (txs)` guard is load-bearing: a block with zero transactions
+/// legitimately has zero receipts and the backfill writes nothing for it, so
+/// without the guard every txless block matches forever. Because the backfill
+/// tick only sleeps when this returns empty, txless blocks would spin the loop
+/// with no delay and starve the blocks that are genuinely missing receipts.
 pub async fn detect_blocks_missing_receipts(pool: &Pool, limit: i64) -> Result<Vec<u64>> {
     let conn = pool.get().await?;
 
@@ -1088,8 +1033,8 @@ pub async fn detect_blocks_missing_receipts(pool: &Pool, limit: i64) -> Result<V
             r#"
             SELECT b.num
             FROM blocks b
-            LEFT JOIN receipts r ON r.block_num = b.num
-            WHERE r.block_num IS NULL
+            WHERE EXISTS (SELECT 1 FROM txs t WHERE t.block_num = b.num)
+              AND NOT EXISTS (SELECT 1 FROM receipts r WHERE r.block_num = b.num)
             ORDER BY b.num DESC
             LIMIT $1
             "#,
