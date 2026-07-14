@@ -1,8 +1,8 @@
 //! Tiered-storage retention tests
 //!
 //! Covers the prune-floor sync semantics (pruned history is not a gap) and
-//! the Pruner itself: dropping PG partitions outside the retention window
-//! only once the data is durable, with the ClickHouse archive intact.
+//! the Pruner itself: dropping PG partitions outside the reconciled hot
+//! boundary, with the ClickHouse archive intact.
 //!
 //! Run with: cargo test --test retention_test
 //! Requires: docker compose -f docker/local/docker-compose.yml up -d postgres clickhouse
@@ -19,7 +19,10 @@ use tidx::db::partitions::{ensure_partitions_covering, list_partitions};
 use tidx::sync::ch_sink::ClickHouseSink;
 use tidx::sync::pruner::Pruner;
 use tidx::sync::sink::SinkSet;
-use tidx::sync::writer::{self, detect_all_gaps, load_sync_state, save_sync_state};
+use tidx::sync::writer::{
+    self, detect_all_gaps, load_archive_state, load_sync_state, save_archive_state,
+    save_sync_state, set_hot_boundary,
+};
 use tidx::types::{BlockRow, LogRow, SyncState, TxRow};
 
 const CHAIN_ID: u64 = 999;
@@ -232,6 +235,18 @@ async fn test_pruner_drops_old_partitions_after_ch_archive() {
     );
 
     let sinks = SinkSet::new(db.pool.clone()).with_clickhouse(ch_sink);
+    sinks
+        .backfill_clickhouse(CHAIN_ID)
+        .await
+        .expect("archive PG data before pruning");
+    set_hot_boundary(
+        &db.pool,
+        CHAIN_ID,
+        20,
+        Some(Utc::now() - Duration::weeks(9)),
+    )
+    .await
+    .unwrap();
     let pruner = Pruner::new(sinks, CHAIN_ID, &retention(true)).unwrap();
     let dropped = pruner.tick().await.expect("prune tick failed");
     assert!(dropped > 0, "should drop out-of-window partitions");
@@ -282,10 +297,10 @@ async fn test_pruner_drops_old_partitions_after_ch_archive() {
     });
 }
 
-/// Blocks not yet contiguously synced in PG must never be pruned.
+/// The pruner consumes, but never advances, the reconciled hot boundary.
 #[tokio::test]
 #[serial(db)]
-async fn test_pruner_blocked_by_synced_num() {
+async fn test_pruner_does_not_advance_hot_boundary() {
     let Some((ch_sink, _ch)) = setup_clickhouse().await else {
         return;
     };
@@ -294,7 +309,7 @@ async fn test_pruner_blocked_by_synced_num() {
 
     let old_ts = Utc::now() - Duration::weeks(10);
     seed_range(&db.pool, 1..=20, old_ts).await;
-    set_state(&db.pool, 10, 2000).await; // synced only through 10 < partition max 20
+    set_state(&db.pool, 10, 2000).await;
 
     let sinks = SinkSet::new(db.pool.clone()).with_clickhouse(ch_sink);
     Pruner::new(sinks, CHAIN_ID, &retention(true))
@@ -310,10 +325,10 @@ async fn test_pruner_blocked_by_synced_num() {
     assert_eq!(state.pruned_below, 0, "watermark must not move");
 }
 
-/// Blocks within REORG_GUARD of the chain head must never be pruned.
+/// A partition that extends above the reconciled boundary is retained.
 #[tokio::test]
 #[serial(db)]
-async fn test_pruner_blocked_by_reorg_guard() {
+async fn test_pruner_keeps_partition_above_hot_boundary() {
     let Some((ch_sink, _ch)) = setup_clickhouse().await else {
         return;
     };
@@ -322,7 +337,10 @@ async fn test_pruner_blocked_by_reorg_guard() {
 
     let old_ts = Utc::now() - Duration::weeks(10);
     seed_range(&db.pool, 1..=20, old_ts).await;
-    set_state(&db.pool, 20, 20).await; // head == synced: everything within guard
+    set_state(&db.pool, 20, 2000).await;
+    set_hot_boundary(&db.pool, CHAIN_ID, 10, Some(old_ts))
+        .await
+        .unwrap();
 
     let sinks = SinkSet::new(db.pool.clone()).with_clickhouse(ch_sink);
     Pruner::new(sinks, CHAIN_ID, &retention(true))
@@ -331,10 +349,10 @@ async fn test_pruner_blocked_by_reorg_guard() {
         .await
         .unwrap();
 
-    // Data within the guard must survive; the watermark must not move.
+    // The partition contains blocks above the boundary, so it stays attached.
     assert_eq!(pg_block_range(&db.pool).await, (Some(1), Some(20)));
     let state = load_sync_state(&db.pool, CHAIN_ID).await.unwrap().unwrap();
-    assert_eq!(state.pruned_below, 0, "watermark must not move");
+    assert_eq!(state.pruned_below, 10, "pruner must not move boundary");
 }
 
 /// require_clickhouse=true with no CH sink configured: refuse to prune.
@@ -347,6 +365,9 @@ async fn test_pruner_requires_clickhouse_sink() {
     let old_ts = Utc::now() - Duration::weeks(10);
     seed_range(&db.pool, 1..=20, old_ts).await;
     set_state(&db.pool, 20, 2000).await;
+    set_hot_boundary(&db.pool, CHAIN_ID, 20, Some(old_ts))
+        .await
+        .unwrap();
 
     let sinks = SinkSet::new(db.pool.clone()); // no CH
     let dropped = Pruner::new(sinks, CHAIN_ID, &retention(true))
@@ -370,6 +391,9 @@ async fn test_pruner_rolling_window_without_clickhouse() {
     seed_range(&db.pool, 1..=20, old_ts).await;
     seed_range(&db.pool, 21..=40, Utc::now()).await;
     set_state(&db.pool, 40, 2000).await;
+    set_hot_boundary(&db.pool, CHAIN_ID, 20, Some(old_ts))
+        .await
+        .unwrap();
 
     let sinks = SinkSet::new(db.pool.clone()); // no CH
     let dropped = Pruner::new(sinks, CHAIN_ID, &retention(false))
@@ -382,4 +406,50 @@ async fn test_pruner_rolling_window_without_clickhouse() {
     assert_eq!(pg_block_range(&db.pool).await, (Some(21), Some(40)));
     let state = load_sync_state(&db.pool, CHAIN_ID).await.unwrap().unwrap();
     assert_eq!(state.pruned_below, 20);
+}
+
+#[tokio::test]
+#[serial(db)]
+async fn test_hot_boundary_can_move_backwards_after_restore() {
+    let db = TestDb::empty().await;
+    db.truncate_all().await;
+
+    set_hot_boundary(&db.pool, CHAIN_ID, 100, Some(Utc::now()))
+        .await
+        .unwrap();
+    set_hot_boundary(
+        &db.pool,
+        CHAIN_ID,
+        50,
+        Some(Utc::now() - Duration::weeks(1)),
+    )
+    .await
+    .unwrap();
+
+    let state = load_sync_state(&db.pool, CHAIN_ID).await.unwrap().unwrap();
+    assert_eq!(state.pruned_below, 50);
+    assert_eq!(state.backfill_num, Some(50));
+}
+
+#[tokio::test]
+#[serial(db)]
+async fn test_archive_state_tracks_a_contiguous_interval() {
+    let db = TestDb::empty().await;
+    db.truncate_all().await;
+
+    save_archive_state(&db.pool, CHAIN_ID, 91, 100)
+        .await
+        .unwrap();
+    save_archive_state(&db.pool, CHAIN_ID, 91, 120)
+        .await
+        .unwrap();
+    save_archive_state(&db.pool, CHAIN_ID, 50, 120)
+        .await
+        .unwrap();
+
+    let state = load_archive_state(&db.pool, CHAIN_ID).await.unwrap();
+    assert_eq!(state.backfill_num, Some(50));
+    assert_eq!(state.tip_num, 120);
+    assert!(state.covers(50, 120));
+    assert!(!state.covers(1, 120));
 }
