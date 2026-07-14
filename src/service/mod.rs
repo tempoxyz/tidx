@@ -25,6 +25,14 @@ pub struct SyncStatus {
     pub gaps: Vec<(i64, i64)>,
     pub backfill_num: Option<i64>,
     pub backfill_remaining: i64,
+    /// Lowest block in the contiguous ClickHouse archive interval.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub archive_backfill_num: Option<i64>,
+    /// Highest block in the contiguous ClickHouse archive interval.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub archive_tip_num: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub archive_backfill_remaining: Option<i64>,
     pub sync_rate: Option<f64>,
     pub eta_secs: Option<f64>,
     pub updated_at: DateTime<Utc>,
@@ -62,7 +70,7 @@ pub async fn get_all_status(pool: &Pool) -> Result<Vec<SyncStatus>> {
 
     let rows = conn
         .query(
-            "SELECT chain_id, head_num, synced_num, tip_num, backfill_num, started_at, updated_at, pruned_below FROM sync_state ORDER BY chain_id",
+            "SELECT chain_id, head_num, synced_num, tip_num, backfill_num, started_at, updated_at, pruned_below, archive_tip_num, archive_backfill_num FROM sync_state ORDER BY chain_id",
             &[],
         )
         .await?;
@@ -75,6 +83,8 @@ pub async fn get_all_status(pool: &Pool) -> Result<Vec<SyncStatus>> {
             let backfill_num: Option<i64> = row.get(4);
             let started_at: Option<DateTime<Utc>> = row.get(5);
             let pruned_below: i64 = row.get(7);
+            let archive_tip_num: i64 = row.get(8);
+            let archive_backfill_num: Option<i64> = row.get(9);
 
             // Blocks at or below the prune floor were intentionally dropped.
             let backfill_remaining = match backfill_num {
@@ -126,6 +136,9 @@ pub async fn get_all_status(pool: &Pool) -> Result<Vec<SyncStatus>> {
                 gaps,
                 backfill_num,
                 backfill_remaining,
+                archive_backfill_num,
+                archive_tip_num: archive_backfill_num.map(|_| archive_tip_num),
+                archive_backfill_remaining: archive_backfill_num.map(|n| n.saturating_sub(1)),
                 sync_rate,
                 eta_secs,
                 updated_at: row.get(6),
