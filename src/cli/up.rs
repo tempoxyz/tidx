@@ -465,10 +465,10 @@ fn spawn_sync_engine(
             });
         }
 
-        // Retention-enabled deployments reconcile two independent tiers:
-        // ClickHouse receives full history while PostgreSQL receives only the
-        // configured hot window. The hot boundary can move in either direction
-        // when pg_keep changes.
+        // Retention-enabled deployments archive full history from RPC into
+        // ClickHouse, then hydrate only the configured PostgreSQL hot window
+        // from checkpointed archive ranges. The hot boundary can move in
+        // either direction when pg_keep changes.
         if let Some(ref retention) = chain.retention {
             match TieredSync::new(
                 sinks.clone(),

@@ -197,7 +197,7 @@ With `[chains.retention]`, historical storage is split into independent paths:
 
 - **Realtime** writes new blocks to both stores.
 - **ClickHouse archive backfill** syncs full history directly from RPC to ClickHouse.
-- **PostgreSQL hot reconciliation** fills only the configured `pg_keep` window. It can restore older weeks when `pg_keep` increases and prune weeks when it decreases.
+- **PostgreSQL hot reconciliation** fills only the configured `pg_keep` window from checkpointed ClickHouse archive ranges. It can restore older weeks without replaying RPC when `pg_keep` increases and prune weeks when it decreases. RPC is used only as a fallback when ClickHouse is not configured.
 
 ```
 Block Numbers:  0                                                    HEAD

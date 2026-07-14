@@ -51,7 +51,7 @@ curl -L https://tidx.vercel.app/docker | bash
 
 Tidx sits between a Tempo node and applications that need structured chain data. The Tempo block explorer in `tempo-apps` is a downstream example of an application that uses the same kind of indexed chain data. The same architecture can support explorers, analytics dashboards, and data services for other applications built on Tempo.
 
-Realtime ingestion writes to both PostgreSQL and ClickHouse. With `[chains.retention]` enabled, historical backfill writes directly to ClickHouse while an independent reconciler materializes only the configured PostgreSQL hot window (for example `pg_keep = "30d"`). Increasing `pg_keep` restores the newly requested range into PostgreSQL before moving the tier boundary; decreasing it moves the boundary first and then drops expired partitions. PostgreSQL therefore never needs enough space for the initial full-chain sync. Without retention, both stores hold full history. Queries route across the tiers via the `engine` and `source` parameters:
+Realtime ingestion writes to both PostgreSQL and ClickHouse. With `[chains.retention]` enabled, historical backfill writes directly from RPC to ClickHouse, then a reconciler hydrates only the configured PostgreSQL hot window from checkpointed ClickHouse archive ranges (for example `pg_keep = "30d"`). Increasing `pg_keep` restores the newly requested range from ClickHouse before moving the tier boundary; decreasing it moves the boundary first and then drops expired partitions. PostgreSQL therefore never needs enough space for the initial full-chain sync, and historical blocks are fetched and decoded from RPC only once. Without retention, both stores hold full history. Queries route across the tiers via the `engine` and `source` parameters:
 
 ```
                         ┌───────────────────────────────────────┐
@@ -182,8 +182,8 @@ url = "http://clickhouse:8123"
 # Historical materialized-table repair runs after base ClickHouse backfill by default.
 repair_derived_on_startup = true
 
-# Optional: tiered storage. Backfills full history directly to ClickHouse and
-# independently materializes a reversible 30d PostgreSQL hot window.
+# Optional: tiered storage. Backfills full history directly to ClickHouse, then
+# materializes a reversible 30d PostgreSQL hot window from that archive.
 [chains.retention]
 pg_keep = "30d"
 
