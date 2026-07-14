@@ -1,9 +1,10 @@
 //! ClickHouse-first historical sync and PostgreSQL hot-window reconciliation.
 //!
 //! In a retention-enabled deployment, ClickHouse owns the full historical
-//! backfill. PostgreSQL is reconciled independently to the configured hot
-//! window, so changing `pg_keep` can either prune or restore PG partitions
-//! without replaying the full chain through PostgreSQL.
+//! backfill. PostgreSQL is reconciled from checkpointed ClickHouse archive
+//! ranges to the configured hot window, so changing `pg_keep` can either prune
+//! or restore PG partitions without replaying chain RPC or full history through
+//! PostgreSQL. RPC is the fallback source when no ClickHouse sink is active.
 
 use alloy::consensus::BlockHeader as _;
 use anyhow::Result;
@@ -213,10 +214,28 @@ impl TieredSync {
 
         if has_gaps(self.sinks.pool(), floor, head).await? {
             let gaps = detect_all_gaps(self.sinks.pool(), floor, head).await?;
-            let ranges = newest_gap_ranges(&gaps, self.batch_size, self.concurrency);
+            let ranges = if self.sinks.has_clickhouse() {
+                let archive = load_archive_state(self.sinks.pool(), self.chain_id).await?;
+                let Some(archive_low) = archive.backfill_num else {
+                    debug!(
+                        chain_id = self.chain_id,
+                        "Waiting for ClickHouse archive before hydrating PostgreSQL"
+                    );
+                    return Ok(Duration::from_secs(2));
+                };
+                let archived_gaps =
+                    intersect_gaps(&gaps, archive_low.max(1), archive.tip_num.min(head));
+                newest_gap_ranges(&archived_gaps, self.batch_size, self.concurrency)
+            } else {
+                newest_gap_ranges(&gaps, self.batch_size, self.concurrency)
+            };
             if !ranges.is_empty() {
                 let blocks: u64 = ranges.iter().map(|(start, end)| end - start + 1).sum();
-                self.sync_ranges(ranges, WriteTarget::Postgres).await?;
+                if self.sinks.has_clickhouse() {
+                    self.hydrate_postgres_ranges(ranges).await?;
+                } else {
+                    self.sync_ranges(ranges, WriteTarget::Postgres).await?;
+                }
                 metrics::record_blocks_indexed(self.chain_id, blocks);
                 metrics::set_backfill_remaining(
                     self.chain_id,
@@ -224,6 +243,13 @@ impl TieredSync {
                     gaps.iter().map(|(start, end)| end - start + 1).sum(),
                 );
                 return Ok(Duration::ZERO);
+            }
+            if self.sinks.has_clickhouse() {
+                debug!(
+                    chain_id = self.chain_id,
+                    "PostgreSQL gaps are outside the completed ClickHouse archive interval"
+                );
+                return Ok(Duration::from_secs(2));
             }
         }
 
@@ -299,6 +325,23 @@ impl TieredSync {
         Ok(low)
     }
 
+    async fn hydrate_postgres_ranges(&self, ranges: Vec<(u64, u64)>) -> Result<()> {
+        let mut tasks = JoinSet::new();
+        for (start, end) in ranges {
+            let sinks = self.sinks.clone();
+            tasks.spawn(async move {
+                sinks
+                    .hydrate_postgres_from_clickhouse(start, end)
+                    .await
+                    .map_err(|e| anyhow::anyhow!("hydrate PostgreSQL range {start}..={end}: {e}"))
+            });
+        }
+        while let Some(result) = tasks.join_next().await {
+            result??;
+        }
+        Ok(())
+    }
+
     async fn sync_ranges(&self, ranges: Vec<(u64, u64)>, target: WriteTarget) -> Result<()> {
         let mut tasks = JoinSet::new();
         for (start, end) in ranges {
@@ -365,6 +408,19 @@ fn newest_gap_ranges(gaps: &[(u64, u64)], batch_size: u64, limit: usize) -> Vec<
     ranges
 }
 
+fn intersect_gaps(gaps: &[(u64, u64)], floor: u64, ceiling: u64) -> Vec<(u64, u64)> {
+    if floor > ceiling {
+        return Vec::new();
+    }
+    gaps.iter()
+        .filter_map(|&(start, end)| {
+            let start = start.max(floor);
+            let end = end.min(ceiling);
+            (start <= end).then_some((start, end))
+        })
+        .collect()
+}
+
 fn range_hull(ranges: &[(u64, u64)]) -> Option<(u64, u64)> {
     Some((
         ranges.iter().map(|(start, _)| *start).min()?,
@@ -405,5 +461,12 @@ mod tests {
             newest_gap_ranges(&gaps, 5, 3),
             vec![(96, 100), (91, 95), (46, 50)]
         );
+    }
+
+    #[test]
+    fn postgres_hydration_is_clamped_to_archived_ranges() {
+        let gaps = vec![(91, 110), (1, 50)];
+        assert_eq!(intersect_gaps(&gaps, 40, 100), vec![(91, 100), (40, 50)]);
+        assert!(intersect_gaps(&gaps, 111, 120).is_empty());
     }
 }

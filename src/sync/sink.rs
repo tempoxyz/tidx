@@ -13,7 +13,8 @@ use super::writer;
 /// Storage target for a decoded sync batch.
 ///
 /// Realtime writes use `All`. Tiered deployments use `ClickHouse` for the
-/// full archive backfill and `Postgres` for hot-window materialization.
+/// full archive backfill and `Postgres` only as the no-ClickHouse fallback for
+/// hot-window materialization.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum WriteTarget {
     All,
@@ -171,6 +172,29 @@ impl SinkSet {
         receipts: &[ReceiptRow],
     ) -> Result<()> {
         self.write_all_to(blocks, txs, logs, receipts, None, WriteTarget::ClickHouse)
+            .await
+    }
+
+    /// Hydrate a PostgreSQL block range from the canonical ClickHouse archive.
+    ///
+    /// The caller is responsible for checking the durable archive watermark
+    /// before requesting the range. A missing block is treated as checkpoint
+    /// corruption and aborts the write rather than creating a PostgreSQL gap.
+    pub async fn hydrate_postgres_from_clickhouse(&self, from: u64, to: u64) -> Result<()> {
+        let ch = self
+            .ch
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("PostgreSQL archive hydration requires ClickHouse"))?;
+        let batch = ch.read_archive_range(from, to).await?;
+        let expected = to.saturating_sub(from).saturating_add(1);
+        if batch.blocks.len() as u64 != expected {
+            anyhow::bail!(
+                "ClickHouse archive checkpoint claimed {from}..={to}, but returned {} of {expected} blocks",
+                batch.blocks.len()
+            );
+        }
+
+        self.write_all_postgres(&batch.blocks, &batch.txs, &batch.logs, &batch.receipts)
             .await
     }
 

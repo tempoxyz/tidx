@@ -3,7 +3,7 @@
 //! Writes blocks, transactions, logs, and receipts directly to ClickHouse
 //! via the official `clickhouse` crate using RowBinary format with LZ4 compression.
 
-use anyhow::{Result, anyhow};
+use anyhow::{Context, Result, anyhow};
 use clickhouse::{Row, RowOwned, RowRead};
 use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
@@ -59,6 +59,15 @@ pub struct ClickHouseSink {
     /// Create the database with `ENGINE = Replicated` and rewrite
     /// MergeTree-family table engines to their `Replicated*` counterparts.
     replicated_database: bool,
+}
+
+/// Canonical base-table rows read from a completed ClickHouse archive range.
+#[derive(Default)]
+pub(crate) struct ArchiveBatch {
+    pub blocks: Vec<BlockRow>,
+    pub txs: Vec<TxRow>,
+    pub logs: Vec<LogRow>,
+    pub receipts: Vec<ReceiptRow>,
 }
 
 /// A historical derived-table repair planned from the schema state observed
@@ -526,6 +535,80 @@ impl ClickHouseSink {
         Ok(())
     }
 
+    /// Read a canonical base-table range for PostgreSQL hot-tier hydration.
+    ///
+    /// Callers must gate this on the durable archive checkpoint. `FINAL`
+    /// collapses identical crash-replay rows before they cross into the
+    /// PostgreSQL tables, which enforce one canonical row per primary key.
+    pub(crate) async fn read_archive_range(&self, from: u64, to: u64) -> Result<ArchiveBatch> {
+        if from > to {
+            return Ok(ArchiveBatch::default());
+        }
+        let from = i64::try_from(from).context("archive range start exceeds Int64")?;
+        let to = i64::try_from(to).context("archive range end exceeds Int64")?;
+
+        let blocks_sql = format!(
+            "SELECT num, hash, parent_hash, timestamp, timestamp_ms, gas_limit, gas_used, miner, \
+             extra_data, consensus_proposer FROM blocks FINAL \
+             WHERE num >= {from} AND num <= {to} ORDER BY num"
+        );
+        let txs_sql = format!(
+            "SELECT block_num, block_timestamp, idx, hash, `type`, `from`, `to`, value, input, \
+             gas_limit, max_fee_per_gas, max_priority_fee_per_gas, gas_used, nonce_key, nonce, \
+             fee_token, fee_payer, calls, call_count, valid_before, valid_after, signature_type \
+             FROM txs FINAL WHERE block_num >= {from} AND block_num <= {to} \
+             ORDER BY block_num, idx"
+        );
+        let logs_sql = format!(
+            "SELECT block_num, block_timestamp, log_idx, tx_idx, tx_hash, address, selector, \
+             topic0, topic1, topic2, topic3, data, is_virtual_forward FROM logs FINAL \
+             WHERE block_num >= {from} AND block_num <= {to} ORDER BY block_num, log_idx"
+        );
+        let receipts_sql = format!(
+            "SELECT block_num, block_timestamp, tx_idx, tx_hash, `from`, `to`, contract_address, \
+             gas_used, cumulative_gas_used, effective_gas_price, status, fee_payer, `type`, \
+             fee_token FROM receipts FINAL WHERE block_num >= {from} AND block_num <= {to} \
+             ORDER BY block_num, tx_idx"
+        );
+
+        let (blocks, txs, logs, receipts) = tokio::try_join!(
+            self.fetch_archive_rows::<ChBlockWire>(&blocks_sql, "blocks"),
+            self.fetch_archive_rows::<ChTxWire>(&txs_sql, "txs"),
+            self.fetch_archive_rows::<ChLogWire>(&logs_sql, "logs"),
+            self.fetch_archive_rows::<ChReceiptWire>(&receipts_sql, "receipts"),
+        )?;
+
+        Ok(ArchiveBatch {
+            blocks: blocks
+                .into_iter()
+                .map(ChBlockWire::into_row)
+                .collect::<Result<_>>()?,
+            txs: txs
+                .into_iter()
+                .map(ChTxWire::into_row)
+                .collect::<Result<_>>()?,
+            logs: logs
+                .into_iter()
+                .map(ChLogWire::into_row)
+                .collect::<Result<_>>()?,
+            receipts: receipts
+                .into_iter()
+                .map(ChReceiptWire::into_row)
+                .collect::<Result<_>>()?,
+        })
+    }
+
+    async fn fetch_archive_rows<T>(&self, sql: &str, table: &str) -> Result<Vec<T>>
+    where
+        T: RowOwned + RowRead,
+    {
+        self.client
+            .query(sql)
+            .fetch_all()
+            .await
+            .map_err(|e| anyhow!("ClickHouse archive read from {table} failed: {e}"))
+    }
+
     /// Query the highest block number in ClickHouse, or None if empty.
     pub async fn max_block_num(&self) -> Result<Option<i64>> {
         let count: u64 = self
@@ -804,7 +887,7 @@ struct ChSchemaObjectRow {
     checksum: String,
 }
 
-#[derive(Row, Serialize)]
+#[derive(Row, Serialize, Deserialize)]
 struct ChBlockWire {
     num: i64,
     hash: String,
@@ -834,9 +917,27 @@ impl ChBlockWire {
             consensus_proposer: b.consensus_proposer.as_ref().map(|v| hex_encode(v)),
         }
     }
+
+    fn into_row(self) -> Result<BlockRow> {
+        Ok(BlockRow {
+            num: self.num,
+            hash: hex_decode(&self.hash).context("decode ClickHouse block hash")?,
+            parent_hash: hex_decode(&self.parent_hash)
+                .context("decode ClickHouse block parent hash")?,
+            timestamp: self.timestamp,
+            timestamp_ms: self.timestamp_ms,
+            gas_limit: self.gas_limit,
+            gas_used: self.gas_used,
+            miner: hex_decode(&self.miner).context("decode ClickHouse block miner")?,
+            extra_data: decode_optional_hex(self.extra_data)
+                .context("decode ClickHouse block extra_data")?,
+            consensus_proposer: decode_optional_hex(self.consensus_proposer)
+                .context("decode ClickHouse block consensus_proposer")?,
+        })
+    }
 }
 
-#[derive(Row, Serialize)]
+#[derive(Row, Serialize, Deserialize)]
 struct ChTxWire {
     block_num: i64,
     #[serde(with = "clickhouse::serde::chrono::datetime64::millis")]
@@ -891,9 +992,43 @@ impl ChTxWire {
             signature_type: tx.signature_type,
         }
     }
+
+    fn into_row(self) -> Result<TxRow> {
+        Ok(TxRow {
+            block_num: self.block_num,
+            block_timestamp: self.block_timestamp,
+            idx: self.idx,
+            hash: hex_decode(&self.hash).context("decode ClickHouse transaction hash")?,
+            tx_type: self.tx_type,
+            from: hex_decode(&self.from).context("decode ClickHouse transaction sender")?,
+            to: decode_optional_hex(self.to).context("decode ClickHouse transaction recipient")?,
+            value: self.value,
+            input: hex_decode(&self.input).context("decode ClickHouse transaction input")?,
+            gas_limit: self.gas_limit,
+            max_fee_per_gas: self.max_fee_per_gas,
+            max_priority_fee_per_gas: self.max_priority_fee_per_gas,
+            gas_used: self.gas_used,
+            nonce_key: hex_decode(&self.nonce_key)
+                .context("decode ClickHouse transaction nonce_key")?,
+            nonce: self.nonce,
+            fee_token: decode_optional_hex(self.fee_token)
+                .context("decode ClickHouse transaction fee_token")?,
+            fee_payer: decode_optional_hex(self.fee_payer)
+                .context("decode ClickHouse transaction fee_payer")?,
+            calls: self
+                .calls
+                .map(|calls| serde_json::from_str(&calls))
+                .transpose()
+                .context("decode ClickHouse transaction calls JSON")?,
+            call_count: self.call_count,
+            valid_before: self.valid_before,
+            valid_after: self.valid_after,
+            signature_type: self.signature_type,
+        })
+    }
 }
 
-#[derive(Row, Serialize)]
+#[derive(Row, Serialize, Deserialize)]
 struct ChLogWire {
     block_num: i64,
     #[serde(with = "clickhouse::serde::chrono::datetime64::millis")]
@@ -933,9 +1068,31 @@ impl ChLogWire {
             is_virtual_forward: log.is_virtual_forward as u8,
         }
     }
+
+    fn into_row(self) -> Result<LogRow> {
+        Ok(LogRow {
+            block_num: self.block_num,
+            block_timestamp: self.block_timestamp,
+            log_idx: self.log_idx,
+            tx_idx: self.tx_idx,
+            tx_hash: hex_decode(&self.tx_hash).context("decode ClickHouse log tx_hash")?,
+            address: hex_decode(&self.address).context("decode ClickHouse log address")?,
+            selector: if self.selector.is_empty() {
+                None
+            } else {
+                Some(hex_decode(&self.selector).context("decode ClickHouse log selector")?)
+            },
+            topic0: decode_optional_hex(self.topic0).context("decode ClickHouse log topic0")?,
+            topic1: decode_optional_hex(self.topic1).context("decode ClickHouse log topic1")?,
+            topic2: decode_optional_hex(self.topic2).context("decode ClickHouse log topic2")?,
+            topic3: decode_optional_hex(self.topic3).context("decode ClickHouse log topic3")?,
+            data: hex_decode(&self.data).context("decode ClickHouse log data")?,
+            is_virtual_forward: self.is_virtual_forward != 0,
+        })
+    }
 }
 
-#[derive(Row, Serialize)]
+#[derive(Row, Serialize, Deserialize)]
 struct ChReceiptWire {
     block_num: i64,
     #[serde(with = "clickhouse::serde::chrono::datetime64::millis")]
@@ -974,11 +1131,45 @@ impl ChReceiptWire {
             fee_token: r.fee_token.as_ref().map(|v| hex_encode(v)),
         }
     }
+
+    fn into_row(self) -> Result<ReceiptRow> {
+        Ok(ReceiptRow {
+            block_num: self.block_num,
+            block_timestamp: self.block_timestamp,
+            tx_idx: self.tx_idx,
+            tx_hash: hex_decode(&self.tx_hash).context("decode ClickHouse receipt tx_hash")?,
+            from: hex_decode(&self.from).context("decode ClickHouse receipt sender")?,
+            to: decode_optional_hex(self.to).context("decode ClickHouse receipt recipient")?,
+            contract_address: decode_optional_hex(self.contract_address)
+                .context("decode ClickHouse receipt contract_address")?,
+            gas_used: self.gas_used,
+            cumulative_gas_used: self.cumulative_gas_used,
+            effective_gas_price: self.effective_gas_price,
+            status: self.status,
+            fee_payer: decode_optional_hex(self.fee_payer)
+                .context("decode ClickHouse receipt fee_payer")?,
+            tx_type: self.tx_type,
+            fee_token: decode_optional_hex(self.fee_token)
+                .context("decode ClickHouse receipt fee_token")?,
+        })
+    }
 }
 
 /// Hex-encode bytes with 0x prefix.
 fn hex_encode(bytes: &[u8]) -> String {
     format!("0x{}", hex::encode(bytes))
+}
+
+fn hex_decode(value: &str) -> Result<Vec<u8>> {
+    let value = value
+        .strip_prefix("0x")
+        .or_else(|| value.strip_prefix("0X"))
+        .unwrap_or(value);
+    hex::decode(value).map_err(|e| anyhow!("invalid hex value: {e}"))
+}
+
+fn decode_optional_hex(value: Option<String>) -> Result<Option<Vec<u8>>> {
+    value.map(|value| hex_decode(&value)).transpose()
 }
 
 /// Stable non-cryptographic checksum of a DDL string. Used only to detect
@@ -1095,6 +1286,63 @@ fn is_valid_identifier(name: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn archive_wire_conversion_restores_postgres_values() {
+        let timestamp = chrono::DateTime::from_timestamp_millis(1_750_000_000_123).unwrap();
+        let tx = TxRow {
+            block_num: 42,
+            block_timestamp: timestamp,
+            idx: 3,
+            hash: vec![0xaa; 32],
+            tx_type: 2,
+            from: vec![0x11; 20],
+            to: Some(vec![0x22; 20]),
+            value: "123".into(),
+            input: vec![0xde, 0xad],
+            gas_limit: 21_000,
+            max_fee_per_gas: "10".into(),
+            max_priority_fee_per_gas: "1".into(),
+            gas_used: Some(20_000),
+            nonce_key: vec![0x33; 20],
+            nonce: 7,
+            fee_token: Some(vec![0x44; 20]),
+            fee_payer: Some(vec![0x55; 20]),
+            calls: Some(serde_json::json!([{"to": "0x1234"}])),
+            call_count: 2,
+            valid_before: Some(100),
+            valid_after: Some(50),
+            signature_type: Some(1),
+        };
+        let restored_tx = ChTxWire::from_row(&tx).into_row().unwrap();
+        assert_eq!(restored_tx.hash, tx.hash);
+        assert_eq!(restored_tx.to, tx.to);
+        assert_eq!(restored_tx.input, tx.input);
+        assert_eq!(restored_tx.fee_token, tx.fee_token);
+        assert_eq!(restored_tx.fee_payer, tx.fee_payer);
+        assert_eq!(restored_tx.calls, tx.calls);
+
+        let log = LogRow {
+            block_num: 42,
+            block_timestamp: timestamp,
+            log_idx: 1,
+            tx_idx: 3,
+            tx_hash: vec![0xaa; 32],
+            address: vec![0x66; 20],
+            selector: None,
+            topic0: Some(vec![0x77; 32]),
+            topic1: None,
+            topic2: None,
+            topic3: None,
+            data: vec![0x88; 16],
+            is_virtual_forward: true,
+        };
+        let restored_log = ChLogWire::from_row(&log).into_row().unwrap();
+        assert_eq!(restored_log.address, log.address);
+        assert_eq!(restored_log.selector, None);
+        assert_eq!(restored_log.topic0, log.topic0);
+        assert!(restored_log.is_virtual_forward);
+    }
 
     #[test]
     fn test_to_replicated_engine_ddl() {
