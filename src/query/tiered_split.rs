@@ -1247,12 +1247,20 @@ fn hot_lower_bound(
     boundary_ts: Option<DateTime<Utc>>,
 ) -> Option<Floor> {
     use BinaryOperator::{Eq, Gt, GtEq, Lt, LtEq};
+    // `inclusive` = whether the matched rows can equal the literal. PostgreSQL
+    // keeps only blocks strictly above the boundary (hot = `col > B`), so an
+    // inclusive bound (`>=`, `=`, `BETWEEN low`, `IN`) is hot-confined only when
+    // the literal is > B, while a strict bound (`>`) is hot-confined at == B
+    // (the smallest matched block is then B + 1). Getting this wrong routes a
+    // query touching block B to plain PostgreSQL, which no longer has it.
     match expr {
         Expr::BinaryOp { left, op, right } => match op {
-            GtEq | Gt => bound_floor(left, right, boundary, boundary_ts),
-            LtEq | Lt => bound_floor(right, left, boundary, boundary_ts),
-            Eq => bound_floor(left, right, boundary, boundary_ts)
-                .or_else(|| bound_floor(right, left, boundary, boundary_ts)),
+            Gt => bound_floor(left, right, boundary, boundary_ts, false),
+            GtEq => bound_floor(left, right, boundary, boundary_ts, true),
+            Lt => bound_floor(right, left, boundary, boundary_ts, false),
+            LtEq => bound_floor(right, left, boundary, boundary_ts, true),
+            Eq => bound_floor(left, right, boundary, boundary_ts, true)
+                .or_else(|| bound_floor(right, left, boundary, boundary_ts, true)),
             _ => None,
         },
         Expr::Between {
@@ -1260,8 +1268,8 @@ fn hot_lower_bound(
             negated: false,
             low,
             ..
-        } => bound_floor(expr, low, boundary, boundary_ts),
-        // Block-list membership with every block at/above the boundary
+        } => bound_floor(expr, low, boundary, boundary_ts, true),
+        // Block-list membership with every block strictly above the boundary
         // (page-enrichment shapes: `block_num IN (…recent blocks…)`).
         Expr::InList {
             expr,
@@ -1277,7 +1285,8 @@ fn hot_lower_bound(
             let mut min = i64::MAX;
             for e in list {
                 let v = literal_i64(e)?;
-                if v < boundary {
+                // `IN` membership is inclusive: block B lives in the cold tier.
+                if v <= boundary {
                     return None;
                 }
                 min = min.min(v);
@@ -1288,22 +1297,33 @@ fn hot_lower_bound(
     }
 }
 
-/// `col ≥ lit` (or `col = lit`) with the literal at or above the boundary.
+/// `col > lit` / `col ≥ lit` / `col = lit` proving the scan stays in the hot
+/// (PostgreSQL) window. `inclusive` is true when a matched row may equal `lit`;
+/// the hot floor is then `boundary + 1`, otherwise `boundary` (a strict `>`).
 fn bound_floor(
     col: &Expr,
     lit: &Expr,
     boundary: i64,
     boundary_ts: Option<DateTime<Utc>>,
+    inclusive: bool,
 ) -> Option<Floor> {
     let (_, name) = column_parts(unwrap_nested(col))?;
     if BLOCK_BOUND_COLUMNS.contains(&name.as_str()) {
-        return literal_i64(lit)
-            .filter(|v| *v >= boundary)
-            .map(Floor::Block);
+        let hot_floor = if inclusive {
+            boundary.saturating_add(1)
+        } else {
+            boundary
+        };
+        return literal_i64(lit).filter(|v| *v >= hot_floor).map(Floor::Block);
     }
     if TS_BOUND_COLUMNS.contains(&name.as_str()) {
         return match (literal_ts(lit), boundary_ts) {
-            (Some(v), Some(b)) if v >= b => Some(Floor::Unknown),
+            // Cold tier holds `block ≤ B`, whose timestamps are `≤ boundary_ts`.
+            // An inclusive lower bound clears the hot window only when strictly
+            // after the boundary timestamp; a strict `>` clears it at equality.
+            (Some(v), Some(b)) if (inclusive && v > b) || (!inclusive && v >= b) => {
+                Some(Floor::Unknown)
+            }
             // Boundary timestamp unknown: cannot prove hot; route cold.
             _ => None,
         };
@@ -1843,6 +1863,39 @@ mod tests {
         assert!(!confined(
             "SELECT 1 FROM txs WHERE block_num NOT IN (29000001)"
         ));
+    }
+
+    #[test]
+    fn hot_confined_boundary_block_routes_cold() {
+        // The prune boundary B is the highest block dropped from PostgreSQL:
+        // PG holds only `num > B`, so any predicate that can match block B
+        // itself must NOT be treated as hot-confined.
+        //
+        // Inclusive shapes touching B → cold.
+        assert!(!confined(&format!("SELECT 1 FROM txs WHERE block_num = {B}")));
+        assert!(!confined(&format!("SELECT 1 FROM txs WHERE block_num >= {B}")));
+        assert!(!confined(&format!("SELECT 1 FROM txs WHERE {B} <= block_num")));
+        assert!(!confined(&format!(
+            "SELECT 1 FROM txs WHERE block_num BETWEEN {B} AND {}",
+            B + 1000
+        )));
+        assert!(!confined(&format!(
+            "SELECT 1 FROM txs WHERE block_num IN ({B}, {})",
+            B + 5
+        )));
+
+        // One block above the boundary is hot for every inclusive shape.
+        let hot = B + 1;
+        assert!(confined(&format!("SELECT 1 FROM txs WHERE block_num = {hot}")));
+        assert!(confined(&format!("SELECT 1 FROM txs WHERE block_num >= {hot}")));
+        assert!(confined(&format!(
+            "SELECT 1 FROM txs WHERE block_num IN ({hot}, {})",
+            hot + 5
+        )));
+
+        // Strict `>` is hot-confined AT the boundary (smallest match is B + 1).
+        assert!(confined(&format!("SELECT 1 FROM logs WHERE block_num > {B}")));
+        assert!(confined(&format!("SELECT 1 FROM logs WHERE {B} < block_num")));
     }
 
     #[test]
