@@ -13,6 +13,11 @@ CREATE TABLE IF NOT EXISTS sync_state (
 -- Persisted in PG so it survives restarts and isn't fooled by realtime sync writing ahead.
 ALTER TABLE sync_state ADD COLUMN IF NOT EXISTS ch_backfill_block INT8 NOT NULL DEFAULT 0;
 
+-- ClickHouse-first archive progress. The interval
+-- [archive_backfill_num, archive_tip_num] is contiguous and durable in CH.
+ALTER TABLE sync_state ADD COLUMN IF NOT EXISTS archive_tip_num INT8 NOT NULL DEFAULT 0;
+ALTER TABLE sync_state ADD COLUMN IF NOT EXISTS archive_backfill_num INT8;
+
 -- Tiered-storage prune floor: highest block intentionally pruned from Postgres.
 -- Gap detection and backfill ignore blocks at or below this.
 ALTER TABLE sync_state ADD COLUMN IF NOT EXISTS pruned_below INT8 NOT NULL DEFAULT 0;
@@ -27,5 +32,7 @@ COMMENT ON COLUMN sync_state.backfill_num IS 'Lowest block synced going backward
 COMMENT ON COLUMN sync_state.sync_rate IS 'Current sync rate in blocks/second (rolling 5s window)';
 COMMENT ON COLUMN sync_state.started_at IS 'When this sync instance started';
 COMMENT ON COLUMN sync_state.ch_backfill_block IS 'ClickHouse backfill cursor: highest block written to all CH tables (0=not started)';
-COMMENT ON COLUMN sync_state.pruned_below IS 'Highest block intentionally pruned from Postgres (0=nothing pruned); gap detection ignores blocks at or below this';
-COMMENT ON COLUMN sync_state.pruned_below_ts IS 'Exclusive upper timestamp bound of pruned rows (weekly partition boundary); NULL=nothing pruned';
+COMMENT ON COLUMN sync_state.archive_tip_num IS 'Highest block in the contiguous ClickHouse archive interval';
+COMMENT ON COLUMN sync_state.archive_backfill_num IS 'Lowest block in the contiguous ClickHouse archive interval (NULL=not started)';
+COMMENT ON COLUMN sync_state.pruned_below IS 'Current PostgreSQL hot-tier boundary; rows at or below it are served from ClickHouse';
+COMMENT ON COLUMN sync_state.pruned_below_ts IS 'Exclusive upper timestamp bound of the ClickHouse/cold tier';
