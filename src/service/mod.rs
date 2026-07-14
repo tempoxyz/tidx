@@ -25,14 +25,6 @@ pub struct SyncStatus {
     pub gaps: Vec<(i64, i64)>,
     pub backfill_num: Option<i64>,
     pub backfill_remaining: i64,
-    /// Lowest block in the contiguous ClickHouse archive interval.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub archive_backfill_num: Option<i64>,
-    /// Highest block in the contiguous ClickHouse archive interval.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub archive_tip_num: Option<i64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub archive_backfill_remaining: Option<i64>,
     pub sync_rate: Option<f64>,
     pub eta_secs: Option<f64>,
     pub updated_at: DateTime<Utc>,
@@ -70,7 +62,7 @@ pub async fn get_all_status(pool: &Pool) -> Result<Vec<SyncStatus>> {
 
     let rows = conn
         .query(
-            "SELECT chain_id, head_num, synced_num, tip_num, backfill_num, started_at, updated_at, pruned_below, archive_tip_num, archive_backfill_num FROM sync_state ORDER BY chain_id",
+            "SELECT chain_id, head_num, synced_num, tip_num, backfill_num, started_at, updated_at, pruned_below FROM sync_state ORDER BY chain_id",
             &[],
         )
         .await?;
@@ -83,8 +75,6 @@ pub async fn get_all_status(pool: &Pool) -> Result<Vec<SyncStatus>> {
             let backfill_num: Option<i64> = row.get(4);
             let started_at: Option<DateTime<Utc>> = row.get(5);
             let pruned_below: i64 = row.get(7);
-            let archive_tip_num: i64 = row.get(8);
-            let archive_backfill_num: Option<i64> = row.get(9);
 
             // Blocks at or below the prune floor were intentionally dropped.
             let backfill_remaining = match backfill_num {
@@ -136,9 +126,6 @@ pub async fn get_all_status(pool: &Pool) -> Result<Vec<SyncStatus>> {
                 gaps,
                 backfill_num,
                 backfill_remaining,
-                archive_backfill_num,
-                archive_tip_num: archive_backfill_num.map(|_| archive_tip_num),
-                archive_backfill_remaining: archive_backfill_num.map(|n| n.saturating_sub(1)),
                 sync_rate,
                 eta_secs,
                 updated_at: row.get(6),
@@ -858,16 +845,20 @@ pub fn format_column_string(row: &tokio_postgres::Row, idx: usize) -> String {
     }
 }
 
+/// Upper bound on characters retained from a database error message.
+const MAX_DB_ERROR_CHARS: usize = 500;
+
 /// Sanitize database error messages to prevent information leakage.
 ///
 /// Removes file paths, internal schema details, and other sensitive info
 /// while preserving useful error context for debugging.
 fn sanitize_db_error(error: &str) -> String {
-    // Truncate very long errors
-    let error = if error.len() > 500 {
-        format!("{}...", &error[..500])
-    } else {
-        error.to_string()
+    // Truncate very long errors. PostgreSQL echoes offending user literals
+    // verbatim, so `error` is attacker-controlled UTF-8: slice on a char
+    // boundary, never a raw byte index (which panics mid-codepoint).
+    let error = match error.char_indices().nth(MAX_DB_ERROR_CHARS) {
+        Some((boundary, _)) => format!("{}...", &error[..boundary]),
+        None => error.to_string(),
     };
 
     // Remove file paths (Unix and Windows)
@@ -1194,7 +1185,26 @@ mod tests {
     fn test_sanitize_truncates_long_errors() {
         let error = "x".repeat(600);
         let sanitized = sanitize_db_error(&error);
-        assert!(sanitized.len() < 510); // 500 + "..."
+        assert!(sanitized.chars().count() <= MAX_DB_ERROR_CHARS + 3); // 500 chars + "..."
         assert!(sanitized.ends_with("..."));
+    }
+
+    #[test]
+    fn test_sanitize_truncates_multibyte_without_panic() {
+        // A multi-byte char straddling the old 500-BYTE cut point used to panic
+        // ("byte index 500 is not a char boundary"). The message body is
+        // attacker-controlled (PostgreSQL echoes bad literals), so this must
+        // never panic and must cut on a char boundary.
+        for pad in 495..505 {
+            let error = format!("{}{}", "a".repeat(pad), "é".repeat(20));
+            let sanitized = sanitize_db_error(&error);
+            assert!(sanitized.ends_with("..."));
+            assert!(sanitized.chars().count() <= MAX_DB_ERROR_CHARS + 3);
+        }
+
+        // Also exercise a wide (4-byte) codepoint right at the boundary.
+        let error = format!("{}{}", "a".repeat(499), "😀".repeat(10));
+        let sanitized = sanitize_db_error(&error);
+        assert!(sanitized.chars().count() <= MAX_DB_ERROR_CHARS + 3);
     }
 }
