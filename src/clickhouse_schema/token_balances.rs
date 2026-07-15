@@ -169,7 +169,7 @@ mod tests {
 
         let ddl = counts.ddl();
         assert!(ddl.contains("CREATE MATERIALIZED VIEW IF NOT EXISTS token_holder_counts"));
-        assert!(ddl.contains("REFRESH AFTER 15 MINUTE DEPENDS ON token_balances_snapshot"));
+        assert!(ddl.contains("REFRESH EVERY 15 MINUTE DEPENDS ON token_balances_snapshot"));
         // Derives from the already-deduped snapshot, not the raw deltas, so each
         // refresh is a cheap GROUP BY over one row per (token, holder).
         assert!(ddl.contains("FROM token_balances_snapshot"));

@@ -249,6 +249,25 @@ mod tests {
     }
 
     #[test]
+    fn refresh_dependencies_use_clickhouse_25_8_compatible_schedule() {
+        for object in derived_objects() {
+            let ddl = object.ddl();
+            if ddl.contains("DEPENDS ON") {
+                assert!(
+                    ddl.contains("REFRESH EVERY"),
+                    "{} uses DEPENDS ON without REFRESH EVERY",
+                    object.name
+                );
+                assert!(
+                    !ddl.contains("REFRESH AFTER"),
+                    "{} uses unsupported REFRESH AFTER with DEPENDS ON",
+                    object.name
+                );
+            }
+        }
+    }
+
+    #[test]
     fn dependency_array_order_is_consistent_with_topo_order() {
         // ensure_schema() iterates base_objects -> migrations -> derived_objects
         // in array order. Assert each object's depends_on resolves to an object

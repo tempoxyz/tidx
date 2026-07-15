@@ -114,7 +114,7 @@ mod tests {
 
         let ddl = snapshot.ddl();
         assert!(ddl.contains("CREATE MATERIALIZED VIEW IF NOT EXISTS address_balances_snapshot"));
-        assert!(ddl.contains("REFRESH AFTER 15 MINUTE DEPENDS ON token_balances_snapshot"));
+        assert!(ddl.contains("REFRESH EVERY 15 MINUTE DEPENDS ON token_balances_snapshot"));
         assert!(ddl.contains("ORDER BY (holder, balance, token)"));
         assert!(ddl.contains("FROM token_balances_snapshot"));
         assert!(!ddl.contains("FROM address_holder_deltas FINAL"));
