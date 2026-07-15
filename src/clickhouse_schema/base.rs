@@ -118,6 +118,15 @@ const DROP_BALANCE_DIRTY_KEYS_20260715: &str =
     include_str!("../../db/clickhouse/migrations/20260715_drop_balance_dirty_keys.sql");
 const FORGET_BALANCE_STATE_BOOTSTRAP_20260715: &str =
     include_str!("../../db/clickhouse/migrations/20260715_forget_balance_state_bootstrap.sql");
+const DROP_DEX_PAIR_LIQUIDITY_FOR_BALANCE_CHECKPOINT_20260715: &str = include_str!(
+    "../../db/clickhouse/migrations/20260715_drop_dex_pair_liquidity_for_balance_checkpoint.sql"
+);
+const DROP_ADDRESS_BALANCES_SNAPSHOT_FOR_BALANCE_CHECKPOINT_20260715: &str = include_str!(
+    "../../db/clickhouse/migrations/20260715_drop_address_balances_snapshot_for_balance_checkpoint.sql"
+);
+const DROP_TOKEN_HOLDER_COUNTS_FOR_BALANCE_CHECKPOINT_20260715: &str = include_str!(
+    "../../db/clickhouse/migrations/20260715_drop_token_holder_counts_for_balance_checkpoint.sql"
+);
 
 /// Idempotent cleanup for objects removed from the managed catalog.
 pub(super) const RETIRED_OBJECT_DROPS: &[&str] = &[
@@ -349,6 +358,39 @@ pub const MIGRATIONS: &[ClickHouseObject] = &[
     ClickHouseObject {
         name: "token_holder_counts_20260715_drop_before_snapshot_replace",
         kind: ClickHouseObjectKind::Migration(DROP_TOKEN_HOLDER_COUNTS_20260715),
+        depends_on: &[],
+        public_query: false,
+        block_column: None,
+        backfill: None,
+    },
+    // token_balances_snapshot has refresh-dependent children. Remove them in
+    // the pre-derived phase so definition reconciliation can replace the
+    // canonical snapshot with its checkpoint-backed form on ClickHouse 25.8.
+    ClickHouseObject {
+        name: "dex_pair_liquidity_20260715_drop_for_balance_checkpoint",
+        kind: ClickHouseObjectKind::Migration(
+            DROP_DEX_PAIR_LIQUIDITY_FOR_BALANCE_CHECKPOINT_20260715,
+        ),
+        depends_on: &[],
+        public_query: false,
+        block_column: None,
+        backfill: None,
+    },
+    ClickHouseObject {
+        name: "address_balances_snapshot_20260715_drop_for_balance_checkpoint",
+        kind: ClickHouseObjectKind::Migration(
+            DROP_ADDRESS_BALANCES_SNAPSHOT_FOR_BALANCE_CHECKPOINT_20260715,
+        ),
+        depends_on: &[],
+        public_query: false,
+        block_column: None,
+        backfill: None,
+    },
+    ClickHouseObject {
+        name: "token_holder_counts_20260715_drop_for_balance_checkpoint",
+        kind: ClickHouseObjectKind::Migration(
+            DROP_TOKEN_HOLDER_COUNTS_FOR_BALANCE_CHECKPOINT_20260715,
+        ),
         depends_on: &[],
         public_query: false,
         block_column: None,

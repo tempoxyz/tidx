@@ -4,6 +4,20 @@ const TOKEN_HOLDER_DELTAS_SCHEMA: &str =
     include_str!("../../db/clickhouse/token_holder_deltas.sql");
 const TOKEN_HOLDER_DELTAS_SELECT: &str =
     include_str!("../../db/clickhouse/token_holder_deltas_select.sql");
+const TOKEN_BALANCE_DIRTY_EVENTS_SCHEMA: &str =
+    include_str!("../../db/clickhouse/token_balance_dirty_events.sql");
+const TOKEN_BALANCE_DIRTY_EVENTS_SELECT: &str =
+    include_str!("../../db/clickhouse/token_balance_dirty_events_select.sql");
+const TOKEN_BALANCE_REORG_KEYS_V2_SCHEMA: &str =
+    include_str!("../../db/clickhouse/token_balance_reorg_keys_v2.sql");
+const TOKEN_BALANCE_CHECKPOINTS_SCHEMA: &str =
+    include_str!("../../db/clickhouse/token_balance_checkpoints.sql");
+const TOKEN_BALANCE_DIRTY_EVENTS_CLEAN_SELECT: &str =
+    include_str!("../../db/clickhouse/token_balance_dirty_events_clean_select.sql");
+const BOOTSTRAP_TOKEN_BALANCE_CHECKPOINTS_20260715: &str =
+    include_str!("../../db/clickhouse/migrations/20260715_bootstrap_token_balance_checkpoints.sql");
+const TOKEN_BALANCE_CHECKPOINT_REFRESH: &str =
+    include_str!("../../db/clickhouse/token_balance_checkpoint_refresh.sql");
 const TOKEN_BALANCES_VIEW: &str = include_str!("../../db/clickhouse/token_balances.sql");
 const TOKEN_BALANCES_SNAPSHOT: &str =
     include_str!("../../db/clickhouse/token_balances_snapshot.sql");
@@ -32,6 +46,74 @@ pub const OBJECTS: &[ClickHouseObject] = &[
         backfill: None,
     },
     ClickHouseObject {
+        name: "token_balance_dirty_events",
+        kind: ClickHouseObjectKind::Table(TOKEN_BALANCE_DIRTY_EVENTS_SCHEMA),
+        depends_on: &["token_holder_deltas"],
+        public_query: false,
+        block_column: None,
+        backfill: None,
+    },
+    ClickHouseObject {
+        name: "token_balance_dirty_events_mv",
+        kind: ClickHouseObjectKind::MaterializedView {
+            target_table: "token_balance_dirty_events",
+            select_sql: TOKEN_BALANCE_DIRTY_EVENTS_SELECT,
+        },
+        depends_on: &["token_holder_deltas", "token_balance_dirty_events"],
+        public_query: false,
+        block_column: None,
+        backfill: None,
+    },
+    ClickHouseObject {
+        name: "token_balance_reorg_keys_v2",
+        kind: ClickHouseObjectKind::Table(TOKEN_BALANCE_REORG_KEYS_V2_SCHEMA),
+        depends_on: &["token_holder_deltas"],
+        public_query: false,
+        block_column: None,
+        backfill: None,
+    },
+    ClickHouseObject {
+        name: "token_balance_checkpoints",
+        kind: ClickHouseObjectKind::Table(TOKEN_BALANCE_CHECKPOINTS_SCHEMA),
+        depends_on: &["token_holder_deltas"],
+        public_query: false,
+        block_column: None,
+        backfill: None,
+    },
+    ClickHouseObject {
+        name: "token_balance_dirty_events_clean_mv",
+        kind: ClickHouseObjectKind::MaterializedView {
+            target_table: "token_balance_dirty_events",
+            select_sql: TOKEN_BALANCE_DIRTY_EVENTS_CLEAN_SELECT,
+        },
+        depends_on: &["token_balance_checkpoints", "token_balance_dirty_events"],
+        public_query: false,
+        block_column: None,
+        backfill: None,
+    },
+    // Run once after the checkpoint table and its queue-cleaning MV exist, but
+    // before any public view switches to the checkpoint-backed generation.
+    ClickHouseObject {
+        name: "token_balance_checkpoints_20260715_bootstrap",
+        kind: ClickHouseObjectKind::Migration(BOOTSTRAP_TOKEN_BALANCE_CHECKPOINTS_20260715),
+        depends_on: &["token_holder_deltas", "token_balance_checkpoints"],
+        public_query: false,
+        block_column: None,
+        backfill: None,
+    },
+    ClickHouseObject {
+        name: "token_balance_checkpoint_refresh",
+        kind: ClickHouseObjectKind::RefreshableMaterializedView(TOKEN_BALANCE_CHECKPOINT_REFRESH),
+        depends_on: &[
+            "token_holder_deltas",
+            "token_balance_dirty_events",
+            "token_balance_checkpoints",
+        ],
+        public_query: false,
+        block_column: None,
+        backfill: None,
+    },
+    ClickHouseObject {
         name: "token_balances",
         kind: ClickHouseObjectKind::View(TOKEN_BALANCES_VIEW),
         depends_on: &["token_holder_deltas"],
@@ -42,7 +124,10 @@ pub const OBJECTS: &[ClickHouseObject] = &[
     ClickHouseObject {
         name: "token_balances_snapshot",
         kind: ClickHouseObjectKind::RefreshableMaterializedView(TOKEN_BALANCES_SNAPSHOT),
-        depends_on: &["token_holder_deltas"],
+        depends_on: &[
+            "token_balance_checkpoints",
+            "token_balance_checkpoint_refresh",
+        ],
         public_query: true,
         // Self-storing refreshable MV: it owns its rows and is fully replaced
         // each refresh, so it isn't block-scoped and reorg cleanup skips it.
@@ -127,7 +212,7 @@ mod tests {
     }
 
     #[test]
-    fn token_balances_snapshot_is_a_refreshable_materialized_view() {
+    fn token_balances_snapshot_publishes_checkpoint_state() {
         let snapshot = OBJECTS
             .iter()
             .find(|object| object.name == "token_balances_snapshot")
@@ -142,16 +227,61 @@ mod tests {
 
         let ddl = snapshot.ddl();
         assert!(ddl.contains("CREATE MATERIALIZED VIEW IF NOT EXISTS token_balances_snapshot"));
-        assert!(ddl.contains("REFRESH AFTER"));
-        assert!(ddl.contains("FROM token_holder_deltas FINAL"));
-        assert!(ddl.contains("HAVING balance > 0"));
-        assert!(ddl.contains("optimize_aggregation_in_order = 1"));
+        assert!(
+            ddl.contains("REFRESH EVERY 15 MINUTE DEPENDS ON token_balance_checkpoint_refresh")
+        );
+        assert!(ddl.contains("FROM token_balance_checkpoints FINAL"));
+        assert!(!ddl.contains("FROM token_holder_deltas FINAL"));
+        assert!(ddl.contains("WHERE credited > debited"));
         assert!(ddl.contains("max_threads = 4"));
 
         // Drops the view (and its inner target table) on definition drift.
         assert_eq!(
             snapshot.drop_sql().as_deref(),
             Some("DROP VIEW IF EXISTS token_balances_snapshot")
+        );
+    }
+
+    #[test]
+    fn balance_checkpoint_reducer_uses_post_checkpoint_deltas() {
+        let events = OBJECTS
+            .iter()
+            .find(|object| object.name == "token_balance_dirty_events")
+            .unwrap();
+        assert!(events.ddl().contains("CollapsingMergeTree(sign)"));
+
+        let checkpoints = OBJECTS
+            .iter()
+            .find(|object| object.name == "token_balance_checkpoints")
+            .unwrap();
+        let checkpoint_ddl = checkpoints.ddl();
+        assert!(checkpoint_ddl.contains("credited         UInt256"));
+        assert!(checkpoint_ddl.contains("debited          UInt256"));
+        assert!(checkpoint_ddl.contains("checkpoint_from_block Int64"));
+        assert!(checkpoint_ddl.contains("checkpoint_block Int64"));
+        assert!(checkpoint_ddl.contains("ReplacingMergeTree(version)"));
+
+        let refresh = OBJECTS
+            .iter()
+            .find(|object| object.name == "token_balance_checkpoint_refresh")
+            .unwrap();
+        let refresh_ddl = refresh.ddl();
+        assert!(refresh_ddl.contains("REFRESH AFTER 1 MINUTE APPEND TO"));
+        assert!(refresh_ddl.contains("block_num > work.scan_from_exclusive"));
+        assert!(refresh_ddl.contains("pending.min_changed_block > current.checkpoint_block"));
+        assert!(refresh_ddl.contains("pending.max_changed_block < current.checkpoint_from_block"));
+        assert!(refresh_ddl.contains("FROM token_holder_deltas FINAL"));
+        assert!(refresh_ddl.contains("FROM token_balance_dirty_events FINAL"));
+
+        let bootstrap = OBJECTS
+            .iter()
+            .find(|object| object.name == "token_balance_checkpoints_20260715_bootstrap")
+            .unwrap();
+        assert!(matches!(bootstrap.kind, ClickHouseObjectKind::Migration(_)));
+        assert!(
+            bootstrap
+                .ddl()
+                .contains("INSERT INTO token_balance_checkpoints")
         );
     }
 

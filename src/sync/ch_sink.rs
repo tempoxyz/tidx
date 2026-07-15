@@ -196,6 +196,7 @@ impl ClickHouseSink {
         }
 
         self.ensure_retired_objects_absent().await?;
+        self.reconcile_pending_balance_checkpoint_reorgs().await?;
 
         info!(database = %self.database, "ClickHouse schema ready");
         Ok(())
@@ -296,6 +297,14 @@ impl ClickHouseSink {
 
     async fn ensure_derived_objects(&self, tracking: &mut HashMap<String, String>) -> Result<()> {
         for object in derived_objects() {
+            // A derived bootstrap may need to run between its source tables and
+            // the public views that consume it. Preserve dependency order while
+            // retaining the one-shot, checksum-locked migration semantics.
+            if matches!(object.kind, ClickHouseObjectKind::Migration(_)) {
+                self.apply_migration(object, tracking).await?;
+                continue;
+            }
+
             let ddl = object.ddl();
             let checksum = checksum_of(&ddl);
             let needs_recreate = match tracking.get(object.name) {
@@ -796,6 +805,11 @@ impl ClickHouseSink {
     /// completion but a replica still serves stale rows) — without the
     /// assertion, replay would happily start atop ghost rows.
     pub async fn delete_from(&self, block_num: u64) -> Result<()> {
+        // ALTER DELETE does not trigger the dirty-event MV. Journal affected
+        // pairs before pruning so a crash cannot lose the checkpoint repair.
+        self.capture_balance_checkpoint_reorg_keys(block_num)
+            .await?;
+
         for table in reorg_tables() {
             let sql = format!(
                 "ALTER TABLE {} DELETE WHERE {} >= {}",
@@ -835,8 +849,108 @@ impl ClickHouseSink {
             }
         }
 
+        self.finalize_balance_checkpoint_reorg(block_num).await?;
+        self.refresh_balance_checkpoints().await?;
+
         debug!(from_block = block_num, "ClickHouse reorg delete complete");
         Ok(())
+    }
+
+    async fn capture_balance_checkpoint_reorg_keys(&self, block_num: u64) -> Result<()> {
+        let block_num = i64::try_from(block_num).context("reorg block exceeds Int64")?;
+        let sql = format!(
+            "INSERT INTO token_balance_reorg_keys_v2 \
+             WITH (SELECT min(timestamp) FROM blocks FINAL WHERE num >= {block_num}) AS cutoff \
+             SELECT {block_num}, token, holder, max(block_num), CAST(1 AS UInt8), \
+                    now64(9, 'UTC') \
+             FROM token_holder_deltas FINAL \
+             WHERE block_timestamp >= cutoff AND block_num >= {block_num} \
+             GROUP BY token, holder"
+        );
+        self.execute_derived_query_with_retry(
+            &sql,
+            "ClickHouse balance checkpoint reorg key capture",
+        )
+        .await
+    }
+
+    async fn finalize_balance_checkpoint_reorg(&self, block_num: u64) -> Result<()> {
+        let block_num = i64::try_from(block_num).context("reorg block exceeds Int64")?;
+        self.execute_derived_query_with_retry(
+            &format!(
+                "INSERT INTO token_balance_dirty_events \
+                 SELECT generateUUIDv4(), token, holder, from_block, max_block, \
+                        CAST(1 AS Int8) \
+                 FROM token_balance_reorg_keys_v2 FINAL \
+                 WHERE from_block = {block_num} AND pending = 1"
+            ),
+            "ClickHouse balance checkpoint reorg event publish",
+        )
+        .await?;
+
+        self.execute_derived_query_with_retry(
+            &format!(
+                "INSERT INTO token_balance_reorg_keys_v2 \
+                 SELECT from_block, token, holder, max_block, CAST(0 AS UInt8), \
+                        now64(9, 'UTC') \
+                 FROM token_balance_reorg_keys_v2 FINAL \
+                 WHERE from_block = {block_num} AND pending = 1"
+            ),
+            "ClickHouse balance checkpoint reorg journal finalize",
+        )
+        .await
+    }
+
+    /// Recover a crash after block deletion but before the affected checkpoint
+    /// events were published. An empty block suffix proves cleanup completed;
+    /// otherwise normal reorg retry resumes the journaled operation.
+    async fn reconcile_pending_balance_checkpoint_reorgs(&self) -> Result<()> {
+        let pending: Vec<ChPendingBalanceReorgRow> = self
+            .client
+            .query(
+                "SELECT DISTINCT from_block FROM token_balance_reorg_keys_v2 FINAL \
+                 WHERE pending = 1 ORDER BY from_block",
+            )
+            .fetch_all()
+            .await
+            .map_err(|e| anyhow!("Failed to load pending ClickHouse balance reorgs: {e}"))?;
+
+        let mut recovered = false;
+        for row in pending {
+            let remaining: u64 = self
+                .client
+                .query(&format!(
+                    "SELECT count() FROM blocks FINAL WHERE num >= {}",
+                    row.from_block
+                ))
+                .fetch_one()
+                .await
+                .map_err(|e| anyhow!("Failed to inspect pending balance reorg: {e}"))?;
+            if remaining == 0 {
+                let from_block = u64::try_from(row.from_block)
+                    .context("pending ClickHouse balance reorg block is negative")?;
+                self.finalize_balance_checkpoint_reorg(from_block).await?;
+                recovered = true;
+            }
+        }
+
+        if recovered {
+            self.refresh_balance_checkpoints().await?;
+        }
+        Ok(())
+    }
+
+    async fn refresh_balance_checkpoints(&self) -> Result<()> {
+        self.execute_derived_query_with_retry(
+            "SYSTEM REFRESH VIEW token_balance_checkpoint_refresh",
+            "ClickHouse balance checkpoint refresh trigger",
+        )
+        .await?;
+        self.execute_derived_query_with_retry(
+            "SYSTEM WAIT VIEW token_balance_checkpoint_refresh",
+            "ClickHouse balance checkpoint refresh wait",
+        )
+        .await
     }
 
     /// Chunk source rows, convert each chunk to wire format, and insert with retry logic.
@@ -901,6 +1015,11 @@ impl ClickHouseSink {
 struct ChSchemaObjectRow {
     name: String,
     checksum: String,
+}
+
+#[derive(Row, Deserialize)]
+struct ChPendingBalanceReorgRow {
+    from_block: i64,
 }
 
 #[derive(Row, Serialize, Deserialize)]

@@ -144,6 +144,9 @@ mod tests {
         for mv in [
             "token_transfers_mv",
             "token_holder_deltas_mv",
+            "token_balance_dirty_events_mv",
+            "token_balance_dirty_events_clean_mv",
+            "token_balance_checkpoint_refresh",
             "address_holder_deltas_mv",
             "dex_pairs_mv",
             "dex_orders_mv",
@@ -151,6 +154,19 @@ mod tests {
         ] {
             assert!(!is_public_query_table(mv), "{mv} should not be public");
             assert!(is_known_table(mv), "{mv} should be known to the sink");
+        }
+    }
+
+    #[test]
+    fn balance_checkpoint_objects_are_internal() {
+        for name in [
+            "token_balance_dirty_events",
+            "token_balance_reorg_keys_v2",
+            "token_balance_checkpoints",
+            "token_balance_checkpoints_20260715_bootstrap",
+        ] {
+            assert!(is_known_table(name), "{name} should be managed");
+            assert!(!is_public_query_table(name), "{name} should stay internal");
         }
     }
 
@@ -381,7 +397,11 @@ mod tests {
     fn managed_merge_tree_storage_uses_zstd_by_default() {
         for object in base_objects().iter().chain(derived_objects()) {
             let ddl = object.ddl();
-            if object.is_table() || object.is_refreshable_materialized_view() {
+            // APPEND refreshable views write into an explicitly managed target
+            // table and do not own storage/accept an ENGINE clause themselves.
+            if object.is_table()
+                || (object.is_refreshable_materialized_view() && ddl.contains("ENGINE ="))
+            {
                 assert!(
                     ddl.contains("SETTINGS default_compression_codec = 'ZSTD(1)'"),
                     "physical table {} does not set the default ZSTD codec",

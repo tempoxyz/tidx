@@ -1054,6 +1054,9 @@ async fn test_sink_ensure_schema_creates_tables() {
         "receipts",
         "token_transfers",
         "token_holder_deltas",
+        "token_balance_dirty_events",
+        "token_balance_reorg_keys_v2",
+        "token_balance_checkpoints",
         "token_balances_snapshot",
     ] {
         let count = ch
@@ -1144,6 +1147,9 @@ async fn test_sink_replaces_snapshot_after_incremental_state_schema() {
         "ALTER TABLE tidx_schema_objects DELETE WHERE name IN (\
             'balance_state_20260715_stop_refresh', \
             'token_holder_counts_20260715_drop_before_snapshot_replace', \
+            'dex_pair_liquidity_20260715_drop_for_balance_checkpoint', \
+            'address_balances_snapshot_20260715_drop_for_balance_checkpoint', \
+            'token_holder_counts_20260715_drop_for_balance_checkpoint', \
             'token_balances_snapshot'\
          ) SETTINGS mutations_sync = 1",
     )
@@ -1366,6 +1372,72 @@ async fn test_sink_token_balances_view_tracks_balances_and_reorgs() {
             .iter()
             .any(|(_, holder, balance)| { holder == bob && balance == "40" })
     );
+}
+
+#[tokio::test]
+#[serial(clickhouse)]
+async fn test_sink_balance_checkpoints_apply_delta_then_repair_replay() {
+    let Some((sink, ch)) = setup_sink().await else {
+        return;
+    };
+
+    let zero = "0x0000000000000000000000000000000000000000";
+    let alice = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    let bob = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+
+    let initial = vec![
+        make_transfer_log(1, 0, zero, alice, 100),
+        make_transfer_log(2, 0, alice, bob, 40),
+    ];
+    sink.write_logs(&initial)
+        .await
+        .expect("initial write failed");
+    refresh_balance_checkpoints(&ch).await;
+
+    assert_eq!(
+        balance_checkpoint(&ch, alice).await,
+        Some(("100".into(), "40".into(), 2))
+    );
+    assert_eq!(
+        balance_checkpoint(&ch, bob).await,
+        Some(("40".into(), "0".into(), 2))
+    );
+
+    let delta = make_transfer_log(3, 0, alice, bob, 5);
+    sink.write_logs(std::slice::from_ref(&delta))
+        .await
+        .expect("delta write failed");
+    refresh_balance_checkpoints(&ch).await;
+
+    assert_eq!(
+        balance_checkpoint(&ch, alice).await,
+        Some(("100".into(), "45".into(), 3))
+    );
+    assert_eq!(
+        balance_checkpoint(&ch, bob).await,
+        Some(("45".into(), "0".into(), 3))
+    );
+
+    // A replay touches a block at or behind the checkpoint. The reducer must
+    // rebuild the affected pairs from FINAL instead of adding the amount twice.
+    sink.write_logs(std::slice::from_ref(&initial[1]))
+        .await
+        .expect("replay write failed");
+    refresh_balance_checkpoints(&ch).await;
+    assert_eq!(
+        balance_checkpoint(&ch, alice).await,
+        Some(("100".into(), "45".into(), 3))
+    );
+    assert_eq!(
+        balance_checkpoint(&ch, bob).await,
+        Some(("45".into(), "0".into(), 3))
+    );
+
+    let pending = ch
+        .query("SELECT count() FROM token_balance_dirty_events FINAL WHERE sign = 1")
+        .await
+        .expect("failed to inspect checkpoint queue");
+    assert_eq!(pending.trim(), "0");
 }
 
 #[tokio::test]
@@ -1658,6 +1730,7 @@ async fn token_holder_balances(ch: &TestClickHouse) -> std::collections::HashMap
 }
 
 async fn refresh_balance_snapshots(ch: &TestClickHouse) {
+    refresh_balance_checkpoints(ch).await;
     for view in [
         "token_balances_snapshot",
         "address_balances_snapshot",
@@ -1670,6 +1743,40 @@ async fn refresh_balance_snapshots(ch: &TestClickHouse) {
             .await
             .unwrap_or_else(|_| panic!("failed to wait for {view}"));
     }
+}
+
+async fn refresh_balance_checkpoints(ch: &TestClickHouse) {
+    ch.query("SYSTEM REFRESH VIEW token_balance_checkpoint_refresh")
+        .await
+        .expect("failed to refresh balance checkpoints");
+    ch.query("SYSTEM WAIT VIEW token_balance_checkpoint_refresh")
+        .await
+        .expect("failed to wait for balance checkpoints");
+}
+
+async fn balance_checkpoint(ch: &TestClickHouse, holder: &str) -> Option<(String, String, i64)> {
+    let result = ch
+        .query_json(&format!(
+            "SELECT toString(credited) AS credited, toString(debited) AS debited, \
+                    checkpoint_block \
+             FROM token_balance_checkpoints FINAL WHERE holder = '{holder}'"
+        ))
+        .await
+        .expect("failed to query balance checkpoint");
+    result["data"].as_array().unwrap().first().map(|row| {
+        (
+            row["credited"].as_str().unwrap().to_string(),
+            row["debited"].as_str().unwrap().to_string(),
+            row["checkpoint_block"]
+                .as_i64()
+                .or_else(|| {
+                    row["checkpoint_block"]
+                        .as_str()
+                        .and_then(|value| value.parse().ok())
+                })
+                .unwrap(),
+        )
+    })
 }
 
 async fn balance_rows(ch: &TestClickHouse, table: &str) -> Vec<(String, String, String)> {
