@@ -19,8 +19,9 @@ use super::decoder::{
 use super::fetcher::RpcClient;
 use super::sink::{SinkSet, WriteTarget};
 use super::writer::{
-    detect_all_gaps, detect_blocks_missing_receipts, find_fork_point, get_block_hash, has_gaps,
-    load_sync_state, save_sync_state, update_sync_rate, update_synced_num, update_tip_num,
+    detect_all_gaps, detect_blocks_missing_receipts, discover_legacy_receipt_repairs,
+    find_fork_point, finish_receipt_repair_attempt, get_block_hash, has_gaps, load_sync_state,
+    save_sync_state, update_sync_rate, update_synced_num, update_tip_num,
 };
 use crate::virtual_address::mark_virtual_forward_hops;
 
@@ -28,6 +29,8 @@ use crate::virtual_address::mark_virtual_forward_hops;
 const REALTIME_RPC_CONCURRENCY: usize = 4;
 const BACKFILL_RPC_CONCURRENCY: usize = 8;
 const RECEIPT_BACKFILL_BLOCK_LIMIT: i64 = 100;
+const RECEIPT_BACKFILL_DISCOVERY_WINDOW: i64 = 1_000;
+const RECEIPT_BACKFILL_POLL_INTERVAL: Duration = Duration::from_secs(2);
 const RECEIPT_BACKFILL_MAX_WRITE_ROWS: usize = 50_000;
 const RECEIPT_BACKFILL_INFO_ROWS: usize = 10_000;
 
@@ -1491,6 +1494,8 @@ async fn run_receipt_backfill_loop(
                 if let Err(e) = result {
                     error!(chain_id, error = %e, "Receipt backfill tick failed");
                     tokio::time::sleep(Duration::from_secs(1)).await;
+                } else {
+                    tokio::time::sleep(RECEIPT_BACKFILL_POLL_INTERVAL).await;
                 }
             }
         }
@@ -1506,12 +1511,19 @@ async fn tick_receipt_backfill(sinks: &SinkSet, rpc: &RpcClient, chain_id: u64) 
 
     let pool = sinks.pool();
 
-    // Find blocks that have no receipts (most recent first)
+    let discovered =
+        discover_legacy_receipt_repairs(pool, chain_id, RECEIPT_BACKFILL_DISCOVERY_WINDOW).await?;
+    if discovered > 0 {
+        info!(
+            chain_id,
+            discovered, "Receipt backfill: discovered legacy work"
+        );
+    }
+
+    // Claim due work from the durable queue (most recent first).
     let blocks_missing = detect_blocks_missing_receipts(pool, RECEIPT_BACKFILL_BLOCK_LIMIT).await?;
 
     if blocks_missing.is_empty() {
-        // All caught up, sleep before checking again
-        tokio::time::sleep(Duration::from_secs(2)).await;
         return Ok(());
     }
 
@@ -1668,6 +1680,12 @@ async fn tick_receipt_backfill(sinks: &SinkSet, rpc: &RpcClient, chain_id: u64) 
         )
         .await?;
     }
+
+    let (completed, deferred) = finish_receipt_repair_attempt(pool, &blocks_missing).await?;
+    debug!(
+        chain_id,
+        completed, deferred, "Receipt backfill: repair attempt finalized"
+    );
 
     Ok(())
 }

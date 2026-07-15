@@ -29,6 +29,37 @@ fn exact_block_nums(nums: impl Iterator<Item = i64>) -> Vec<i64> {
     nums.collect::<BTreeSet<_>>().into_iter().collect()
 }
 
+/// Replace repair-queue state for the complete set of blocks currently held
+/// in `_staging_txs`. This runs in the same transaction as the transaction
+/// replacement, so a crash cannot leave new incomplete transactions unqueued.
+async fn refresh_receipt_repair_queue_from_staging(
+    tx: &tokio_postgres::Transaction<'_>,
+    block_nums: &[i64],
+) -> Result<()> {
+    if block_nums.is_empty() {
+        return Ok(());
+    }
+
+    tx.execute(
+        "DELETE FROM receipt_repair_queue WHERE block_num = ANY($1)",
+        &[&block_nums],
+    )
+    .await?;
+    tx.execute(
+        r#"
+        INSERT INTO receipt_repair_queue (block_num, block_timestamp)
+        SELECT block_num, MIN(block_timestamp)
+        FROM _staging_txs
+        WHERE gas_used IS NULL
+        GROUP BY block_num
+        "#,
+        &[],
+    )
+    .await?;
+
+    Ok(())
+}
+
 pub async fn write_block(pool: &Pool, block: &BlockRow) -> Result<()> {
     write_blocks(pool, std::slice::from_ref(block)).await
 }
@@ -213,6 +244,7 @@ pub async fn write_txs(pool: &Pool, txs: &[TxRow]) -> Result<()> {
         &[],
     )
     .await?;
+    refresh_receipt_repair_queue_from_staging(&tx, &block_nums).await?;
     tx.commit().await?;
 
     metrics::record_sink_write_duration("postgres", "txs", start.elapsed());
@@ -601,6 +633,7 @@ async fn write_batch_inner(
             &[],
         )
         .await?;
+        refresh_receipt_repair_queue_from_staging(&tx, &block_nums).await?;
     }
 
     // ── logs ──────────────────────────────────────────────────────────────
@@ -1077,27 +1110,186 @@ pub async fn detect_gaps(pool: &Pool, below: u64) -> Result<Vec<(u64, u64)>> {
         .collect())
 }
 
-/// Detect blocks that have no receipts (for deferred receipt backfill).
-/// Returns block numbers that exist in blocks table but have no receipts.
-/// Limited to a batch size and ordered by block_num DESC (most recent first).
+/// Discover legacy incomplete transactions in one bounded block-number window.
+///
+/// The cursor is durable and each block range is visited once. The existing
+/// `txs(block_num)` index bounds every read, so upgrades do not build a new
+/// index or repeatedly scan transaction/receipt history.
+pub async fn discover_legacy_receipt_repairs(
+    pool: &Pool,
+    chain_id: u64,
+    block_window: i64,
+) -> Result<usize> {
+    let mut conn = pool.get().await?;
+    let tx = conn.transaction().await?;
+    let chain_id = chain_id as i64;
+    let block_window = block_window.max(1);
+
+    let state = tx
+        .query_opt(
+            "SELECT next_block, completed FROM receipt_repair_discovery \
+             WHERE chain_id = $1 FOR UPDATE",
+            &[&chain_id],
+        )
+        .await?;
+
+    if state.as_ref().is_some_and(|row| row.get::<_, bool>(1)) {
+        tx.commit().await?;
+        return Ok(0);
+    }
+
+    let bounds = tx
+        .query_one("SELECT MIN(block_num), MAX(block_num) FROM txs", &[])
+        .await?;
+    let min_block: Option<i64> = bounds.get(0);
+    let max_block: Option<i64> = bounds.get(1);
+
+    let (Some(min_block), Some(max_block)) = (min_block, max_block) else {
+        tx.execute(
+            r#"
+            INSERT INTO receipt_repair_discovery (chain_id, next_block, completed)
+            VALUES ($1, NULL, TRUE)
+            ON CONFLICT (chain_id) DO UPDATE SET
+                next_block = NULL,
+                completed = TRUE,
+                updated_at = NOW()
+            "#,
+            &[&chain_id],
+        )
+        .await?;
+        tx.commit().await?;
+        return Ok(0);
+    };
+
+    let next_block = state
+        .as_ref()
+        .and_then(|row| row.get::<_, Option<i64>>(0))
+        .unwrap_or(max_block);
+
+    if next_block < min_block {
+        tx.execute(
+            "UPDATE receipt_repair_discovery SET completed = TRUE, \
+             next_block = NULL, updated_at = NOW() WHERE chain_id = $1",
+            &[&chain_id],
+        )
+        .await?;
+        tx.commit().await?;
+        return Ok(0);
+    }
+
+    let from_block = (next_block - block_window + 1).max(min_block);
+    let inserted = tx
+        .execute(
+            r#"
+            INSERT INTO receipt_repair_queue (block_num, block_timestamp)
+            SELECT block_num, MIN(block_timestamp)
+            FROM txs
+            WHERE block_num >= $1
+              AND block_num <= $2
+              AND gas_used IS NULL
+            GROUP BY block_num
+            ON CONFLICT (block_num) DO UPDATE SET
+                block_timestamp = EXCLUDED.block_timestamp,
+                updated_at = NOW()
+            "#,
+            &[&from_block, &next_block],
+        )
+        .await?;
+
+    let completed = from_block == min_block;
+    let following_block = (!completed).then_some(from_block - 1);
+    tx.execute(
+        r#"
+        INSERT INTO receipt_repair_discovery (chain_id, next_block, completed)
+        VALUES ($1, $2, $3)
+        ON CONFLICT (chain_id) DO UPDATE SET
+            next_block = EXCLUDED.next_block,
+            completed = EXCLUDED.completed,
+            updated_at = NOW()
+        "#,
+        &[&chain_id, &following_block, &completed],
+    )
+    .await?;
+    tx.commit().await?;
+
+    Ok(inserted as usize)
+}
+
+/// Return due blocks from the durable receipt-repair queue.
 pub async fn detect_blocks_missing_receipts(pool: &Pool, limit: i64) -> Result<Vec<u64>> {
     let conn = pool.get().await?;
 
     let rows = conn
         .query(
             r#"
-            SELECT b.num
-            FROM blocks b
-            LEFT JOIN receipts r ON r.block_num = b.num
-            WHERE r.block_num IS NULL
-            ORDER BY b.num DESC
-            LIMIT $1
+            WITH due AS MATERIALIZED (
+                SELECT block_num
+                FROM receipt_repair_queue
+                WHERE next_attempt_at <= NOW()
+                ORDER BY next_attempt_at, block_num DESC
+                LIMIT $1
+                FOR UPDATE SKIP LOCKED
+            )
+            UPDATE receipt_repair_queue q
+            SET next_attempt_at = NOW() + INTERVAL '2 minutes',
+                updated_at = NOW()
+            FROM due
+            WHERE q.block_num = due.block_num
+            RETURNING q.block_num
             "#,
             &[&limit],
         )
         .await?;
 
-    Ok(rows.iter().map(|r| r.get::<_, i64>(0) as u64).collect())
+    let mut blocks: Vec<u64> = rows.iter().map(|r| r.get::<_, i64>(0) as u64).collect();
+    blocks.sort_unstable_by(|a, b| b.cmp(a));
+    Ok(blocks)
+}
+
+/// Remove repaired queue entries and exponentially defer poison/incomplete
+/// entries. Exact block timestamps keep the completion probe partition-pruned.
+pub async fn finish_receipt_repair_attempt(pool: &Pool, block_nums: &[u64]) -> Result<(u64, u64)> {
+    if block_nums.is_empty() {
+        return Ok((0, 0));
+    }
+
+    let block_nums: Vec<i64> = block_nums.iter().map(|&block| block as i64).collect();
+    let mut conn = pool.get().await?;
+    let tx = conn.transaction().await?;
+    let completed = tx
+        .execute(
+            r#"
+            DELETE FROM receipt_repair_queue q
+            WHERE q.block_num = ANY($1)
+              AND NOT EXISTS (
+                  SELECT 1
+                  FROM txs t
+                  WHERE t.block_timestamp = q.block_timestamp
+                    AND t.block_num = q.block_num
+                    AND t.gas_used IS NULL
+              )
+            "#,
+            &[&block_nums],
+        )
+        .await?;
+    let deferred = tx
+        .execute(
+            r#"
+            UPDATE receipt_repair_queue
+            SET attempts = attempts + 1,
+                next_attempt_at = NOW() + make_interval(
+                    secs => LEAST(3600, POWER(2, LEAST(attempts + 1, 12))::INT)
+                ),
+                last_error = 'receipt data still incomplete after RPC repair',
+                updated_at = NOW()
+            WHERE block_num = ANY($1)
+            "#,
+            &[&block_nums],
+        )
+        .await?;
+    tx.commit().await?;
+
+    Ok((completed, deferred))
 }
 
 /// Detect ALL gaps between `floor` and `tip_num`, including the leading gap
@@ -1149,6 +1341,11 @@ pub async fn delete_blocks_from(pool: &Pool, from_block: u64) -> Result<u64> {
     let from_block_i64 = from_block as i64;
 
     // Delete in order: logs, receipts, txs, blocks (foreign key order)
+    conn.execute(
+        "DELETE FROM receipt_repair_queue WHERE block_num >= $1",
+        &[&from_block_i64],
+    )
+    .await?;
     conn.execute("DELETE FROM logs WHERE block_num >= $1", &[&from_block_i64])
         .await?;
     conn.execute(
