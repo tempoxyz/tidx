@@ -142,9 +142,11 @@ mod tests {
 
         let ddl = snapshot.ddl();
         assert!(ddl.contains("CREATE MATERIALIZED VIEW IF NOT EXISTS token_balances_snapshot"));
-        assert!(ddl.contains("REFRESH EVERY"));
+        assert!(ddl.contains("REFRESH AFTER"));
         assert!(ddl.contains("FROM token_holder_deltas FINAL"));
         assert!(ddl.contains("HAVING balance > 0"));
+        assert!(ddl.contains("optimize_aggregation_in_order = 1"));
+        assert!(ddl.contains("max_threads = 4"));
 
         // Drops the view (and its inner target table) on definition drift.
         assert_eq!(
@@ -167,12 +169,14 @@ mod tests {
 
         let ddl = counts.ddl();
         assert!(ddl.contains("CREATE MATERIALIZED VIEW IF NOT EXISTS token_holder_counts"));
-        assert!(ddl.contains("REFRESH EVERY"));
+        assert!(ddl.contains("REFRESH AFTER 15 MINUTE DEPENDS ON token_balances_snapshot"));
         // Derives from the already-deduped snapshot, not the raw deltas, so each
         // refresh is a cheap GROUP BY over one row per (token, holder).
         assert!(ddl.contains("FROM token_balances_snapshot"));
         assert!(ddl.contains("count() AS holder_count"));
         assert!(ddl.contains("GROUP BY token"));
+        assert!(ddl.contains("optimize_aggregation_in_order = 1"));
+        assert!(ddl.contains("max_threads = 4"));
         assert_eq!(
             counts.drop_sql().as_deref(),
             Some("DROP VIEW IF EXISTS token_holder_counts")

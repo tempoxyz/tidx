@@ -806,6 +806,12 @@ const RETIRED_CLICKHOUSE_OBJECTS: &[&str] = &[
     "token_approvals",
     "token_approvals_current",
     "token_approvals_mv",
+    "balance_dirty_keys",
+    "balance_dirty_keys_mv",
+    "balance_reorg_keys",
+    "balance_state",
+    "balance_state_clean_mv",
+    "balance_state_refresh",
 ];
 
 async fn seed_retired_clickhouse_objects(ch: &TestClickHouse) {
@@ -837,6 +843,40 @@ async fn seed_retired_clickhouse_objects(ch: &TestClickHouse) {
     ch.query("CREATE VIEW token_approvals_current AS SELECT marker FROM token_approvals")
         .await
         .expect("failed to seed token_approvals_current");
+
+    seed_retired_balance_state_objects(ch).await;
+}
+
+async fn seed_retired_balance_state_objects(ch: &TestClickHouse) {
+    ch.query(
+        "CREATE TABLE balance_dirty_keys (token String, holder String) \
+         ENGINE = MergeTree ORDER BY (token, holder)",
+    )
+    .await
+    .expect("failed to seed balance_dirty_keys");
+    ch.query(
+        "CREATE TABLE balance_reorg_keys (from_block Int64, token String, holder String) \
+         ENGINE = MergeTree ORDER BY (from_block, token, holder)",
+    )
+    .await
+    .expect("failed to seed balance_reorg_keys");
+    ch.query(
+        "CREATE TABLE balance_state (token String, holder String, balance UInt256) \
+         ENGINE = MergeTree ORDER BY (token, holder)",
+    )
+    .await
+    .expect("failed to seed balance_state");
+    ch.query("CREATE VIEW balance_dirty_keys_mv AS SELECT token, holder FROM balance_dirty_keys")
+        .await
+        .expect("failed to seed balance_dirty_keys_mv");
+    ch.query("CREATE VIEW balance_state_clean_mv AS SELECT token, holder FROM balance_dirty_keys")
+        .await
+        .expect("failed to seed balance_state_clean_mv");
+    ch.query(
+        "CREATE VIEW balance_state_refresh AS SELECT token, holder, balance FROM balance_state",
+    )
+    .await
+    .expect("failed to seed balance_state_refresh");
 }
 
 async fn assert_retired_clickhouse_objects_absent(ch: &TestClickHouse) {
@@ -1088,6 +1128,68 @@ async fn test_sink_ensure_schema_drops_retired_objects() {
 
 #[tokio::test]
 #[serial(clickhouse)]
+async fn test_sink_replaces_snapshot_after_incremental_state_schema() {
+    let Some((sink, ch)) = setup_sink().await else {
+        return;
+    };
+
+    // Model the important parts of the PR #271 transition: the canonical
+    // snapshot needs replacement while a refresh-dependent child exists, and
+    // the retired reducer objects are still present.
+    ch.query("DROP VIEW IF EXISTS address_balances_snapshot SYNC")
+        .await
+        .expect("failed to remove address snapshot fixture");
+    seed_retired_balance_state_objects(&ch).await;
+    ch.query(
+        "ALTER TABLE tidx_schema_objects DELETE WHERE name IN (\
+            'balance_state_20260715_stop_refresh', \
+            'token_holder_counts_20260715_drop_before_snapshot_replace', \
+            'token_balances_snapshot'\
+         ) SETTINGS mutations_sync = 1",
+    )
+    .await
+    .expect("failed to reset transition tracking fixture");
+    ch.query(
+        "INSERT INTO tidx_schema_objects (name, checksum, kind) \
+         VALUES \
+            ('token_balances_snapshot', 'pre-rollback-definition', \
+             'refreshable_materialized_view'), \
+            ('balance_state_20260714_bootstrap', 'applied-by-pr-271', 'migration')",
+    )
+    .await
+    .expect("failed to seed stale snapshot checksum");
+
+    sink.ensure_schema_only()
+        .await
+        .expect("incremental state schema transition failed");
+
+    assert_retired_clickhouse_objects_absent(&ch).await;
+    let retired_bootstrap = ch
+        .query(
+            "SELECT count() FROM tidx_schema_objects FINAL \
+             WHERE name = 'balance_state_20260714_bootstrap'",
+        )
+        .await
+        .expect("failed to inspect retired bootstrap tracking");
+    assert_eq!(retired_bootstrap.trim(), "0");
+    for view in [
+        "token_balances_snapshot",
+        "address_balances_snapshot",
+        "token_holder_counts",
+    ] {
+        let count = ch
+            .query(&format!(
+                "SELECT count() FROM system.tables WHERE database = currentDatabase() \
+                 AND name = '{view}'"
+            ))
+            .await
+            .unwrap_or_else(|_| panic!("failed to inspect recreated {view}"));
+        assert_eq!(count.trim(), "1", "{view} should be recreated");
+    }
+}
+
+#[tokio::test]
+#[serial(clickhouse)]
 async fn test_sink_write_blocks() {
     let Some((sink, ch)) = setup_sink().await else {
         return;
@@ -1234,11 +1336,36 @@ async fn test_sink_token_balances_view_tracks_balances_and_reorgs() {
     assert_eq!(balances.get(bob).map(String::as_str), Some("30"));
     assert!(!balances.contains_key(zero));
 
+    // Replaying the source batch creates physical duplicates, but FINAL keeps
+    // the canonical snapshot idempotent. The address snapshot must be the same
+    // atomic balance generation with only its storage order changed.
+    sink.write_logs(&logs)
+        .await
+        .expect("replayed write_logs failed");
+    refresh_balance_snapshots(&ch).await;
+    assert_eq!(
+        balance_rows(&ch, "token_balances_snapshot").await,
+        balance_rows(&ch, "address_balances_snapshot").await
+    );
+    assert_eq!(balance_rows(&ch, "token_balances_snapshot").await.len(), 2);
+
     sink.delete_from(3).await.expect("delete_from failed");
 
     let balances = token_holder_balances(&ch).await;
     assert_eq!(balances.get(alice).map(String::as_str), Some("60"));
     assert_eq!(balances.get(bob).map(String::as_str), Some("40"));
+
+    refresh_balance_snapshots(&ch).await;
+    assert_eq!(
+        balance_rows(&ch, "token_balances_snapshot").await,
+        balance_rows(&ch, "address_balances_snapshot").await
+    );
+    let snapshot = balance_rows(&ch, "token_balances_snapshot").await;
+    assert!(
+        snapshot
+            .iter()
+            .any(|(_, holder, balance)| { holder == bob && balance == "40" })
+    );
 }
 
 #[tokio::test]
@@ -1523,6 +1650,43 @@ async fn token_holder_balances(ch: &TestClickHouse) -> std::collections::HashMap
         .iter()
         .map(|row| {
             (
+                row["holder"].as_str().unwrap().to_string(),
+                row["balance"].as_str().unwrap().to_string(),
+            )
+        })
+        .collect()
+}
+
+async fn refresh_balance_snapshots(ch: &TestClickHouse) {
+    for view in [
+        "token_balances_snapshot",
+        "address_balances_snapshot",
+        "token_holder_counts",
+    ] {
+        ch.query(&format!("SYSTEM REFRESH VIEW {view}"))
+            .await
+            .unwrap_or_else(|_| panic!("failed to refresh {view}"));
+        ch.query(&format!("SYSTEM WAIT VIEW {view}"))
+            .await
+            .unwrap_or_else(|_| panic!("failed to wait for {view}"));
+    }
+}
+
+async fn balance_rows(ch: &TestClickHouse, table: &str) -> Vec<(String, String, String)> {
+    let result = ch
+        .query_json(&format!(
+            "SELECT token, holder, toString(balance) AS balance \
+             FROM {table} ORDER BY token, holder"
+        ))
+        .await
+        .unwrap_or_else(|_| panic!("failed to query {table}"));
+    result["data"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|row| {
+            (
+                row["token"].as_str().unwrap().to_string(),
                 row["holder"].as_str().unwrap().to_string(),
                 row["balance"].as_str().unwrap().to_string(),
             )
