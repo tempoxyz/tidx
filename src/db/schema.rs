@@ -43,6 +43,8 @@ pub async fn run_migrations(pool: &Pool) -> Result<()> {
         .await?;
     conn.batch_execute(include_str!("../../db/sync_state.sql"))
         .await?;
+    conn.batch_execute(include_str!("../../db/receipt_repair.sql"))
+        .await?;
     conn.batch_execute(include_str!("../../db/functions.sql"))
         .await?;
 

@@ -7,7 +7,10 @@ use serial_test::serial;
 use tidx::db::ThrottledPool;
 use tidx::sync::engine::SyncEngine;
 use tidx::sync::sink::SinkSet;
-use tidx::sync::writer::{write_blocks, write_logs, write_txs};
+use tidx::sync::writer::{
+    detect_blocks_missing_receipts, discover_legacy_receipt_repairs, finish_receipt_repair_attempt,
+    write_blocks, write_logs, write_txs,
+};
 use tidx::types::{BlockRow, LogRow, TxRow};
 
 fn generate_blocks(count: usize, offset: i64) -> Vec<BlockRow> {
@@ -143,6 +146,118 @@ async fn test_batch_write_txs() {
         .unwrap();
     assert_eq!(row.get::<_, i16>(0), 2);
     assert_eq!(row.get::<_, i64>(1), 100);
+}
+
+#[tokio::test]
+#[serial(db)]
+async fn test_receipt_repair_queue_tracks_only_incomplete_transactions() {
+    let db = TestDb::empty().await;
+    db.truncate_all().await;
+
+    let blocks = generate_blocks(3, 21_000_000);
+    write_blocks(&db.pool, &blocks).await.unwrap();
+
+    let mut incomplete = generate_txs(1, 21_000_001);
+    incomplete[0].gas_used = None;
+    let complete = generate_txs(1, 21_000_002);
+    let txs: Vec<_> = incomplete.into_iter().chain(complete).collect();
+    write_txs(&db.pool, &txs).await.unwrap();
+
+    let claimed = detect_blocks_missing_receipts(&db.pool, 100).await.unwrap();
+    assert_eq!(claimed, vec![21_000_001]);
+
+    let (completed, deferred) = finish_receipt_repair_attempt(&db.pool, &claimed)
+        .await
+        .unwrap();
+    assert_eq!((completed, deferred), (0, 1));
+
+    let conn = db.pool.get().await.unwrap();
+    let row = conn
+        .query_one(
+            "SELECT attempts, next_attempt_at > NOW() \
+             FROM receipt_repair_queue WHERE block_num = 21000001",
+            &[],
+        )
+        .await
+        .unwrap();
+    assert_eq!(row.get::<_, i32>(0), 1);
+    assert!(row.get::<_, bool>(1));
+
+    conn.execute(
+        "UPDATE txs SET gas_used = 21000 WHERE block_num = 21000001",
+        &[],
+    )
+    .await
+    .unwrap();
+    let (completed, deferred) = finish_receipt_repair_attempt(&db.pool, &claimed)
+        .await
+        .unwrap();
+    assert_eq!((completed, deferred), (1, 0));
+
+    let queue_count: i64 = conn
+        .query_one("SELECT COUNT(*) FROM receipt_repair_queue", &[])
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(queue_count, 0, "empty and complete blocks must not queue");
+}
+
+#[tokio::test]
+#[serial(db)]
+async fn test_receipt_repair_legacy_discovery_is_bounded_and_durable() {
+    let db = TestDb::empty().await;
+    db.truncate_all().await;
+
+    let blocks = generate_blocks(2, 21_100_000);
+    write_blocks(&db.pool, &blocks).await.unwrap();
+
+    let mut incomplete = generate_txs(1, 21_100_000);
+    incomplete[0].gas_used = None;
+    let complete = generate_txs(1, 21_100_001);
+    let txs: Vec<_> = incomplete.into_iter().chain(complete).collect();
+    write_txs(&db.pool, &txs).await.unwrap();
+
+    let conn = db.pool.get().await.unwrap();
+    conn.execute("TRUNCATE receipt_repair_queue", &[])
+        .await
+        .unwrap();
+
+    assert_eq!(
+        discover_legacy_receipt_repairs(&db.pool, 42431, 1)
+            .await
+            .unwrap(),
+        0,
+        "first one-block window contains only the complete block"
+    );
+    assert_eq!(
+        discover_legacy_receipt_repairs(&db.pool, 42431, 1)
+            .await
+            .unwrap(),
+        1,
+        "second one-block window discovers the legacy incomplete block"
+    );
+
+    let state = conn
+        .query_one(
+            "SELECT completed, next_block FROM receipt_repair_discovery WHERE chain_id = 42431",
+            &[],
+        )
+        .await
+        .unwrap();
+    assert!(state.get::<_, bool>(0));
+    assert_eq!(state.get::<_, Option<i64>>(1), None);
+
+    assert_eq!(
+        discover_legacy_receipt_repairs(&db.pool, 42431, 1)
+            .await
+            .unwrap(),
+        0,
+        "completed discovery must never rescan history"
+    );
+    assert_eq!(
+        detect_blocks_missing_receipts(&db.pool, 100).await.unwrap(),
+        vec![21_100_000]
+    );
 }
 
 #[tokio::test]
