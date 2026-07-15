@@ -37,9 +37,11 @@ pub enum ClickHouseObjectKind {
         target_table: &'static str,
         select_sql: &'static str,
     },
-    /// A full `CREATE MATERIALIZED VIEW … REFRESH …` statement. This covers
-    /// both self-storing views that atomically replace an inner target and
-    /// `APPEND TO` reducers that publish into an explicitly managed table.
+    /// `CREATE MATERIALIZED VIEW … REFRESH EVERY … ENGINE … AS select` — a
+    /// self-storing refreshable materialized view that periodically recomputes
+    /// its entire contents from source tables and atomically swaps the result
+    /// into its inner target table. Used for aggregates that are too expensive
+    /// to recompute on every read but don't need incremental freshness.
     /// Dropped + recreated whenever the DDL checksum changes.
     ///
     /// The stored string is the full `CREATE MATERIALIZED VIEW …` statement.
@@ -91,21 +93,8 @@ impl ClickHouseObject {
         )
     }
 
-    /// Whether this catalog object owns MergeTree storage whose codec is
-    /// declared in the object's own DDL. Refreshable views using `TO target`
-    /// inherit storage settings from that separately managed target table.
-    pub fn owns_storage(&self) -> bool {
-        self.is_table()
-            || matches!(
-                self.kind,
-                ClickHouseObjectKind::RefreshableMaterializedView(sql)
-                    if sql.contains("ENGINE =")
-            )
-    }
-
     /// DROP statement to run before re-creating a definition-drifted view/MV.
-    /// Dropping a self-storing refreshable MV also drops its inner target;
-    /// explicit `TO target` tables remain intact.
+    /// Dropping a refreshable MV also drops its inner target table.
     pub fn drop_sql(&self) -> Option<String> {
         match self.kind {
             ClickHouseObjectKind::MaterializedView { .. }

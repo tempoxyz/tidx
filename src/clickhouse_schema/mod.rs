@@ -189,6 +189,12 @@ mod tests {
             "token_approvals",
             "token_approvals_current",
             "token_approvals_mv",
+            "balance_dirty_keys",
+            "balance_dirty_keys_mv",
+            "balance_reorg_keys",
+            "balance_state",
+            "balance_state_clean_mv",
+            "balance_state_refresh",
         ] {
             assert!(!is_known_table(name), "{name} should be removed");
             assert!(!is_public_query_table(name), "{name} should not be public");
@@ -214,6 +220,14 @@ mod tests {
                 "DROP TABLE IF EXISTS address_txs SYNC",
                 "DROP VIEW IF EXISTS contract_creations_mv SYNC",
                 "DROP TABLE IF EXISTS contract_creations SYNC",
+                "DROP VIEW IF EXISTS balance_state_refresh SYNC",
+                "DROP VIEW IF EXISTS balance_state_clean_mv SYNC",
+                "DROP VIEW IF EXISTS balance_dirty_keys_mv SYNC",
+                "DROP TABLE IF EXISTS balance_state SYNC",
+                "DROP TABLE IF EXISTS balance_reorg_keys SYNC",
+                "DROP TABLE IF EXISTS balance_dirty_keys SYNC",
+                "ALTER TABLE tidx_schema_objects\n    DELETE WHERE name = \
+                 'balance_state_20260714_bootstrap'\n    SETTINGS mutations_sync = 1",
             ]
         );
     }
@@ -348,7 +362,7 @@ mod tests {
     fn managed_merge_tree_storage_uses_zstd_by_default() {
         for object in base_objects().iter().chain(derived_objects()) {
             let ddl = object.ddl();
-            if object.owns_storage() {
+            if object.is_table() || object.is_refreshable_materialized_view() {
                 assert!(
                     ddl.contains("SETTINGS default_compression_codec = 'ZSTD(1)'"),
                     "physical table {} does not set the default ZSTD codec",

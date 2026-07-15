@@ -17,7 +17,7 @@
 -- (still experimental as of ClickHouse 25.x); the sink sets it when applying
 -- this DDL.
 CREATE MATERIALIZED VIEW IF NOT EXISTS token_holder_counts
-REFRESH EVERY 15 MINUTE DEPENDS ON token_balances_snapshot
+REFRESH EVERY 15 MINUTE
 ENGINE = MergeTree
 ORDER BY (token)
 SETTINGS default_compression_codec = 'ZSTD(1)'

@@ -102,6 +102,22 @@ const DROP_CONTRACT_CREATIONS_MV_20260711: &str =
     include_str!("../../db/clickhouse/migrations/20260711_drop_contract_creations_mv.sql");
 const DROP_CONTRACT_CREATIONS_20260711: &str =
     include_str!("../../db/clickhouse/migrations/20260711_drop_contract_creations.sql");
+const DROP_BALANCE_STATE_REFRESH_20260715: &str =
+    include_str!("../../db/clickhouse/migrations/20260715_drop_balance_state_refresh.sql");
+const DROP_TOKEN_HOLDER_COUNTS_20260715: &str =
+    include_str!("../../db/clickhouse/migrations/20260715_drop_token_holder_counts.sql");
+const DROP_BALANCE_STATE_CLEAN_MV_20260715: &str =
+    include_str!("../../db/clickhouse/migrations/20260715_drop_balance_state_clean_mv.sql");
+const DROP_BALANCE_DIRTY_KEYS_MV_20260715: &str =
+    include_str!("../../db/clickhouse/migrations/20260715_drop_balance_dirty_keys_mv.sql");
+const DROP_BALANCE_STATE_20260715: &str =
+    include_str!("../../db/clickhouse/migrations/20260715_drop_balance_state.sql");
+const DROP_BALANCE_REORG_KEYS_20260715: &str =
+    include_str!("../../db/clickhouse/migrations/20260715_drop_balance_reorg_keys.sql");
+const DROP_BALANCE_DIRTY_KEYS_20260715: &str =
+    include_str!("../../db/clickhouse/migrations/20260715_drop_balance_dirty_keys.sql");
+const FORGET_BALANCE_STATE_BOOTSTRAP_20260715: &str =
+    include_str!("../../db/clickhouse/migrations/20260715_forget_balance_state_bootstrap.sql");
 
 /// Idempotent cleanup for objects removed from the managed catalog.
 pub(super) const RETIRED_OBJECT_DROPS: &[&str] = &[
@@ -114,6 +130,13 @@ pub(super) const RETIRED_OBJECT_DROPS: &[&str] = &[
     DROP_ADDRESS_TXS_20260711,
     DROP_CONTRACT_CREATIONS_MV_20260711,
     DROP_CONTRACT_CREATIONS_20260711,
+    DROP_BALANCE_STATE_REFRESH_20260715,
+    DROP_BALANCE_STATE_CLEAN_MV_20260715,
+    DROP_BALANCE_DIRTY_KEYS_MV_20260715,
+    DROP_BALANCE_STATE_20260715,
+    DROP_BALANCE_REORG_KEYS_20260715,
+    DROP_BALANCE_DIRTY_KEYS_20260715,
+    FORGET_BALANCE_STATE_BOOTSTRAP_20260715,
 ];
 
 pub const TABLES: &[ClickHouseObject] = &[
@@ -308,6 +331,25 @@ pub const MIGRATIONS: &[ClickHouseObject] = &[
         name: "logs_20260714_materialize_block_num_index",
         kind: ClickHouseObjectKind::Migration(MATERIALIZE_LOGS_INDEX_20260714),
         depends_on: &["logs_20260714_block_num_index"],
+        public_query: false,
+        block_column: None,
+        backfill: None,
+    },
+    // PR #271 made token_holder_counts a refresh-dependent child of
+    // token_balances_snapshot. Stop the high-frequency reducer and remove that
+    // child before derived-object reconciliation replaces the snapshot.
+    ClickHouseObject {
+        name: "balance_state_20260715_stop_refresh",
+        kind: ClickHouseObjectKind::Migration(DROP_BALANCE_STATE_REFRESH_20260715),
+        depends_on: &[],
+        public_query: false,
+        block_column: None,
+        backfill: None,
+    },
+    ClickHouseObject {
+        name: "token_holder_counts_20260715_drop_before_snapshot_replace",
+        kind: ClickHouseObjectKind::Migration(DROP_TOKEN_HOLDER_COUNTS_20260715),
+        depends_on: &[],
         public_query: false,
         block_column: None,
         backfill: None,
