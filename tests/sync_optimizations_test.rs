@@ -4,10 +4,10 @@ use common::tempo::TempoNode;
 use common::testdb::TestDb;
 
 use serial_test::serial;
-use tidx::db::ThrottledPool;
+use tidx::db::{ThrottledPool, run_post_startup_migrations};
 use tidx::sync::engine::SyncEngine;
 use tidx::sync::sink::SinkSet;
-use tidx::sync::writer::{write_blocks, write_logs, write_txs};
+use tidx::sync::writer::{detect_blocks_missing_receipts, write_blocks, write_logs, write_txs};
 use tidx::types::{BlockRow, LogRow, TxRow};
 
 fn generate_blocks(count: usize, offset: i64) -> Vec<BlockRow> {
@@ -143,6 +143,32 @@ async fn test_batch_write_txs() {
         .unwrap();
     assert_eq!(row.get::<_, i16>(0), 2);
     assert_eq!(row.get::<_, i64>(1), 100);
+}
+
+#[tokio::test]
+#[serial(db)]
+async fn test_receipt_backfill_ignores_blocks_without_transactions() {
+    let db = TestDb::empty().await;
+    db.truncate_all().await;
+    run_post_startup_migrations(&db.pool)
+        .await
+        .expect("Failed to create receipt backfill index");
+
+    let blocks = generate_blocks(3, 21_000_000);
+    write_blocks(&db.pool, &blocks).await.unwrap();
+
+    let mut missing_receipt_tx = generate_txs(1, 21_000_001);
+    missing_receipt_tx[0].gas_used = None;
+    write_txs(&db.pool, &missing_receipt_tx).await.unwrap();
+
+    let complete_tx = generate_txs(1, 21_000_002);
+    write_txs(&db.pool, &complete_tx).await.unwrap();
+
+    let blocks_missing = detect_blocks_missing_receipts(&db.pool, 500)
+        .await
+        .expect("Failed to detect receipt backfill candidates");
+
+    assert_eq!(blocks_missing, vec![21_000_001]);
 }
 
 #[tokio::test]

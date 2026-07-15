@@ -28,6 +28,7 @@ use crate::virtual_address::mark_virtual_forward_hops;
 const REALTIME_RPC_CONCURRENCY: usize = 4;
 const BACKFILL_RPC_CONCURRENCY: usize = 8;
 const RECEIPT_BACKFILL_BLOCK_LIMIT: i64 = 100;
+const RECEIPT_BACKFILL_POLL_INTERVAL: Duration = Duration::from_secs(2);
 const RECEIPT_BACKFILL_MAX_WRITE_ROWS: usize = 50_000;
 const RECEIPT_BACKFILL_INFO_ROWS: usize = 10_000;
 
@@ -1491,6 +1492,8 @@ async fn run_receipt_backfill_loop(
                 if let Err(e) = result {
                     error!(chain_id, error = %e, "Receipt backfill tick failed");
                     tokio::time::sleep(Duration::from_secs(1)).await;
+                } else {
+                    tokio::time::sleep(RECEIPT_BACKFILL_POLL_INTERVAL).await;
                 }
             }
         }
@@ -1510,8 +1513,6 @@ async fn tick_receipt_backfill(sinks: &SinkSet, rpc: &RpcClient, chain_id: u64) 
     let blocks_missing = detect_blocks_missing_receipts(pool, RECEIPT_BACKFILL_BLOCK_LIMIT).await?;
 
     if blocks_missing.is_empty() {
-        // All caught up, sleep before checking again
-        tokio::time::sleep(Duration::from_secs(2)).await;
         return Ok(());
     }
 

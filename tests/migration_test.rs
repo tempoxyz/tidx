@@ -174,6 +174,28 @@ async fn test_pg_upgrade_adds_missing_postgres_ddl() {
                 "idx_logs_virtual_forward".to_string(),
             ]
         );
+
+        let missing_receipt_index_exists: bool = conn
+            .query_one(
+                r#"
+                SELECT EXISTS (
+                    SELECT 1
+                    FROM pg_indexes
+                    WHERE schemaname = 'public'
+                      AND tablename = 'txs'
+                      AND indexname = 'idx_txs_missing_receipt'
+                      AND indexdef LIKE '%WHERE (gas_used IS NULL)%'
+                )
+                "#,
+                &[],
+            )
+            .await
+            .expect("Failed to query transaction indexes")
+            .get(0);
+        assert!(
+            missing_receipt_index_exists,
+            "receipt backfill should have a partial transaction index"
+        );
     })
     .catch_unwind()
     .await;

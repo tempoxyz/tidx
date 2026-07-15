@@ -1077,20 +1077,44 @@ pub async fn detect_gaps(pool: &Pool, below: u64) -> Result<Vec<(u64, u64)>> {
         .collect())
 }
 
-/// Detect blocks that have no receipts (for deferred receipt backfill).
-/// Returns block numbers that exist in blocks table but have no receipts.
-/// Limited to a batch size and ordered by block_num DESC (most recent first).
+/// Detect blocks containing transactions that still need receipt enrichment.
+///
+/// `gas_used` starts as `NULL` when a transaction is decoded without its
+/// receipt and is populated from the receipt after backfill. Using that marker
+/// avoids treating legitimate zero-transaction blocks as missing receipts.
+/// The partial `idx_txs_missing_receipt` index keeps the ordered lookup cheap.
 pub async fn detect_blocks_missing_receipts(pool: &Pool, limit: i64) -> Result<Vec<u64>> {
     let conn = pool.get().await?;
+
+    let index_ready: bool = conn
+        .query_one(
+            r#"
+            SELECT EXISTS (
+                SELECT 1
+                FROM pg_class c
+                JOIN pg_index i ON i.indexrelid = c.oid
+                WHERE c.oid = to_regclass('idx_txs_missing_receipt')
+                  AND i.indisvalid
+            )
+            "#,
+            &[],
+        )
+        .await?
+        .get(0);
+
+    // Existing deployments build this index in a post-startup migration. Do
+    // not fall back to a full transaction-table scan while it is being built.
+    if !index_ready {
+        return Ok(Vec::new());
+    }
 
     let rows = conn
         .query(
             r#"
-            SELECT b.num
-            FROM blocks b
-            LEFT JOIN receipts r ON r.block_num = b.num
-            WHERE r.block_num IS NULL
-            ORDER BY b.num DESC
+            SELECT DISTINCT block_num
+            FROM txs
+            WHERE gas_used IS NULL
+            ORDER BY block_num DESC
             LIMIT $1
             "#,
             &[&limit],
