@@ -1,0 +1,6 @@
+---
+source: src/query/parser.rs
+assertion_line: 1881
+expression: sig.rewrite_filters_for_pushdown(sql)
+---
+SELECT * FROM OrderPlaced WHERE topic1 = '0x00000000000000000000000000000000000000000000000000000000010ad0bd'
