@@ -33,7 +33,7 @@ pub const OBJECTS: &[ClickHouseObject] = &[
     ClickHouseObject {
         name: "address_balances",
         kind: ClickHouseObjectKind::View(ADDRESS_BALANCES_VIEW),
-        depends_on: &["address_holder_deltas"],
+        depends_on: &["token_holder_deltas", "balance_dirty_keys", "balance_state"],
         public_query: true,
         block_column: None,
         backfill: None,
@@ -41,7 +41,7 @@ pub const OBJECTS: &[ClickHouseObject] = &[
     ClickHouseObject {
         name: "address_balances_snapshot",
         kind: ClickHouseObjectKind::RefreshableMaterializedView(ADDRESS_BALANCES_SNAPSHOT),
-        depends_on: &["address_holder_deltas"],
+        depends_on: &["address_balances"],
         public_query: true,
         // Self-storing refreshable MV: fully replaced each refresh, so it isn't
         // block-scoped and reorg cleanup skips it.
@@ -93,7 +93,8 @@ mod tests {
             .unwrap();
         assert!(view.is_view());
         let ddl = view.ddl();
-        assert!(ddl.contains("FROM address_holder_deltas FINAL"));
+        assert!(ddl.contains("FROM token_holder_deltas FINAL"));
+        assert!(ddl.contains("FROM balance_state FINAL"));
         assert!(ddl.contains("GROUP BY holder, token"));
         assert!(ddl.contains("HAVING balance > 0"));
     }
@@ -114,11 +115,10 @@ mod tests {
 
         let ddl = snapshot.ddl();
         assert!(ddl.contains("CREATE MATERIALIZED VIEW IF NOT EXISTS address_balances_snapshot"));
-        assert!(ddl.contains("REFRESH EVERY"));
+        assert!(ddl.contains("REFRESH AFTER"));
         assert!(ddl.contains("ORDER BY (holder, balance, token)"));
-        assert!(ddl.contains("FROM address_holder_deltas FINAL"));
-        assert!(ddl.contains("GROUP BY holder, token"));
-        assert!(ddl.contains("HAVING balance > 0"));
+        assert!(ddl.contains("FROM address_balances"));
+        assert!(!ddl.contains("FROM address_holder_deltas FINAL"));
         assert_eq!(
             snapshot.drop_sql().as_deref(),
             Some("DROP VIEW IF EXISTS address_balances_snapshot")
