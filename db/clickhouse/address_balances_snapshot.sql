@@ -8,10 +8,10 @@
 -- balance reads hit a holder-keyed primary range instead of re-aggregating the
 -- event history.
 --
--- Each refresh atomically publishes the current incremental balance state in
--- holder order. Dirty pairs are resolved by address_balances from the
--- canonical FINAL ledger, preserving reorg correctness without re-aggregating
--- every historical delta.
+-- The canonical aggregation is performed once by token_balances_snapshot.
+-- This dependent refresh only reorders that same atomic generation for the
+-- address access pattern, so token- and address-keyed snapshots cannot derive
+-- different balances from duplicate or reorged source rows.
 --
 -- ORDER BY (holder, balance, token) so address balance pages/counts filtered by
 -- holder can prune to one account before sorting by balance.
@@ -20,13 +20,17 @@
 -- (still experimental as of ClickHouse 25.x); the sink sets it when applying
 -- this DDL.
 CREATE MATERIALIZED VIEW IF NOT EXISTS address_balances_snapshot
-REFRESH AFTER 15 MINUTE
+REFRESH AFTER 15 MINUTE DEPENDS ON token_balances_snapshot
 ENGINE = MergeTree
 ORDER BY (holder, balance, token)
 SETTINGS default_compression_codec = 'ZSTD(1)'
 AS
-SELECT holder, token, balance
-FROM address_balances
+SELECT
+    holder,
+    token,
+    balance
+FROM token_balances_snapshot
 SETTINGS
-    max_threads = 8,
-    max_memory_usage = 34359738368
+    max_threads = 4,
+    max_memory_usage = 17179869184,
+    max_bytes_before_external_sort = 2000000000

@@ -806,6 +806,12 @@ const RETIRED_CLICKHOUSE_OBJECTS: &[&str] = &[
     "token_approvals",
     "token_approvals_current",
     "token_approvals_mv",
+    "balance_dirty_keys",
+    "balance_dirty_keys_mv",
+    "balance_reorg_keys",
+    "balance_state",
+    "balance_state_clean_mv",
+    "balance_state_refresh",
 ];
 
 async fn seed_retired_clickhouse_objects(ch: &TestClickHouse) {
@@ -837,6 +843,40 @@ async fn seed_retired_clickhouse_objects(ch: &TestClickHouse) {
     ch.query("CREATE VIEW token_approvals_current AS SELECT marker FROM token_approvals")
         .await
         .expect("failed to seed token_approvals_current");
+
+    seed_retired_balance_state_objects(ch).await;
+}
+
+async fn seed_retired_balance_state_objects(ch: &TestClickHouse) {
+    ch.query(
+        "CREATE TABLE balance_dirty_keys (token String, holder String) \
+         ENGINE = MergeTree ORDER BY (token, holder)",
+    )
+    .await
+    .expect("failed to seed balance_dirty_keys");
+    ch.query(
+        "CREATE TABLE balance_reorg_keys (from_block Int64, token String, holder String) \
+         ENGINE = MergeTree ORDER BY (from_block, token, holder)",
+    )
+    .await
+    .expect("failed to seed balance_reorg_keys");
+    ch.query(
+        "CREATE TABLE balance_state (token String, holder String, balance UInt256) \
+         ENGINE = MergeTree ORDER BY (token, holder)",
+    )
+    .await
+    .expect("failed to seed balance_state");
+    ch.query("CREATE VIEW balance_dirty_keys_mv AS SELECT token, holder FROM balance_dirty_keys")
+        .await
+        .expect("failed to seed balance_dirty_keys_mv");
+    ch.query("CREATE VIEW balance_state_clean_mv AS SELECT token, holder FROM balance_dirty_keys")
+        .await
+        .expect("failed to seed balance_state_clean_mv");
+    ch.query(
+        "CREATE VIEW balance_state_refresh AS SELECT token, holder, balance FROM balance_state",
+    )
+    .await
+    .expect("failed to seed balance_state_refresh");
 }
 
 async fn assert_retired_clickhouse_objects_absent(ch: &TestClickHouse) {
@@ -1014,9 +1054,6 @@ async fn test_sink_ensure_schema_creates_tables() {
         "receipts",
         "token_transfers",
         "token_holder_deltas",
-        "balance_dirty_keys",
-        "balance_reorg_keys",
-        "balance_state",
         "token_balances_snapshot",
     ] {
         let count = ch
@@ -1087,6 +1124,68 @@ async fn test_sink_ensure_schema_drops_retired_objects() {
         .await
         .expect("second ensure_schema failed");
     assert_retired_clickhouse_objects_absent(&ch).await;
+}
+
+#[tokio::test]
+#[serial(clickhouse)]
+async fn test_sink_replaces_snapshot_after_incremental_state_schema() {
+    let Some((sink, ch)) = setup_sink().await else {
+        return;
+    };
+
+    // Model the important parts of the PR #271 transition: the canonical
+    // snapshot needs replacement while a refresh-dependent child exists, and
+    // the retired reducer objects are still present.
+    ch.query("DROP VIEW IF EXISTS address_balances_snapshot SYNC")
+        .await
+        .expect("failed to remove address snapshot fixture");
+    seed_retired_balance_state_objects(&ch).await;
+    ch.query(
+        "ALTER TABLE tidx_schema_objects DELETE WHERE name IN (\
+            'balance_state_20260715_stop_refresh', \
+            'token_holder_counts_20260715_drop_before_snapshot_replace', \
+            'token_balances_snapshot'\
+         ) SETTINGS mutations_sync = 1",
+    )
+    .await
+    .expect("failed to reset transition tracking fixture");
+    ch.query(
+        "INSERT INTO tidx_schema_objects (name, checksum, kind) \
+         VALUES \
+            ('token_balances_snapshot', 'pre-rollback-definition', \
+             'refreshable_materialized_view'), \
+            ('balance_state_20260714_bootstrap', 'applied-by-pr-271', 'migration')",
+    )
+    .await
+    .expect("failed to seed stale snapshot checksum");
+
+    sink.ensure_schema_only()
+        .await
+        .expect("incremental state schema transition failed");
+
+    assert_retired_clickhouse_objects_absent(&ch).await;
+    let retired_bootstrap = ch
+        .query(
+            "SELECT count() FROM tidx_schema_objects FINAL \
+             WHERE name = 'balance_state_20260714_bootstrap'",
+        )
+        .await
+        .expect("failed to inspect retired bootstrap tracking");
+    assert_eq!(retired_bootstrap.trim(), "0");
+    for view in [
+        "token_balances_snapshot",
+        "address_balances_snapshot",
+        "token_holder_counts",
+    ] {
+        let count = ch
+            .query(&format!(
+                "SELECT count() FROM system.tables WHERE database = currentDatabase() \
+                 AND name = '{view}'"
+            ))
+            .await
+            .unwrap_or_else(|_| panic!("failed to inspect recreated {view}"));
+        assert_eq!(count.trim(), "1", "{view} should be recreated");
+    }
 }
 
 #[tokio::test]
@@ -1237,57 +1336,18 @@ async fn test_sink_token_balances_view_tracks_balances_and_reorgs() {
     assert_eq!(balances.get(bob).map(String::as_str), Some("30"));
     assert!(!balances.contains_key(zero));
 
-    let dirty_before_refresh = ch
-        .query("SELECT count() FROM balance_dirty_keys FINAL WHERE dirty = 1")
-        .await
-        .expect("dirty balance key query failed");
-    assert_eq!(dirty_before_refresh.trim(), "2");
-
-    ch.query("SYSTEM REFRESH VIEW balance_state_refresh")
-        .await
-        .expect("balance state refresh trigger failed");
-    ch.query("SYSTEM WAIT VIEW balance_state_refresh")
-        .await
-        .expect("balance state refresh wait failed");
-
-    let state = ch
-        .query_json(
-            "SELECT holder, toString(balance) AS balance, is_deleted \
-             FROM balance_state FINAL ORDER BY holder",
-        )
-        .await
-        .expect("balance state query failed");
-    let state_rows = state["data"]
-        .as_array()
-        .expect("balance state rows missing");
-    assert_eq!(state_rows.len(), 2);
-    assert_eq!(state_rows[0]["holder"].as_str(), Some(alice));
-    assert_eq!(state_rows[0]["balance"].as_str(), Some("60"));
-    assert_eq!(state_rows[0]["is_deleted"].as_u64(), Some(0));
-    assert_eq!(state_rows[1]["holder"].as_str(), Some(bob));
-    assert_eq!(state_rows[1]["balance"].as_str(), Some("30"));
-    assert_eq!(state_rows[1]["is_deleted"].as_u64(), Some(0));
-
-    let dirty_after_refresh = ch
-        .query("SELECT count() FROM balance_dirty_keys FINAL WHERE dirty = 1")
-        .await
-        .expect("clean balance key query failed");
-    assert_eq!(dirty_after_refresh.trim(), "0");
-
-    // Replaying the exact same source rows is idempotent: FINAL deduplicates
-    // the ledger and the reducer republishes the same absolute balances.
+    // Replaying the source batch creates physical duplicates, but FINAL keeps
+    // the canonical snapshot idempotent. The address snapshot must be the same
+    // atomic balance generation with only its storage order changed.
     sink.write_logs(&logs)
         .await
         .expect("replayed write_logs failed");
-    ch.query("SYSTEM REFRESH VIEW balance_state_refresh")
-        .await
-        .expect("replayed balance state refresh trigger failed");
-    ch.query("SYSTEM WAIT VIEW balance_state_refresh")
-        .await
-        .expect("replayed balance state refresh wait failed");
-    let balances = token_holder_balances(&ch).await;
-    assert_eq!(balances.get(alice).map(String::as_str), Some("60"));
-    assert_eq!(balances.get(bob).map(String::as_str), Some("30"));
+    refresh_balance_snapshots(&ch).await;
+    assert_eq!(
+        balance_rows(&ch, "token_balances_snapshot").await,
+        balance_rows(&ch, "address_balances_snapshot").await
+    );
+    assert_eq!(balance_rows(&ch, "token_balances_snapshot").await.len(), 2);
 
     sink.delete_from(3).await.expect("delete_from failed");
 
@@ -1295,74 +1355,17 @@ async fn test_sink_token_balances_view_tracks_balances_and_reorgs() {
     assert_eq!(balances.get(alice).map(String::as_str), Some("60"));
     assert_eq!(balances.get(bob).map(String::as_str), Some("40"));
 
-    let pending_reorgs = ch
-        .query("SELECT count() FROM balance_reorg_keys FINAL WHERE pending = 1")
-        .await
-        .expect("pending balance reorg query failed");
-    assert_eq!(pending_reorgs.trim(), "0");
-}
-
-#[tokio::test]
-#[serial(clickhouse)]
-async fn test_sink_recovers_pending_balance_reorg_after_restart() {
-    let Some((sink, ch)) = setup_sink().await else {
-        return;
-    };
-
-    let zero = "0x0000000000000000000000000000000000000000";
-    let alice = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
-    let bob = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
-
-    let blocks: Vec<BlockRow> = (1..=3).map(make_block).collect();
-    sink.write_blocks(&blocks)
-        .await
-        .expect("write_blocks failed");
-    sink.write_logs(&[
-        make_transfer_log(1, 0, zero, alice, 100),
-        make_transfer_log(2, 0, alice, bob, 40),
-        make_transfer_log(3, 0, bob, zero, 10),
-    ])
-    .await
-    .expect("write_logs failed");
-    ch.query("SYSTEM REFRESH VIEW balance_state_refresh")
-        .await
-        .expect("initial balance state refresh trigger failed");
-    ch.query("SYSTEM WAIT VIEW balance_state_refresh")
-        .await
-        .expect("initial balance state refresh wait failed");
-
-    // Model a crash after balance-derived rows and blocks were deleted but
-    // before the journal keys were republished to the dirty queue.
-    ch.query(
-        "INSERT INTO balance_reorg_keys \
-         SELECT 3, token, holder, CAST(1 AS UInt8), now64(9, 'UTC') \
-         FROM token_holder_deltas FINAL WHERE block_num >= 3 GROUP BY token, holder",
-    )
-    .await
-    .expect("pending reorg journal insert failed");
-    ch.query(
-        "ALTER TABLE token_holder_deltas DELETE WHERE block_num >= 3 \
-         SETTINGS mutations_sync = 1",
-    )
-    .await
-    .expect("simulated holder delta delete failed");
-    ch.query("ALTER TABLE blocks DELETE WHERE num >= 3 SETTINGS mutations_sync = 1")
-        .await
-        .expect("simulated block delete failed");
-
-    sink.ensure_schema_only()
-        .await
-        .expect("schema restart recovery failed");
-
-    let balances = token_holder_balances(&ch).await;
-    assert_eq!(balances.get(alice).map(String::as_str), Some("60"));
-    assert_eq!(balances.get(bob).map(String::as_str), Some("40"));
-
-    let pending_reorgs = ch
-        .query("SELECT count() FROM balance_reorg_keys FINAL WHERE pending = 1")
-        .await
-        .expect("pending balance reorg recovery query failed");
-    assert_eq!(pending_reorgs.trim(), "0");
+    refresh_balance_snapshots(&ch).await;
+    assert_eq!(
+        balance_rows(&ch, "token_balances_snapshot").await,
+        balance_rows(&ch, "address_balances_snapshot").await
+    );
+    let snapshot = balance_rows(&ch, "token_balances_snapshot").await;
+    assert!(
+        snapshot
+            .iter()
+            .any(|(_, holder, balance)| { holder == bob && balance == "40" })
+    );
 }
 
 #[tokio::test]
@@ -1411,32 +1414,6 @@ async fn test_sink_ensure_schema_backfills_token_transfer_views() {
     assert_eq!(balances.get(alice).map(String::as_str), Some("60"));
     assert_eq!(balances.get(bob).map(String::as_str), Some("30"));
     assert!(!balances.contains_key(zero));
-
-    // On a fresh database the derived backfill runs after the one-time state
-    // bootstrap. Its inserts are queued as dirty, then consumed by the regular
-    // reducer refresh.
-    ch.query("SYSTEM REFRESH VIEW balance_state_refresh")
-        .await
-        .expect("backfilled balance state refresh trigger failed");
-    ch.query("SYSTEM WAIT VIEW balance_state_refresh")
-        .await
-        .expect("backfilled balance state refresh wait failed");
-
-    let state = ch
-        .query_json(
-            "SELECT holder, toString(balance) AS balance \
-             FROM balance_state FINAL WHERE is_deleted = 0 ORDER BY holder",
-        )
-        .await
-        .expect("bootstrapped balance state query failed");
-    let rows = state["data"]
-        .as_array()
-        .expect("bootstrapped balance state rows missing");
-    assert_eq!(rows.len(), 2);
-    assert_eq!(rows[0]["holder"].as_str(), Some(alice));
-    assert_eq!(rows[0]["balance"].as_str(), Some("60"));
-    assert_eq!(rows[1]["holder"].as_str(), Some(bob));
-    assert_eq!(rows[1]["balance"].as_str(), Some("30"));
 }
 
 struct TokenTransferEvent {
@@ -1650,17 +1627,6 @@ async fn test_post_derived_migrations_repair_legacy_signed_holder_deltas() {
         .expect("column type query failed");
     assert_eq!(delta_type.trim(), "UInt256");
 
-    ch.query(include_str!("../db/clickhouse/balance_dirty_keys.sql"))
-        .await
-        .expect("create balance_dirty_keys");
-    ch.query(include_str!("../db/clickhouse/balance_state.sql"))
-        .await
-        .expect("create balance_state");
-    ch.query(include_str!(
-        "../db/clickhouse/migrations/20260714_bootstrap_balance_state.sql"
-    ))
-    .await
-    .expect("bootstrap balance_state");
     ch.query(include_str!("../db/clickhouse/token_balances.sql"))
         .await
         .expect("create token_balances view");
@@ -1684,6 +1650,43 @@ async fn token_holder_balances(ch: &TestClickHouse) -> std::collections::HashMap
         .iter()
         .map(|row| {
             (
+                row["holder"].as_str().unwrap().to_string(),
+                row["balance"].as_str().unwrap().to_string(),
+            )
+        })
+        .collect()
+}
+
+async fn refresh_balance_snapshots(ch: &TestClickHouse) {
+    for view in [
+        "token_balances_snapshot",
+        "address_balances_snapshot",
+        "token_holder_counts",
+    ] {
+        ch.query(&format!("SYSTEM REFRESH VIEW {view}"))
+            .await
+            .unwrap_or_else(|_| panic!("failed to refresh {view}"));
+        ch.query(&format!("SYSTEM WAIT VIEW {view}"))
+            .await
+            .unwrap_or_else(|_| panic!("failed to wait for {view}"));
+    }
+}
+
+async fn balance_rows(ch: &TestClickHouse, table: &str) -> Vec<(String, String, String)> {
+    let result = ch
+        .query_json(&format!(
+            "SELECT token, holder, toString(balance) AS balance \
+             FROM {table} ORDER BY token, holder"
+        ))
+        .await
+        .unwrap_or_else(|_| panic!("failed to query {table}"));
+    result["data"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|row| {
+            (
+                row["token"].as_str().unwrap().to_string(),
                 row["holder"].as_str().unwrap().to_string(),
                 row["balance"].as_str().unwrap().to_string(),
             )

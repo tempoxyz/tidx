@@ -4,16 +4,6 @@ const TOKEN_HOLDER_DELTAS_SCHEMA: &str =
     include_str!("../../db/clickhouse/token_holder_deltas.sql");
 const TOKEN_HOLDER_DELTAS_SELECT: &str =
     include_str!("../../db/clickhouse/token_holder_deltas_select.sql");
-const BALANCE_DIRTY_KEYS_SCHEMA: &str = include_str!("../../db/clickhouse/balance_dirty_keys.sql");
-const BALANCE_DIRTY_KEYS_SELECT: &str =
-    include_str!("../../db/clickhouse/balance_dirty_keys_select.sql");
-const BALANCE_REORG_KEYS_SCHEMA: &str = include_str!("../../db/clickhouse/balance_reorg_keys.sql");
-const BALANCE_STATE_SCHEMA: &str = include_str!("../../db/clickhouse/balance_state.sql");
-const BALANCE_STATE_CLEAN_SELECT: &str =
-    include_str!("../../db/clickhouse/balance_state_clean_select.sql");
-const BALANCE_STATE_REFRESH: &str = include_str!("../../db/clickhouse/balance_state_refresh.sql");
-const BOOTSTRAP_BALANCE_STATE_20260714: &str =
-    include_str!("../../db/clickhouse/migrations/20260714_bootstrap_balance_state.sql");
 const TOKEN_BALANCES_VIEW: &str = include_str!("../../db/clickhouse/token_balances.sql");
 const TOKEN_BALANCES_SNAPSHOT: &str =
     include_str!("../../db/clickhouse/token_balances_snapshot.sql");
@@ -42,78 +32,9 @@ pub const OBJECTS: &[ClickHouseObject] = &[
         backfill: None,
     },
     ClickHouseObject {
-        name: "balance_dirty_keys",
-        kind: ClickHouseObjectKind::Table(BALANCE_DIRTY_KEYS_SCHEMA),
-        depends_on: &["token_holder_deltas"],
-        public_query: false,
-        block_column: None,
-        backfill: None,
-    },
-    ClickHouseObject {
-        name: "balance_dirty_keys_mv",
-        kind: ClickHouseObjectKind::MaterializedView {
-            target_table: "balance_dirty_keys",
-            select_sql: BALANCE_DIRTY_KEYS_SELECT,
-        },
-        depends_on: &["token_holder_deltas", "balance_dirty_keys"],
-        public_query: false,
-        block_column: None,
-        backfill: None,
-    },
-    ClickHouseObject {
-        name: "balance_reorg_keys",
-        kind: ClickHouseObjectKind::Table(BALANCE_REORG_KEYS_SCHEMA),
-        depends_on: &["token_holder_deltas"],
-        public_query: false,
-        block_column: None,
-        backfill: None,
-    },
-    ClickHouseObject {
-        name: "balance_state",
-        kind: ClickHouseObjectKind::Table(BALANCE_STATE_SCHEMA),
-        depends_on: &["token_holder_deltas"],
-        public_query: false,
-        block_column: None,
-        backfill: None,
-    },
-    ClickHouseObject {
-        name: "balance_state_clean_mv",
-        kind: ClickHouseObjectKind::MaterializedView {
-            target_table: "balance_dirty_keys",
-            select_sql: BALANCE_STATE_CLEAN_SELECT,
-        },
-        depends_on: &["balance_state", "balance_dirty_keys"],
-        public_query: false,
-        block_column: None,
-        backfill: None,
-    },
-    ClickHouseObject {
-        name: "balance_state_refresh",
-        kind: ClickHouseObjectKind::RefreshableMaterializedView(BALANCE_STATE_REFRESH),
-        depends_on: &["balance_dirty_keys", "balance_state", "token_holder_deltas"],
-        public_query: false,
-        block_column: None,
-        backfill: None,
-    },
-    // This migration intentionally sits between the reducer and the public
-    // views. Existing snapshots remain available while the one-time state
-    // bootstrap scans historical deltas.
-    ClickHouseObject {
-        name: "balance_state_20260714_bootstrap",
-        kind: ClickHouseObjectKind::Migration(BOOTSTRAP_BALANCE_STATE_20260714),
-        depends_on: &[
-            "balance_state",
-            "balance_state_clean_mv",
-            "token_holder_deltas",
-        ],
-        public_query: false,
-        block_column: None,
-        backfill: None,
-    },
-    ClickHouseObject {
         name: "token_balances",
         kind: ClickHouseObjectKind::View(TOKEN_BALANCES_VIEW),
-        depends_on: &["token_holder_deltas", "balance_dirty_keys", "balance_state"],
+        depends_on: &["token_holder_deltas"],
         public_query: true,
         block_column: None,
         backfill: None,
@@ -121,7 +42,7 @@ pub const OBJECTS: &[ClickHouseObject] = &[
     ClickHouseObject {
         name: "token_balances_snapshot",
         kind: ClickHouseObjectKind::RefreshableMaterializedView(TOKEN_BALANCES_SNAPSHOT),
-        depends_on: &["token_balances"],
+        depends_on: &["token_holder_deltas"],
         public_query: true,
         // Self-storing refreshable MV: it owns its rows and is fully replaced
         // each refresh, so it isn't block-scoped and reorg cleanup skips it.
@@ -202,8 +123,6 @@ mod tests {
         assert!(view.is_view());
         let ddl = view.ddl();
         assert!(ddl.contains("FROM token_holder_deltas FINAL"));
-        assert!(ddl.contains("FROM balance_state FINAL"));
-        assert!(ddl.contains("FROM balance_dirty_keys FINAL"));
         assert!(ddl.contains("HAVING balance > 0"));
     }
 
@@ -224,47 +143,16 @@ mod tests {
         let ddl = snapshot.ddl();
         assert!(ddl.contains("CREATE MATERIALIZED VIEW IF NOT EXISTS token_balances_snapshot"));
         assert!(ddl.contains("REFRESH AFTER"));
-        assert!(ddl.contains("FROM token_balances"));
-        assert!(!ddl.contains("FROM token_holder_deltas FINAL"));
+        assert!(ddl.contains("FROM token_holder_deltas FINAL"));
+        assert!(ddl.contains("HAVING balance > 0"));
+        assert!(ddl.contains("optimize_aggregation_in_order = 1"));
+        assert!(ddl.contains("max_threads = 4"));
 
         // Drops the view (and its inner target table) on definition drift.
         assert_eq!(
             snapshot.drop_sql().as_deref(),
             Some("DROP VIEW IF EXISTS token_balances_snapshot")
         );
-    }
-
-    #[test]
-    fn balance_state_reducer_is_versioned_and_reorg_aware() {
-        let dirty = OBJECTS
-            .iter()
-            .find(|object| object.name == "balance_dirty_keys")
-            .unwrap();
-        assert!(dirty.ddl().contains("ReplacingMergeTree(version)"));
-
-        let state = OBJECTS
-            .iter()
-            .find(|object| object.name == "balance_state")
-            .unwrap();
-        assert!(state.ddl().contains("ReplacingMergeTree(version)"));
-        assert!(state.ddl().contains("is_deleted UInt8"));
-
-        let refresh = OBJECTS
-            .iter()
-            .find(|object| object.name == "balance_state_refresh")
-            .unwrap();
-        let ddl = refresh.ddl();
-        assert!(ddl.contains("REFRESH AFTER 1 MINUTE APPEND TO balance_state"));
-        assert!(ddl.contains("FROM token_holder_deltas FINAL"));
-        assert!(ddl.contains("FROM balance_dirty_keys FINAL"));
-        assert!(ddl.contains("max_threads = 8"));
-
-        let bootstrap = OBJECTS
-            .iter()
-            .find(|object| object.name == "balance_state_20260714_bootstrap")
-            .unwrap();
-        assert!(matches!(bootstrap.kind, ClickHouseObjectKind::Migration(_)));
-        assert!(bootstrap.ddl().contains("INSERT INTO balance_state"));
     }
 
     #[test]
@@ -281,13 +169,14 @@ mod tests {
 
         let ddl = counts.ddl();
         assert!(ddl.contains("CREATE MATERIALIZED VIEW IF NOT EXISTS token_holder_counts"));
-        assert!(ddl.contains("REFRESH EVERY"));
-        assert!(ddl.contains("DEPENDS ON token_balances_snapshot"));
+        assert!(ddl.contains("REFRESH AFTER 15 MINUTE DEPENDS ON token_balances_snapshot"));
         // Derives from the already-deduped snapshot, not the raw deltas, so each
         // refresh is a cheap GROUP BY over one row per (token, holder).
         assert!(ddl.contains("FROM token_balances_snapshot"));
         assert!(ddl.contains("count() AS holder_count"));
         assert!(ddl.contains("GROUP BY token"));
+        assert!(ddl.contains("optimize_aggregation_in_order = 1"));
+        assert!(ddl.contains("max_threads = 4"));
         assert_eq!(
             counts.drop_sql().as_deref(),
             Some("DROP VIEW IF EXISTS token_holder_counts")
