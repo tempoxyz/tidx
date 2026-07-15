@@ -165,6 +165,41 @@ impl RpcClient {
             .collect()
     }
 
+    /// Fetch full blocks for a range, recursively splitting when the batch
+    /// response is too large for the RPC to serve in one request.
+    pub fn get_blocks_batch_adaptive(
+        &self,
+        range: RangeInclusive<u64>,
+    ) -> BoxFuture<'_, Result<Vec<Block>>> {
+        Box::pin(async move {
+            let from = *range.start();
+            let to = *range.end();
+
+            match self.get_blocks_batch(range).await {
+                Ok(blocks) => Ok(blocks),
+                Err(e) if Self::is_batch_too_large(&e) => {
+                    if from == to {
+                        anyhow::bail!("Single full block {from} exceeds RPC response size limit");
+                    }
+
+                    let mid = from + (to - from) / 2;
+                    tracing::debug!(
+                        from,
+                        to,
+                        mid,
+                        "RPC full-block batch too large, splitting range"
+                    );
+
+                    let mut left = self.get_blocks_batch_adaptive(from..=mid).await?;
+                    let right = self.get_blocks_batch_adaptive((mid + 1)..=to).await?;
+                    left.extend(right);
+                    Ok(left)
+                }
+                Err(e) => Err(e),
+            }
+        })
+    }
+
     /// Fetch receipts for a block (includes logs)
     pub async fn get_block_receipts(&self, block_num: u64) -> Result<Vec<Receipt>> {
         let resp: RpcResponse<Vec<Receipt>> = self
@@ -257,7 +292,7 @@ impl RpcClient {
 
             match self.get_receipts_batch(range).await {
                 Ok(receipts) => Ok(receipts),
-                Err(e) if Self::is_receipts_batch_too_large(&e) => {
+                Err(e) if Self::is_batch_too_large(&e) => {
                     if from == to {
                         anyhow::bail!(
                             "Single block {from} receipts exceed RPC response size limit"
@@ -373,7 +408,7 @@ impl RpcClient {
         message.contains("exceeds max results") || message.contains("block range")
     }
 
-    fn is_receipts_batch_too_large(err: &anyhow::Error) -> bool {
+    fn is_batch_too_large(err: &anyhow::Error) -> bool {
         let message = err.to_string().to_lowercase();
         message.contains("too large") || message.contains("response size exceeded")
     }
@@ -426,6 +461,8 @@ mod tests {
     #[derive(Clone)]
     struct TestState {
         request_sizes: Arc<Mutex<Vec<usize>>>,
+        success_result: Value,
+        oversized_message: &'static str,
     }
 
     async fn rpc_handler(
@@ -438,21 +475,25 @@ mod tests {
 
         if batch_size > 2 {
             Json(json!({
-                "jsonrpc": "2.0",
+            "jsonrpc": "2.0",
                 "id": 0,
                 "error": {
                     "code": -32000,
-                    "message": "response size exceeded"
+                    "message": state.oversized_message
                 }
             }))
         } else {
             let responses: Vec<Value> = requests
                 .iter()
                 .map(|req| {
+                    let mut result = state.success_result.clone();
+                    if req["method"] == "eth_getBlockByNumber" {
+                        result["number"] = req["params"][0].clone();
+                    }
                     json!({
                         "jsonrpc": "2.0",
                         "id": req["id"].as_u64().unwrap(),
-                        "result": []
+                        "result": result
                     })
                 })
                 .collect();
@@ -465,6 +506,8 @@ mod tests {
         let request_sizes = Arc::new(Mutex::new(Vec::new()));
         let state = TestState {
             request_sizes: request_sizes.clone(),
+            success_result: json!([]),
+            oversized_message: "response size exceeded",
         };
 
         let app = Router::new()
@@ -492,6 +535,53 @@ mod tests {
             "should return one receipt vector per block"
         );
         assert!(receipts.iter().all(Vec::is_empty));
+
+        let sizes = request_sizes.lock().await.clone();
+        assert_eq!(sizes, vec![5, 3, 2, 1, 2]);
+
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn test_get_blocks_batch_adaptive_splits_oversized_responses() {
+        let request_sizes = Arc::new(Mutex::new(Vec::new()));
+        let header = tempo_alloy::rpc::TempoHeaderResponse {
+            inner: alloy::rpc::types::Header::default(),
+            timestamp_millis: 0,
+        };
+        let state = TestState {
+            request_sizes: request_sizes.clone(),
+            success_result: serde_json::to_value(Block::empty(header)).unwrap(),
+            oversized_message: "The batch response was too large",
+        };
+
+        let app = Router::new()
+            .route("/", post(rpc_handler))
+            .with_state(state);
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("Failed to bind test RPC server");
+        let addr = listener.local_addr().unwrap();
+
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("RPC server failed");
+        });
+
+        let client = RpcClient::new(&format!("http://127.0.0.1:{}", addr.port()));
+        let blocks = client
+            .get_blocks_batch_adaptive(1..=5)
+            .await
+            .expect("adaptive full-block fetch should succeed");
+
+        assert_eq!(blocks.len(), 5);
+        assert_eq!(
+            blocks
+                .iter()
+                .map(|block| alloy::consensus::BlockHeader::number(&block.header))
+                .collect::<Vec<_>>(),
+            vec![1, 2, 3, 4, 5]
+        );
 
         let sizes = request_sizes.lock().await.clone();
         assert_eq!(sizes, vec![5, 3, 2, 1, 2]);

@@ -578,7 +578,7 @@ impl SyncEngine {
         Vec<crate::types::ReceiptRow>,
     )> {
         let (blocks, receipts) = tokio::try_join!(
-            self.realtime_rpc.get_blocks_batch(from..=to),
+            self.realtime_rpc.get_blocks_batch_adaptive(from..=to),
             self.realtime_rpc.get_receipts_batch_adaptive(from..=to)
         )?;
 
@@ -1384,7 +1384,7 @@ pub(crate) async fn sync_range_standalone_to(
     use alloy::network::ReceiptResponse;
 
     let (blocks, receipts) = tokio::try_join!(
-        rpc.get_blocks_batch(from..=to),
+        rpc.get_blocks_batch_adaptive(from..=to),
         rpc.get_receipts_batch_adaptive(from..=to)
     )?;
 
