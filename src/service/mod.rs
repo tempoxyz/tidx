@@ -8,8 +8,9 @@ use tokio_postgres::types::ToSql;
 use crate::db::Pool;
 use crate::metrics;
 use crate::query::{
-    EventSignature, HARD_LIMIT_MAX, apply_event_signature_ctes_postgres,
+    EventSignature, HARD_LIMIT_MAX, TIERED_WINDOW_MAX, apply_event_signature_ctes_postgres,
     apply_event_signature_ctes_tiered, plan_tiered_split, validate_query,
+    validate_query_with_max_limit,
 };
 
 #[derive(Debug, Clone, Serialize)]
@@ -197,10 +198,29 @@ pub async fn execute_query_postgres(
     signatures: &[&str],
     options: &QueryOptions,
 ) -> Result<QueryResult> {
+    execute_query_postgres_with_max_limit(pool, sql, signatures, options, HARD_LIMIT_MAX).await
+}
+
+async fn execute_query_postgres_tiered_arm(
+    pool: &Pool,
+    sql: &str,
+    signatures: &[&str],
+    options: &QueryOptions,
+) -> Result<QueryResult> {
+    execute_query_postgres_with_max_limit(pool, sql, signatures, options, TIERED_WINDOW_MAX).await
+}
+
+async fn execute_query_postgres_with_max_limit(
+    pool: &Pool,
+    sql: &str,
+    signatures: &[&str],
+    options: &QueryOptions,
+    max_limit: i64,
+) -> Result<QueryResult> {
     let sql = apply_event_signature_ctes_postgres(sql, signatures)?;
 
     // Validate query (after CTE wrapping so signature-derived table names are valid)
-    validate_query(&sql)?;
+    validate_query_with_max_limit(&sql, max_limit)?;
 
     // Add LIMIT if not present (AST-based detection to avoid string matching bypass)
     let sql = append_limit_if_missing(&sql, options.limit);
@@ -466,6 +486,9 @@ async fn try_execute_tiered_split(
     let eff_limit = plan
         .sql_limit
         .map_or(options.limit, |l| l.min(options.limit));
+    let Some(fetch_limit) = plan.sql_offset.checked_add(eff_limit) else {
+        return Ok(None);
+    };
     let budget = |start: &Instant| {
         options
             .timeout_ms
@@ -482,40 +505,52 @@ async fn try_execute_tiered_split(
         let Some(ch) = clickhouse else {
             return Ok(None);
         };
-        let cold_sql = plan.arm_sql(false, boundary, Some(eff_limit));
-        let hot_sql = plan.arm_sql(true, boundary, Some(eff_limit));
+        let cold_sql = plan.arm_sql(false, boundary, Some(fetch_limit));
+        let hot_sql = plan.arm_sql(true, boundary, Some(fetch_limit));
         let timeout_ms = budget(&start);
         let hot_options = QueryOptions {
             timeout_ms,
-            limit: options.limit,
+            limit: fetch_limit.max(1),
         };
         let (mut cold_raw, hot) = tokio::try_join!(
-            ch.query_user_with_settings(
+            ch.query_tiered_arm_with_settings(
                 &cold_sql,
                 signatures,
                 timeout_ms,
-                eff_limit.max(1),
+                fetch_limit.max(1),
                 TIERED_COLD_CH_SETTINGS,
             ),
-            execute_query_postgres(pool, &hot_sql, signatures, &hot_options),
+            execute_query_postgres_tiered_arm(pool, &hot_sql, signatures, &hot_options),
         )?;
         normalize_cold_result(&mut cold_raw, &plan.selector_null_cols);
         (hot, cold_raw.into())
     } else {
         // Descending or unordered: hot (PostgreSQL) rows first.
-        let hot_sql = plan.arm_sql(true, boundary, Some(eff_limit.max(0)));
-        let hot = execute_query_postgres(pool, &hot_sql, signatures, options).await?;
-        if hot.row_count as i64 >= eff_limit {
-            return Ok(Some(finish_tiered(hot, None, false, eff_limit, start)));
+        let hot_sql = plan.arm_sql(true, boundary, Some(fetch_limit.max(0)));
+        let hot_options = QueryOptions {
+            timeout_ms: options.timeout_ms,
+            limit: fetch_limit.max(1),
+        };
+        let hot =
+            execute_query_postgres_tiered_arm(pool, &hot_sql, signatures, &hot_options).await?;
+        if hot.row_count as i64 >= fetch_limit {
+            return Ok(Some(finish_tiered(
+                hot,
+                None,
+                false,
+                plan.sql_offset,
+                eff_limit,
+                start,
+            )));
         }
         // Hot under-filled: fill the remainder from the ClickHouse archive.
         let Some(ch) = clickhouse else {
             return Ok(None);
         };
-        let remaining = eff_limit - hot.row_count as i64;
+        let remaining = fetch_limit - hot.row_count as i64;
         let cold_sql = plan.arm_sql(false, boundary, Some(remaining));
         let mut cold_raw = ch
-            .query_user_with_settings(
+            .query_tiered_arm_with_settings(
                 &cold_sql,
                 signatures,
                 budget(&start),
@@ -547,6 +582,7 @@ async fn try_execute_tiered_split(
         hot,
         Some(cold),
         plan.cold_leads,
+        plan.sql_offset,
         eff_limit,
         start,
     )))
@@ -558,6 +594,7 @@ fn finish_tiered(
     hot: QueryResult,
     cold: Option<QueryResult>,
     cold_leads: bool,
+    offset: i64,
     limit: i64,
     start: Instant,
 ) -> QueryResult {
@@ -573,9 +610,11 @@ fn finish_tiered(
         } else {
             result.rows.extend(cold.rows);
         }
-        result.rows.truncate(limit.max(0) as usize);
-        result.row_count = result.rows.len();
     }
+    let offset = offset.max(0) as usize;
+    result.rows.drain(..offset.min(result.rows.len()));
+    result.rows.truncate(limit.max(0) as usize);
+    result.row_count = result.rows.len();
     result.engine = Some("tiered".to_string());
     result.query_time_ms = Some(start.elapsed().as_secs_f64() * 1000.0);
     result
@@ -908,6 +947,34 @@ mod tests {
             engine: None,
             query_time_ms: None,
         }
+    }
+
+    fn pg_result(nums: &[i64]) -> QueryResult {
+        QueryResult {
+            columns: vec!["num".to_string()],
+            rows: nums.iter().map(|num| vec![json!(num)]).collect(),
+            row_count: nums.len(),
+            engine: None,
+            query_time_ms: None,
+        }
+    }
+
+    #[test]
+    fn finish_tiered_applies_offset_after_stitching() {
+        let result = finish_tiered(
+            pg_result(&[10, 9, 8, 7, 6]),
+            Some(pg_result(&[5, 4, 3])),
+            false,
+            4,
+            3,
+            Instant::now(),
+        );
+
+        assert_eq!(
+            result.rows,
+            vec![vec![json!(6)], vec![json!(5)], vec![json!(4)]]
+        );
+        assert_eq!(result.row_count, 3);
     }
 
     #[test]

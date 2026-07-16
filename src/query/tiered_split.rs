@@ -238,6 +238,8 @@ pub struct TieredSplit {
     pub cold_leads: bool,
     /// Literal `LIMIT n` from the query, if present.
     pub sql_limit: Option<i64>,
+    /// Literal `OFFSET n` from the query.
+    pub sql_offset: i64,
     /// Projection indexes of `Selector`-kind columns: the cold arm rewrites
     /// their '' cells to NULL (ClickHouse stores PG NULL selectors as '').
     pub selector_null_cols: Vec<usize>,
@@ -275,17 +277,28 @@ pub fn plan_tiered_split(sql: &str, events: &[EventSignature]) -> Option<TieredS
         return None;
     }
 
-    let sql_limit = match &query.limit_clause {
-        None => None,
-        Some(LimitClause::LimitOffset {
-            limit: Some(Expr::Value(v)),
-            offset: None,
-            limit_by,
-        }) if limit_by.is_empty() => match &v.value {
-            Value::Number(n, _) => Some(n.parse::<i64>().ok().filter(|n| *n >= 0)?),
-            _ => return None,
+    let parse_nonnegative = |expr: &Expr| match expr {
+        Expr::Value(v) => match &v.value {
+            Value::Number(n, _) => n.parse::<i64>().ok().filter(|n| *n >= 0),
+            _ => None,
         },
-        // OFFSET / LIMIT ALL / MySQL comma form: stitching would be wrong.
+        _ => None,
+    };
+    let (sql_limit, sql_offset) = match &query.limit_clause {
+        None => (None, 0),
+        Some(LimitClause::LimitOffset {
+            limit: Some(limit),
+            offset,
+            limit_by,
+        }) if limit_by.is_empty() => {
+            let limit = parse_nonnegative(limit)?;
+            let offset = match offset {
+                Some(offset) => parse_nonnegative(&offset.value)?,
+                None => 0,
+            };
+            (Some(limit), offset)
+        }
+        // LIMIT ALL / MySQL comma form.
         Some(_) => return None,
     };
 
@@ -373,6 +386,7 @@ pub fn plan_tiered_split(sql: &str, events: &[EventSignature]) -> Option<TieredS
         relations,
         cold_leads,
         sql_limit,
+        sql_offset,
         selector_null_cols,
     })
 }
@@ -1565,11 +1579,18 @@ mod tests {
     }
 
     #[test]
-    fn rejects_offset_but_allows_limit_all() {
-        assert!(plan("SELECT num FROM blocks ORDER BY num DESC LIMIT 10 OFFSET 5").is_none());
+    fn accepts_offset_and_limit_all() {
+        let p = plan("SELECT num FROM blocks ORDER BY num DESC LIMIT 10 OFFSET 5").unwrap();
+        assert_eq!(p.sql_limit, Some(10));
+        assert_eq!(p.sql_offset, 5);
+        assert_eq!(
+            p.arm_sql(true, 1000, Some(15)),
+            "SELECT num FROM blocks WHERE num > 1000 ORDER BY num DESC LIMIT 15"
+        );
         // sqlparser normalizes LIMIT ALL to no limit clause; equivalent to no LIMIT.
         let p = plan("SELECT num FROM blocks LIMIT ALL").unwrap();
         assert_eq!(p.sql_limit, None);
+        assert_eq!(p.sql_offset, 0);
     }
 
     #[test]

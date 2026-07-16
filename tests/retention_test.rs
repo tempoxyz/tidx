@@ -14,8 +14,10 @@ use common::clickhouse::TestClickHouse;
 use common::testdb::TestDb;
 use serial_test::serial;
 
-use tidx::config::RetentionConfig;
+use tidx::clickhouse::ClickHouseEngine;
+use tidx::config::{ClickHouseConfig, RetentionConfig};
 use tidx::db::partitions::{ensure_partitions_covering, list_partitions};
+use tidx::service::{QueryOptions, execute_query_tiered};
 use tidx::sync::ch_sink::ClickHouseSink;
 use tidx::sync::pruner::Pruner;
 use tidx::sync::sink::SinkSet;
@@ -27,6 +29,7 @@ use tidx::types::{BlockRow, LogRow, SyncState, TxRow};
 
 const CHAIN_ID: u64 = 999;
 const CH_DB: &str = "tidx_test_retention";
+const OFFSET_CH_DB: &str = "tidx_test_offset";
 
 // ── Test data helpers ──────────────────────────────────────────────────────
 
@@ -143,8 +146,8 @@ fn retention(require_clickhouse: bool) -> RetentionConfig {
 }
 
 /// Set up ClickHouse sink for archive tests. Returns None if CH unavailable.
-async fn setup_clickhouse() -> Option<(ClickHouseSink, TestClickHouse)> {
-    let ch = TestClickHouse::new(CH_DB)
+async fn setup_clickhouse(database: &str) -> Option<(ClickHouseSink, TestClickHouse)> {
+    let ch = TestClickHouse::new(database)
         .await
         .expect("Failed to create CH client");
     if ch.wait_for_ready().await.is_err() {
@@ -152,7 +155,8 @@ async fn setup_clickhouse() -> Option<(ClickHouseSink, TestClickHouse)> {
         return None;
     }
     ch.reset_database().await.expect("Failed to reset CH db");
-    let sink = ClickHouseSink::new(&ch.url, CH_DB, None, None).expect("Failed to create CH sink");
+    let sink =
+        ClickHouseSink::new(&ch.url, database, None, None).expect("Failed to create CH sink");
     sink.ensure_schema().await.expect("Failed to ensure schema");
     Some((sink, ch))
 }
@@ -164,6 +168,77 @@ async fn pg_block_range(pool: &tidx::db::Pool) -> (Option<i64>, Option<i64>) {
         .await
         .unwrap();
     (row.get(0), row.get(1))
+}
+
+#[tokio::test]
+#[serial(db)]
+async fn test_tiered_offset_applies_after_stitching() {
+    let Some((ch_sink, ch)) = setup_clickhouse(OFFSET_CH_DB).await else {
+        return;
+    };
+    let db = TestDb::empty().await;
+    db.truncate_all().await;
+
+    let base_ts = Utc::now();
+    seed_range(&db.pool, 1..=40, base_ts).await;
+    set_state(&db.pool, 40, 40).await;
+    set_hot_boundary(
+        &db.pool,
+        CHAIN_ID,
+        20,
+        Some(base_ts + Duration::seconds(20)),
+    )
+    .await
+    .unwrap();
+
+    let blocks: Vec<_> = (1..=40)
+        .map(|num| make_block(num, base_ts + Duration::seconds(num - 1)))
+        .collect();
+    ch_sink.write_blocks(&blocks).await.unwrap();
+
+    let engine = ClickHouseEngine::new(
+        &ClickHouseConfig {
+            enabled: true,
+            url: ch.url.clone(),
+            database: Some(OFFSET_CH_DB.to_string()),
+            ..Default::default()
+        },
+        CHAIN_ID,
+    )
+    .unwrap();
+    let result = execute_query_tiered(
+        &db.pool,
+        Some(&engine),
+        CHAIN_ID,
+        "SELECT num FROM blocks ORDER BY num DESC LIMIT 6 OFFSET 18",
+        &[],
+        &QueryOptions::default(),
+    )
+    .await
+    .unwrap();
+    let maximum_window = execute_query_tiered(
+        &db.pool,
+        Some(&engine),
+        CHAIN_ID,
+        "SELECT num FROM blocks ORDER BY num ASC LIMIT 10000 OFFSET 1",
+        &[],
+        &QueryOptions::default(),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(
+        result.rows,
+        [22, 21, 20, 19, 18, 17]
+            .map(|num| vec![serde_json::json!(num)])
+            .to_vec()
+    );
+    assert_eq!(
+        maximum_window.rows,
+        (2..=40)
+            .map(|num| vec![serde_json::json!(num)])
+            .collect::<Vec<_>>()
+    );
 }
 
 // ── Prune-floor sync semantics ─────────────────────────────────────────────
@@ -215,7 +290,7 @@ fn test_backfill_complete_at_prune_floor() {
 #[tokio::test]
 #[serial(db)]
 async fn test_pruner_drops_old_partitions_after_ch_archive() {
-    let Some((ch_sink, ch)) = setup_clickhouse().await else {
+    let Some((ch_sink, ch)) = setup_clickhouse(CH_DB).await else {
         return;
     };
     let db = TestDb::empty().await;
@@ -301,7 +376,7 @@ async fn test_pruner_drops_old_partitions_after_ch_archive() {
 #[tokio::test]
 #[serial(db)]
 async fn test_pruner_does_not_advance_hot_boundary() {
-    let Some((ch_sink, _ch)) = setup_clickhouse().await else {
+    let Some((ch_sink, _ch)) = setup_clickhouse(CH_DB).await else {
         return;
     };
     let db = TestDb::empty().await;
@@ -329,7 +404,7 @@ async fn test_pruner_does_not_advance_hot_boundary() {
 #[tokio::test]
 #[serial(db)]
 async fn test_pruner_keeps_partition_above_hot_boundary() {
-    let Some((ch_sink, _ch)) = setup_clickhouse().await else {
+    let Some((ch_sink, _ch)) = setup_clickhouse(CH_DB).await else {
         return;
     };
     let db = TestDb::empty().await;

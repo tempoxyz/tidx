@@ -14,6 +14,12 @@ pub use tiered_split::{
     HotWindow, TieredSplit, hot_window_confined, hot_window_confinement, plan_tiered_split,
 };
 pub use validator::{HARD_LIMIT_MAX, validate_clickhouse_query, validate_query};
+pub(crate) use validator::{
+    validate_clickhouse_query_with_max_limit, validate_query_with_max_limit,
+};
+
+/// Maximum rows needed for one legal `OFFSET + LIMIT` window.
+pub(crate) const TIERED_WINDOW_MAX: i64 = HARD_LIMIT_MAX * 2;
 
 use regex_lite::Regex;
 use std::sync::LazyLock;

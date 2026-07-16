@@ -19,6 +19,10 @@ pub const HARD_LIMIT_MAX: i64 = 10_000;
 /// Uses a reject-by-default approach: only explicitly allowed tables,
 /// functions, and expression types are permitted. Everything else is rejected.
 pub fn validate_query(sql: &str) -> Result<()> {
+    validate_query_with_max_limit(sql, HARD_LIMIT_MAX)
+}
+
+pub(crate) fn validate_query_with_max_limit(sql: &str, max_limit: i64) -> Result<()> {
     if sql.len() > MAX_QUERY_LENGTH {
         return Err(anyhow!(
             "Query too large ({} bytes, max {})",
@@ -50,7 +54,7 @@ pub fn validate_query(sql: &str) -> Result<()> {
     match stmt {
         Statement::Query(query) => {
             let cte_names = HashSet::new();
-            validate_query_ast(query, &cte_names, 0)
+            validate_query_ast_with_max_limit(query, &cte_names, 0, max_limit)
         }
         _ => Err(anyhow!("Only SELECT queries are allowed")),
     }
@@ -62,6 +66,10 @@ pub fn validate_query(sql: &str) -> Result<()> {
 /// engine-specific scalar functions, but table functions, system catalogs, and
 /// multi-statement/non-SELECT queries are never needed for public queries.
 pub fn validate_clickhouse_query(sql: &str) -> Result<()> {
+    validate_clickhouse_query_with_max_limit(sql, HARD_LIMIT_MAX)
+}
+
+pub(crate) fn validate_clickhouse_query_with_max_limit(sql: &str, max_limit: i64) -> Result<()> {
     if sql.len() > MAX_QUERY_LENGTH {
         return Err(anyhow!(
             "Query too large ({} bytes, max {})",
@@ -90,13 +98,22 @@ pub fn validate_clickhouse_query(sql: &str) -> Result<()> {
     match &statements[0] {
         Statement::Query(query) => {
             let cte_names = HashSet::new();
-            validate_clickhouse_query_ast(query, &cte_names, 0)
+            validate_clickhouse_query_ast_with_max_limit(query, &cte_names, 0, max_limit)
         }
         _ => Err(anyhow!("Only SELECT queries are allowed")),
     }
 }
 
 fn validate_query_ast(query: &Query, cte_names: &HashSet<String>, depth: usize) -> Result<()> {
+    validate_query_ast_with_max_limit(query, cte_names, depth, HARD_LIMIT_MAX)
+}
+
+fn validate_query_ast_with_max_limit(
+    query: &Query,
+    cte_names: &HashSet<String>,
+    depth: usize,
+    max_limit: i64,
+) -> Result<()> {
     if depth > MAX_SUBQUERY_DEPTH {
         return Err(anyhow!(
             "Subquery nesting too deep (max {} levels)",
@@ -145,12 +162,16 @@ fn validate_query_ast(query: &Query, cte_names: &HashSet<String>, depth: usize) 
         }
     }
 
-    validate_limit_clause(query.limit_clause.as_ref(), true)?;
+    validate_limit_clause_with_max(query.limit_clause.as_ref(), true, max_limit)?;
 
     Ok(())
 }
 
-fn validate_limit_clause(limit_clause: Option<&LimitClause>, reject_limit_by: bool) -> Result<()> {
+fn validate_limit_clause_with_max(
+    limit_clause: Option<&LimitClause>,
+    reject_limit_by: bool,
+    max_limit: i64,
+) -> Result<()> {
     if let Some(limit_clause) = limit_clause {
         match limit_clause {
             LimitClause::LimitOffset {
@@ -159,20 +180,20 @@ fn validate_limit_clause(limit_clause: Option<&LimitClause>, reject_limit_by: bo
                 limit_by,
             } => {
                 if let Some(limit_expr) = limit {
-                    validate_limit_expr(limit_expr, "LIMIT")?;
+                    validate_limit_expr_with_max(limit_expr, "LIMIT", max_limit)?;
                 } else {
                     return Err(anyhow!("LIMIT ALL is not allowed"));
                 }
                 if let Some(offset) = offset {
-                    validate_limit_expr(&offset.value, "OFFSET")?;
+                    validate_limit_expr_with_max(&offset.value, "OFFSET", max_limit)?;
                 }
                 if reject_limit_by && !limit_by.is_empty() {
                     return Err(anyhow!("LIMIT BY is not allowed"));
                 }
             }
             LimitClause::OffsetCommaLimit { offset, limit } => {
-                validate_limit_expr(offset, "OFFSET")?;
-                validate_limit_expr(limit, "LIMIT")?;
+                validate_limit_expr_with_max(offset, "OFFSET", max_limit)?;
+                validate_limit_expr_with_max(limit, "LIMIT", max_limit)?;
             }
         }
     }
@@ -181,6 +202,10 @@ fn validate_limit_clause(limit_clause: Option<&LimitClause>, reject_limit_by: bo
 }
 
 fn validate_limit_expr(expr: &Expr, context: &str) -> Result<()> {
+    validate_limit_expr_with_max(expr, context, HARD_LIMIT_MAX)
+}
+
+fn validate_limit_expr_with_max(expr: &Expr, context: &str, max_limit: i64) -> Result<()> {
     match expr {
         Expr::Value(v) => {
             let val = &v.value;
@@ -190,9 +215,9 @@ fn validate_limit_expr(expr: &Expr, context: &str) -> Result<()> {
                         if num < 0 {
                             return Err(anyhow!("{context} must not be negative"));
                         }
-                        if num > HARD_LIMIT_MAX {
+                        if num > max_limit {
                             return Err(anyhow!(
-                                "{context} value {num} exceeds maximum ({HARD_LIMIT_MAX})"
+                                "{context} value {num} exceeds maximum ({max_limit})"
                             ));
                         }
                         Ok(())
@@ -235,6 +260,15 @@ fn validate_clickhouse_query_ast(
     cte_names: &HashSet<String>,
     depth: usize,
 ) -> Result<()> {
+    validate_clickhouse_query_ast_with_max_limit(query, cte_names, depth, HARD_LIMIT_MAX)
+}
+
+fn validate_clickhouse_query_ast_with_max_limit(
+    query: &Query,
+    cte_names: &HashSet<String>,
+    depth: usize,
+    max_limit: i64,
+) -> Result<()> {
     if depth > MAX_SUBQUERY_DEPTH {
         return Err(anyhow!(
             "Subquery nesting too deep (max {} levels)",
@@ -267,7 +301,7 @@ fn validate_clickhouse_query_ast(
         }
     }
 
-    validate_limit_clause(query.limit_clause.as_ref(), false)?;
+    validate_limit_clause_with_max(query.limit_clause.as_ref(), false, max_limit)?;
     if let Some(LimitClause::LimitOffset { limit_by, .. }) = query.limit_clause.as_ref() {
         for expr in limit_by {
             validate_clickhouse_expr(expr, &all_cte_names, depth)?;
@@ -1824,6 +1858,21 @@ mod tests {
     fn test_clickhouse_rejects_excessive_limit_values() {
         assert!(validate_clickhouse_query("SELECT * FROM logs LIMIT 10001").is_err());
         assert!(validate_clickhouse_query("SELECT * FROM logs LIMIT 1 OFFSET 10001").is_err());
+    }
+
+    #[test]
+    fn test_internal_validators_allow_bounded_limit() {
+        assert!(
+            validate_query_with_max_limit("SELECT * FROM logs LIMIT 20000", HARD_LIMIT_MAX * 2,)
+                .is_ok()
+        );
+        assert!(
+            validate_clickhouse_query_with_max_limit(
+                "SELECT * FROM logs LIMIT 20000",
+                HARD_LIMIT_MAX * 2,
+            )
+            .is_ok()
+        );
     }
 
     #[test]

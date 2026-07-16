@@ -13,8 +13,8 @@ use tracing::{error, warn};
 
 use crate::config::ClickHouseConfig;
 use crate::query::{
-    HARD_LIMIT_MAX, apply_event_signature_ctes_clickhouse, convert_timestamp_literals_clickhouse,
-    validate_clickhouse_query,
+    HARD_LIMIT_MAX, TIERED_WINDOW_MAX, apply_event_signature_ctes_clickhouse,
+    convert_timestamp_literals_clickhouse, validate_clickhouse_query_with_max_limit,
 };
 
 const MAX_QUERY_RESULT_BYTES: usize = 10 * 1024 * 1024;
@@ -123,9 +123,48 @@ impl ClickHouseEngine {
         limit: i64,
         settings: &[(&str, &str)],
     ) -> Result<QueryResult> {
+        self.query_user_with_settings_max_limit(
+            sql,
+            signatures,
+            timeout_ms,
+            limit,
+            HARD_LIMIT_MAX,
+            settings,
+        )
+        .await
+    }
+
+    pub(crate) async fn query_tiered_arm_with_settings(
+        &self,
+        sql: &str,
+        signatures: &[&str],
+        timeout_ms: u64,
+        limit: i64,
+        settings: &[(&str, &str)],
+    ) -> Result<QueryResult> {
+        self.query_user_with_settings_max_limit(
+            sql,
+            signatures,
+            timeout_ms,
+            limit,
+            TIERED_WINDOW_MAX,
+            settings,
+        )
+        .await
+    }
+
+    async fn query_user_with_settings_max_limit(
+        &self,
+        sql: &str,
+        signatures: &[&str],
+        timeout_ms: u64,
+        limit: i64,
+        max_limit: i64,
+        settings: &[(&str, &str)],
+    ) -> Result<QueryResult> {
         let sql = Self::prepare_query(sql, signatures)?;
-        validate_clickhouse_query(&sql)?;
-        let sql = Self::wrap_user_query_with_limit(&sql, limit.clamp(1, HARD_LIMIT_MAX));
+        validate_clickhouse_query_with_max_limit(&sql, max_limit)?;
+        let sql = Self::wrap_user_query_with_limit(&sql, limit.clamp(1, max_limit));
         self.execute_prepared_query_with_settings(&sql, Some(timeout_ms), settings)
             .await
     }
@@ -495,7 +534,10 @@ mod tests {
         assert!(sql.starts_with("WITH Transfer AS ("));
         assert!(sql.contains("), recent AS ("));
         assert_eq!(sql.matches("WITH ").count(), 1);
-        assert!(validate_clickhouse_query(&sql).is_ok(), "got: {sql}");
+        assert!(
+            crate::query::validate_clickhouse_query(&sql).is_ok(),
+            "got: {sql}"
+        );
     }
 
     #[test]
