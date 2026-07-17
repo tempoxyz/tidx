@@ -1,5 +1,6 @@
 use anyhow::Result;
 use chrono::{DateTime, Utc};
+use std::collections::HashSet;
 use tracing::info;
 
 use crate::db::Pool;
@@ -59,6 +60,11 @@ impl SinkSet {
     /// Whether a ClickHouse sink is active.
     pub fn has_clickhouse(&self) -> bool {
         self.ch.is_some()
+    }
+
+    /// Access the ClickHouse sink, if configured.
+    pub(crate) fn clickhouse(&self) -> Option<&ClickHouseSink> {
+        self.ch.as_ref()
     }
 
     /// Forget cached partition coverage (call after partitions are dropped).
@@ -350,13 +356,42 @@ impl SinkSet {
             Some((batch_end, data))
         };
 
-        while let Some((batch_end, (blocks, txs, logs, mut receipts))) = pending.take() {
+        while let Some((batch_end, (mut blocks, mut txs, mut logs, mut receipts))) = pending.take()
+        {
             let block_count = blocks.len() as i64;
 
             // Postgres receipts lack the denormalized tx-level type/fee_token;
             // populate them from txs so the ClickHouse mirror matches the
             // live-sync path before writing.
             super::decoder::enrich_receipts_from_txs(&mut receipts, &txs);
+
+            // Rows already in ClickHouse duplicate ReplacingMergeTree rows
+            // until a merge if re-inserted. Filter per table so a legacy
+            // partial write (blocks without children) still gets its missing
+            // child rows healed from PostgreSQL.
+            if !blocks.is_empty() {
+                let lo = blocks.first().expect("non-empty batch").num.max(0) as u64;
+                let hi = blocks.last().expect("non-empty batch").num.max(0) as u64;
+                let as_set = |nums: Vec<u64>| -> HashSet<i64> {
+                    nums.into_iter().map(|n| n as i64).collect()
+                };
+                let (in_blocks, in_txs, in_logs, in_receipts) = tokio::try_join!(
+                    ch.block_nums_in_table_range("blocks", lo, hi),
+                    ch.block_nums_in_table_range("txs", lo, hi),
+                    ch.block_nums_in_table_range("logs", lo, hi),
+                    ch.block_nums_in_table_range("receipts", lo, hi),
+                )?;
+                let (in_blocks, in_txs, in_logs, in_receipts) = (
+                    as_set(in_blocks),
+                    as_set(in_txs),
+                    as_set(in_logs),
+                    as_set(in_receipts),
+                );
+                blocks.retain(|b| !in_blocks.contains(&b.num));
+                txs.retain(|t| !in_txs.contains(&t.block_num));
+                logs.retain(|l| !in_logs.contains(&l.block_num));
+                receipts.retain(|r| !in_receipts.contains(&r.block_num));
+            }
 
             // Pipeline: fetch next batch from PG while writing current batch to CH
             let next_fetch = async {
@@ -374,15 +409,10 @@ impl SinkSet {
                 Ok::<_, anyhow::Error>(Some((next_end, data)))
             };
 
+            // Children first, blocks last: a block row in ClickHouse then
+            // proves the whole batch landed.
             let ch_write = async {
                 tokio::try_join!(
-                    async {
-                        if !blocks.is_empty() {
-                            ch.write_blocks(&blocks).await
-                        } else {
-                            Ok(())
-                        }
-                    },
                     async {
                         if !txs.is_empty() {
                             ch.write_txs(&txs).await
@@ -404,10 +434,14 @@ impl SinkSet {
                             Ok(())
                         }
                     },
-                )
+                )?;
+                if !blocks.is_empty() {
+                    ch.write_blocks(&blocks).await?;
+                }
+                Ok::<_, anyhow::Error>(())
             };
 
-            let (next_data, _) = tokio::try_join!(next_fetch, ch_write)?;
+            let (next_data, ()) = tokio::try_join!(next_fetch, ch_write)?;
 
             // Advance cursor only after all tables written successfully
             save_ch_backfill_cursor(&self.pool, chain_id, batch_end).await?;
@@ -458,13 +492,15 @@ async fn write_clickhouse_batch(
     logs: &[LogRow],
     receipts: &[ReceiptRow],
 ) -> Result<()> {
+    // Children first, blocks last: a block row in ClickHouse then proves the
+    // whole batch landed, keeping block presence checks sound when a write
+    // fails partway.
     tokio::try_join!(
-        ch.write_blocks(blocks),
         ch.write_txs(txs),
         ch.write_logs(logs),
         ch.write_receipts(receipts),
     )?;
-    Ok(())
+    ch.write_blocks(blocks).await
 }
 
 /// Get the max block number in PostgreSQL, or None if empty.

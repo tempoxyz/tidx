@@ -181,6 +181,23 @@ impl ClickHouseSink {
             debug!(table = object.name, database = %self.database, "ClickHouse table ready");
         }
 
+        // A retried insert re-sends an identical part; the dedup window drops
+        // it instead of duplicating rows. Replicated tables already
+        // deduplicate through the Keeper-backed window.
+        if !self.replicated_database {
+            for table in ["blocks", "txs", "logs", "receipts"] {
+                self.client
+                    .query(&format!(
+                        "ALTER TABLE {table} MODIFY SETTING non_replicated_deduplication_window = 100"
+                    ))
+                    .execute()
+                    .await
+                    .map_err(|e| {
+                        anyhow!("Failed to set deduplication window on {table}: {e}")
+                    })?;
+            }
+        }
+
         self.ensure_schema_objects_table().await?;
         let mut tracking = self.load_applied_checksums().await?;
 
@@ -623,6 +640,38 @@ impl ClickHouseSink {
             .fetch_all()
             .await
             .map_err(|e| anyhow!("ClickHouse archive read from {table} failed: {e}"))
+    }
+
+    /// Distinct block numbers present in `blocks` within `[from, to]`,
+    /// ascending. Presence in `blocks` proves the whole batch landed:
+    /// writers commit the child tables before blocks.
+    pub(crate) async fn block_nums_in_range(&self, from: u64, to: u64) -> Result<Vec<u64>> {
+        self.block_nums_in_table_range("blocks", from, to).await
+    }
+
+    /// Distinct block numbers with rows in `table` within `[from, to]`,
+    /// ascending.
+    pub(crate) async fn block_nums_in_table_range(
+        &self,
+        table: &str,
+        from: u64,
+        to: u64,
+    ) -> Result<Vec<u64>> {
+        if from > to {
+            return Ok(Vec::new());
+        }
+        let table = validate_table_name(table)?;
+        let col = crate::clickhouse_schema::block_column(table)
+            .ok_or_else(|| anyhow!("ClickHouse table has no block column: {table}"))?;
+        let nums: Vec<i64> = self
+            .client
+            .query(&format!(
+                "SELECT DISTINCT {col} FROM {table} WHERE {col} >= {from} AND {col} <= {to} ORDER BY {col}"
+            ))
+            .fetch_all()
+            .await
+            .map_err(|e| anyhow!("ClickHouse query failed: {e}"))?;
+        Ok(nums.into_iter().map(|n| n.max(0) as u64).collect())
     }
 
     /// Query the highest block number in ClickHouse, or None if empty.
