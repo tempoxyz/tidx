@@ -1221,6 +1221,31 @@ async fn test_sink_write_blocks() {
     assert_eq!(num4, 5);
 }
 
+/// A retried insert re-sends an identical part; the insert dedup window must
+/// drop it instead of writing duplicate ReplacingMergeTree rows.
+#[tokio::test]
+#[serial(clickhouse)]
+async fn test_retried_identical_insert_is_deduplicated() {
+    let Some((sink, ch)) = setup_sink().await else {
+        return;
+    };
+
+    // Block merges so surviving duplicates stay visible as physical rows.
+    ch.query_raw(&format!("SYSTEM STOP MERGES {SINK_DB}.blocks"))
+        .await
+        .expect("stop merges failed");
+
+    let blocks: Vec<BlockRow> = (1..=5).map(make_block).collect();
+    sink.write_blocks(&blocks)
+        .await
+        .expect("write_blocks failed");
+    sink.write_blocks(&blocks)
+        .await
+        .expect("write_blocks retry failed");
+
+    assert_eq!(ch.table_count("blocks").await.unwrap(), 5);
+}
+
 #[tokio::test]
 #[serial(clickhouse)]
 async fn test_sink_write_txs() {
@@ -2372,6 +2397,49 @@ async fn test_backfill_pg_to_clickhouse_preserves_virtual_forward_flag() {
     assert_eq!(rows.len(), 2);
     assert_eq!(rows[0]["is_virtual_forward"].as_u64(), Some(0));
     assert_eq!(rows[1]["is_virtual_forward"].as_u64(), Some(1));
+}
+
+/// A restarted backfill (stale cursor) must not duplicate blocks ClickHouse
+/// already holds: each table's rows are filtered by that table's own
+/// presence before each batch write.
+#[tokio::test]
+#[serial(clickhouse)]
+async fn test_backfill_restart_does_not_duplicate_present_blocks() {
+    let Some((pool, sinks, _ch_sink, ch)) = setup_backfill().await else {
+        return;
+    };
+
+    // Two backfill batches: BACKFILL_BLOCK_BATCH blocks plus one.
+    let blocks: Vec<BlockRow> = (1..=5001).map(make_block).collect();
+    writer::write_blocks(&pool, &blocks)
+        .await
+        .expect("PG write_blocks failed");
+
+    sinks
+        .backfill_clickhouse(TEST_CHAIN_ID)
+        .await
+        .expect("backfill failed");
+    assert_eq!(ch.table_count("blocks").await.unwrap(), 5001);
+
+    // Block merges so surviving duplicates stay visible, then rewind the
+    // cursor to simulate a restart with stale state.
+    ch.query_raw(&format!("SYSTEM STOP MERGES {SINK_DB}.blocks"))
+        .await
+        .expect("stop merges failed");
+    let conn = pool.get().await.unwrap();
+    conn.execute(
+        "UPDATE sync_state SET ch_backfill_block = 0 WHERE chain_id = $1",
+        &[&(TEST_CHAIN_ID as i64)],
+    )
+    .await
+    .expect("cursor rewind failed");
+    drop(conn);
+
+    sinks
+        .backfill_clickhouse(TEST_CHAIN_ID)
+        .await
+        .expect("backfill rerun failed");
+    assert_eq!(ch.table_count("blocks").await.unwrap(), 5001);
 }
 
 /// Backfill should resume from the persisted PG cursor.
