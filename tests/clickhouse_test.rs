@@ -11,7 +11,7 @@ mod common;
 use common::clickhouse::TestClickHouse;
 use serial_test::serial;
 use tidx::clickhouse_schema::{base_objects, migrations, post_derived_migrations};
-use tidx::query::EventSignature;
+use tidx::query::{EventSignature, apply_event_signature_ctes_clickhouse};
 use tidx::sync::ch_sink::ClickHouseSink;
 use tidx::sync::sink::SinkSet;
 use tidx::sync::writer;
@@ -2126,6 +2126,26 @@ async fn test_predicate_pushdown_against_sink_data() {
         .as_u64()
         .unwrap();
     assert_eq!(cnt, 5, "expected 5 transfers from addr_a");
+
+    let token_sql = apply_event_signature_ctes_clickhouse(
+        r#"SELECT "from", "to", address, value, tx_hash, block_num, log_idx, block_timestamp
+FROM Transfer
+WHERE address = '0xcccccccccccccccccccccccccccccccccccccccc'
+ORDER BY block_num DESC, log_idx DESC
+LIMIT 6"#,
+        &["Transfer(address indexed from, address indexed to, uint256 value)"],
+    )
+    .unwrap();
+    assert!(token_sql.contains("logs.address = '0xcccccccccccccccccccccccccccccccccccccccc'"));
+
+    let result = ch
+        .query_json(&token_sql)
+        .await
+        .expect("token-scoped transfer query failed");
+    let rows = result["data"].as_array().unwrap();
+    assert_eq!(rows.len(), 6);
+    assert_eq!(rows[0]["block_num"].as_i64(), Some(12));
+    assert_eq!(rows[5]["block_num"].as_i64(), Some(3));
 }
 
 /// Verify hex literal filter works with sink-written 0x data (no conversion needed).
