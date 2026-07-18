@@ -561,7 +561,10 @@ fn apply_event_signature_ctes(
         rewritten_sql = sig.rewrite_filters_for_pushdown(&rewritten_sql);
     }
 
-    let pushdown = extract_raw_column_predicates(&rewritten_sql);
+    let pushdown = extract_raw_column_predicates_with_qualifier(
+        &rewritten_sql,
+        matches!(dialect, EventCteDialect::ClickHouse).then_some("logs"),
+    );
     let ctes: Vec<String> = match dialect {
         EventCteDialect::Postgres => {
             let used_columns = extract_column_references(&rewritten_sql);
@@ -910,6 +913,10 @@ fn extract_ident_from_expr(expr: &Expr, columns: &mut HashSet<String>) {
 /// Only extracts simple comparisons (=, >=, <=, >, <) and IN lists on known
 /// raw columns. Decoded event columns are NOT extracted.
 pub fn extract_raw_column_predicates(sql: &str) -> Vec<String> {
+    extract_raw_column_predicates_with_qualifier(sql, None)
+}
+
+fn extract_raw_column_predicates_with_qualifier(sql: &str, qualifier: Option<&str>) -> Vec<String> {
     let mut predicates = Vec::new();
 
     let dialect = GenericDialect {};
@@ -919,7 +926,7 @@ pub fn extract_raw_column_predicates(sql: &str) -> Vec<String> {
 
     for stmt in &statements {
         let _ = visit_expressions(stmt, |expr| {
-            extract_raw_predicate(expr, &mut predicates);
+            extract_raw_predicate(expr, &mut predicates, qualifier);
             ControlFlow::<()>::Continue(())
         });
     }
@@ -928,7 +935,7 @@ pub fn extract_raw_column_predicates(sql: &str) -> Vec<String> {
 }
 
 /// Extract a single raw-column predicate from an expression.
-fn extract_raw_predicate(expr: &Expr, predicates: &mut Vec<String>) {
+fn extract_raw_predicate(expr: &Expr, predicates: &mut Vec<String>, qualifier: Option<&str>) {
     match expr {
         // col op literal  or  literal op col
         Expr::BinaryOp { left, op, right } => {
@@ -943,9 +950,9 @@ fn extract_raw_predicate(expr: &Expr, predicates: &mut Vec<String>) {
                 return;
             }
 
-            if let Some(pred) = try_raw_comparison(left, op, right) {
+            if let Some(pred) = try_raw_comparison(left, op, right, qualifier) {
                 predicates.push(pred);
-            } else if let Some(pred) = try_raw_comparison_reversed(left, op, right) {
+            } else if let Some(pred) = try_raw_comparison_reversed(left, op, right, qualifier) {
                 predicates.push(pred);
             }
         }
@@ -978,7 +985,8 @@ fn extract_raw_predicate(expr: &Expr, predicates: &mut Vec<String>) {
                 }
             }
             if !values.is_empty() {
-                predicates.push(format!("{col_name} IN ({})", values.join(", ")));
+                let column = qualify_raw_column(&col_name, qualifier);
+                predicates.push(format!("{column} IN ({})", values.join(", ")));
             }
         }
         _ => {}
@@ -986,7 +994,12 @@ fn extract_raw_predicate(expr: &Expr, predicates: &mut Vec<String>) {
 }
 
 /// Try to extract `column op literal` where column is a raw logs column.
-fn try_raw_comparison(left: &Expr, op: &BinaryOperator, right: &Expr) -> Option<String> {
+fn try_raw_comparison(
+    left: &Expr,
+    op: &BinaryOperator,
+    right: &Expr,
+    qualifier: Option<&str>,
+) -> Option<String> {
     let col_name = match left {
         Expr::Identifier(ident) => ident.value.to_lowercase(),
         _ => return None,
@@ -996,11 +1009,17 @@ fn try_raw_comparison(left: &Expr, op: &BinaryOperator, right: &Expr) -> Option<
     }
     let value = expr_to_sql_literal(right)?;
     let op_str = binary_op_to_str(op)?;
-    Some(format!("{col_name} {op_str} {value}"))
+    let column = qualify_raw_column(&col_name, qualifier);
+    Some(format!("{column} {op_str} {value}"))
 }
 
 /// Try to extract `literal op column` (reversed) where column is a raw logs column.
-fn try_raw_comparison_reversed(left: &Expr, op: &BinaryOperator, right: &Expr) -> Option<String> {
+fn try_raw_comparison_reversed(
+    left: &Expr,
+    op: &BinaryOperator,
+    right: &Expr,
+    qualifier: Option<&str>,
+) -> Option<String> {
     let col_name = match right {
         Expr::Identifier(ident) => ident.value.to_lowercase(),
         _ => return None,
@@ -1019,7 +1038,15 @@ fn try_raw_comparison_reversed(left: &Expr, op: &BinaryOperator, right: &Expr) -
         _ => return None,
     };
     let op_str = binary_op_to_str(&flipped_op)?;
-    Some(format!("{col_name} {op_str} {value}"))
+    let column = qualify_raw_column(&col_name, qualifier);
+    Some(format!("{column} {op_str} {value}"))
+}
+
+fn qualify_raw_column(column: &str, qualifier: Option<&str>) -> String {
+    qualifier.map_or_else(
+        || column.to_string(),
+        |qualifier| format!("{qualifier}.{column}"),
+    )
 }
 
 fn expr_to_sql_literal(expr: &Expr) -> Option<String> {
@@ -2005,6 +2032,23 @@ mod tests {
     }
 
     #[test]
+    fn test_extract_raw_predicates_qualifies_all_logs_columns() {
+        let preds = extract_raw_column_predicates_with_qualifier(
+            "SELECT * FROM Transfer WHERE block_num = 1 AND block_timestamp >= '2026-01-01' AND address = '0xabc' AND tx_hash = '0xdef' AND log_idx < 2 AND tx_idx IN (3, 4)",
+            Some("logs"),
+        );
+
+        for column in RAW_PUSHDOWN_COLUMNS {
+            assert!(
+                preds
+                    .iter()
+                    .any(|predicate| predicate.starts_with(&format!("logs.{column} "))),
+                "expected qualified predicate for {column}: {preds:?}"
+            );
+        }
+    }
+
+    #[test]
     fn test_extract_raw_predicates_empty_for_no_raw_columns() {
         let preds = extract_raw_column_predicates(
             r#"SELECT * FROM Transfer WHERE "to" = '0xABC' AND "value" > 1000"#,
@@ -2038,6 +2082,22 @@ mod tests {
             "address = '0xABC'".to_string(),
         ];
         assert_snapshot!(sig.to_cte_sql_clickhouse_with_pushdown(None, &pushdown));
+    }
+
+    #[test]
+    fn test_clickhouse_token_address_pushdown_qualifies_logs_column() {
+        let sql = apply_event_signature_ctes_clickhouse(
+            r#"SELECT "from", "to", address, value, tx_hash, block_num, log_idx, block_timestamp
+FROM Transfer
+WHERE address = '0x20c0000000000000000000008f5425160ebe5525'
+ORDER BY block_num DESC, log_idx DESC
+LIMIT 6"#,
+            &["Transfer(address indexed from, address indexed to, uint256 tokens)"],
+        )
+        .unwrap();
+
+        assert!(sql.contains("AND logs.address = '0x20c0000000000000000000008f5425160ebe5525'"));
+        assert!(sql.contains("ORDER BY block_num DESC, log_idx DESC\nLIMIT 6"));
     }
 
     #[test]
