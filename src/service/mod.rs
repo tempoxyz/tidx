@@ -709,10 +709,7 @@ async fn run_pg_query(
             result
         }
         Ok(Err(e)) => {
-            return Err(anyhow!(
-                "Query error: {}",
-                sanitize_db_error(&e.to_string())
-            ));
+            return Err(anyhow!("Query error: {}", postgres_query_error_message(&e)));
         }
         Err(_) => return Err(anyhow!("Query timeout")),
     };
@@ -846,6 +843,38 @@ fn estimated_json_value_bytes(value: &serde_json::Value) -> usize {
             .map(|(key, value)| key.len() + estimated_json_value_bytes(value))
             .sum(),
     }
+}
+
+fn postgres_query_error_message(error: &anyhow::Error) -> String {
+    let db_error = error
+        .chain()
+        .filter_map(|cause| cause.downcast_ref::<tokio_postgres::Error>())
+        .find_map(tokio_postgres::Error::as_db_error);
+
+    let Some(db_error) = db_error else {
+        return sanitize_db_error(&error.to_string());
+    };
+
+    let mut parts = vec![db_error.message().to_string()];
+
+    if let Some(detail) = db_error.detail() {
+        parts.push(format!("detail: {detail}"));
+    }
+    if let Some(hint) = db_error.hint() {
+        parts.push(format!("hint: {hint}"));
+    }
+    if let Some(position) = db_error.position() {
+        match position {
+            tokio_postgres::error::ErrorPosition::Original(position) => {
+                parts.push(format!("position: {position}"));
+            }
+            tokio_postgres::error::ErrorPosition::Internal { position, .. } => {
+                parts.push(format!("internal position: {position}"));
+            }
+        }
+    }
+
+    sanitize_db_error(&parts.join("; "))
 }
 
 pub fn format_column_string(row: &tokio_postgres::Row, idx: usize) -> String {

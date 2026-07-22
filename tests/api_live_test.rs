@@ -290,6 +290,41 @@ async fn test_query_rejects_non_select() {
 
 #[tokio::test]
 #[serial(db)]
+async fn test_query_returns_postgres_error_message() {
+    let db = TestDb::empty().await;
+    let broadcaster = Arc::new(Broadcaster::new());
+    let (pools, chain_id) = make_pools(db.pool.clone());
+    let mut app = make_test_service(pools, chain_id, broadcaster).await;
+
+    let response = app
+        .call(
+            Request::builder()
+                .method("GET")
+                .uri("/query?sql=SELECT%20missing_column%20FROM%20blocks&chainId=1")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let error = json["error"].as_str().unwrap();
+
+    assert_eq!(json["ok"], false);
+    assert!(
+        error.contains("column \"missing_column\" does not exist"),
+        "expected useful PostgreSQL error, got: {error}"
+    );
+    assert!(!error.ends_with("db error"), "got generic error: {error}");
+}
+
+#[tokio::test]
+#[serial(db)]
 async fn test_query_chain_id_param() {
     let db = TestDb::new().await;
     let broadcaster = Arc::new(Broadcaster::new());
