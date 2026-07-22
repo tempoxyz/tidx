@@ -7,6 +7,10 @@ const VIRTUAL_FORWARD_INDEX_SQL: &str =
     include_str!("../../db/migrations/20260417_add_logs_virtual_forward_indexes.sql");
 const VIRTUAL_FORWARD_TX_HASH_INDEX_SQL: &str =
     include_str!("../../db/migrations/20260417_add_logs_tx_hash_virtual_forward_index.sql");
+const LOGS_ADDRESS_TOPIC0_INDEX_SQL: &str =
+    include_str!("../../db/migrations/20260722_add_logs_address_topic0_index.sql");
+const LOGS_SELECTOR_INDEXED_ADDRESS_INDEX_SQL: &str =
+    include_str!("../../db/migrations/20260722_add_logs_selector_indexed_address_index.sql");
 
 pub async fn run_migrations(pool: &Pool) -> Result<()> {
     let conn = pool.get().await?;
@@ -97,6 +101,10 @@ pub async fn run_post_startup_migrations(pool: &Pool) -> Result<()> {
     conn.batch_execute(&adapt(VIRTUAL_FORWARD_INDEX_SQL))
         .await?;
     conn.batch_execute(&adapt(VIRTUAL_FORWARD_TX_HASH_INDEX_SQL))
+        .await?;
+    conn.batch_execute(&adapt(LOGS_ADDRESS_TOPIC0_INDEX_SQL))
+        .await?;
+    conn.batch_execute(&adapt(LOGS_SELECTOR_INDEXED_ADDRESS_INDEX_SQL))
         .await?;
 
     Ok(())
