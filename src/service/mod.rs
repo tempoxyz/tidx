@@ -323,7 +323,8 @@ fn hot_query_prefers_clickhouse(hw: &crate::query::HotWindow, tip: i64) -> bool 
 ///
 /// Eligible shapes (see [`plan_tiered_split`]) are split at the prune
 /// boundary and served natively — hot arm on PostgreSQL `public.*`, cold arm
-/// on ClickHouse — then stitched. Split-ineligible queries provably confined
+/// on ClickHouse — then stitched. A failing hot arm degrades the split to
+/// the native ClickHouse archive. Split-ineligible queries provably confined
 /// to the hot window run on plain PostgreSQL, except wide-span aggregates,
 /// which ClickHouse serves faster. Everything else runs natively on the
 /// ClickHouse archive (it holds full history), falling back on failure:
@@ -489,7 +490,7 @@ async fn try_execute_tiered_split(
             timeout_ms,
             limit: options.limit,
         };
-        let (mut cold_raw, hot) = tokio::try_join!(
+        let (cold, hot) = tokio::join!(
             ch.query_user_with_settings(
                 &cold_sql,
                 signatures,
@@ -498,13 +499,32 @@ async fn try_execute_tiered_split(
                 TIERED_COLD_CH_SETTINGS,
             ),
             execute_query_postgres(pool, &hot_sql, signatures, &hot_options),
-        )?;
+        );
+        let hot = match hot {
+            Ok(hot) => hot,
+            Err(e) => {
+                return degrade_split_to_clickhouse(ch, sql, signatures, e, options, start)
+                    .await
+                    .map(Some);
+            }
+        };
+        let mut cold_raw = cold?;
         normalize_cold_result(&mut cold_raw, &plan.selector_null_cols);
         (hot, cold_raw.into())
     } else {
         // Descending or unordered: hot (PostgreSQL) rows first.
         let hot_sql = plan.arm_sql(true, boundary, Some(eff_limit.max(0)));
-        let hot = execute_query_postgres(pool, &hot_sql, signatures, options).await?;
+        let hot = match execute_query_postgres(pool, &hot_sql, signatures, options).await {
+            Ok(hot) => hot,
+            Err(e) => {
+                let Some(ch) = clickhouse else {
+                    return Err(e);
+                };
+                return degrade_split_to_clickhouse(ch, sql, signatures, e, options, start)
+                    .await
+                    .map(Some);
+            }
+        };
         if hot.row_count as i64 >= eff_limit {
             return Ok(Some(finish_tiered(hot, None, false, eff_limit, start)));
         }
@@ -550,6 +570,40 @@ async fn try_execute_tiered_split(
         eff_limit,
         start,
     )))
+}
+
+/// Degraded split path: the hot PostgreSQL arm failed, so serve the original
+/// query natively on the ClickHouse archive (dual-written, full history).
+async fn degrade_split_to_clickhouse(
+    ch: &crate::clickhouse::ClickHouseEngine,
+    sql: &str,
+    signatures: &[&str],
+    hot_err: anyhow::Error,
+    options: &QueryOptions,
+    start: Instant,
+) -> Result<QueryResult> {
+    tracing::warn!(target: "tidx::query", error = %hot_err, "tiered: hot arm failed; degrading split query to the clickhouse archive");
+    let timeout_ms = options
+        .timeout_ms
+        .saturating_sub(start.elapsed().as_millis() as u64)
+        .max(TIERED_COLD_MIN_TIMEOUT_MS);
+    let mut raw = ch
+        .query_user_with_settings(
+            sql,
+            signatures,
+            timeout_ms,
+            options.limit,
+            TIERED_COLD_CH_SETTINGS,
+        )
+        .await
+        .map_err(|ch_err| {
+            anyhow!("tiered split failed on both arms: hot (postgres): {hot_err}; cold (clickhouse): {ch_err}")
+        })?;
+    normalize_cold_result(&mut raw, &[]);
+    let mut result: QueryResult = raw.into();
+    result.engine = Some("tiered".to_string());
+    result.query_time_ms = Some(start.elapsed().as_secs_f64() * 1000.0);
+    Ok(result)
 }
 
 /// Assemble the stitched tiered result. Hot (PostgreSQL) column names win:

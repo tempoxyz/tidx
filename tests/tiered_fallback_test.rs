@@ -13,6 +13,7 @@ use serial_test::serial;
 
 use tidx::clickhouse::ClickHouseEngine;
 use tidx::config::ClickHouseConfig;
+use tidx::db::run_migrations;
 use tidx::service::{QueryOptions, execute_query_tiered};
 use tidx::sync::ch_sink::ClickHouseSink;
 use tidx::sync::writer::set_hot_boundary;
@@ -36,21 +37,21 @@ fn make_block(num: i64, ts: chrono::DateTime<Utc>) -> BlockRow {
     }
 }
 
-/// A hot-arm failure on a descending split query must degrade to the
-/// ClickHouse archive (it holds full history), not surface the error.
-#[tokio::test]
-#[serial(db)]
-async fn test_desc_split_falls_back_to_clickhouse_when_hot_arm_fails() {
+/// Seeds ClickHouse with blocks 1..=20, sets the hot boundary at block 10,
+/// and drops the hot PostgreSQL table. Returns None when CH is unavailable.
+async fn setup_broken_hot_arm() -> Option<(TestClickHouse, TestDb, ClickHouseEngine)> {
     let ch = TestClickHouse::new(CH_DB).await.expect("CH client");
     if ch.wait_for_ready().await.is_err() {
         println!("ClickHouse not available, skipping test");
-        return;
+        return None;
     }
     ch.reset_database().await.expect("Failed to reset CH db");
     let sink = ClickHouseSink::new(&ch.url, CH_DB, None, None).expect("Failed to create CH sink");
     sink.ensure_schema_only().await.expect("CH schema");
 
     let db = TestDb::empty().await;
+    // Each test drops the hot table; restore the schema before reuse.
+    run_migrations(&db.pool).await.expect("migrations");
     db.truncate_all().await;
 
     // Full history (blocks 1..=20) is dual-written to the ClickHouse archive.
@@ -59,9 +60,14 @@ async fn test_desc_split_falls_back_to_clickhouse_when_hot_arm_fails() {
         .map(|n| make_block(n, base_ts + Duration::seconds(n)))
         .collect();
     sink.write_blocks(&blocks).await.expect("CH blocks");
-    set_hot_boundary(&db.pool, CHAIN_ID, 10, Some(base_ts + Duration::seconds(10)))
-        .await
-        .expect("set boundary");
+    set_hot_boundary(
+        &db.pool,
+        CHAIN_ID,
+        10,
+        Some(base_ts + Duration::seconds(10)),
+    )
+    .await
+    .expect("set boundary");
 
     // Break only the hot PostgreSQL arm; ClickHouse can still serve the query.
     let conn = db.pool.get().await.expect("conn");
@@ -81,8 +87,20 @@ async fn test_desc_split_falls_back_to_clickhouse_when_hot_arm_fails() {
     )
     .expect("CH engine");
 
+    Some((ch, db, engine))
+}
+
+/// A hot-arm failure on a descending split query must degrade to the
+/// ClickHouse archive (it holds full history), not surface the error.
+#[tokio::test]
+#[serial(db)]
+async fn test_desc_split_falls_back_to_clickhouse_when_hot_arm_fails() {
+    let Some((_ch, db, engine)) = setup_broken_hot_arm().await else {
+        return;
+    };
+
     // Split-eligible descending head page (see plan_tiered_split): the hot
-    // arm runs first and its error currently propagates without fallback.
+    // arm runs first and its failure degrades to the ClickHouse arm.
     let result = execute_query_tiered(
         &db.pool,
         Some(&engine),
@@ -107,4 +125,41 @@ async fn test_desc_split_falls_back_to_clickhouse_when_hot_arm_fails() {
         vec![20, 19, 18, 17, 16],
         "head page must come from the full ClickHouse history"
     );
+    assert_eq!(result.engine.as_deref(), Some("tiered"));
+}
+
+/// The ascending split runs both arms concurrently; a hot-arm failure must
+/// likewise degrade to the ClickHouse archive.
+#[tokio::test]
+#[serial(db)]
+async fn test_asc_split_falls_back_to_clickhouse_when_hot_arm_fails() {
+    let Some((_ch, db, engine)) = setup_broken_hot_arm().await else {
+        return;
+    };
+
+    let result = execute_query_tiered(
+        &db.pool,
+        Some(&engine),
+        CHAIN_ID,
+        "SELECT num FROM blocks ORDER BY num ASC LIMIT 5",
+        &[],
+        &QueryOptions {
+            timeout_ms: 10_000,
+            limit: 100,
+        },
+    )
+    .await
+    .expect("hot-arm failure must degrade to the ClickHouse arm, not error");
+
+    let nums: Vec<i64> = result
+        .rows
+        .iter()
+        .map(|r| r[0].as_i64().expect("num is an integer"))
+        .collect();
+    assert_eq!(
+        nums,
+        vec![1, 2, 3, 4, 5],
+        "ascending page must come from the full ClickHouse history"
+    );
+    assert_eq!(result.engine.as_deref(), Some("tiered"));
 }
