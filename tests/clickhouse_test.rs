@@ -676,7 +676,8 @@ async fn test_role_granted_cte() {
 
 /// `query_user` (the public /query path) must execute parenthesized UNION arms
 /// with a trailing ORDER BY/LIMIT, a shape valid in PostgreSQL. ClickHouse
-/// grammar rejects it today (Code 62), so callers get an opaque error.
+/// grammar rejects the trailing clauses (Code 62) unless they are hoisted
+/// into a derived-table wrapper.
 #[tokio::test]
 #[serial(clickhouse)]
 async fn test_query_user_union_with_trailing_order_by() {
@@ -713,7 +714,17 @@ async fn test_query_user_union_with_trailing_order_by() {
         .await
         .expect("union with trailing ORDER BY should execute");
 
-    assert_eq!(result.rows.len(), 2);
+    let nums: Vec<i64> = result
+        .rows
+        .iter()
+        .map(|row| {
+            row[0]
+                .as_i64()
+                .or_else(|| row[0].as_str().and_then(|s| s.parse().ok()))
+                .expect("numeric num")
+        })
+        .collect();
+    assert_eq!(nums, [3, 2]);
 }
 
 // ============================================================================

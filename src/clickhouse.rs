@@ -14,7 +14,7 @@ use tracing::{error, warn};
 use crate::config::ClickHouseConfig;
 use crate::query::{
     HARD_LIMIT_MAX, apply_event_signature_ctes_clickhouse, convert_timestamp_literals_clickhouse,
-    validate_clickhouse_query,
+    hoist_set_operation_order_by_clickhouse, validate_clickhouse_query,
 };
 
 const MAX_QUERY_RESULT_BYTES: usize = 10 * 1024 * 1024;
@@ -125,6 +125,7 @@ impl ClickHouseEngine {
     ) -> Result<QueryResult> {
         let sql = Self::prepare_query(sql, signatures)?;
         validate_clickhouse_query(&sql)?;
+        let sql = hoist_set_operation_order_by_clickhouse(&sql);
         let sql = Self::wrap_user_query_with_limit(&sql, limit.clamp(1, HARD_LIMIT_MAX));
         self.execute_prepared_query_with_settings(&sql, Some(timeout_ms), settings)
             .await
