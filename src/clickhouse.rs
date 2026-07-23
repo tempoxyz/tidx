@@ -548,6 +548,44 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn test_client_timeout_is_not_a_connection_error() {
+        let url = std::env::var("CLICKHOUSE_URL")
+            .unwrap_or_else(|_| "http://localhost:8123".to_string());
+        let config = ClickHouseConfig {
+            enabled: true,
+            url,
+            failover_urls: vec![],
+            database: Some("default".to_string()),
+            ..Default::default()
+        };
+        let engine = ClickHouseEngine::new(&config, 4217).unwrap();
+
+        engine
+            .query("SELECT 1", &[])
+            .await
+            .expect("ClickHouse must be reachable");
+
+        // The trailing setting overrides the server timeout to 30s, so the
+        // ~1.1s client deadline reliably fires first (as when the server-side
+        // check overshoots in production).
+        let err = engine
+            .execute_prepared_query_with_settings(
+                "SELECT sleep(3)",
+                Some(1_000),
+                &[("max_execution_time", "30")],
+            )
+            .await
+            .expect_err("query must exceed the client deadline");
+
+        // A slow query is a timeout, not an unreachable instance; classifying
+        // it as a connection error burns failover retries.
+        assert!(
+            !is_connection_error(&err),
+            "client timeout misclassified as connection error: {err}"
+        );
+    }
+
     #[test]
     fn test_wrap_user_query_with_limit_caps_public_results() {
         let sql = ClickHouseEngine::wrap_user_query_with_limit(
