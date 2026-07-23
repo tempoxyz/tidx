@@ -711,7 +711,7 @@ async fn run_pg_query(
         Ok(Err(e)) => {
             return Err(anyhow!(
                 "Query error: {}",
-                sanitize_db_error(&e.to_string())
+                sanitize_db_error(&describe_query_error(&e))
             ));
         }
         Err(_) => return Err(anyhow!("Query timeout")),
@@ -856,6 +856,18 @@ pub fn format_column_string(row: &tokio_postgres::Row, idx: usize) -> String {
         serde_json::Value::Bool(b) => b.to_string(),
         other => other.to_string(),
     }
+}
+
+/// Expand an error to its most descriptive message. tokio-postgres `Display`
+/// flattens server errors to "db error"; the real message lives in `DbError`.
+fn describe_query_error(e: &anyhow::Error) -> String {
+    if let Some(db) = e
+        .downcast_ref::<tokio_postgres::Error>()
+        .and_then(|e| e.as_db_error())
+    {
+        return format!("{} ({})", db.message(), db.code().code());
+    }
+    format!("{e:#}")
 }
 
 /// Sanitize database error messages to prevent information leakage.

@@ -1140,6 +1140,10 @@ async fn test_query_error_surfaces_pg_message() {
         msg.contains("division by zero"),
         "expected PostgreSQL error message in query error, got: {msg:?}"
     );
+    assert!(
+        msg.contains("22012"),
+        "expected SQLSTATE code in query error, got: {msg:?}"
+    );
 }
 
 #[tokio::test]
