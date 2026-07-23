@@ -21,6 +21,8 @@ const LOGS_SELECTOR_TOPIC1_BLOCK_INDEX_SQL: &str =
     include_str!("../../db/migrations/20260723_add_logs_selector_topic1_block_index.sql");
 const LOGS_SELECTOR_TOPIC2_BLOCK_INDEX_SQL: &str =
     include_str!("../../db/migrations/20260723_add_logs_selector_topic2_block_index.sql");
+const LOGS_SELECTOR_TOPIC3_BLOCK_INDEX_SQL: &str =
+    include_str!("../../db/migrations/20260723_add_logs_selector_topic3_block_index.sql");
 
 pub async fn run_migrations(pool: &Pool) -> Result<()> {
     let conn = pool.get().await?;
@@ -124,6 +126,8 @@ pub async fn run_post_startup_migrations(pool: &Pool) -> Result<()> {
     conn.batch_execute(&adapt(LOGS_SELECTOR_TOPIC1_BLOCK_INDEX_SQL))
         .await?;
     conn.batch_execute(&adapt(LOGS_SELECTOR_TOPIC2_BLOCK_INDEX_SQL))
+        .await?;
+    conn.batch_execute(&adapt(LOGS_SELECTOR_TOPIC3_BLOCK_INDEX_SQL))
         .await?;
 
     Ok(())

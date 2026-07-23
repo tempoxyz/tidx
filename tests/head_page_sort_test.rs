@@ -28,13 +28,14 @@ SELECT g, now(), 0, decode(lpad(to_hex(g), 64, '0'), 'hex'),
 FROM generate_series(1, 2000) g;
 
 INSERT INTO logs (block_num, block_timestamp, log_idx, tx_idx, tx_hash, address,
-                  selector, topic0, topic1, topic2, data)
+                  selector, topic0, topic1, topic2, topic3, data)
 SELECT g, now(), 0, 0, decode(lpad(to_hex(g), 64, '0'), 'hex'),
        '\x2222222222222222222222222222222222222222',
        '\xddf252ad',
        '\xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef',
        decode(lpad(to_hex(g % 50 + 1), 64, '0'), 'hex'),
        decode(lpad(to_hex((g + 1) % 50 + 1), 64, '0'), 'hex'),
+       decode(lpad(to_hex((g + 2) % 50 + 1), 64, '0'), 'hex'),
        '\x'
 FROM generate_series(1, 2000) g;
 
@@ -87,6 +88,13 @@ async fn test_head_page_sort_served_by_ordered_index() {
             r#"SELECT tx_hash FROM logs
                WHERE selector = '\xddf252ad'
                  AND topic2 = '\x0000000000000000000000000000000000000000000000000000000000000001'
+               ORDER BY block_num DESC, log_idx DESC LIMIT 10"#,
+        ),
+        (
+            "logs by selector + indexed address (topic3)",
+            r#"SELECT tx_hash FROM logs
+               WHERE selector = '\xddf252ad'
+                 AND topic3 = '\x0000000000000000000000000000000000000000000000000000000000000001'
                ORDER BY block_num DESC, log_idx DESC LIMIT 10"#,
         ),
     ];

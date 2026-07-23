@@ -204,6 +204,7 @@ async fn test_pg_upgrade_adds_missing_postgres_ddl() {
                     'idx_logs_selector_indexed_address',
                     'idx_logs_selector_topic1_block',
                     'idx_logs_selector_topic2_block',
+                    'idx_logs_selector_topic3_block',
                     'idx_logs_virtual_forward',
                     'idx_logs_tx_hash_virtual_forward'
                   )
@@ -224,6 +225,7 @@ async fn test_pg_upgrade_adds_missing_postgres_ddl() {
                 "idx_logs_selector_indexed_address".to_string(),
                 "idx_logs_selector_topic1_block".to_string(),
                 "idx_logs_selector_topic2_block".to_string(),
+                "idx_logs_selector_topic3_block".to_string(),
                 "idx_logs_tx_hash_virtual_forward".to_string(),
                 "idx_logs_virtual_forward".to_string(),
             ]
