@@ -6820,6 +6820,7 @@ dependencies = [
  "glob",
  "hex",
  "hex-literal",
+ "hyper",
  "insta",
  "metrics",
  "metrics-exporter-prometheus",
