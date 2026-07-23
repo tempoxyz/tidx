@@ -17,10 +17,22 @@ use tidx::db::run_migrations;
 use tidx::service::{QueryOptions, execute_query_tiered};
 use tidx::sync::ch_sink::ClickHouseSink;
 use tidx::sync::writer::set_hot_boundary;
-use tidx::types::BlockRow;
+use tidx::types::{BlockRow, LogRow};
 
 const CHAIN_ID: u64 = 999;
 const CH_DB: &str = "tidx_repro_tiered_hot_arm";
+
+fn make_log(block_num: i64, ts: chrono::DateTime<Utc>, selector: Option<Vec<u8>>) -> LogRow {
+    LogRow {
+        block_num,
+        block_timestamp: ts,
+        tx_hash: vec![block_num as u8; 32],
+        address: vec![0xbb; 20],
+        selector,
+        data: vec![0x01],
+        ..Default::default()
+    }
+}
 
 fn make_block(num: i64, ts: chrono::DateTime<Utc>) -> BlockRow {
     BlockRow {
@@ -162,4 +174,64 @@ async fn test_asc_split_falls_back_to_clickhouse_when_hot_arm_fails() {
         "ascending page must come from the full ClickHouse history"
     );
     assert_eq!(result.engine.as_deref(), Some("tiered"));
+}
+
+/// A degraded logs query must keep PostgreSQL's NULL-selector representation:
+/// ClickHouse stores missing selectors as '', which the degrade path rewrites
+/// back to NULL.
+#[tokio::test]
+#[serial(db)]
+async fn test_degraded_split_preserves_null_selector() {
+    let Some((ch, db, engine)) = setup_broken_hot_arm().await else {
+        return;
+    };
+
+    // Full log history in the ClickHouse archive; block 20's log has no selector.
+    let sink = ClickHouseSink::new(&ch.url, CH_DB, None, None).expect("CH sink");
+    let base_ts = Utc::now() - Duration::seconds(30);
+    let logs: Vec<_> = (1..=20)
+        .map(|n| {
+            make_log(
+                n,
+                base_ts + Duration::seconds(n),
+                (n != 20).then(|| vec![0xdd; 4]),
+            )
+        })
+        .collect();
+    sink.write_logs(&logs).await.expect("CH logs");
+
+    // Break the hot PostgreSQL arm for the logs shape too.
+    let conn = db.pool.get().await.expect("conn");
+    conn.execute("DROP TABLE logs CASCADE", &[])
+        .await
+        .expect("drop hot logs table");
+    drop(conn);
+
+    let result = execute_query_tiered(
+        &db.pool,
+        Some(&engine),
+        CHAIN_ID,
+        "SELECT block_num, selector FROM logs ORDER BY block_num DESC LIMIT 2",
+        &[],
+        &QueryOptions {
+            timeout_ms: 10_000,
+            limit: 100,
+        },
+    )
+    .await
+    .expect("hot-arm failure must degrade to the ClickHouse arm, not error");
+
+    let rows: Vec<(i64, &serde_json::Value)> = result
+        .rows
+        .iter()
+        .map(|r| (r[0].as_i64().expect("block_num is an integer"), &r[1]))
+        .collect();
+    assert_eq!(rows[0].0, 20);
+    assert!(
+        rows[0].1.is_null(),
+        "missing selector must degrade as NULL, got {:?}",
+        rows[0].1
+    );
+    assert_eq!(rows[1].0, 19);
+    assert_eq!(rows[1].1.as_str(), Some("0xdddddddd"));
 }

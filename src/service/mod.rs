@@ -503,9 +503,17 @@ async fn try_execute_tiered_split(
         let hot = match hot {
             Ok(hot) => hot,
             Err(e) => {
-                return degrade_split_to_clickhouse(ch, sql, signatures, e, options, start)
-                    .await
-                    .map(Some);
+                return degrade_split_to_clickhouse(
+                    ch,
+                    sql,
+                    signatures,
+                    &plan.selector_null_cols,
+                    e,
+                    options,
+                    start,
+                )
+                .await
+                .map(Some);
             }
         };
         let mut cold_raw = cold?;
@@ -520,9 +528,17 @@ async fn try_execute_tiered_split(
                 let Some(ch) = clickhouse else {
                     return Err(e);
                 };
-                return degrade_split_to_clickhouse(ch, sql, signatures, e, options, start)
-                    .await
-                    .map(Some);
+                return degrade_split_to_clickhouse(
+                    ch,
+                    sql,
+                    signatures,
+                    &plan.selector_null_cols,
+                    e,
+                    options,
+                    start,
+                )
+                .await
+                .map(Some);
             }
         };
         if hot.row_count as i64 >= eff_limit {
@@ -578,6 +594,7 @@ async fn degrade_split_to_clickhouse(
     ch: &crate::clickhouse::ClickHouseEngine,
     sql: &str,
     signatures: &[&str],
+    selector_null_cols: &[usize],
     hot_err: anyhow::Error,
     options: &QueryOptions,
     start: Instant,
@@ -599,7 +616,7 @@ async fn degrade_split_to_clickhouse(
         .map_err(|ch_err| {
             anyhow!("tiered split failed on both arms: hot (postgres): {hot_err}; cold (clickhouse): {ch_err}")
         })?;
-    normalize_cold_result(&mut raw, &[]);
+    normalize_cold_result(&mut raw, selector_null_cols);
     let mut result: QueryResult = raw.into();
     result.engine = Some("tiered".to_string());
     result.query_time_ms = Some(start.elapsed().as_secs_f64() * 1000.0);
