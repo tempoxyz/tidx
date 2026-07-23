@@ -77,13 +77,24 @@ pub fn convert_timestamp_literals_clickhouse(sql: &str) -> String {
 /// ClickHouse grammar only accepts another set operator after a parenthesized
 /// arm. Non-matching queries are returned unchanged.
 pub fn hoist_set_operation_order_by_clickhouse(sql: &str) -> String {
+    // A fully parenthesized set expression parses as nested `SetExpr::Query`
+    // layers; unwrap them to find the set operation. Inner clauses (its own
+    // ORDER BY/LIMIT) stay inside the derived table.
+    fn is_set_operation(body: &SetExpr) -> bool {
+        match body {
+            SetExpr::SetOperation { .. } => true,
+            SetExpr::Query(inner) => is_set_operation(&inner.body),
+            _ => false,
+        }
+    }
+
     let Ok(mut statements) = Parser::parse_sql(&ClickHouseDialect {}, sql) else {
         return sql.to_string();
     };
     let [Statement::Query(query)] = statements.as_mut_slice() else {
         return sql.to_string();
     };
-    if !matches!(query.body.as_ref(), SetExpr::SetOperation { .. })
+    if !is_set_operation(query.body.as_ref())
         || (query.order_by.is_none() && query.limit_clause.is_none() && query.fetch.is_none())
     {
         return sql.to_string();
@@ -191,12 +202,37 @@ mod tests {
     }
 
     #[test]
+    fn hoist_parenthesized_set_query() {
+        assert_eq!(
+            hoist_set_operation_order_by_clickhouse(
+                "(SELECT num FROM blocks UNION SELECT num FROM txs) ORDER BY num LIMIT 10"
+            ),
+            "SELECT * FROM ((SELECT num FROM blocks UNION SELECT num FROM txs)) \
+             AS tidx_set_query ORDER BY num LIMIT 10"
+        );
+    }
+
+    #[test]
+    fn hoist_parenthesized_set_query_preserves_inner_clauses() {
+        assert_eq!(
+            hoist_set_operation_order_by_clickhouse(
+                "(SELECT num FROM blocks UNION SELECT num FROM txs ORDER BY num LIMIT 5) \
+                 ORDER BY num DESC LIMIT 3"
+            ),
+            "SELECT * FROM \
+             ((SELECT num FROM blocks UNION SELECT num FROM txs ORDER BY num LIMIT 5)) \
+             AS tidx_set_query ORDER BY num DESC LIMIT 3"
+        );
+    }
+
+    #[test]
     fn hoist_untouched() {
         // Plain selects and bare set operations pass through unchanged.
         for sql in [
             "SELECT num FROM blocks ORDER BY num DESC LIMIT 2",
             "(SELECT num FROM blocks LIMIT 1) UNION (SELECT num FROM txs LIMIT 1)",
             "SELECT * FROM (SELECT num FROM blocks UNION SELECT num FROM txs) AS t ORDER BY num",
+            "(SELECT num FROM blocks) ORDER BY num LIMIT 2",
         ] {
             assert_eq!(hoist_set_operation_order_by_clickhouse(sql), sql);
         }
