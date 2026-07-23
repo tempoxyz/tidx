@@ -16,6 +16,9 @@ pub use tiered_split::{
 pub use validator::{HARD_LIMIT_MAX, validate_clickhouse_query, validate_query};
 
 use regex_lite::Regex;
+use sqlparser::ast::{SetExpr, Statement, TableFactor};
+use sqlparser::dialect::ClickHouseDialect;
+use sqlparser::parser::Parser;
 use std::sync::LazyLock;
 
 /// Regex to match hex literals: '0x' followed by 40+ hex characters (addresses, topics, hashes)
@@ -68,6 +71,58 @@ pub fn convert_timestamp_literals_clickhouse(sql: &str) -> String {
         .into_owned()
 }
 
+/// Hoist a set operation's trailing `ORDER BY`/`LIMIT`/`OFFSET` into a
+/// derived-table wrapper: `SELECT * FROM (<set operation>) AS tidx_set_query
+/// ORDER BY ... LIMIT ...`. The trailing form is valid PostgreSQL, but
+/// ClickHouse grammar only accepts another set operator after a parenthesized
+/// arm. Non-matching queries are returned unchanged.
+pub fn hoist_set_operation_order_by_clickhouse(sql: &str) -> String {
+    // A fully parenthesized set expression parses as nested `SetExpr::Query`
+    // layers; unwrap them to find the set operation. Inner clauses (its own
+    // ORDER BY/LIMIT) stay inside the derived table.
+    fn is_set_operation(body: &SetExpr) -> bool {
+        match body {
+            SetExpr::SetOperation { .. } => true,
+            SetExpr::Query(inner) => is_set_operation(&inner.body),
+            _ => false,
+        }
+    }
+
+    let Ok(mut statements) = Parser::parse_sql(&ClickHouseDialect {}, sql) else {
+        return sql.to_string();
+    };
+    let [Statement::Query(query)] = statements.as_mut_slice() else {
+        return sql.to_string();
+    };
+    if !is_set_operation(query.body.as_ref())
+        || (query.order_by.is_none() && query.limit_clause.is_none() && query.fetch.is_none())
+    {
+        return sql.to_string();
+    }
+
+    // Splice the set operation into a parsed wrapper; every other query-level
+    // clause stays put and now attaches to the wrapper's plain SELECT.
+    let wrapper = "SELECT * FROM (SELECT 1) AS tidx_set_query";
+    let Some(Statement::Query(mut wrapper_query)) =
+        Parser::parse_sql(&ClickHouseDialect {}, wrapper)
+            .expect("valid wrapper template")
+            .pop()
+    else {
+        unreachable!("wrapper template is a single query");
+    };
+    let SetExpr::Select(select) = wrapper_query.body.as_mut() else {
+        unreachable!("wrapper template body is a select");
+    };
+    let Some(TableFactor::Derived { subquery, .. }) =
+        select.from.first_mut().map(|t| &mut t.relation)
+    else {
+        unreachable!("wrapper template selects from a derived table");
+    };
+    std::mem::swap(&mut subquery.body, &mut query.body);
+    query.body = wrapper_query.body;
+    statements[0].to_string()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -106,6 +161,81 @@ mod tests {
             convert_timestamp_literals_clickhouse("ts >= '2026-07-09 03:30:42+00:00'"),
             "ts >= '2026-07-09 03:30:42'"
         );
+    }
+
+    #[test]
+    fn hoist_union_trailing_order_by_limit() {
+        assert_eq!(
+            hoist_set_operation_order_by_clickhouse(
+                "(SELECT num FROM blocks ORDER BY num DESC LIMIT 2) \
+                 UNION (SELECT num FROM blocks ORDER BY num DESC LIMIT 2) \
+                 ORDER BY num DESC LIMIT 2"
+            ),
+            "SELECT * FROM ((SELECT num FROM blocks ORDER BY num DESC LIMIT 2) \
+             UNION (SELECT num FROM blocks ORDER BY num DESC LIMIT 2)) AS tidx_set_query \
+             ORDER BY num DESC LIMIT 2"
+        );
+    }
+
+    #[test]
+    fn hoist_union_trailing_offset() {
+        assert_eq!(
+            hoist_set_operation_order_by_clickhouse(
+                "SELECT num FROM blocks UNION ALL SELECT num FROM txs ORDER BY num LIMIT 5 OFFSET 1"
+            ),
+            "SELECT * FROM (SELECT num FROM blocks UNION ALL SELECT num FROM txs) \
+             AS tidx_set_query ORDER BY num LIMIT 5 OFFSET 1"
+        );
+    }
+
+    #[test]
+    fn hoist_preserves_leading_cte() {
+        assert_eq!(
+            hoist_set_operation_order_by_clickhouse(
+                "WITH b AS (SELECT num FROM blocks) \
+                 (SELECT num FROM b) UNION (SELECT num FROM b) ORDER BY num"
+            ),
+            "WITH b AS (SELECT num FROM blocks) \
+             SELECT * FROM ((SELECT num FROM b) UNION (SELECT num FROM b)) \
+             AS tidx_set_query ORDER BY num"
+        );
+    }
+
+    #[test]
+    fn hoist_parenthesized_set_query() {
+        assert_eq!(
+            hoist_set_operation_order_by_clickhouse(
+                "(SELECT num FROM blocks UNION SELECT num FROM txs) ORDER BY num LIMIT 10"
+            ),
+            "SELECT * FROM ((SELECT num FROM blocks UNION SELECT num FROM txs)) \
+             AS tidx_set_query ORDER BY num LIMIT 10"
+        );
+    }
+
+    #[test]
+    fn hoist_parenthesized_set_query_preserves_inner_clauses() {
+        assert_eq!(
+            hoist_set_operation_order_by_clickhouse(
+                "(SELECT num FROM blocks UNION SELECT num FROM txs ORDER BY num LIMIT 5) \
+                 ORDER BY num DESC LIMIT 3"
+            ),
+            "SELECT * FROM \
+             ((SELECT num FROM blocks UNION SELECT num FROM txs ORDER BY num LIMIT 5)) \
+             AS tidx_set_query ORDER BY num DESC LIMIT 3"
+        );
+    }
+
+    #[test]
+    fn hoist_untouched() {
+        // Plain selects and bare set operations pass through unchanged.
+        for sql in [
+            "SELECT num FROM blocks ORDER BY num DESC LIMIT 2",
+            "(SELECT num FROM blocks LIMIT 1) UNION (SELECT num FROM txs LIMIT 1)",
+            "SELECT * FROM (SELECT num FROM blocks UNION SELECT num FROM txs) AS t ORDER BY num",
+            "(SELECT num FROM blocks) ORDER BY num LIMIT 2",
+        ] {
+            assert_eq!(hoist_set_operation_order_by_clickhouse(sql), sql);
+        }
     }
 
     #[test]

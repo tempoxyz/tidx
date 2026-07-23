@@ -10,7 +10,9 @@ mod common;
 
 use common::clickhouse::TestClickHouse;
 use serial_test::serial;
+use tidx::clickhouse::ClickHouseEngine;
 use tidx::clickhouse_schema::{base_objects, migrations, post_derived_migrations};
+use tidx::config::ClickHouseConfig;
 use tidx::query::{EventSignature, apply_event_signature_ctes_clickhouse};
 use tidx::sync::ch_sink::ClickHouseSink;
 use tidx::sync::sink::SinkSet;
@@ -670,6 +672,109 @@ async fn test_role_granted_cte() {
 
     assert!(data.is_some());
     assert_eq!(data.unwrap().len(), 1);
+}
+
+/// `query_user` (the public /query path) must execute parenthesized UNION arms
+/// with a trailing ORDER BY/LIMIT, a shape valid in PostgreSQL. ClickHouse
+/// grammar rejects the trailing clauses (Code 62) unless they are hoisted
+/// into a derived-table wrapper.
+#[tokio::test]
+#[serial(clickhouse)]
+async fn test_query_user_union_with_trailing_order_by() {
+    let ch = TestClickHouse::new("tidx_repro_union_ch")
+        .await
+        .expect("Failed to create ClickHouse client");
+
+    if ch.wait_for_ready().await.is_err() {
+        println!("ClickHouse not available, skipping test");
+        return;
+    }
+
+    ch.reset_database().await.expect("Failed to reset database");
+    ch.create_mock_blocks_table()
+        .await
+        .expect("Failed to create blocks table");
+    ch.query("INSERT INTO blocks (num, hash) VALUES (1, '0x01'), (2, '0x02'), (3, '0x03')")
+        .await
+        .expect("Failed to insert blocks");
+
+    let config = ClickHouseConfig {
+        enabled: true,
+        url: ch.url.clone(),
+        database: Some(ch.database.clone()),
+        ..Default::default()
+    };
+    let engine = ClickHouseEngine::new(&config, 4217).expect("Failed to create engine");
+
+    let sql = "(SELECT num FROM blocks ORDER BY num DESC LIMIT 2) \
+               UNION (SELECT num FROM blocks ORDER BY num DESC LIMIT 2) \
+               ORDER BY num DESC LIMIT 2";
+    let result = engine
+        .query_user(sql, &[], 5_000, 100)
+        .await
+        .expect("union with trailing ORDER BY should execute");
+
+    let nums: Vec<i64> = result
+        .rows
+        .iter()
+        .map(|row| {
+            row[0]
+                .as_i64()
+                .or_else(|| row[0].as_str().and_then(|s| s.parse().ok()))
+                .expect("numeric num")
+        })
+        .collect();
+    assert_eq!(nums, [3, 2]);
+}
+
+/// Same shape with the whole set expression parenthesized:
+/// `(a UNION b) ORDER BY ...`. ClickHouse rejects trailing clauses after a
+/// parenthesized set query too, so the hoist must unwrap it.
+#[tokio::test]
+#[serial(clickhouse)]
+async fn test_query_user_parenthesized_union_with_trailing_order_by() {
+    let ch = TestClickHouse::new("tidx_repro_union_ch_paren")
+        .await
+        .expect("Failed to create ClickHouse client");
+
+    if ch.wait_for_ready().await.is_err() {
+        println!("ClickHouse not available, skipping test");
+        return;
+    }
+
+    ch.reset_database().await.expect("Failed to reset database");
+    ch.create_mock_blocks_table()
+        .await
+        .expect("Failed to create blocks table");
+    ch.query("INSERT INTO blocks (num, hash) VALUES (1, '0x01'), (2, '0x02'), (3, '0x03')")
+        .await
+        .expect("Failed to insert blocks");
+
+    let config = ClickHouseConfig {
+        enabled: true,
+        url: ch.url.clone(),
+        database: Some(ch.database.clone()),
+        ..Default::default()
+    };
+    let engine = ClickHouseEngine::new(&config, 4217).expect("Failed to create engine");
+
+    let sql = "(SELECT num FROM blocks UNION SELECT num FROM blocks) ORDER BY num DESC LIMIT 2";
+    let result = engine
+        .query_user(sql, &[], 5_000, 100)
+        .await
+        .expect("parenthesized union with trailing ORDER BY should execute");
+
+    let nums: Vec<i64> = result
+        .rows
+        .iter()
+        .map(|row| {
+            row[0]
+                .as_i64()
+                .or_else(|| row[0].as_str().and_then(|s| s.parse().ok()))
+                .expect("numeric num")
+        })
+        .collect();
+    assert_eq!(nums, [3, 2]);
 }
 
 // ============================================================================
