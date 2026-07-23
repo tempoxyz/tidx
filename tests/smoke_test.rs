@@ -1148,6 +1148,50 @@ async fn test_query_error_surfaces_pg_message() {
 
 #[tokio::test]
 #[serial(db)]
+async fn test_query_error_with_timeout_text_stays_query_error() {
+    let db = TestDb::empty().await;
+    let opts = default_options();
+
+    let err = execute_query_postgres(&db.pool, "SELECT 'timeout'::int", &[], &opts)
+        .await
+        .expect_err("cast should fail");
+
+    // Server text echoing "timeout" must stay a query error; the API maps
+    // only the exact "Query timeout" marker to a 408.
+    let msg = err.to_string();
+    assert!(
+        msg.starts_with("Query error:") && msg.contains("timeout"),
+        "expected query error echoing user text, got: {msg:?}"
+    );
+}
+
+#[tokio::test]
+#[serial(db)]
+async fn test_query_statement_timeout_maps_to_query_timeout() {
+    let db = TestDb::empty().await;
+
+    // Hold an exclusive lock so the query blocks past its statement_timeout.
+    let mut conn = db.pool.get().await.expect("connection");
+    let lock_tx = conn.transaction().await.expect("transaction");
+    lock_tx
+        .execute("LOCK TABLE blocks IN ACCESS EXCLUSIVE MODE", &[])
+        .await
+        .expect("lock");
+
+    let opts = QueryOptions {
+        timeout_ms: 500,
+        limit: 1000,
+    };
+    let err = execute_query_postgres(&db.pool, "SELECT count(*) FROM blocks", &[], &opts)
+        .await
+        .expect_err("blocked query should time out");
+
+    // SQLSTATE 57014 (query_canceled) reduces to the exact timeout marker.
+    assert_eq!(err.to_string(), "Query timeout");
+}
+
+#[tokio::test]
+#[serial(db)]
 async fn test_query_rejects_forbidden_keywords() {
     let db = TestDb::new().await;
     let opts = default_options();

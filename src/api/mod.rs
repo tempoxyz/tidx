@@ -449,7 +449,9 @@ async fn handle_query_once(
     let sigs: Vec<&str> = signatures.iter().map(String::as_str).collect();
 
     let map_pg_err = |e: anyhow::Error| {
-        if e.to_string().contains("timeout") {
+        // run_pg_query reduces timeouts (elapsed deadline, SQLSTATE 57014
+        // cancels) to exactly this marker; server text must not match.
+        if e.to_string() == "Query timeout" {
             ApiError::Timeout
         } else {
             ApiError::QueryError(e.to_string())

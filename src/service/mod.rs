@@ -3,6 +3,7 @@ use chrono::{DateTime, Utc};
 use futures::TryStreamExt;
 use serde::Serialize;
 use std::time::Instant;
+use tokio_postgres::error::SqlState;
 use tokio_postgres::types::ToSql;
 
 use crate::db::Pool;
@@ -709,6 +710,11 @@ async fn run_pg_query(
             result
         }
         Ok(Err(e)) => {
+            // statement_timeout cancels surface as SQLSTATE 57014
+            // (query_canceled); reduce them to the deadline branch's marker.
+            if pg_db_error(&e).is_some_and(|db| db.code() == &SqlState::QUERY_CANCELED) {
+                return Err(anyhow!("Query timeout"));
+            }
             return Err(anyhow!(
                 "Query error: {}",
                 sanitize_db_error(&describe_query_error(&e))
@@ -858,13 +864,16 @@ pub fn format_column_string(row: &tokio_postgres::Row, idx: usize) -> String {
     }
 }
 
+/// The underlying PostgreSQL server error, if any.
+fn pg_db_error(e: &anyhow::Error) -> Option<&tokio_postgres::error::DbError> {
+    e.downcast_ref::<tokio_postgres::Error>()
+        .and_then(|e| e.as_db_error())
+}
+
 /// Expand an error to its most descriptive message. tokio-postgres `Display`
 /// flattens server errors to "db error"; the real message lives in `DbError`.
 fn describe_query_error(e: &anyhow::Error) -> String {
-    if let Some(db) = e
-        .downcast_ref::<tokio_postgres::Error>()
-        .and_then(|e| e.as_db_error())
-    {
+    if let Some(db) = pg_db_error(e) {
         return format!("{} ({})", db.message(), db.code().code());
     }
     format!("{e:#}")
