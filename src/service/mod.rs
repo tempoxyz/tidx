@@ -884,9 +884,14 @@ fn describe_query_error(e: &anyhow::Error) -> String {
 /// Removes file paths, internal schema details, and other sensitive info
 /// while preserving useful error context for debugging.
 fn sanitize_db_error(error: &str) -> String {
-    // Truncate very long errors
+    // Truncate very long errors on a char boundary (byte 500 may split a
+    // multi-byte character).
     let error = if error.len() > 500 {
-        format!("{}...", &error[..500])
+        let mut end = 500;
+        while !error.is_char_boundary(end) {
+            end -= 1;
+        }
+        format!("{}...", &error[..end])
     } else {
         error.to_string()
     };
@@ -1217,5 +1222,14 @@ mod tests {
         let sanitized = sanitize_db_error(&error);
         assert!(sanitized.len() < 510); // 500 + "..."
         assert!(sanitized.ends_with("..."));
+    }
+
+    #[test]
+    fn test_sanitize_truncates_multibyte_on_char_boundary() {
+        // 3-byte chars; byte 500 falls mid-character.
+        let error = "語".repeat(400);
+        let sanitized = sanitize_db_error(&error);
+        assert!(sanitized.ends_with("..."));
+        assert!(sanitized.trim_end_matches("...").chars().all(|c| c == '語'));
     }
 }
