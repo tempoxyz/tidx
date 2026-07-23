@@ -252,11 +252,10 @@ impl ClickHouseEngine {
         let resp = if let Some(timeout) = request_timeout {
             tokio::time::timeout(timeout, send)
                 .await
-                .map_err(|_| anyhow!("ClickHouse query execution cancelled by client"))?
-                .map_err(|e| anyhow!("ClickHouse HTTP request failed: {e}"))?
+                .map_err(|_| timeout_error(timeout))?
+                .map_err(|e| send_error(e, Some(timeout)))?
         } else {
-            send.await
-                .map_err(|e| anyhow!("ClickHouse HTTP request failed: {e}"))?
+            send.await.map_err(|e| send_error(e, None))?
         };
 
         if !resp.status().is_success() {
@@ -343,13 +342,38 @@ impl ClickHouseEngine {
 }
 
 fn clickhouse_request_timeout(timeout_ms: u64) -> std::time::Duration {
+    // Wide margin past the server's max_execution_time so its precise
+    // TIMEOUT_EXCEEDED error normally arrives before the client deadline.
     std::time::Duration::from_millis(
         timeout_ms
             .div_ceil(1000)
             .max(1)
             .saturating_mul(1000)
-            .saturating_add(100),
+            .saturating_add(1000),
     )
+}
+
+/// Error for a client-side deadline expiry: a slow query, not an
+/// unreachable instance.
+fn timeout_error(timeout: std::time::Duration) -> anyhow::Error {
+    anyhow!(
+        "ClickHouse request timed out after {}ms",
+        timeout.as_millis()
+    )
+}
+
+/// Wrap a reqwest send failure, keeping the typed source so
+/// [`is_connection_error`] can classify it precisely.
+fn send_error(e: reqwest::Error, timeout: Option<std::time::Duration>) -> anyhow::Error {
+    let msg = if e.is_timeout() {
+        match timeout {
+            Some(t) => format!("ClickHouse request timed out after {}ms", t.as_millis()),
+            None => "ClickHouse request timed out".to_string(),
+        }
+    } else {
+        format!("ClickHouse HTTP request failed: {e}")
+    };
+    anyhow::Error::new(e).context(msg)
 }
 
 async fn read_limited_response(mut resp: reqwest::Response) -> Result<String> {
@@ -372,18 +396,47 @@ async fn read_limited_response(mut resp: reqwest::Response) -> Result<String> {
     String::from_utf8(body).map_err(|e| anyhow!("ClickHouse response was not valid UTF-8: {e}"))
 }
 
-/// Returns true for errors that indicate the ClickHouse instance is unreachable
-/// (connection refused, timeout, DNS failure, etc.) — as opposed to query-level
-/// errors that would happen on any instance.
+/// Returns true for errors that indicate the ClickHouse instance is
+/// unreachable or unhealthy (connection refused, DNS failure, connection
+/// reset or closed before a response), as opposed to client timeouts or
+/// query-level errors that would happen on any instance.
 pub(crate) fn is_connection_error(err: &anyhow::Error) -> bool {
+    if let Some(e) = err.downcast_ref::<reqwest::Error>() {
+        if e.is_connect() {
+            return true;
+        }
+        return !e.is_timeout() && source_is_connection_reset(e);
+    }
     let msg = err.to_string();
-    msg.contains("HTTP request failed")
-        || msg.contains("connection refused")
+    msg.contains("connection refused")
         || msg.contains("Connection refused")
         || msg.contains("connect error")
         || msg.contains("dns error")
-        || msg.contains("timed out")
-        || msg.contains("hyper::Error")
+}
+
+/// Walks the source chain for an instance that accepted TCP but reset or
+/// closed the connection before responding.
+fn source_is_connection_reset(err: &(dyn std::error::Error + 'static)) -> bool {
+    let mut source = err.source();
+    while let Some(e) = source {
+        if let Some(io) = e.downcast_ref::<std::io::Error>()
+            && matches!(
+                io.kind(),
+                std::io::ErrorKind::ConnectionReset
+                    | std::io::ErrorKind::ConnectionAborted
+                    | std::io::ErrorKind::BrokenPipe
+            )
+        {
+            return true;
+        }
+        if let Some(h) = e.downcast_ref::<hyper::Error>()
+            && h.is_incomplete_message()
+        {
+            return true;
+        }
+        source = e.source();
+    }
+    false
 }
 
 /// Query result from ClickHouse.
@@ -411,19 +464,70 @@ mod tests {
             anyhow!("ClickHouse query failed: Code: 60. DB::Exception: Table logs doesn't exist");
         assert!(!is_connection_error(&query_err));
 
-        let timeout_err = anyhow!("ClickHouse query execution cancelled by client");
+        let timeout_err = timeout_error(std::time::Duration::from_secs(2));
         assert!(!is_connection_error(&timeout_err));
+    }
+
+    #[tokio::test]
+    async fn test_connect_failure_is_connection_error() {
+        // Port 9 (discard) is closed locally; a real refused connection.
+        let e = reqwest::Client::new()
+            .post("http://127.0.0.1:9/")
+            .send()
+            .await
+            .expect_err("connect must fail");
+        let err = send_error(e, None);
+        assert!(is_connection_error(&err), "got: {err:#}");
+    }
+
+    #[tokio::test]
+    async fn test_reset_connection_is_connection_error() {
+        // An instance that accepts TCP then closes before responding must
+        // still classify as a connection error so failover triggers.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                drop(stream);
+            }
+        });
+
+        let e = reqwest::Client::new()
+            .post(format!("http://{addr}/"))
+            .body("SELECT 1")
+            .send()
+            .await
+            .expect_err("send must fail");
+        let err = send_error(e, None);
+        assert!(is_connection_error(&err), "got: {err:#}");
+    }
+
+    #[test]
+    fn test_io_reset_in_source_chain_is_connection_reset() {
+        for kind in [
+            std::io::ErrorKind::ConnectionReset,
+            std::io::ErrorKind::ConnectionAborted,
+            std::io::ErrorKind::BrokenPipe,
+        ] {
+            let err = anyhow::Error::new(std::io::Error::from(kind))
+                .context("ClickHouse HTTP request failed");
+            assert!(source_is_connection_reset(err.as_ref()), "kind: {kind:?}");
+        }
+
+        let err = anyhow::Error::new(std::io::Error::from(std::io::ErrorKind::TimedOut))
+            .context("ClickHouse HTTP request failed");
+        assert!(!source_is_connection_reset(err.as_ref()));
     }
 
     #[test]
     fn test_clickhouse_request_timeout_exceeds_server_timeout() {
         assert_eq!(
             clickhouse_request_timeout(1_001),
-            std::time::Duration::from_millis(2_100)
+            std::time::Duration::from_secs(3)
         );
         assert_eq!(
             clickhouse_request_timeout(100),
-            std::time::Duration::from_millis(1_100)
+            std::time::Duration::from_secs(2)
         );
     }
 
@@ -546,6 +650,47 @@ mod tests {
         assert_eq!(
             url,
             "http://clickhouse-1:8123/?database=tidx_4217&default_format=JSON&max_result_bytes=10485760&result_overflow_mode=throw&union_default_mode=DISTINCT&max_execution_time=2"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_client_timeout_is_not_a_connection_error() {
+        let url =
+            std::env::var("CLICKHOUSE_URL").unwrap_or_else(|_| "http://localhost:8123".to_string());
+        let config = ClickHouseConfig {
+            enabled: true,
+            url,
+            failover_urls: vec![],
+            database: Some("default".to_string()),
+            ..Default::default()
+        };
+        let engine = ClickHouseEngine::new(&config, 4217).unwrap();
+
+        // Skip when ClickHouse is unavailable (e.g. CI's unit-test job runs
+        // without services); `make test` boots ClickHouse and runs the full
+        // suite, so integration runs still exercise this.
+        if engine.query("SELECT 1", &[]).await.is_err() {
+            println!("ClickHouse not available, skipping test");
+            return;
+        }
+
+        // The trailing setting overrides the server timeout to 30s, so the
+        // 2s client deadline reliably fires first (as when the server-side
+        // check overshoots in production).
+        let err = engine
+            .execute_prepared_query_with_settings(
+                "SELECT sleep(3)",
+                Some(1_000),
+                &[("max_execution_time", "30")],
+            )
+            .await
+            .expect_err("query must exceed the client deadline");
+
+        // A slow query is a timeout, not an unreachable instance; classifying
+        // it as a connection error burns failover retries.
+        assert!(
+            !is_connection_error(&err),
+            "client timeout misclassified as connection error: {err}"
         );
     }
 

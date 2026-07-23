@@ -26,6 +26,8 @@ async fn test_pg_upgrade_adds_missing_postgres_ddl() {
             r#"
             DROP TABLE IF EXISTS blocks CASCADE;
             DROP TABLE IF EXISTS logs CASCADE;
+            DROP TABLE IF EXISTS txs CASCADE;
+            DROP TABLE IF EXISTS receipts CASCADE;
 
             CREATE TABLE blocks (
                 num             INT8 NOT NULL,
@@ -56,6 +58,48 @@ async fn test_pg_upgrade_adds_missing_postgres_ddl() {
                 PRIMARY KEY (block_timestamp, block_num, log_idx)
             );
 
+            CREATE TABLE txs (
+                block_num               INT8 NOT NULL,
+                block_timestamp         TIMESTAMPTZ NOT NULL,
+                idx                     INT4 NOT NULL,
+                hash                    BYTEA NOT NULL,
+                type                    INT2 NOT NULL,
+                "from"                  BYTEA NOT NULL,
+                "to"                    BYTEA,
+                value                   TEXT NOT NULL,
+                input                   BYTEA NOT NULL,
+                gas_limit               INT8 NOT NULL,
+                max_fee_per_gas         TEXT NOT NULL,
+                max_priority_fee_per_gas TEXT NOT NULL,
+                gas_used                INT8,
+                nonce_key               BYTEA NOT NULL,
+                nonce                   INT8 NOT NULL,
+                fee_token               BYTEA,
+                fee_payer               BYTEA,
+                calls                   JSONB,
+                call_count              INT2 NOT NULL DEFAULT 1,
+                valid_before            INT8,
+                valid_after             INT8,
+                signature_type          INT2,
+                PRIMARY KEY (block_timestamp, block_num, idx)
+            );
+
+            CREATE TABLE receipts (
+                block_num               INT8 NOT NULL,
+                block_timestamp         TIMESTAMPTZ NOT NULL,
+                tx_idx                  INT4 NOT NULL,
+                tx_hash                 BYTEA NOT NULL,
+                "from"                  BYTEA NOT NULL,
+                "to"                    BYTEA,
+                contract_address        BYTEA,
+                gas_used                INT8 NOT NULL,
+                cumulative_gas_used     INT8 NOT NULL,
+                effective_gas_price     TEXT,
+                status                  INT2,
+                fee_payer               BYTEA,
+                PRIMARY KEY (block_timestamp, block_num, tx_idx)
+            );
+
             CREATE INDEX IF NOT EXISTS idx_logs_block_num ON logs (block_num DESC);
             CREATE INDEX IF NOT EXISTS idx_logs_tx_hash ON logs (tx_hash);
             CREATE INDEX IF NOT EXISTS idx_logs_selector ON logs (selector, block_timestamp DESC);
@@ -63,6 +107,8 @@ async fn test_pg_upgrade_adds_missing_postgres_ddl() {
             CREATE INDEX IF NOT EXISTS idx_logs_address_topic1 ON logs (topic1, address, block_num DESC);
             CREATE INDEX IF NOT EXISTS idx_logs_topic2 ON logs (topic2);
             CREATE INDEX IF NOT EXISTS idx_logs_topic3 ON logs (topic3);
+            CREATE INDEX IF NOT EXISTS idx_txs_from ON txs ("from", block_timestamp DESC);
+            CREATE INDEX IF NOT EXISTS idx_receipts_fee_payer ON receipts (fee_payer, block_timestamp DESC) WHERE fee_payer IS NOT NULL;
             "#,
         )
         .await
@@ -156,6 +202,9 @@ async fn test_pg_upgrade_adds_missing_postgres_ddl() {
                   AND indexname IN (
                     'idx_logs_address_topic0_block',
                     'idx_logs_selector_indexed_address',
+                    'idx_logs_selector_topic1_block',
+                    'idx_logs_selector_topic2_block',
+                    'idx_logs_selector_topic3_block',
                     'idx_logs_virtual_forward',
                     'idx_logs_tx_hash_virtual_forward'
                   )
@@ -174,8 +223,42 @@ async fn test_pg_upgrade_adds_missing_postgres_ddl() {
             vec![
                 "idx_logs_address_topic0_block".to_string(),
                 "idx_logs_selector_indexed_address".to_string(),
+                "idx_logs_selector_topic1_block".to_string(),
+                "idx_logs_selector_topic2_block".to_string(),
+                "idx_logs_selector_topic3_block".to_string(),
                 "idx_logs_tx_hash_virtual_forward".to_string(),
                 "idx_logs_virtual_forward".to_string(),
+            ]
+        );
+
+        let indexes: Vec<String> = conn
+            .query(
+                r#"
+                SELECT indexname
+                FROM pg_indexes
+                WHERE schemaname = 'public'
+                  AND tablename IN ('txs', 'receipts')
+                  AND indexname IN (
+                    'idx_txs_from_block',
+                    'idx_txs_fee_payer_block',
+                    'idx_receipts_fee_payer_block'
+                  )
+                ORDER BY indexname
+                "#,
+                &[],
+            )
+            .await
+            .expect("Failed to query indexes")
+            .into_iter()
+            .map(|r| r.get(0))
+            .collect();
+
+        assert_eq!(
+            indexes,
+            vec![
+                "idx_receipts_fee_payer_block".to_string(),
+                "idx_txs_fee_payer_block".to_string(),
+                "idx_txs_from_block".to_string(),
             ]
         );
     })
