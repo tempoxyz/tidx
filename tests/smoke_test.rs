@@ -1125,6 +1125,25 @@ async fn test_query_rejects_non_select() {
 
 #[tokio::test]
 #[serial(db)]
+async fn test_query_error_surfaces_pg_message() {
+    let db = TestDb::empty().await;
+    let opts = default_options();
+
+    let err = execute_query_postgres(&db.pool, "SELECT 1/0", &[], &opts)
+        .await
+        .expect_err("division by zero should fail");
+
+    // Query errors must surface the underlying PostgreSQL message; tokio-postgres
+    // Display flattens DbError to the literal "db error", hiding it.
+    let msg = err.to_string();
+    assert!(
+        msg.contains("division by zero"),
+        "expected PostgreSQL error message in query error, got: {msg:?}"
+    );
+}
+
+#[tokio::test]
+#[serial(db)]
 async fn test_query_rejects_forbidden_keywords() {
     let db = TestDb::new().await;
     let opts = default_options();
