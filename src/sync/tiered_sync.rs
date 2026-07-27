@@ -194,18 +194,15 @@ impl TieredSync {
             }
         }
 
-        // Descending arm: historical backfill toward genesis, skipping blocks
-        // already archived (a bootstrap can start below older coverage).
+        // Descending arm: historical backfill toward genesis. Replay every
+        // uncheckpointed range so an upgrade can heal a legacy write that
+        // committed blocks but only part of its child rows. The sink filters
+        // exact natural keys before writing.
         let end = backfill_num.saturating_sub(1);
         if end >= 1 {
             let ranges = descending_ranges(end, 1, self.batch_size, self.concurrency);
-            if let Some((new_low, hull_end)) = range_hull(&ranges) {
-                let present = ch.block_nums_in_range(new_low, hull_end).await?;
-                let missing = missing_ranges(new_low, hull_end, &present);
-                if !missing.is_empty() {
-                    let ranges = chunk_ranges(missing, self.batch_size);
-                    self.sync_ranges(ranges, WriteTarget::ClickHouse).await?;
-                }
+            if let Some((new_low, _)) = range_hull(&ranges) {
+                self.sync_ranges(ranges, WriteTarget::ClickHouse).await?;
                 save_archive_state(self.sinks.pool(), self.chain_id, new_low, state.tip_num)
                     .await?;
                 metrics::set_backfill_block(self.chain_id, "clickhouse_archive", new_low);

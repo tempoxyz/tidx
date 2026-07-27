@@ -18,7 +18,7 @@ use tidx::db::{self, ThrottledPool};
 use tidx::sync::ch_sink::ClickHouseSink;
 use tidx::sync::engine::SyncEngine;
 use tidx::sync::pruner::Pruner;
-use tidx::sync::sink::SinkSet;
+use tidx::sync::sink::{ClickHouseBackfillPlan, SinkSet};
 use tidx::sync::tiered_sync::TieredSync;
 
 const CLICKHOUSE_BACKFILL_RETRY_MAX_SECS: u64 = 10;
@@ -432,32 +432,62 @@ fn spawn_sync_engine(
             let backfill_chain_name = chain.name.clone();
             let backfill_chain_id = chain.chain_id;
             let derived_repair_sink = derived_repair_sink.clone();
-            tokio::spawn(async move {
-                let mut attempt: u32 = 0;
-                loop {
-                    match backfill_sinks.backfill_clickhouse(backfill_chain_id).await {
-                        Ok(()) => break,
-                        Err(e) => {
-                            attempt += 1;
-                            let delay_secs =
-                                retry_delay_secs(attempt, CLICKHOUSE_BACKFILL_RETRY_MAX_SECS);
-                            error!(
-                                error = %e,
-                                chain = %backfill_chain_name,
-                                attempt,
-                                retry_in_secs = delay_secs,
-                                "ClickHouse backfill failed, retrying"
-                            );
-                            tokio::time::sleep(std::time::Duration::from_secs(delay_secs)).await;
-                        }
+            let backfill_plan = loop {
+                match backfill_sinks
+                    .clickhouse_backfill_plan(backfill_chain_id)
+                    .await
+                {
+                    Ok(plan) => break plan,
+                    Err(e) => {
+                        error!(
+                            error = %e,
+                            chain = %backfill_chain_name,
+                            "Failed to snapshot ClickHouse backfill boundary, retrying"
+                        );
+                        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
                     }
                 }
+            };
+
+            if backfill_plan.complete_before_realtime {
+                info!(
+                    chain = %backfill_chain_name,
+                    upper_bound = ?backfill_plan.upper_bound,
+                    "Completing initial ClickHouse catch-up before realtime sync"
+                );
+                run_legacy_clickhouse_backfill(
+                    &backfill_sinks,
+                    &backfill_chain_name,
+                    backfill_chain_id,
+                    backfill_plan,
+                )
+                .await;
 
                 if let Some(derived_repair_sink) = derived_repair_sink {
-                    run_clickhouse_derived_repair_loop(derived_repair_sink, backfill_chain_name)
-                        .await;
+                    tokio::spawn(run_clickhouse_derived_repair_loop(
+                        derived_repair_sink,
+                        backfill_chain_name,
+                    ));
                 }
-            });
+            } else {
+                tokio::spawn(async move {
+                    run_legacy_clickhouse_backfill(
+                        &backfill_sinks,
+                        &backfill_chain_name,
+                        backfill_chain_id,
+                        backfill_plan,
+                    )
+                    .await;
+
+                    if let Some(derived_repair_sink) = derived_repair_sink {
+                        run_clickhouse_derived_repair_loop(
+                            derived_repair_sink,
+                            backfill_chain_name,
+                        )
+                        .await;
+                    }
+                });
+            }
         } else if let Some(derived_repair_sink) = derived_repair_sink {
             let chain_name = chain.name.clone();
             tokio::spawn(async move {
@@ -539,6 +569,32 @@ fn spawn_sync_engine(
 
 fn retry_delay_secs(attempt: u32, max_secs: u64) -> u64 {
     2u64.saturating_pow(attempt).min(max_secs)
+}
+
+async fn run_legacy_clickhouse_backfill(
+    sinks: &SinkSet,
+    chain_name: &str,
+    chain_id: u64,
+    plan: ClickHouseBackfillPlan,
+) {
+    let mut attempt: u32 = 0;
+    loop {
+        match sinks.run_clickhouse_startup_backfill(chain_id, plan).await {
+            Ok(()) => break,
+            Err(e) => {
+                attempt += 1;
+                let delay_secs = retry_delay_secs(attempt, CLICKHOUSE_BACKFILL_RETRY_MAX_SECS);
+                error!(
+                    error = %e,
+                    chain = %chain_name,
+                    attempt,
+                    retry_in_secs = delay_secs,
+                    "ClickHouse backfill failed, retrying"
+                );
+                tokio::time::sleep(std::time::Duration::from_secs(delay_secs)).await;
+            }
+        }
+    }
 }
 
 async fn run_clickhouse_derived_repair_loop(sink: ClickHouseSink, chain_name: String) {

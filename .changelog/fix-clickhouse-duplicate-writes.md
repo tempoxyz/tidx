@@ -2,4 +2,4 @@
 tidx: patch
 ---
 
-Fixed duplicate ClickHouse `ReplacingMergeTree` rows from concurrent writers, which surfaced as shifted `OFFSET` pages in `/query` results.
+Fixed duplicate or missing ClickHouse rows across retries, reorgs, partial writes, and startup backfills using canonical deduplication tokens, exact-key repair, and durable handoffs.

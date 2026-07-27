@@ -727,6 +727,58 @@ async fn test_query_user_union_with_trailing_order_by() {
     assert_eq!(nums, [3, 2]);
 }
 
+/// Hoisting a bare set operation must normalize relation-qualified ordering
+/// references because the relations are inside the derived table.
+#[tokio::test]
+#[serial(clickhouse)]
+async fn test_query_user_union_with_qualified_trailing_order_by() {
+    let ch = TestClickHouse::new("tidx_repro_union_ch_qualified")
+        .await
+        .expect("Failed to create ClickHouse client");
+
+    if ch.wait_for_ready().await.is_err() {
+        println!("ClickHouse not available, skipping test");
+        return;
+    }
+
+    ch.reset_database().await.expect("Failed to reset database");
+    ch.create_mock_blocks_table()
+        .await
+        .expect("Failed to create blocks table");
+    ch.query("INSERT INTO blocks (num, hash) VALUES (1, '0x01'), (2, '0x02'), (3, '0x03')")
+        .await
+        .expect("Failed to insert blocks");
+
+    let config = ClickHouseConfig {
+        enabled: true,
+        url: ch.url.clone(),
+        database: Some(ch.database.clone()),
+        ..Default::default()
+    };
+    let engine = ClickHouseEngine::new(&config, 4217).expect("Failed to create engine");
+
+    let sql = "SELECT b.num AS height FROM blocks AS b WHERE b.num <= 2 \
+               UNION ALL \
+               SELECT b.num AS height FROM blocks AS b WHERE b.num >= 2 \
+               ORDER BY b.num DESC LIMIT 3";
+    let result = engine
+        .query_user(sql, &[], 5_000, 100)
+        .await
+        .expect("qualified union ordering should execute");
+
+    let nums: Vec<i64> = result
+        .rows
+        .iter()
+        .map(|row| {
+            row[0]
+                .as_i64()
+                .or_else(|| row[0].as_str().and_then(|s| s.parse().ok()))
+                .expect("numeric num")
+        })
+        .collect();
+    assert_eq!(nums, [3, 2, 2]);
+}
+
 /// Same shape with the whole set expression parenthesized:
 /// `(a UNION b) ORDER BY ...`. ClickHouse rejects trailing clauses after a
 /// parenthesized set query too, so the hoist must unwrap it.
@@ -1989,6 +2041,59 @@ async fn test_sink_reorg_reinsert_correctness() {
     );
 }
 
+/// A reorg can replace a block while leaving its transactions, logs, and
+/// receipts byte-for-byte identical. Those child rows must survive replay.
+#[tokio::test]
+#[serial(clickhouse)]
+async fn test_sink_reorg_replays_identical_child_rows() {
+    let Some((_pool, sinks, _ch_sink, ch)) = setup_backfill().await else {
+        return;
+    };
+
+    let original_block = make_block(8);
+    let tx = make_tx(8, 0);
+    let log = make_log(8, 0);
+    let receipt = make_receipt(8, 0);
+    sinks
+        .write_all(
+            std::slice::from_ref(&original_block),
+            std::slice::from_ref(&tx),
+            std::slice::from_ref(&log),
+            std::slice::from_ref(&receipt),
+        )
+        .await
+        .expect("initial batch failed");
+
+    sinks.delete_from(8).await.expect("reorg delete failed");
+    for table in ["blocks", "txs", "logs", "receipts"] {
+        assert_eq!(
+            ch.table_count(table).await.unwrap(),
+            0,
+            "{table} should be empty after the reorg delete"
+        );
+    }
+
+    let mut canonical_block = original_block;
+    canonical_block.hash = vec![0xff; 32];
+    sinks
+        .write_all(
+            std::slice::from_ref(&canonical_block),
+            std::slice::from_ref(&tx),
+            std::slice::from_ref(&log),
+            std::slice::from_ref(&receipt),
+        )
+        .await
+        .expect("canonical replay failed");
+
+    for table in ["blocks", "txs", "logs", "receipts"] {
+        assert_eq!(
+            ch.table_count(table).await.unwrap(),
+            1,
+            "{table} should contain the canonical replay"
+        );
+    }
+}
+
 #[tokio::test]
 #[serial(clickhouse)]
 async fn test_sink_hex_encoding() {
@@ -2478,12 +2583,22 @@ async fn test_backfill_pg_to_empty_clickhouse() {
         .await
         .expect("PG write_receipts failed");
 
+    let plan = sinks
+        .clickhouse_backfill_plan(TEST_CHAIN_ID)
+        .await
+        .expect("backfill plan failed");
+    assert_eq!(plan.upper_bound, Some(10));
+    assert!(
+        plan.complete_before_realtime,
+        "legacy rows without sync state need an ordered startup catch-up"
+    );
+
     // Verify PG has data, CH is empty
     assert_eq!(ch.table_count("blocks").await.unwrap(), 0);
 
-    // Run backfill
+    // Run the ordered startup catch-up and establish the first durable tip.
     sinks
-        .backfill_clickhouse(TEST_CHAIN_ID)
+        .run_clickhouse_startup_backfill(TEST_CHAIN_ID, plan)
         .await
         .expect("backfill failed");
 
@@ -2492,6 +2607,62 @@ async fn test_backfill_pg_to_empty_clickhouse() {
     assert_eq!(ch.table_count("txs").await.unwrap(), 20);
     assert_eq!(ch.table_count("logs").await.unwrap(), 30);
     assert_eq!(ch.table_count("receipts").await.unwrap(), 20);
+    let state = writer::load_sync_state(&pool, TEST_CHAIN_ID)
+        .await
+        .unwrap()
+        .expect("startup catch-up should establish sync state");
+    assert_eq!(
+        state.tip_num, 10,
+        "realtime must resume after the copied PostgreSQL range"
+    );
+}
+
+/// A zero-valued sync row has no durable dual-write handoff either. Preserve
+/// the legacy PG catch-up, but require it to complete before realtime starts.
+#[tokio::test]
+#[serial(clickhouse)]
+async fn test_backfill_plan_serializes_zero_tip_legacy_rows() {
+    let Some((pool, sinks, _ch_sink, ch)) = setup_backfill().await else {
+        return;
+    };
+
+    let blocks: Vec<BlockRow> = (1..=3).map(make_block).collect();
+    writer::write_blocks(&pool, &blocks).await.unwrap();
+    writer::update_tip_num(&pool, TEST_CHAIN_ID, 0, 0)
+        .await
+        .unwrap();
+
+    let plan = sinks
+        .clickhouse_backfill_plan(TEST_CHAIN_ID)
+        .await
+        .expect("backfill plan failed");
+    assert_eq!(plan.upper_bound, Some(3));
+    assert!(plan.complete_before_realtime);
+
+    let pg_only = SinkSet::new(pool.clone());
+    pg_only
+        .run_clickhouse_startup_backfill(TEST_CHAIN_ID, plan)
+        .await
+        .unwrap();
+    let state = writer::load_sync_state(&pool, TEST_CHAIN_ID)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        state.tip_num, 0,
+        "startup handoff must not advance without an active ClickHouse sink"
+    );
+
+    sinks
+        .run_clickhouse_startup_backfill(TEST_CHAIN_ID, plan)
+        .await
+        .unwrap();
+    assert_eq!(ch.table_count("blocks").await.unwrap(), 3);
+    let state = writer::load_sync_state(&pool, TEST_CHAIN_ID)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(state.tip_num, 3);
 }
 
 #[tokio::test]
@@ -2565,6 +2736,37 @@ async fn test_backfill_restart_does_not_duplicate_present_blocks() {
         .await
         .expect("backfill rerun failed");
     assert_eq!(ch.table_count("blocks").await.unwrap(), 5001);
+}
+
+/// A failed chunk can leave only some rows for a block in a child table.
+/// Backfill must filter by the full natural key, not skip the whole block.
+#[tokio::test]
+#[serial(clickhouse)]
+async fn test_backfill_repairs_partial_child_table_blocks() {
+    let Some((pool, sinks, ch_sink, ch)) = setup_backfill().await else {
+        return;
+    };
+
+    let blocks = vec![make_block(1)];
+    let txs: Vec<_> = (0..2).map(|idx| make_tx(1, idx)).collect();
+    let logs: Vec<_> = (0..2).map(|idx| make_log(1, idx)).collect();
+    let receipts: Vec<_> = (0..2).map(|idx| make_receipt(1, idx)).collect();
+
+    writer::write_blocks(&pool, &blocks).await.unwrap();
+    writer::write_txs(&pool, &txs).await.unwrap();
+    writer::write_logs(&pool, &logs).await.unwrap();
+    writer::write_receipts(&pool, &receipts).await.unwrap();
+
+    ch_sink.write_txs(&txs[..1]).await.unwrap();
+    ch_sink.write_logs(&logs[..1]).await.unwrap();
+    ch_sink.write_receipts(&receipts[..1]).await.unwrap();
+
+    sinks.backfill_clickhouse(TEST_CHAIN_ID).await.unwrap();
+
+    assert_eq!(ch.table_count("blocks").await.unwrap(), 1);
+    assert_eq!(ch.table_count("txs").await.unwrap(), 2);
+    assert_eq!(ch.table_count("logs").await.unwrap(), 2);
+    assert_eq!(ch.table_count("receipts").await.unwrap(), 2);
 }
 
 /// Backfill should resume from the persisted PG cursor.
@@ -2655,6 +2857,46 @@ async fn test_backfill_noop_when_pg_empty() {
         .expect("backfill failed");
 
     assert_eq!(ch.table_count("blocks").await.unwrap(), 0);
+}
+
+/// The startup snapshot must not copy a PostgreSQL-first realtime commit
+/// beyond the last block durably acknowledged by both sinks.
+#[tokio::test]
+#[serial(clickhouse)]
+async fn test_backfill_stops_at_durable_sync_tip() {
+    let Some((pool, sinks, _ch_sink, ch)) = setup_backfill().await else {
+        return;
+    };
+
+    let blocks: Vec<BlockRow> = (1..=3).map(make_block).collect();
+    writer::write_blocks(&pool, &blocks).await.unwrap();
+    writer::update_tip_num(&pool, TEST_CHAIN_ID, 2, 3)
+        .await
+        .unwrap();
+
+    let plan = sinks
+        .clickhouse_backfill_plan(TEST_CHAIN_ID)
+        .await
+        .expect("backfill plan failed");
+    assert_eq!(plan.upper_bound, Some(2));
+    assert!(
+        !plan.complete_before_realtime,
+        "a positive durable tip is a non-overlapping realtime handoff"
+    );
+
+    sinks.backfill_clickhouse(TEST_CHAIN_ID).await.unwrap();
+
+    let result = ch
+        .query_json("SELECT num FROM blocks ORDER BY num")
+        .await
+        .unwrap();
+    let nums: Vec<_> = result["data"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|row| row["num"].as_i64().unwrap())
+        .collect();
+    assert_eq!(nums, vec![1, 2]);
 }
 
 /// If CH is partially populated but the cursor was never advanced, backfill
