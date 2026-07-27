@@ -382,7 +382,7 @@ async fn read_limited_response(mut resp: reqwest::Response) -> Result<String> {
     while let Some(chunk) = resp
         .chunk()
         .await
-        .map_err(|e| anyhow!("Failed to read response: {e}"))?
+        .map_err(|e| anyhow::Error::new(e).context("Failed to read response"))?
     {
         if body.len().saturating_add(chunk.len()) > MAX_QUERY_RESULT_BYTES {
             return Err(anyhow!(
@@ -396,47 +396,17 @@ async fn read_limited_response(mut resp: reqwest::Response) -> Result<String> {
     String::from_utf8(body).map_err(|e| anyhow!("ClickHouse response was not valid UTF-8: {e}"))
 }
 
-/// Returns true for errors that indicate the ClickHouse instance is
-/// unreachable or unhealthy (connection refused, DNS failure, connection
-/// reset or closed before a response), as opposed to client timeouts or
-/// query-level errors that would happen on any instance.
+/// Returns true for instance-specific transport failures, but not client
+/// timeouts or query-level errors that would recur on another instance.
 pub(crate) fn is_connection_error(err: &anyhow::Error) -> bool {
     if let Some(e) = err.downcast_ref::<reqwest::Error>() {
-        if e.is_connect() {
-            return true;
-        }
-        return !e.is_timeout() && source_is_connection_reset(e);
+        return e.is_connect() || !e.is_timeout();
     }
     let msg = err.to_string();
     msg.contains("connection refused")
         || msg.contains("Connection refused")
         || msg.contains("connect error")
         || msg.contains("dns error")
-}
-
-/// Walks the source chain for an instance that accepted TCP but reset or
-/// closed the connection before responding.
-fn source_is_connection_reset(err: &(dyn std::error::Error + 'static)) -> bool {
-    let mut source = err.source();
-    while let Some(e) = source {
-        if let Some(io) = e.downcast_ref::<std::io::Error>()
-            && matches!(
-                io.kind(),
-                std::io::ErrorKind::ConnectionReset
-                    | std::io::ErrorKind::ConnectionAborted
-                    | std::io::ErrorKind::BrokenPipe
-            )
-        {
-            return true;
-        }
-        if let Some(h) = e.downcast_ref::<hyper::Error>()
-            && h.is_incomplete_message()
-        {
-            return true;
-        }
-        source = e.source();
-    }
-    false
 }
 
 /// Query result from ClickHouse.
@@ -454,6 +424,43 @@ pub struct QueryResult {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    async fn read_request(stream: &mut tokio::net::TcpStream) {
+        let mut request = Vec::new();
+        let mut buf = [0; 1024];
+        loop {
+            let read = stream.read(&mut buf).await.unwrap();
+            if read == 0 {
+                return;
+            }
+            request.extend_from_slice(&buf[..read]);
+
+            let Some(header_end) = request.windows(4).position(|w| w == b"\r\n\r\n") else {
+                continue;
+            };
+            let headers = String::from_utf8_lossy(&request[..header_end]);
+            let content_length = headers
+                .lines()
+                .find_map(|line| {
+                    let (name, value) = line.split_once(':')?;
+                    name.eq_ignore_ascii_case("content-length")
+                        .then(|| value.trim().parse::<usize>().ok())
+                        .flatten()
+                })
+                .unwrap_or(0);
+            if request.len() >= header_end + 4 + content_length {
+                return;
+            }
+        }
+    }
+
+    async fn serve_once(listener: tokio::net::TcpListener, response: Vec<u8>) {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        read_request(&mut stream).await;
+        stream.write_all(&response).await.unwrap();
+        stream.shutdown().await.unwrap();
+    }
 
     #[test]
     fn test_is_connection_error() {
@@ -470,9 +477,13 @@ mod tests {
 
     #[tokio::test]
     async fn test_connect_failure_is_connection_error() {
-        // Port 9 (discard) is closed locally; a real refused connection.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener);
+
         let e = reqwest::Client::new()
-            .post("http://127.0.0.1:9/")
+            .post(format!("http://{addr}/"))
+            .timeout(std::time::Duration::from_secs(1))
             .send()
             .await
             .expect_err("connect must fail");
@@ -482,14 +493,11 @@ mod tests {
 
     #[tokio::test]
     async fn test_reset_connection_is_connection_error() {
-        // An instance that accepts TCP then closes before responding must
-        // still classify as a connection error so failover triggers.
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move {
-            while let Ok((stream, _)) = listener.accept().await {
-                drop(stream);
-            }
+            let (stream, _) = listener.accept().await.unwrap();
+            drop(stream);
         });
 
         let e = reqwest::Client::new()
@@ -502,21 +510,77 @@ mod tests {
         assert!(is_connection_error(&err), "got: {err:#}");
     }
 
-    #[test]
-    fn test_io_reset_in_source_chain_is_connection_reset() {
-        for kind in [
-            std::io::ErrorKind::ConnectionReset,
-            std::io::ErrorKind::ConnectionAborted,
-            std::io::ErrorKind::BrokenPipe,
-        ] {
-            let err = anyhow::Error::new(std::io::Error::from(kind))
-                .context("ClickHouse HTTP request failed");
-            assert!(source_is_connection_reset(err.as_ref()), "kind: {kind:?}");
-        }
+    #[tokio::test]
+    async fn test_malformed_response_fails_over() {
+        let primary = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let primary_url = format!("http://{}", primary.local_addr().unwrap());
+        let primary_task = tokio::spawn(serve_once(primary, b"HTTP/1.1 nope\r\n\r\n".to_vec()));
 
-        let err = anyhow::Error::new(std::io::Error::from(std::io::ErrorKind::TimedOut))
-            .context("ClickHouse HTTP request failed");
-        assert!(!source_is_connection_reset(err.as_ref()));
+        let secondary = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let secondary_url = format!("http://{}", secondary.local_addr().unwrap());
+        let body = r#"{"meta":[{"name":"n","type":"UInt8"}],"data":[{"n":1}],"rows":1}"#;
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        let secondary_task = tokio::spawn(serve_once(secondary, response.into_bytes()));
+
+        let config = ClickHouseConfig {
+            enabled: true,
+            url: primary_url,
+            failover_urls: vec![secondary_url.clone()],
+            database: Some("default".to_string()),
+            ..Default::default()
+        };
+        let engine = ClickHouseEngine::new(&config, 4217).unwrap();
+        let result = engine.query("SELECT 1 AS n", &[]).await.unwrap();
+
+        assert_eq!(result.rows, vec![vec![serde_json::json!(1)]]);
+        assert_eq!(engine.active_url(), secondary_url);
+        primary_task.await.unwrap();
+        secondary_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_truncated_response_body_fails_over() {
+        let primary = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let primary_url = format!("http://{}", primary.local_addr().unwrap());
+        let primary_task = tokio::spawn(async move {
+            let (mut stream, _) = primary.accept().await.unwrap();
+            read_request(&mut stream).await;
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
+                      Content-Length: 1024\r\nConnection: close\r\n\r\n{\"meta\":",
+                )
+                .await
+                .unwrap();
+            stream.shutdown().await.unwrap();
+        });
+
+        let secondary = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let secondary_url = format!("http://{}", secondary.local_addr().unwrap());
+        let body = r#"{"meta":[{"name":"n","type":"UInt8"}],"data":[{"n":1}],"rows":1}"#;
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        let secondary_task = tokio::spawn(serve_once(secondary, response.into_bytes()));
+
+        let config = ClickHouseConfig {
+            enabled: true,
+            url: primary_url,
+            failover_urls: vec![secondary_url.clone()],
+            database: Some("default".to_string()),
+            ..Default::default()
+        };
+        let engine = ClickHouseEngine::new(&config, 4217).unwrap();
+        let result = engine.query("SELECT 1 AS n", &[]).await.unwrap();
+
+        assert_eq!(result.rows, vec![vec![serde_json::json!(1)]]);
+        assert_eq!(engine.active_url(), secondary_url);
+        primary_task.await.unwrap();
+        secondary_task.await.unwrap();
     }
 
     #[test]
