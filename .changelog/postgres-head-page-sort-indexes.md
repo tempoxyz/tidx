@@ -2,4 +2,4 @@
 tidx: patch
 ---
 
-Added PostgreSQL indexes serving head-page block ordering for sender, fee payer, and indexed-address lookups.
+Added PostgreSQL head-page indexes for sender, fee payer, and indexed-address lookups, built concurrently per partition with interrupted-build recovery.

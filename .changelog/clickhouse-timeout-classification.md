@@ -2,4 +2,4 @@
 tidx: patch
 ---
 
-Fixed ClickHouse error classification: client timeouts no longer burn failover retries, while connections reset or closed before a response still trigger failover.
+Fixed ClickHouse failover classification so client timeouts stop immediately while non-timeout transport and protocol failures try a healthy secondary.

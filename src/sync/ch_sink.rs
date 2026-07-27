@@ -489,11 +489,29 @@ impl ClickHouseSink {
     }
 
     pub async fn write_blocks(&self, blocks: &[BlockRow]) -> Result<()> {
+        self.write_blocks_with_deduplication_seed(blocks, None)
+            .await
+    }
+
+    pub(crate) async fn write_blocks_deduplicated(
+        &self,
+        blocks: &[BlockRow],
+        seed: &str,
+    ) -> Result<()> {
+        self.write_blocks_with_deduplication_seed(blocks, Some(seed))
+            .await
+    }
+
+    async fn write_blocks_with_deduplication_seed(
+        &self,
+        blocks: &[BlockRow],
+        seed: Option<&str>,
+    ) -> Result<()> {
         if blocks.is_empty() {
             return Ok(());
         }
         let start = Instant::now();
-        self.insert_chunked("blocks", blocks, ChBlockWire::from_row)
+        self.insert_chunked("blocks", blocks, ChBlockWire::from_row, seed)
             .await?;
         metrics::record_sink_write_duration(self.name(), "blocks", start.elapsed());
         metrics::record_sink_write_rows(self.name(), "blocks", blocks.len() as u64);
@@ -506,11 +524,25 @@ impl ClickHouseSink {
     }
 
     pub async fn write_txs(&self, txs: &[TxRow]) -> Result<()> {
+        self.write_txs_with_deduplication_seed(txs, None).await
+    }
+
+    pub(crate) async fn write_txs_deduplicated(&self, txs: &[TxRow], seed: &str) -> Result<()> {
+        self.write_txs_with_deduplication_seed(txs, Some(seed))
+            .await
+    }
+
+    async fn write_txs_with_deduplication_seed(
+        &self,
+        txs: &[TxRow],
+        seed: Option<&str>,
+    ) -> Result<()> {
         if txs.is_empty() {
             return Ok(());
         }
         let start = Instant::now();
-        self.insert_chunked("txs", txs, ChTxWire::from_row).await?;
+        self.insert_chunked("txs", txs, ChTxWire::from_row, seed)
+            .await?;
         metrics::record_sink_write_duration(self.name(), "txs", start.elapsed());
         metrics::record_sink_write_rows(self.name(), "txs", txs.len() as u64);
         metrics::increment_sink_row_count(self.name(), "txs", txs.len() as u64);
@@ -521,11 +553,24 @@ impl ClickHouseSink {
     }
 
     pub async fn write_logs(&self, logs: &[LogRow]) -> Result<()> {
+        self.write_logs_with_deduplication_seed(logs, None).await
+    }
+
+    pub(crate) async fn write_logs_deduplicated(&self, logs: &[LogRow], seed: &str) -> Result<()> {
+        self.write_logs_with_deduplication_seed(logs, Some(seed))
+            .await
+    }
+
+    async fn write_logs_with_deduplication_seed(
+        &self,
+        logs: &[LogRow],
+        seed: Option<&str>,
+    ) -> Result<()> {
         if logs.is_empty() {
             return Ok(());
         }
         let start = Instant::now();
-        self.insert_chunked("logs", logs, ChLogWire::from_row)
+        self.insert_chunked("logs", logs, ChLogWire::from_row, seed)
             .await?;
         metrics::record_sink_write_duration(self.name(), "logs", start.elapsed());
         metrics::record_sink_write_rows(self.name(), "logs", logs.len() as u64);
@@ -537,11 +582,29 @@ impl ClickHouseSink {
     }
 
     pub async fn write_receipts(&self, receipts: &[ReceiptRow]) -> Result<()> {
+        self.write_receipts_with_deduplication_seed(receipts, None)
+            .await
+    }
+
+    pub(crate) async fn write_receipts_deduplicated(
+        &self,
+        receipts: &[ReceiptRow],
+        seed: &str,
+    ) -> Result<()> {
+        self.write_receipts_with_deduplication_seed(receipts, Some(seed))
+            .await
+    }
+
+    async fn write_receipts_with_deduplication_seed(
+        &self,
+        receipts: &[ReceiptRow],
+        seed: Option<&str>,
+    ) -> Result<()> {
         if receipts.is_empty() {
             return Ok(());
         }
         let start = Instant::now();
-        self.insert_chunked("receipts", receipts, ChReceiptWire::from_row)
+        self.insert_chunked("receipts", receipts, ChReceiptWire::from_row, seed)
             .await?;
         metrics::record_sink_write_duration(self.name(), "receipts", start.elapsed());
         metrics::record_sink_write_rows(self.name(), "receipts", receipts.len() as u64);
@@ -672,6 +735,41 @@ impl ClickHouseSink {
             .await
             .map_err(|e| anyhow!("ClickHouse query failed: {e}"))?;
         Ok(nums.into_iter().map(|n| n.max(0) as u64).collect())
+    }
+
+    /// Natural row keys present in a child table within `[from, to]`.
+    ///
+    /// Backfill retries use these keys instead of block-level presence because
+    /// a chunked insert can commit only part of a high-throughput block.
+    pub(crate) async fn row_keys_in_table_range(
+        &self,
+        table: &str,
+        from: u64,
+        to: u64,
+    ) -> Result<Vec<(i64, i32)>> {
+        if from > to {
+            return Ok(Vec::new());
+        }
+        let table = validate_table_name(table)?;
+        let position_col = match table {
+            "txs" => "idx",
+            "logs" => "log_idx",
+            "receipts" => "tx_idx",
+            _ => return Err(anyhow!("ClickHouse table has no child row key: {table}")),
+        };
+        let rows: Vec<ChRowKey> = self
+            .client
+            .query(&format!(
+                "SELECT block_num, {position_col} AS row_idx FROM {table} \
+                 WHERE block_num >= {from} AND block_num <= {to}"
+            ))
+            .fetch_all()
+            .await
+            .map_err(|e| anyhow!("ClickHouse query failed: {e}"))?;
+        Ok(rows
+            .into_iter()
+            .map(|row| (row.block_num, row.row_idx))
+            .collect())
     }
 
     /// Query the highest block number in ClickHouse, or None if empty.
@@ -891,13 +989,29 @@ impl ClickHouseSink {
     /// Chunk source rows, convert each chunk to wire format, and insert with retry logic.
     /// This avoids allocating the full wire-format vec upfront, bounding peak memory
     /// to `CH_INSERT_CHUNK_SIZE` wire structs at a time.
-    async fn insert_chunked<S, W, F>(&self, table: &str, rows: &[S], convert: F) -> Result<()>
+    async fn insert_chunked<S, W, F>(
+        &self,
+        table: &str,
+        rows: &[S],
+        convert: F,
+        deduplication_seed: Option<&str>,
+    ) -> Result<()>
     where
-        W: Serialize + for<'a> Row<Value<'a> = W>,
+        W: Hash + Serialize + for<'a> Row<Value<'a> = W>,
         F: Fn(&S) -> W,
     {
-        for chunk in rows.chunks(CH_INSERT_CHUNK_SIZE) {
+        for (chunk_index, chunk) in rows.chunks(CH_INSERT_CHUNK_SIZE).enumerate() {
             let wire: Vec<W> = chunk.iter().map(&convert).collect();
+            // Retries reuse a token, while a reorg's replacement block hash
+            // gives otherwise identical child rows a new token.
+            let deduplication_token = deduplication_seed.map(|seed| {
+                let mut hasher = DefaultHasher::new();
+                seed.hash(&mut hasher);
+                table.hash(&mut hasher);
+                chunk_index.hash(&mut hasher);
+                wire.hash(&mut hasher);
+                format!("tidx-{:016x}", hasher.finish())
+            });
             let mut last_error = None;
             for attempt in 0..CH_MAX_RETRIES {
                 if attempt > 0 {
@@ -905,7 +1019,10 @@ impl ClickHouseSink {
                     warn!(table, attempt, "ClickHouse insert retry after {backoff:?}");
                     tokio::time::sleep(backoff).await;
                 }
-                match self.try_insert(table, &wire).await {
+                match self
+                    .try_insert(table, &wire, deduplication_token.as_deref())
+                    .await
+                {
                     Ok(()) => {
                         last_error = None;
                         break;
@@ -924,7 +1041,12 @@ impl ClickHouseSink {
         Ok(())
     }
 
-    async fn try_insert<T>(&self, table: &str, rows: &[T]) -> Result<()>
+    async fn try_insert<T>(
+        &self,
+        table: &str,
+        rows: &[T],
+        deduplication_token: Option<&str>,
+    ) -> Result<()>
     where
         T: Serialize + for<'a> Row<Value<'a> = T>,
     {
@@ -933,6 +1055,9 @@ impl ClickHouseSink {
             .insert::<T>(table)
             .await?
             .with_timeouts(Some(CH_SEND_TIMEOUT), Some(CH_END_TIMEOUT));
+        if let Some(token) = deduplication_token {
+            insert = insert.with_option("insert_deduplication_token", token);
+        }
         for row in rows {
             insert.write(row).await?;
         }
@@ -952,7 +1077,13 @@ struct ChSchemaObjectRow {
     checksum: String,
 }
 
-#[derive(Row, Serialize, Deserialize)]
+#[derive(Row, Deserialize)]
+struct ChRowKey {
+    block_num: i64,
+    row_idx: i32,
+}
+
+#[derive(Hash, Row, Serialize, Deserialize)]
 struct ChBlockWire {
     num: i64,
     hash: String,
@@ -1002,7 +1133,7 @@ impl ChBlockWire {
     }
 }
 
-#[derive(Row, Serialize, Deserialize)]
+#[derive(Hash, Row, Serialize, Deserialize)]
 struct ChTxWire {
     block_num: i64,
     #[serde(with = "clickhouse::serde::chrono::datetime64::millis")]
@@ -1093,7 +1224,7 @@ impl ChTxWire {
     }
 }
 
-#[derive(Row, Serialize, Deserialize)]
+#[derive(Hash, Row, Serialize, Deserialize)]
 struct ChLogWire {
     block_num: i64,
     #[serde(with = "clickhouse::serde::chrono::datetime64::millis")]
@@ -1157,7 +1288,7 @@ impl ChLogWire {
     }
 }
 
-#[derive(Row, Serialize, Deserialize)]
+#[derive(Hash, Row, Serialize, Deserialize)]
 struct ChReceiptWire {
     block_num: i64,
     #[serde(with = "clickhouse::serde::chrono::datetime64::millis")]

@@ -14,13 +14,15 @@ use serial_test::serial;
 use tidx::clickhouse::ClickHouseEngine;
 use tidx::config::ClickHouseConfig;
 use tidx::db::run_migrations;
+use tidx::query::EventSignature;
 use tidx::service::{QueryOptions, execute_query_tiered};
 use tidx::sync::ch_sink::ClickHouseSink;
-use tidx::sync::writer::set_hot_boundary;
+use tidx::sync::writer::{set_hot_boundary, write_logs};
 use tidx::types::{BlockRow, LogRow};
 
 const CHAIN_ID: u64 = 999;
 const CH_DB: &str = "tidx_repro_tiered_hot_arm";
+const STRING_EVENT: &str = "TokenCreated(string name)";
 
 fn make_log(block_num: i64, ts: chrono::DateTime<Utc>, selector: Option<Vec<u8>>) -> LogRow {
     LogRow {
@@ -49,9 +51,9 @@ fn make_block(num: i64, ts: chrono::DateTime<Utc>) -> BlockRow {
     }
 }
 
-/// Seeds ClickHouse with blocks 1..=20, sets the hot boundary at block 10,
-/// and drops the hot PostgreSQL table. Returns None when CH is unavailable.
-async fn setup_broken_hot_arm() -> Option<(TestClickHouse, TestDb, ClickHouseEngine)> {
+/// Seeds ClickHouse with blocks 1..=20 and sets the hot boundary at block 10.
+/// Returns None when ClickHouse is unavailable.
+async fn setup_tiered_store() -> Option<(TestClickHouse, TestDb, ClickHouseEngine)> {
     let ch = TestClickHouse::new(CH_DB).await.expect("CH client");
     if ch.wait_for_ready().await.is_err() {
         println!("ClickHouse not available, skipping test");
@@ -81,13 +83,6 @@ async fn setup_broken_hot_arm() -> Option<(TestClickHouse, TestDb, ClickHouseEng
     .await
     .expect("set boundary");
 
-    // Break only the hot PostgreSQL arm; ClickHouse can still serve the query.
-    let conn = db.pool.get().await.expect("conn");
-    conn.execute("DROP TABLE blocks CASCADE", &[])
-        .await
-        .expect("drop hot table");
-    drop(conn);
-
     let engine = ClickHouseEngine::new(
         &ClickHouseConfig {
             enabled: true,
@@ -98,6 +93,20 @@ async fn setup_broken_hot_arm() -> Option<(TestClickHouse, TestDb, ClickHouseEng
         CHAIN_ID,
     )
     .expect("CH engine");
+
+    Some((ch, db, engine))
+}
+
+/// Sets up tiered storage, then removes the hot PostgreSQL blocks table.
+async fn setup_broken_hot_arm() -> Option<(TestClickHouse, TestDb, ClickHouseEngine)> {
+    let (ch, db, engine) = setup_tiered_store().await?;
+
+    // Break only the hot PostgreSQL arm; ClickHouse can still serve the query.
+    let conn = db.pool.get().await.expect("conn");
+    conn.execute("DROP TABLE blocks CASCADE", &[])
+        .await
+        .expect("drop hot table");
+    drop(conn);
 
     Some((ch, db, engine))
 }
@@ -174,6 +183,63 @@ async fn test_asc_split_falls_back_to_clickhouse_when_hot_arm_fails() {
         "ascending page must come from the full ClickHouse history"
     );
     assert_eq!(result.engine.as_deref(), Some("tiered"));
+}
+
+fn malformed_abi_string_data() -> Vec<u8> {
+    let mut data = vec![0; 96];
+    data[31] = 32; // offset to the dynamic string payload
+    data[63] = 1; // one-byte string
+    data[64] = 0xff; // invalid UTF-8
+    data
+}
+
+/// PostgreSQL decoding errors carry the user-visible query semantics. They
+/// must surface instead of degrading to ClickHouse, which replaces bad UTF-8.
+#[tokio::test]
+#[serial(db)]
+async fn test_split_surfaces_hot_postgres_abi_decode_error() {
+    let Some((ch, db, engine)) = setup_tiered_store().await else {
+        return;
+    };
+
+    let signature = EventSignature::parse(STRING_EVENT).expect("event signature");
+    let mut log = make_log(20, Utc::now(), Some(signature.topic0.to_vec()));
+    log.data = malformed_abi_string_data();
+
+    let sink = ClickHouseSink::new(&ch.url, CH_DB, None, None).expect("CH sink");
+    sink.write_logs(std::slice::from_ref(&log))
+        .await
+        .expect("CH log");
+    write_logs(&db.pool, std::slice::from_ref(&log))
+        .await
+        .expect("PG log");
+
+    let sql = "SELECT block_num, name FROM TokenCreated ORDER BY block_num DESC LIMIT 1";
+    let cold = engine
+        .query_user(sql, &[STRING_EVENT], 10_000, 100)
+        .await
+        .expect("ClickHouse accepts malformed UTF-8 bytes");
+    assert_eq!(cold.row_count, 1);
+
+    let err = execute_query_tiered(
+        &db.pool,
+        Some(&engine),
+        CHAIN_ID,
+        sql,
+        &[STRING_EVENT],
+        &QueryOptions {
+            timeout_ms: 10_000,
+            limit: 100,
+        },
+    )
+    .await
+    .expect_err("PostgreSQL ABI decoding error must surface");
+
+    let message = err.to_string();
+    assert!(
+        message.contains("invalid byte sequence") && message.contains("22021"),
+        "expected PostgreSQL UTF-8 decoding error, got: {message:?}"
+    );
 }
 
 /// A degraded logs query must keep PostgreSQL's NULL-selector representation:
