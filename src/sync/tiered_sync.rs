@@ -96,13 +96,14 @@ impl TieredSync {
             chain_id = self.chain_id,
             "ClickHouse archive backfill starting"
         );
+        let mut prev_missing: Vec<(u64, u64)> = Vec::new();
         loop {
             tokio::select! {
                 _ = shutdown.recv() => {
                     info!(chain_id = self.chain_id, "ClickHouse archive backfill shutting down");
                     return;
                 }
-                result = self.tick_archive() => {
+                result = self.tick_archive(&mut prev_missing) => {
                     match result {
                         Ok(true) => {}
                         Ok(false) => tokio::time::sleep(Duration::from_secs(2)).await,
@@ -116,43 +117,94 @@ impl TieredSync {
         }
     }
 
-    async fn tick_archive(&self) -> Result<bool> {
+    /// Advance the archive interval without racing realtime.
+    ///
+    /// Realtime commits every batch to ClickHouse before advancing `tip_num`,
+    /// so the interval extends over already-archived blocks by verifying
+    /// presence; only proven holes (an era indexed while the ClickHouse sink
+    /// was down) are refetched from RPC. Writing blocks realtime also writes
+    /// duplicates ReplacingMergeTree rows until a background merge collapses
+    /// them.
+    async fn tick_archive(&self, prev_missing: &mut Vec<(u64, u64)>) -> Result<bool> {
+        let Some(ch) = self.sinks.clickhouse() else {
+            return Ok(false);
+        };
         let head = self.rpc.latest_block_number().await?;
         let mut state = load_archive_state(self.sinks.pool(), self.chain_id).await?;
-        let fresh_archive = state.backfill_num.is_none();
+        let realtime_tip = load_sync_state(self.sinks.pool(), self.chain_id)
+            .await?
+            .map(|s| s.tip_num)
+            .unwrap_or(0);
+        let watermark = realtime_tip.min(head);
         let mut progressed = false;
 
-        // Repair any interval opened while the process was offline. Realtime
-        // writes may already have inserted some of these rows; CH inserts are
-        // idempotent and the archive watermark advances only after the whole
-        // adjacent window succeeds.
-        if let Some(backfill_num) = state.backfill_num
-            && state.tip_num < head
-        {
-            let ranges = ascending_ranges(
-                state.tip_num.saturating_add(1).max(1),
-                head,
-                self.batch_size,
-                self.concurrency,
-            );
-            if let Some((_, new_tip)) = range_hull(&ranges) {
-                self.sync_ranges(ranges, WriteTarget::ClickHouse).await?;
-                save_archive_state(self.sinks.pool(), self.chain_id, backfill_num, new_tip).await?;
-                state.tip_num = new_tip;
-                progressed = true;
+        // A fresh archive starts at the realtime watermark and grows in both
+        // directions; starting at the chain head would race realtime.
+        if state.backfill_num.is_none() {
+            if watermark == 0 {
+                return Ok(false);
+            }
+            if ch
+                .block_nums_in_range(watermark, watermark)
+                .await?
+                .is_empty()
+            {
+                self.sync_ranges(vec![(watermark, watermark)], WriteTarget::ClickHouse)
+                    .await?;
+            }
+            save_archive_state(self.sinks.pool(), self.chain_id, watermark, watermark).await?;
+            state.backfill_num = Some(watermark);
+            state.tip_num = watermark;
+            progressed = true;
+        }
+        let backfill_num = state
+            .backfill_num
+            .expect("archive interval initialized above");
+
+        // Ascending arm: follow realtime toward the watermark. Blocks above
+        // the watermark are realtime's to write.
+        if state.tip_num < watermark {
+            let cap = self
+                .batch_size
+                .saturating_mul(self.concurrency as u64)
+                .max(1);
+            let from = state.tip_num + 1;
+            let window_end = watermark.min(state.tip_num.saturating_add(cap));
+            let present = ch.block_nums_in_range(from, window_end).await?;
+            let missing = missing_ranges(from, window_end, &present);
+            if missing.is_empty() {
+                save_archive_state(self.sinks.pool(), self.chain_id, backfill_num, window_end)
+                    .await?;
+                state.tip_num = window_end;
+                prev_missing.clear();
+                // A full-cap advance means the arm is still catching up; once
+                // it tracks realtime it can idle between ticks.
+                progressed = window_end < watermark;
+            } else {
+                // A hole seen on two consecutive ticks is real; a single
+                // sighting is usually a reorg rewrite in flight, so wait for
+                // realtime instead of racing it.
+                let confirmed = intersect_ranges(&missing, prev_missing);
+                *prev_missing = missing;
+                if !confirmed.is_empty() {
+                    let ranges = chunk_ranges(confirmed, self.batch_size);
+                    self.sync_ranges(ranges, WriteTarget::ClickHouse).await?;
+                    progressed = true;
+                }
             }
         }
 
-        let end = state
-            .backfill_num
-            .map(|low| low.saturating_sub(1))
-            .unwrap_or(head);
+        // Descending arm: historical backfill toward genesis. Replay every
+        // uncheckpointed range so an upgrade can heal a legacy write that
+        // committed blocks but only part of its child rows. The sink filters
+        // exact natural keys before writing.
+        let end = backfill_num.saturating_sub(1);
         if end >= 1 {
             let ranges = descending_ranges(end, 1, self.batch_size, self.concurrency);
             if let Some((new_low, _)) = range_hull(&ranges) {
                 self.sync_ranges(ranges, WriteTarget::ClickHouse).await?;
-                let archive_tip = if fresh_archive { head } else { state.tip_num };
-                save_archive_state(self.sinks.pool(), self.chain_id, new_low, archive_tip).await?;
+                save_archive_state(self.sinks.pool(), self.chain_id, new_low, state.tip_num)
+                    .await?;
                 metrics::set_backfill_block(self.chain_id, "clickhouse_archive", new_low);
                 metrics::set_backfill_remaining(
                     self.chain_id,
@@ -163,7 +215,8 @@ impl TieredSync {
                 if new_low == 1 {
                     info!(
                         chain_id = self.chain_id,
-                        archive_tip, "ClickHouse archive backfill reached genesis"
+                        archive_tip = state.tip_num,
+                        "ClickHouse archive backfill reached genesis"
                     );
                 }
             }
@@ -377,22 +430,56 @@ fn descending_ranges(mut end: u64, floor: u64, batch_size: u64, limit: usize) ->
     ranges
 }
 
-fn ascending_ranges(
-    mut start: u64,
-    ceiling: u64,
-    batch_size: u64,
-    limit: usize,
-) -> Vec<(u64, u64)> {
+/// Sub-ranges of `[from, to]` absent from `present` (sorted ascending).
+fn missing_ranges(from: u64, to: u64, present: &[u64]) -> Vec<(u64, u64)> {
     let mut ranges = Vec::new();
-    while start <= ceiling && ranges.len() < limit {
-        let end = start.saturating_add(batch_size - 1).min(ceiling);
-        ranges.push((start, end));
-        if end == ceiling {
+    let mut cursor = from;
+    for &num in present {
+        if num < cursor {
+            continue;
+        }
+        if num > to {
             break;
         }
-        start = end + 1;
+        if num > cursor {
+            ranges.push((cursor, num - 1));
+        }
+        cursor = num + 1;
+    }
+    if cursor <= to {
+        ranges.push((cursor, to));
     }
     ranges
+}
+
+/// Intersection of two sorted, disjoint range lists.
+fn intersect_ranges(a: &[(u64, u64)], b: &[(u64, u64)]) -> Vec<(u64, u64)> {
+    let (mut i, mut j) = (0, 0);
+    let mut out = Vec::new();
+    while i < a.len() && j < b.len() {
+        let start = a[i].0.max(b[j].0);
+        let end = a[i].1.min(b[j].1);
+        if start <= end {
+            out.push((start, end));
+        }
+        if a[i].1 < b[j].1 { i += 1 } else { j += 1 }
+    }
+    out
+}
+
+/// Split ranges into chunks of at most `batch_size` blocks.
+fn chunk_ranges(ranges: Vec<(u64, u64)>, batch_size: u64) -> Vec<(u64, u64)> {
+    let batch = batch_size.max(1);
+    let mut out = Vec::new();
+    for (start, end) in ranges {
+        let mut from = start;
+        while from <= end {
+            let to = from.saturating_add(batch - 1).min(end);
+            out.push((from, to));
+            from = to + 1;
+        }
+    }
+    out
 }
 
 fn newest_gap_ranges(gaps: &[(u64, u64)], batch_size: u64, limit: usize) -> Vec<(u64, u64)> {
@@ -448,10 +535,37 @@ mod tests {
             descending_ranges(100, 1, 10, 3),
             vec![(91, 100), (81, 90), (71, 80)]
         );
+    }
+
+    #[test]
+    fn missing_ranges_complement_present_blocks() {
+        assert_eq!(missing_ranges(1, 10, &[]), vec![(1, 10)]);
+        assert_eq!(missing_ranges(1, 10, &(1..=10).collect::<Vec<_>>()), vec![]);
         assert_eq!(
-            ascending_ranges(1, 100, 10, 3),
-            vec![(1, 10), (11, 20), (21, 30)]
+            missing_ranges(1, 10, &[1, 2, 5, 6, 9]),
+            vec![(3, 4), (7, 8), (10, 10)]
         );
+        // Out-of-window numbers are ignored.
+        assert_eq!(missing_ranges(5, 6, &[1, 5, 6, 9]), vec![]);
+    }
+
+    #[test]
+    fn intersect_ranges_keeps_overlap_only() {
+        assert_eq!(
+            intersect_ranges(&[(1, 5), (8, 12)], &[(3, 9)]),
+            vec![(3, 5), (8, 9)]
+        );
+        assert_eq!(intersect_ranges(&[(1, 5)], &[]), vec![]);
+        assert_eq!(intersect_ranges(&[(1, 2)], &[(3, 4)]), vec![]);
+    }
+
+    #[test]
+    fn chunk_ranges_bounds_batch_size() {
+        assert_eq!(
+            chunk_ranges(vec![(1, 25)], 10),
+            vec![(1, 10), (11, 20), (21, 25)]
+        );
+        assert_eq!(chunk_ranges(vec![(5, 5), (7, 8)], 10), vec![(5, 5), (7, 8)]);
     }
 
     #[test]

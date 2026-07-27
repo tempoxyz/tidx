@@ -189,6 +189,12 @@ mod tests {
             "token_approvals",
             "token_approvals_current",
             "token_approvals_mv",
+            "balance_dirty_keys",
+            "balance_dirty_keys_mv",
+            "balance_reorg_keys",
+            "balance_state",
+            "balance_state_clean_mv",
+            "balance_state_refresh",
         ] {
             assert!(!is_known_table(name), "{name} should be removed");
             assert!(!is_public_query_table(name), "{name} should not be public");
@@ -214,6 +220,14 @@ mod tests {
                 "DROP TABLE IF EXISTS address_txs SYNC",
                 "DROP VIEW IF EXISTS contract_creations_mv SYNC",
                 "DROP TABLE IF EXISTS contract_creations SYNC",
+                "DROP VIEW IF EXISTS balance_state_refresh SYNC",
+                "DROP VIEW IF EXISTS balance_state_clean_mv SYNC",
+                "DROP VIEW IF EXISTS balance_dirty_keys_mv SYNC",
+                "DROP TABLE IF EXISTS balance_state SYNC",
+                "DROP TABLE IF EXISTS balance_reorg_keys SYNC",
+                "DROP TABLE IF EXISTS balance_dirty_keys SYNC",
+                "ALTER TABLE tidx_schema_objects\n    DELETE WHERE name = \
+                 'balance_state_20260714_bootstrap'\n    SETTINGS mutations_sync = 1",
             ]
         );
     }
@@ -229,6 +243,25 @@ mod tests {
                     "{} depends on unknown object {}",
                     object.name,
                     dependency
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn refresh_dependencies_use_clickhouse_25_8_compatible_schedule() {
+        for object in derived_objects() {
+            let ddl = object.ddl();
+            if ddl.contains("DEPENDS ON") {
+                assert!(
+                    ddl.contains("REFRESH EVERY"),
+                    "{} uses DEPENDS ON without REFRESH EVERY",
+                    object.name
+                );
+                assert!(
+                    !ddl.contains("REFRESH AFTER"),
+                    "{} uses unsupported REFRESH AFTER with DEPENDS ON",
+                    object.name
                 );
             }
         }
@@ -252,6 +285,30 @@ mod tests {
             }
             seen.push(object.name);
         }
+    }
+
+    #[test]
+    fn logs_block_range_index_is_created_and_materialized() {
+        let logs = base_objects()
+            .iter()
+            .find(|object| object.name == "logs")
+            .expect("logs table should be registered")
+            .ddl();
+        assert!(logs.contains("INDEX idx_block_num block_num TYPE minmax GRANULARITY 1"));
+
+        let add = migrations()
+            .iter()
+            .find(|object| object.name == "logs_20260714_block_num_index")
+            .expect("logs block number index migration should be registered")
+            .ddl();
+        assert!(add.contains("ADD INDEX IF NOT EXISTS idx_block_num"));
+
+        let materialize = migrations()
+            .iter()
+            .find(|object| object.name == "logs_20260714_materialize_block_num_index")
+            .expect("logs block number index materialization should be registered")
+            .ddl();
+        assert!(materialize.contains("MATERIALIZE INDEX idx_block_num"));
     }
 
     #[test]

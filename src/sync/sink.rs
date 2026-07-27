@@ -1,5 +1,7 @@
 use anyhow::Result;
 use chrono::{DateTime, Utc};
+use sha3::{Digest, Keccak256};
+use std::collections::HashSet;
 use tracing::info;
 
 use crate::db::Pool;
@@ -25,6 +27,14 @@ pub(crate) enum WriteTarget {
 /// Number of blocks worth of data to fetch per query during backfill.
 /// Uses block-range pagination (no long-lived transactions).
 const BACKFILL_BLOCK_BATCH: i64 = 5_000;
+
+/// Startup snapshot for the legacy PostgreSQL-to-ClickHouse backfill.
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ClickHouseBackfillPlan {
+    pub upper_bound: Option<i64>,
+    pub complete_before_realtime: bool,
+}
 
 /// Fan-out writer that sends data to all configured sinks.
 ///
@@ -59,6 +69,11 @@ impl SinkSet {
     /// Whether a ClickHouse sink is active.
     pub fn has_clickhouse(&self) -> bool {
         self.ch.is_some()
+    }
+
+    /// Access the ClickHouse sink, if configured.
+    pub(crate) fn clickhouse(&self) -> Option<&ClickHouseSink> {
+        self.ch.as_ref()
     }
 
     /// Forget cached partition coverage (call after partitions are dropped).
@@ -171,8 +186,17 @@ impl SinkSet {
         logs: &[LogRow],
         receipts: &[ReceiptRow],
     ) -> Result<()> {
-        self.write_all_to(blocks, txs, logs, receipts, None, WriteTarget::ClickHouse)
-            .await
+        let ch = self.ch.as_ref().ok_or_else(|| {
+            anyhow::anyhow!("ClickHouse archive backfill requested without an active sink")
+        })?;
+        let (mut blocks, mut txs, mut logs, mut receipts) = (
+            blocks.to_vec(),
+            txs.to_vec(),
+            logs.to_vec(),
+            receipts.to_vec(),
+        );
+        filter_clickhouse_rows(ch, &mut blocks, &mut txs, &mut logs, &mut receipts).await?;
+        write_clickhouse_batch(ch, &blocks, &txs, &logs, &receipts).await
     }
 
     /// Hydrate a PostgreSQL block range from the canonical ClickHouse archive.
@@ -298,15 +322,71 @@ impl SinkSet {
     /// block range. The cursor advances only after all tables succeed for that range.
     /// Tables use ReplacingMergeTree so re-inserts after a crash are safe.
     pub async fn backfill_clickhouse(&self, chain_id: u64) -> Result<()> {
+        let plan = self.clickhouse_backfill_plan(chain_id).await?;
+        self.backfill_clickhouse_through(chain_id, plan.upper_bound)
+            .await
+    }
+
+    /// Plan the startup catch-up against a stable PostgreSQL snapshot.
+    ///
+    /// `tip_num` advances only after both realtime sinks complete, so capping
+    /// the legacy PG→CH backfill there prevents it from racing a PG-first
+    /// realtime commit. Legacy databases with no positive tip still need all
+    /// existing PostgreSQL rows copied, but that first copy must finish before
+    /// realtime starts because no non-overlapping handoff point exists yet.
+    #[doc(hidden)]
+    pub async fn clickhouse_backfill_plan(&self, chain_id: u64) -> Result<ClickHouseBackfillPlan> {
+        let (pg_max, tip_num) = pg_backfill_snapshot(&self.pool, chain_id).await?;
+        let Some(pg_max) = pg_max else {
+            return Ok(ClickHouseBackfillPlan {
+                upper_bound: None,
+                complete_before_realtime: false,
+            });
+        };
+        let durable_tip = tip_num.filter(|tip| *tip > 0);
+        Ok(ClickHouseBackfillPlan {
+            upper_bound: Some(durable_tip.map_or(pg_max, |tip| pg_max.min(tip))),
+            complete_before_realtime: durable_tip.is_none(),
+        })
+    }
+
+    /// Execute a startup plan and establish its realtime handoff when needed.
+    ///
+    /// For an absent or zero tip, the PostgreSQL maximum becomes durable only
+    /// after the bounded copy finishes. Advancing `tip_num` at that point makes
+    /// the realtime engine start after the copied range instead of replaying it.
+    #[doc(hidden)]
+    pub async fn run_clickhouse_startup_backfill(
+        &self,
+        chain_id: u64,
+        plan: ClickHouseBackfillPlan,
+    ) -> Result<()> {
+        if self.ch.is_none() {
+            return Ok(());
+        }
+        self.backfill_clickhouse_through(chain_id, plan.upper_bound)
+            .await?;
+        if plan.complete_before_realtime
+            && let Some(tip_num) = plan.upper_bound.filter(|tip| *tip > 0)
+        {
+            writer::update_tip_num(&self.pool, chain_id, tip_num as u64, tip_num as u64).await?;
+        }
+        Ok(())
+    }
+
+    #[doc(hidden)]
+    pub async fn backfill_clickhouse_through(
+        &self,
+        chain_id: u64,
+        upper_bound: Option<i64>,
+    ) -> Result<()> {
         let ch = match &self.ch {
             Some(ch) => ch,
             None => return Ok(()),
         };
-
-        let pg_max = pg_max_block_num(&self.pool).await?;
-        let pg_max = match pg_max {
+        let pg_max = match upper_bound {
             Some(n) => n,
-            None => return Ok(()), // PG is empty, nothing to backfill
+            None => return Ok(()),
         };
 
         // Load persisted cursor from PG (survives restarts)
@@ -350,13 +430,16 @@ impl SinkSet {
             Some((batch_end, data))
         };
 
-        while let Some((batch_end, (blocks, txs, logs, mut receipts))) = pending.take() {
+        while let Some((batch_end, (mut blocks, mut txs, mut logs, mut receipts))) = pending.take()
+        {
             let block_count = blocks.len() as i64;
 
             // Postgres receipts lack the denormalized tx-level type/fee_token;
             // populate them from txs so the ClickHouse mirror matches the
             // live-sync path before writing.
             super::decoder::enrich_receipts_from_txs(&mut receipts, &txs);
+
+            filter_clickhouse_rows(ch, &mut blocks, &mut txs, &mut logs, &mut receipts).await?;
 
             // Pipeline: fetch next batch from PG while writing current batch to CH
             let next_fetch = async {
@@ -374,40 +457,9 @@ impl SinkSet {
                 Ok::<_, anyhow::Error>(Some((next_end, data)))
             };
 
-            let ch_write = async {
-                tokio::try_join!(
-                    async {
-                        if !blocks.is_empty() {
-                            ch.write_blocks(&blocks).await
-                        } else {
-                            Ok(())
-                        }
-                    },
-                    async {
-                        if !txs.is_empty() {
-                            ch.write_txs(&txs).await
-                        } else {
-                            Ok(())
-                        }
-                    },
-                    async {
-                        if !logs.is_empty() {
-                            ch.write_logs(&logs).await
-                        } else {
-                            Ok(())
-                        }
-                    },
-                    async {
-                        if !receipts.is_empty() {
-                            ch.write_receipts(&receipts).await
-                        } else {
-                            Ok(())
-                        }
-                    },
-                )
-            };
+            let ch_write = write_clickhouse_batch(ch, &blocks, &txs, &logs, &receipts);
 
-            let (next_data, _) = tokio::try_join!(next_fetch, ch_write)?;
+            let (next_data, ()) = tokio::try_join!(next_fetch, ch_write)?;
 
             // Advance cursor only after all tables written successfully
             save_ch_backfill_cursor(&self.pool, chain_id, batch_end).await?;
@@ -458,20 +510,92 @@ async fn write_clickhouse_batch(
     logs: &[LogRow],
     receipts: &[ReceiptRow],
 ) -> Result<()> {
-    tokio::try_join!(
-        ch.write_blocks(blocks),
-        ch.write_txs(txs),
-        ch.write_logs(logs),
-        ch.write_receipts(receipts),
+    // Children first, blocks last: a block row in ClickHouse then proves the
+    // whole batch landed, keeping block presence checks sound when a write
+    // fails partway.
+    if let Some(seed) = clickhouse_batch_deduplication_seed(blocks) {
+        tokio::try_join!(
+            ch.write_txs_deduplicated(txs, &seed),
+            ch.write_logs_deduplicated(logs, &seed),
+            ch.write_receipts_deduplicated(receipts, &seed),
+        )?;
+        ch.write_blocks_deduplicated(blocks, &seed).await
+    } else {
+        tokio::try_join!(
+            ch.write_txs(txs),
+            ch.write_logs(logs),
+            ch.write_receipts(receipts),
+        )?;
+        ch.write_blocks(blocks).await
+    }
+}
+
+fn clickhouse_batch_deduplication_seed(blocks: &[BlockRow]) -> Option<String> {
+    if blocks.is_empty() {
+        return None;
+    }
+    let mut hasher = Keccak256::new();
+    for block in blocks {
+        hasher.update(block.num.to_le_bytes());
+        hasher.update(&block.hash);
+    }
+    Some(hex::encode(hasher.finalize()))
+}
+
+async fn filter_clickhouse_rows(
+    ch: &ClickHouseSink,
+    blocks: &mut Vec<BlockRow>,
+    txs: &mut Vec<TxRow>,
+    logs: &mut Vec<LogRow>,
+    receipts: &mut Vec<ReceiptRow>,
+) -> Result<()> {
+    let range = blocks
+        .iter()
+        .map(|row| row.num)
+        .chain(txs.iter().map(|row| row.block_num))
+        .chain(logs.iter().map(|row| row.block_num))
+        .chain(receipts.iter().map(|row| row.block_num))
+        .fold(None, |range, num| match range {
+            None => Some((num, num)),
+            Some((lo, hi)) => Some((lo.min(num), hi.max(num))),
+        });
+    let Some((lo, hi)) = range else {
+        return Ok(());
+    };
+    let (lo, hi) = (lo.max(0) as u64, hi.max(0) as u64);
+    let (in_blocks, in_txs, in_logs, in_receipts) = tokio::try_join!(
+        ch.block_nums_in_table_range("blocks", lo, hi),
+        ch.row_keys_in_table_range("txs", lo, hi),
+        ch.row_keys_in_table_range("logs", lo, hi),
+        ch.row_keys_in_table_range("receipts", lo, hi),
     )?;
+    let in_blocks = in_blocks
+        .into_iter()
+        .map(|num| num as i64)
+        .collect::<HashSet<_>>();
+    let in_txs = in_txs.into_iter().collect::<HashSet<_>>();
+    let in_logs = in_logs.into_iter().collect::<HashSet<_>>();
+    let in_receipts = in_receipts.into_iter().collect::<HashSet<_>>();
+
+    blocks.retain(|row| !in_blocks.contains(&row.num));
+    txs.retain(|row| !in_txs.contains(&(row.block_num, row.idx)));
+    logs.retain(|row| !in_logs.contains(&(row.block_num, row.log_idx)));
+    receipts.retain(|row| !in_receipts.contains(&(row.block_num, row.tx_idx)));
     Ok(())
 }
 
-/// Get the max block number in PostgreSQL, or None if empty.
-async fn pg_max_block_num(pool: &Pool) -> Result<Option<i64>> {
+/// Read the source high-water mark and durable dual-write tip together.
+async fn pg_backfill_snapshot(pool: &Pool, chain_id: u64) -> Result<(Option<i64>, Option<i64>)> {
     let conn = pool.get().await?;
-    let row = conn.query_one("SELECT MAX(num) FROM blocks", &[]).await?;
-    Ok(row.get::<_, Option<i64>>(0))
+    let row = conn
+        .query_one(
+            "SELECT
+                (SELECT MAX(num) FROM blocks),
+                (SELECT tip_num FROM sync_state WHERE chain_id = $1)",
+            &[&(chain_id as i64)],
+        )
+        .await?;
+    Ok((row.get(0), row.get(1)))
 }
 
 /// Load the CH backfill cursor for a chain. Returns 0 if no row exists.

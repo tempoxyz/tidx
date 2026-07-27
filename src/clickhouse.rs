@@ -14,7 +14,7 @@ use tracing::{error, warn};
 use crate::config::ClickHouseConfig;
 use crate::query::{
     HARD_LIMIT_MAX, apply_event_signature_ctes_clickhouse, convert_timestamp_literals_clickhouse,
-    validate_clickhouse_query,
+    hoist_set_operation_order_by_clickhouse, validate_clickhouse_query,
 };
 
 const MAX_QUERY_RESULT_BYTES: usize = 10 * 1024 * 1024;
@@ -125,6 +125,7 @@ impl ClickHouseEngine {
     ) -> Result<QueryResult> {
         let sql = Self::prepare_query(sql, signatures)?;
         validate_clickhouse_query(&sql)?;
+        let sql = hoist_set_operation_order_by_clickhouse(&sql);
         let sql = Self::wrap_user_query_with_limit(&sql, limit.clamp(1, HARD_LIMIT_MAX));
         self.execute_prepared_query_with_settings(&sql, Some(timeout_ms), settings)
             .await
@@ -251,11 +252,10 @@ impl ClickHouseEngine {
         let resp = if let Some(timeout) = request_timeout {
             tokio::time::timeout(timeout, send)
                 .await
-                .map_err(|_| anyhow!("ClickHouse query execution cancelled by client"))?
-                .map_err(|e| anyhow!("ClickHouse HTTP request failed: {e}"))?
+                .map_err(|_| timeout_error(timeout))?
+                .map_err(|e| send_error(e, Some(timeout)))?
         } else {
-            send.await
-                .map_err(|e| anyhow!("ClickHouse HTTP request failed: {e}"))?
+            send.await.map_err(|e| send_error(e, None))?
         };
 
         if !resp.status().is_success() {
@@ -342,13 +342,38 @@ impl ClickHouseEngine {
 }
 
 fn clickhouse_request_timeout(timeout_ms: u64) -> std::time::Duration {
+    // Wide margin past the server's max_execution_time so its precise
+    // TIMEOUT_EXCEEDED error normally arrives before the client deadline.
     std::time::Duration::from_millis(
         timeout_ms
             .div_ceil(1000)
             .max(1)
             .saturating_mul(1000)
-            .saturating_add(100),
+            .saturating_add(1000),
     )
+}
+
+/// Error for a client-side deadline expiry: a slow query, not an
+/// unreachable instance.
+fn timeout_error(timeout: std::time::Duration) -> anyhow::Error {
+    anyhow!(
+        "ClickHouse request timed out after {}ms",
+        timeout.as_millis()
+    )
+}
+
+/// Wrap a reqwest send failure, keeping the typed source so
+/// [`is_connection_error`] can classify it precisely.
+fn send_error(e: reqwest::Error, timeout: Option<std::time::Duration>) -> anyhow::Error {
+    let msg = if e.is_timeout() {
+        match timeout {
+            Some(t) => format!("ClickHouse request timed out after {}ms", t.as_millis()),
+            None => "ClickHouse request timed out".to_string(),
+        }
+    } else {
+        format!("ClickHouse HTTP request failed: {e}")
+    };
+    anyhow::Error::new(e).context(msg)
 }
 
 async fn read_limited_response(mut resp: reqwest::Response) -> Result<String> {
@@ -357,7 +382,7 @@ async fn read_limited_response(mut resp: reqwest::Response) -> Result<String> {
     while let Some(chunk) = resp
         .chunk()
         .await
-        .map_err(|e| anyhow!("Failed to read response: {e}"))?
+        .map_err(|e| anyhow::Error::new(e).context("Failed to read response"))?
     {
         if body.len().saturating_add(chunk.len()) > MAX_QUERY_RESULT_BYTES {
             return Err(anyhow!(
@@ -371,18 +396,17 @@ async fn read_limited_response(mut resp: reqwest::Response) -> Result<String> {
     String::from_utf8(body).map_err(|e| anyhow!("ClickHouse response was not valid UTF-8: {e}"))
 }
 
-/// Returns true for errors that indicate the ClickHouse instance is unreachable
-/// (connection refused, timeout, DNS failure, etc.) — as opposed to query-level
-/// errors that would happen on any instance.
+/// Returns true for instance-specific transport failures, but not client
+/// timeouts or query-level errors that would recur on another instance.
 pub(crate) fn is_connection_error(err: &anyhow::Error) -> bool {
+    if let Some(e) = err.downcast_ref::<reqwest::Error>() {
+        return e.is_connect() || !e.is_timeout();
+    }
     let msg = err.to_string();
-    msg.contains("HTTP request failed")
-        || msg.contains("connection refused")
+    msg.contains("connection refused")
         || msg.contains("Connection refused")
         || msg.contains("connect error")
         || msg.contains("dns error")
-        || msg.contains("timed out")
-        || msg.contains("hyper::Error")
 }
 
 /// Query result from ClickHouse.
@@ -400,6 +424,43 @@ pub struct QueryResult {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    async fn read_request(stream: &mut tokio::net::TcpStream) {
+        let mut request = Vec::new();
+        let mut buf = [0; 1024];
+        loop {
+            let read = stream.read(&mut buf).await.unwrap();
+            if read == 0 {
+                return;
+            }
+            request.extend_from_slice(&buf[..read]);
+
+            let Some(header_end) = request.windows(4).position(|w| w == b"\r\n\r\n") else {
+                continue;
+            };
+            let headers = String::from_utf8_lossy(&request[..header_end]);
+            let content_length = headers
+                .lines()
+                .find_map(|line| {
+                    let (name, value) = line.split_once(':')?;
+                    name.eq_ignore_ascii_case("content-length")
+                        .then(|| value.trim().parse::<usize>().ok())
+                        .flatten()
+                })
+                .unwrap_or(0);
+            if request.len() >= header_end + 4 + content_length {
+                return;
+            }
+        }
+    }
+
+    async fn serve_once(listener: tokio::net::TcpListener, response: Vec<u8>) {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        read_request(&mut stream).await;
+        stream.write_all(&response).await.unwrap();
+        stream.shutdown().await.unwrap();
+    }
 
     #[test]
     fn test_is_connection_error() {
@@ -410,19 +471,127 @@ mod tests {
             anyhow!("ClickHouse query failed: Code: 60. DB::Exception: Table logs doesn't exist");
         assert!(!is_connection_error(&query_err));
 
-        let timeout_err = anyhow!("ClickHouse query execution cancelled by client");
+        let timeout_err = timeout_error(std::time::Duration::from_secs(2));
         assert!(!is_connection_error(&timeout_err));
+    }
+
+    #[tokio::test]
+    async fn test_connect_failure_is_connection_error() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener);
+
+        let e = reqwest::Client::new()
+            .post(format!("http://{addr}/"))
+            .timeout(std::time::Duration::from_secs(1))
+            .send()
+            .await
+            .expect_err("connect must fail");
+        let err = send_error(e, None);
+        assert!(is_connection_error(&err), "got: {err:#}");
+    }
+
+    #[tokio::test]
+    async fn test_reset_connection_is_connection_error() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            drop(stream);
+        });
+
+        let e = reqwest::Client::new()
+            .post(format!("http://{addr}/"))
+            .body("SELECT 1")
+            .send()
+            .await
+            .expect_err("send must fail");
+        let err = send_error(e, None);
+        assert!(is_connection_error(&err), "got: {err:#}");
+    }
+
+    #[tokio::test]
+    async fn test_malformed_response_fails_over() {
+        let primary = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let primary_url = format!("http://{}", primary.local_addr().unwrap());
+        let primary_task = tokio::spawn(serve_once(primary, b"HTTP/1.1 nope\r\n\r\n".to_vec()));
+
+        let secondary = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let secondary_url = format!("http://{}", secondary.local_addr().unwrap());
+        let body = r#"{"meta":[{"name":"n","type":"UInt8"}],"data":[{"n":1}],"rows":1}"#;
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        let secondary_task = tokio::spawn(serve_once(secondary, response.into_bytes()));
+
+        let config = ClickHouseConfig {
+            enabled: true,
+            url: primary_url,
+            failover_urls: vec![secondary_url.clone()],
+            database: Some("default".to_string()),
+            ..Default::default()
+        };
+        let engine = ClickHouseEngine::new(&config, 4217).unwrap();
+        let result = engine.query("SELECT 1 AS n", &[]).await.unwrap();
+
+        assert_eq!(result.rows, vec![vec![serde_json::json!(1)]]);
+        assert_eq!(engine.active_url(), secondary_url);
+        primary_task.await.unwrap();
+        secondary_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_truncated_response_body_fails_over() {
+        let primary = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let primary_url = format!("http://{}", primary.local_addr().unwrap());
+        let primary_task = tokio::spawn(async move {
+            let (mut stream, _) = primary.accept().await.unwrap();
+            read_request(&mut stream).await;
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
+                      Content-Length: 1024\r\nConnection: close\r\n\r\n{\"meta\":",
+                )
+                .await
+                .unwrap();
+            stream.shutdown().await.unwrap();
+        });
+
+        let secondary = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let secondary_url = format!("http://{}", secondary.local_addr().unwrap());
+        let body = r#"{"meta":[{"name":"n","type":"UInt8"}],"data":[{"n":1}],"rows":1}"#;
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        let secondary_task = tokio::spawn(serve_once(secondary, response.into_bytes()));
+
+        let config = ClickHouseConfig {
+            enabled: true,
+            url: primary_url,
+            failover_urls: vec![secondary_url.clone()],
+            database: Some("default".to_string()),
+            ..Default::default()
+        };
+        let engine = ClickHouseEngine::new(&config, 4217).unwrap();
+        let result = engine.query("SELECT 1 AS n", &[]).await.unwrap();
+
+        assert_eq!(result.rows, vec![vec![serde_json::json!(1)]]);
+        assert_eq!(engine.active_url(), secondary_url);
+        primary_task.await.unwrap();
+        secondary_task.await.unwrap();
     }
 
     #[test]
     fn test_clickhouse_request_timeout_exceeds_server_timeout() {
         assert_eq!(
             clickhouse_request_timeout(1_001),
-            std::time::Duration::from_millis(2_100)
+            std::time::Duration::from_secs(3)
         );
         assert_eq!(
             clickhouse_request_timeout(100),
-            std::time::Duration::from_millis(1_100)
+            std::time::Duration::from_secs(2)
         );
     }
 
@@ -545,6 +714,47 @@ mod tests {
         assert_eq!(
             url,
             "http://clickhouse-1:8123/?database=tidx_4217&default_format=JSON&max_result_bytes=10485760&result_overflow_mode=throw&union_default_mode=DISTINCT&max_execution_time=2"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_client_timeout_is_not_a_connection_error() {
+        let url =
+            std::env::var("CLICKHOUSE_URL").unwrap_or_else(|_| "http://localhost:8123".to_string());
+        let config = ClickHouseConfig {
+            enabled: true,
+            url,
+            failover_urls: vec![],
+            database: Some("default".to_string()),
+            ..Default::default()
+        };
+        let engine = ClickHouseEngine::new(&config, 4217).unwrap();
+
+        // Skip when ClickHouse is unavailable (e.g. CI's unit-test job runs
+        // without services); `make test` boots ClickHouse and runs the full
+        // suite, so integration runs still exercise this.
+        if engine.query("SELECT 1", &[]).await.is_err() {
+            println!("ClickHouse not available, skipping test");
+            return;
+        }
+
+        // The trailing setting overrides the server timeout to 30s, so the
+        // 2s client deadline reliably fires first (as when the server-side
+        // check overshoots in production).
+        let err = engine
+            .execute_prepared_query_with_settings(
+                "SELECT sleep(3)",
+                Some(1_000),
+                &[("max_execution_time", "30")],
+            )
+            .await
+            .expect_err("query must exceed the client deadline");
+
+        // A slow query is a timeout, not an unreachable instance; classifying
+        // it as a connection error burns failover retries.
+        assert!(
+            !is_connection_error(&err),
+            "client timeout misclassified as connection error: {err}"
         );
     }
 

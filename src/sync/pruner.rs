@@ -145,6 +145,17 @@ impl Pruner {
                     continue;
                 }
                 partitions::drop_partition(pool, table, &name).await?;
+                if table == "txs" {
+                    let start = partitions::week_start(week);
+                    let end = partitions::week_start(week + 1);
+                    let conn = pool.get().await?;
+                    conn.execute(
+                        "DELETE FROM receipt_repair_queue \
+                         WHERE block_timestamp >= $1 AND block_timestamp < $2",
+                        &[&start, &end],
+                    )
+                    .await?;
+                }
                 info!(chain_id = self.chain_id, table, partition = %name, "Pruned partition");
                 dropped += 1;
             }

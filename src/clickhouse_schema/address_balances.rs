@@ -41,7 +41,7 @@ pub const OBJECTS: &[ClickHouseObject] = &[
     ClickHouseObject {
         name: "address_balances_snapshot",
         kind: ClickHouseObjectKind::RefreshableMaterializedView(ADDRESS_BALANCES_SNAPSHOT),
-        depends_on: &["address_holder_deltas"],
+        depends_on: &["token_balances_snapshot"],
         public_query: true,
         // Self-storing refreshable MV: fully replaced each refresh, so it isn't
         // block-scoped and reorg cleanup skips it.
@@ -114,11 +114,11 @@ mod tests {
 
         let ddl = snapshot.ddl();
         assert!(ddl.contains("CREATE MATERIALIZED VIEW IF NOT EXISTS address_balances_snapshot"));
-        assert!(ddl.contains("REFRESH EVERY"));
+        assert!(ddl.contains("REFRESH EVERY 15 MINUTE DEPENDS ON token_balances_snapshot"));
         assert!(ddl.contains("ORDER BY (holder, balance, token)"));
-        assert!(ddl.contains("FROM address_holder_deltas FINAL"));
-        assert!(ddl.contains("GROUP BY holder, token"));
-        assert!(ddl.contains("HAVING balance > 0"));
+        assert!(ddl.contains("FROM token_balances_snapshot"));
+        assert!(!ddl.contains("FROM address_holder_deltas FINAL"));
+        assert!(!ddl.contains("GROUP BY holder, token"));
         assert_eq!(
             snapshot.drop_sql().as_deref(),
             Some("DROP VIEW IF EXISTS address_balances_snapshot")

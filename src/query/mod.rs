@@ -16,6 +16,14 @@ pub use tiered_split::{
 pub use validator::{HARD_LIMIT_MAX, validate_clickhouse_query, validate_query};
 
 use regex_lite::Regex;
+use sqlparser::ast::{
+    Expr, Ident, LimitClause, OrderByKind, Select, SelectItem, SetExpr, Statement, TableFactor,
+    VisitMut, VisitorMut,
+};
+use sqlparser::dialect::ClickHouseDialect;
+use sqlparser::parser::Parser;
+use std::collections::HashMap;
+use std::ops::ControlFlow;
 use std::sync::LazyLock;
 
 /// Regex to match hex literals: '0x' followed by 40+ hex characters (addresses, topics, hashes)
@@ -68,6 +76,252 @@ pub fn convert_timestamp_literals_clickhouse(sql: &str) -> String {
         .into_owned()
 }
 
+#[derive(Default)]
+struct SetOutputReferences {
+    by_source: HashMap<(String, String), Option<Ident>>,
+}
+
+impl SetOutputReferences {
+    fn from_set(body: &SetExpr) -> Self {
+        let mut arms = Vec::new();
+        collect_set_selects(body, &mut arms);
+        let Some(first) = arms.first() else {
+            return Self::default();
+        };
+        if arms
+            .iter()
+            .any(|select| select.projection.iter().any(set_item_expands_columns))
+        {
+            return Self::default();
+        }
+
+        let output_names: Vec<_> = first.projection.iter().map(set_output_name).collect();
+        let mut references = Self::default();
+
+        for select in arms {
+            let relation_qualifiers = table_qualifiers(select);
+            for (index, item) in select.projection.iter().enumerate() {
+                let Some(output) = output_names.get(index).and_then(Clone::clone) else {
+                    continue;
+                };
+                let Some((qualifier, column)) = projected_source(item) else {
+                    continue;
+                };
+                if let Some(qualifier) = qualifier {
+                    references.insert(qualifier, column, output);
+                } else {
+                    for qualifier in &relation_qualifiers {
+                        references.insert(qualifier.clone(), column.clone(), output.clone());
+                    }
+                }
+            }
+        }
+
+        references
+    }
+
+    fn insert(&mut self, qualifier: String, column: String, output: Ident) {
+        self.by_source
+            .entry((qualifier, column))
+            .and_modify(|current| {
+                if current.as_ref() != Some(&output) {
+                    *current = None;
+                }
+            })
+            .or_insert(Some(output));
+    }
+
+    fn resolve(&self, parts: &[Ident]) -> Option<Ident> {
+        let [.., qualifier, column] = parts else {
+            return None;
+        };
+        self.by_source
+            .get(&(qualifier.value.clone(), column.value.clone()))
+            .and_then(Clone::clone)
+    }
+}
+
+fn collect_set_selects<'a>(body: &'a SetExpr, selects: &mut Vec<&'a Select>) {
+    match body {
+        SetExpr::Select(select) => selects.push(select),
+        SetExpr::Query(query) => collect_set_selects(&query.body, selects),
+        SetExpr::SetOperation { left, right, .. } => {
+            collect_set_selects(left, selects);
+            collect_set_selects(right, selects);
+        }
+        _ => {}
+    }
+}
+
+fn set_item_expands_columns(item: &SelectItem) -> bool {
+    matches!(
+        item,
+        SelectItem::Wildcard(_) | SelectItem::QualifiedWildcard(_, _)
+    )
+}
+
+fn set_output_name(item: &SelectItem) -> Option<Ident> {
+    match item {
+        SelectItem::ExprWithAlias { alias, .. } => Some(alias.clone()),
+        SelectItem::UnnamedExpr(Expr::Identifier(column)) => Some(column.clone()),
+        SelectItem::UnnamedExpr(Expr::CompoundIdentifier(parts)) => parts.last().cloned(),
+        _ => None,
+    }
+}
+
+fn projected_source(item: &SelectItem) -> Option<(Option<String>, String)> {
+    let expr = match item {
+        SelectItem::UnnamedExpr(expr) | SelectItem::ExprWithAlias { expr, .. } => expr,
+        _ => return None,
+    };
+    match expr {
+        Expr::Identifier(column) => Some((None, column.value.clone())),
+        Expr::CompoundIdentifier(parts) => {
+            let [.., qualifier, column] = parts.as_slice() else {
+                return None;
+            };
+            Some((Some(qualifier.value.clone()), column.value.clone()))
+        }
+        _ => None,
+    }
+}
+
+fn table_qualifiers(select: &Select) -> Vec<String> {
+    let mut qualifiers = Vec::new();
+    for table in &select.from {
+        collect_table_qualifier(&table.relation, &mut qualifiers);
+        for join in &table.joins {
+            collect_table_qualifier(&join.relation, &mut qualifiers);
+        }
+    }
+    qualifiers
+}
+
+fn collect_table_qualifier(table: &TableFactor, qualifiers: &mut Vec<String>) {
+    if let TableFactor::Table { name, alias, .. } = table {
+        let qualifier = alias
+            .as_ref()
+            .map(|alias| alias.name.value.clone())
+            .or_else(|| {
+                name.0
+                    .last()
+                    .and_then(|part| part.as_ident())
+                    .map(|ident| ident.value.clone())
+            });
+        if let Some(qualifier) = qualifier {
+            qualifiers.push(qualifier);
+        }
+    }
+}
+
+struct SetOutputReferenceNormalizer<'a> {
+    query_depth: usize,
+    references: &'a SetOutputReferences,
+}
+
+impl VisitorMut for SetOutputReferenceNormalizer<'_> {
+    type Break = ();
+
+    fn pre_visit_query(&mut self, _query: &mut sqlparser::ast::Query) -> ControlFlow<Self::Break> {
+        self.query_depth += 1;
+        ControlFlow::Continue(())
+    }
+
+    fn post_visit_query(&mut self, _query: &mut sqlparser::ast::Query) -> ControlFlow<Self::Break> {
+        self.query_depth -= 1;
+        ControlFlow::Continue(())
+    }
+
+    fn post_visit_expr(&mut self, expr: &mut Expr) -> ControlFlow<Self::Break> {
+        if self.query_depth == 0
+            && let Expr::CompoundIdentifier(parts) = expr
+            && let Some(column) = self
+                .references
+                .resolve(parts)
+                .or_else(|| parts.last().cloned())
+        {
+            *expr = Expr::Identifier(column);
+        }
+        ControlFlow::Continue(())
+    }
+}
+
+fn normalize_set_output_references(expr: &mut Expr, references: &SetOutputReferences) {
+    let _ = expr.visit(&mut SetOutputReferenceNormalizer {
+        query_depth: 0,
+        references,
+    });
+}
+
+/// Hoist a set operation's trailing `ORDER BY`/`LIMIT`/`OFFSET` into a
+/// derived-table wrapper: `SELECT * FROM (<set operation>) AS tidx_set_query
+/// ORDER BY ... LIMIT ...`. The trailing form is valid PostgreSQL, but
+/// ClickHouse grammar only accepts another set operator after a parenthesized
+/// arm. Non-matching queries are returned unchanged.
+pub fn hoist_set_operation_order_by_clickhouse(sql: &str) -> String {
+    // A fully parenthesized set expression parses as nested `SetExpr::Query`
+    // layers; unwrap them to find the set operation. Inner clauses (its own
+    // ORDER BY/LIMIT) stay inside the derived table.
+    fn is_set_operation(body: &SetExpr) -> bool {
+        match body {
+            SetExpr::SetOperation { .. } => true,
+            SetExpr::Query(inner) => is_set_operation(&inner.body),
+            _ => false,
+        }
+    }
+
+    let Ok(mut statements) = Parser::parse_sql(&ClickHouseDialect {}, sql) else {
+        return sql.to_string();
+    };
+    let [Statement::Query(query)] = statements.as_mut_slice() else {
+        return sql.to_string();
+    };
+    if !is_set_operation(query.body.as_ref())
+        || (query.order_by.is_none() && query.limit_clause.is_none() && query.fetch.is_none())
+    {
+        return sql.to_string();
+    }
+    let output_references = SetOutputReferences::from_set(query.body.as_ref());
+
+    // A set operation's trailing clauses address its output columns, not the
+    // relations inside either arm. Drop arm qualifiers before those clauses
+    // move outside the derived table.
+    if let Some(order_by) = &mut query.order_by
+        && let OrderByKind::Expressions(exprs) = &mut order_by.kind
+    {
+        for order_expr in exprs {
+            normalize_set_output_references(&mut order_expr.expr, &output_references);
+        }
+    }
+    if let Some(LimitClause::LimitOffset { limit_by, .. }) = &mut query.limit_clause {
+        for expr in limit_by {
+            normalize_set_output_references(expr, &output_references);
+        }
+    }
+
+    // Splice the set operation into a parsed wrapper; every other query-level
+    // clause stays put and now attaches to the wrapper's plain SELECT.
+    let wrapper = "SELECT * FROM (SELECT 1) AS tidx_set_query";
+    let Some(Statement::Query(mut wrapper_query)) =
+        Parser::parse_sql(&ClickHouseDialect {}, wrapper)
+            .expect("valid wrapper template")
+            .pop()
+    else {
+        unreachable!("wrapper template is a single query");
+    };
+    let SetExpr::Select(select) = wrapper_query.body.as_mut() else {
+        unreachable!("wrapper template body is a select");
+    };
+    let Some(TableFactor::Derived { subquery, .. }) =
+        select.from.first_mut().map(|t| &mut t.relation)
+    else {
+        unreachable!("wrapper template selects from a derived table");
+    };
+    std::mem::swap(&mut subquery.body, &mut query.body);
+    query.body = wrapper_query.body;
+    statements[0].to_string()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -106,6 +360,135 @@ mod tests {
             convert_timestamp_literals_clickhouse("ts >= '2026-07-09 03:30:42+00:00'"),
             "ts >= '2026-07-09 03:30:42'"
         );
+    }
+
+    #[test]
+    fn hoist_union_trailing_order_by_limit() {
+        assert_eq!(
+            hoist_set_operation_order_by_clickhouse(
+                "(SELECT num FROM blocks ORDER BY num DESC LIMIT 2) \
+                 UNION (SELECT num FROM blocks ORDER BY num DESC LIMIT 2) \
+                 ORDER BY num DESC LIMIT 2"
+            ),
+            "SELECT * FROM ((SELECT num FROM blocks ORDER BY num DESC LIMIT 2) \
+             UNION (SELECT num FROM blocks ORDER BY num DESC LIMIT 2)) AS tidx_set_query \
+             ORDER BY num DESC LIMIT 2"
+        );
+    }
+
+    #[test]
+    fn hoist_union_trailing_offset() {
+        assert_eq!(
+            hoist_set_operation_order_by_clickhouse(
+                "SELECT num FROM blocks UNION ALL SELECT num FROM txs ORDER BY num LIMIT 5 OFFSET 1"
+            ),
+            "SELECT * FROM (SELECT num FROM blocks UNION ALL SELECT num FROM txs) \
+             AS tidx_set_query ORDER BY num LIMIT 5 OFFSET 1"
+        );
+    }
+
+    #[test]
+    fn hoist_normalizes_qualified_trailing_references() {
+        assert_eq!(
+            hoist_set_operation_order_by_clickhouse(
+                "SELECT b.num FROM blocks AS b UNION ALL SELECT b.num FROM blocks AS b \
+                 ORDER BY b.num DESC, abs(b.num) LIMIT 1 BY b.num"
+            ),
+            "SELECT * FROM (SELECT b.num FROM blocks AS b UNION ALL \
+             SELECT b.num FROM blocks AS b) AS tidx_set_query \
+             ORDER BY num DESC, abs(num) LIMIT 1 BY num"
+        );
+    }
+
+    #[test]
+    fn hoist_resolves_qualified_reference_to_first_arm_alias() {
+        assert_eq!(
+            hoist_set_operation_order_by_clickhouse(
+                "SELECT b.num AS height FROM blocks AS b \
+                 UNION ALL SELECT b.num AS height FROM blocks AS b \
+                 ORDER BY b.num DESC"
+            ),
+            "SELECT * FROM (SELECT b.num AS height FROM blocks AS b UNION ALL \
+             SELECT b.num AS height FROM blocks AS b) AS tidx_set_query \
+             ORDER BY height DESC"
+        );
+    }
+
+    #[test]
+    fn hoist_resolves_later_arm_reference_to_first_arm_output() {
+        assert_eq!(
+            hoist_set_operation_order_by_clickhouse(
+                "SELECT b.num FROM blocks AS b \
+                 UNION ALL SELECT t.block_num FROM txs AS t \
+                 ORDER BY t.block_num DESC"
+            ),
+            "SELECT * FROM (SELECT b.num FROM blocks AS b UNION ALL \
+             SELECT t.block_num FROM txs AS t) AS tidx_set_query \
+             ORDER BY num DESC"
+        );
+    }
+
+    #[test]
+    fn hoist_preserves_qualified_references_in_trailing_subqueries() {
+        assert_eq!(
+            hoist_set_operation_order_by_clickhouse(
+                "SELECT b.num FROM blocks AS b UNION ALL SELECT b.num FROM blocks AS b \
+                 ORDER BY b.num + (SELECT max(t.idx) FROM txs AS t)"
+            ),
+            "SELECT * FROM (SELECT b.num FROM blocks AS b UNION ALL \
+             SELECT b.num FROM blocks AS b) AS tidx_set_query \
+             ORDER BY num + (SELECT max(t.idx) FROM txs AS t)"
+        );
+    }
+
+    #[test]
+    fn hoist_preserves_leading_cte() {
+        assert_eq!(
+            hoist_set_operation_order_by_clickhouse(
+                "WITH b AS (SELECT num FROM blocks) \
+                 (SELECT num FROM b) UNION (SELECT num FROM b) ORDER BY num"
+            ),
+            "WITH b AS (SELECT num FROM blocks) \
+             SELECT * FROM ((SELECT num FROM b) UNION (SELECT num FROM b)) \
+             AS tidx_set_query ORDER BY num"
+        );
+    }
+
+    #[test]
+    fn hoist_parenthesized_set_query() {
+        assert_eq!(
+            hoist_set_operation_order_by_clickhouse(
+                "(SELECT num FROM blocks UNION SELECT num FROM txs) ORDER BY num LIMIT 10"
+            ),
+            "SELECT * FROM ((SELECT num FROM blocks UNION SELECT num FROM txs)) \
+             AS tidx_set_query ORDER BY num LIMIT 10"
+        );
+    }
+
+    #[test]
+    fn hoist_parenthesized_set_query_preserves_inner_clauses() {
+        assert_eq!(
+            hoist_set_operation_order_by_clickhouse(
+                "(SELECT num FROM blocks UNION SELECT num FROM txs ORDER BY num LIMIT 5) \
+                 ORDER BY num DESC LIMIT 3"
+            ),
+            "SELECT * FROM \
+             ((SELECT num FROM blocks UNION SELECT num FROM txs ORDER BY num LIMIT 5)) \
+             AS tidx_set_query ORDER BY num DESC LIMIT 3"
+        );
+    }
+
+    #[test]
+    fn hoist_untouched() {
+        // Plain selects and bare set operations pass through unchanged.
+        for sql in [
+            "SELECT num FROM blocks ORDER BY num DESC LIMIT 2",
+            "(SELECT num FROM blocks LIMIT 1) UNION (SELECT num FROM txs LIMIT 1)",
+            "SELECT * FROM (SELECT num FROM blocks UNION SELECT num FROM txs) AS t ORDER BY num",
+            "(SELECT num FROM blocks) ORDER BY num LIMIT 2",
+        ] {
+            assert_eq!(hoist_set_operation_order_by_clickhouse(sql), sql);
+        }
     }
 
     #[test]

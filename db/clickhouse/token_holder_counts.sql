@@ -17,7 +17,7 @@
 -- (still experimental as of ClickHouse 25.x); the sink sets it when applying
 -- this DDL.
 CREATE MATERIALIZED VIEW IF NOT EXISTS token_holder_counts
-REFRESH EVERY 15 MINUTE
+REFRESH EVERY 15 MINUTE DEPENDS ON token_balances_snapshot
 ENGINE = MergeTree
 ORDER BY (token)
 SETTINGS default_compression_codec = 'ZSTD(1)'
@@ -27,3 +27,8 @@ SELECT
     count() AS holder_count
 FROM token_balances_snapshot
 GROUP BY token
+SETTINGS
+    optimize_aggregation_in_order = 1,
+    max_threads = 4,
+    max_memory_usage = 8589934592,
+    max_bytes_before_external_group_by = 2000000000

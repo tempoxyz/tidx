@@ -3,6 +3,7 @@ use chrono::{DateTime, Utc};
 use futures::TryStreamExt;
 use serde::Serialize;
 use std::time::Instant;
+use tokio_postgres::error::SqlState;
 use tokio_postgres::types::ToSql;
 
 use crate::db::Pool;
@@ -190,6 +191,18 @@ impl Default for QueryOptions {
 const MAX_QUERY_RESULT_BYTES: usize = 10 * 1024 * 1024;
 const MAX_CELL_BYTES: usize = 1024 * 1024;
 
+#[derive(Debug, thiserror::Error)]
+enum PostgresQueryFailure {
+    #[error("Query timeout")]
+    Timeout,
+    #[error("{message}")]
+    Database { code: SqlState, message: String },
+    #[error("{message}")]
+    Unavailable { message: String },
+    #[error("{message}")]
+    Processing { message: String },
+}
+
 /// Execute a query on PostgreSQL.
 pub async fn execute_query_postgres(
     pool: &Pool,
@@ -323,7 +336,8 @@ fn hot_query_prefers_clickhouse(hw: &crate::query::HotWindow, tip: i64) -> bool 
 ///
 /// Eligible shapes (see [`plan_tiered_split`]) are split at the prune
 /// boundary and served natively — hot arm on PostgreSQL `public.*`, cold arm
-/// on ClickHouse — then stitched. Split-ineligible queries provably confined
+/// on ClickHouse — then stitched. A failing hot arm degrades the split to
+/// the native ClickHouse archive. Split-ineligible queries provably confined
 /// to the hot window run on plain PostgreSQL, except wide-span aggregates,
 /// which ClickHouse serves faster. Everything else runs natively on the
 /// ClickHouse archive (it holds full history), falling back on failure:
@@ -489,7 +503,7 @@ async fn try_execute_tiered_split(
             timeout_ms,
             limit: options.limit,
         };
-        let (mut cold_raw, hot) = tokio::try_join!(
+        let (cold, hot) = tokio::join!(
             ch.query_user_with_settings(
                 &cold_sql,
                 signatures,
@@ -498,13 +512,50 @@ async fn try_execute_tiered_split(
                 TIERED_COLD_CH_SETTINGS,
             ),
             execute_query_postgres(pool, &hot_sql, signatures, &hot_options),
-        )?;
+        );
+        let hot = match hot {
+            Ok(hot) => hot,
+            Err(e) if is_retryable_hot_postgres_failure(&e) => {
+                return degrade_split_to_clickhouse(
+                    ch,
+                    sql,
+                    signatures,
+                    &plan.selector_null_cols,
+                    e,
+                    options,
+                    start,
+                )
+                .await
+                .map(Some);
+            }
+            Err(e) => return Err(e),
+        };
+        let mut cold_raw = cold?;
         normalize_cold_result(&mut cold_raw, &plan.selector_null_cols);
         (hot, cold_raw.into())
     } else {
         // Descending or unordered: hot (PostgreSQL) rows first.
         let hot_sql = plan.arm_sql(true, boundary, Some(eff_limit.max(0)));
-        let hot = execute_query_postgres(pool, &hot_sql, signatures, options).await?;
+        let hot = match execute_query_postgres(pool, &hot_sql, signatures, options).await {
+            Ok(hot) => hot,
+            Err(e) if is_retryable_hot_postgres_failure(&e) => {
+                let Some(ch) = clickhouse else {
+                    return Err(e);
+                };
+                return degrade_split_to_clickhouse(
+                    ch,
+                    sql,
+                    signatures,
+                    &plan.selector_null_cols,
+                    e,
+                    options,
+                    start,
+                )
+                .await
+                .map(Some);
+            }
+            Err(e) => return Err(e),
+        };
         if hot.row_count as i64 >= eff_limit {
             return Ok(Some(finish_tiered(hot, None, false, eff_limit, start)));
         }
@@ -550,6 +601,41 @@ async fn try_execute_tiered_split(
         eff_limit,
         start,
     )))
+}
+
+/// Degraded split path: the hot PostgreSQL arm failed, so serve the original
+/// query natively on the ClickHouse archive (dual-written, full history).
+async fn degrade_split_to_clickhouse(
+    ch: &crate::clickhouse::ClickHouseEngine,
+    sql: &str,
+    signatures: &[&str],
+    selector_null_cols: &[usize],
+    hot_err: anyhow::Error,
+    options: &QueryOptions,
+    start: Instant,
+) -> Result<QueryResult> {
+    tracing::warn!(target: "tidx::query", error = %hot_err, "tiered: hot arm failed; degrading split query to the clickhouse archive");
+    let timeout_ms = options
+        .timeout_ms
+        .saturating_sub(start.elapsed().as_millis() as u64)
+        .max(TIERED_COLD_MIN_TIMEOUT_MS);
+    let mut raw = ch
+        .query_user_with_settings(
+            sql,
+            signatures,
+            timeout_ms,
+            options.limit,
+            TIERED_COLD_CH_SETTINGS,
+        )
+        .await
+        .map_err(|ch_err| {
+            anyhow!("tiered split failed on both arms: hot (postgres): {hot_err}; cold (clickhouse): {ch_err}")
+        })?;
+    normalize_cold_result(&mut raw, selector_null_cols);
+    let mut result: QueryResult = raw.into();
+    result.engine = Some("tiered".to_string());
+    result.query_time_ms = Some(start.elapsed().as_secs_f64() * 1000.0);
+    Ok(result)
 }
 
 /// Assemble the stitched tiered result. Hot (PostgreSQL) column names win:
@@ -647,17 +733,24 @@ async fn run_pg_query(
     session_setup: &[&str],
     engine: &str,
 ) -> Result<QueryResult> {
-    let mut conn = pool.get().await?;
-    let tx = conn.transaction().await?;
+    let mut conn = pool.get().await.map_err(|e| {
+        anyhow::Error::new(PostgresQueryFailure::Unavailable {
+            message: e.to_string(),
+        })
+    })?;
+    let tx = conn.transaction().await.map_err(classify_postgres_error)?;
 
     tx.execute(
         &format!("SET LOCAL statement_timeout = {}", options.timeout_ms),
         &[],
     )
-    .await?;
+    .await
+    .map_err(classify_postgres_error)?;
 
     for stmt in session_setup {
-        tx.execute(*stmt, &[]).await?;
+        tx.execute(*stmt, &[])
+            .await
+            .map_err(classify_postgres_error)?;
     }
 
     let start = Instant::now();
@@ -709,15 +802,12 @@ async fn run_pg_query(
             result
         }
         Ok(Err(e)) => {
-            return Err(anyhow!(
-                "Query error: {}",
-                sanitize_db_error(&e.to_string())
-            ));
+            return Err(classify_query_execution_error(e));
         }
-        Err(_) => return Err(anyhow!("Query timeout")),
+        Err(_) => return Err(PostgresQueryFailure::Timeout.into()),
     };
 
-    tx.commit().await?;
+    tx.commit().await.map_err(classify_postgres_error)?;
 
     if columns.is_empty() {
         columns = conn
@@ -858,14 +948,61 @@ pub fn format_column_string(row: &tokio_postgres::Row, idx: usize) -> String {
     }
 }
 
+fn classify_query_execution_error(error: anyhow::Error) -> anyhow::Error {
+    match error.downcast::<tokio_postgres::Error>() {
+        Ok(error) => classify_postgres_error(error),
+        Err(error) => PostgresQueryFailure::Processing {
+            message: format!("Query error: {}", sanitize_db_error(&format!("{error:#}"))),
+        }
+        .into(),
+    }
+}
+
+fn classify_postgres_error(error: tokio_postgres::Error) -> anyhow::Error {
+    let Some(db) = error.as_db_error() else {
+        return PostgresQueryFailure::Unavailable {
+            message: error.to_string(),
+        }
+        .into();
+    };
+    if db.code() == &SqlState::QUERY_CANCELED {
+        return PostgresQueryFailure::Timeout.into();
+    }
+    PostgresQueryFailure::Database {
+        code: db.code().clone(),
+        message: format!(
+            "Query error: {}",
+            sanitize_db_error(&format!("{} ({})", db.message(), db.code().code()))
+        ),
+    }
+    .into()
+}
+
+fn is_retryable_hot_postgres_failure(error: &anyhow::Error) -> bool {
+    match error.downcast_ref::<PostgresQueryFailure>() {
+        Some(PostgresQueryFailure::Unavailable { .. }) => true,
+        Some(PostgresQueryFailure::Database { code, .. }) => {
+            let code = code.code();
+            code.starts_with("08")
+                || matches!(code, "42P01" | "57P01" | "57P02" | "57P03" | "57P04")
+        }
+        _ => false,
+    }
+}
+
 /// Sanitize database error messages to prevent information leakage.
 ///
 /// Removes file paths, internal schema details, and other sensitive info
 /// while preserving useful error context for debugging.
 fn sanitize_db_error(error: &str) -> String {
-    // Truncate very long errors
+    // Truncate very long errors on a char boundary (byte 500 may split a
+    // multi-byte character).
     let error = if error.len() > 500 {
-        format!("{}...", &error[..500])
+        let mut end = 500;
+        while !error.is_char_boundary(end) {
+            end -= 1;
+        }
+        format!("{}...", &error[..end])
     } else {
         error.to_string()
     };
@@ -965,6 +1102,52 @@ mod tests {
     // ========================================================================
     // Tiered hot-engine choice
     // ========================================================================
+
+    #[test]
+    fn hot_split_retries_only_postgres_availability_failures() {
+        let unavailable = anyhow::Error::new(PostgresQueryFailure::Unavailable {
+            message: "connection closed".to_string(),
+        });
+        assert!(is_retryable_hot_postgres_failure(&unavailable));
+
+        for code in [
+            SqlState::UNDEFINED_TABLE,
+            SqlState::CONNECTION_FAILURE,
+            SqlState::ADMIN_SHUTDOWN,
+            SqlState::CRASH_SHUTDOWN,
+            SqlState::CANNOT_CONNECT_NOW,
+            SqlState::DATABASE_DROPPED,
+        ] {
+            let database = anyhow::Error::new(PostgresQueryFailure::Database {
+                code,
+                message: "availability error".to_string(),
+            });
+            assert!(is_retryable_hot_postgres_failure(&database));
+        }
+
+        for code in [
+            SqlState::from_code("22021"),
+            SqlState::QUERY_CANCELED,
+            SqlState::SYNTAX_ERROR,
+        ] {
+            let database = anyhow::Error::new(PostgresQueryFailure::Database {
+                code,
+                message: "query error".to_string(),
+            });
+            assert!(!is_retryable_hot_postgres_failure(&database));
+        }
+
+        let timeout = anyhow::Error::new(PostgresQueryFailure::Timeout);
+        assert!(!is_retryable_hot_postgres_failure(&timeout));
+
+        let processing = anyhow::Error::new(PostgresQueryFailure::Processing {
+            message: "result limit".to_string(),
+        });
+        assert!(!is_retryable_hot_postgres_failure(&processing));
+        assert!(!is_retryable_hot_postgres_failure(&anyhow!(
+            "validation error"
+        )));
+    }
 
     #[test]
     fn hot_aggregates_prefer_clickhouse_by_span() {
@@ -1196,5 +1379,14 @@ mod tests {
         let sanitized = sanitize_db_error(&error);
         assert!(sanitized.len() < 510); // 500 + "..."
         assert!(sanitized.ends_with("..."));
+    }
+
+    #[test]
+    fn test_sanitize_truncates_multibyte_on_char_boundary() {
+        // 3-byte chars; byte 500 falls mid-character.
+        let error = "語".repeat(400);
+        let sanitized = sanitize_db_error(&error);
+        assert!(sanitized.ends_with("..."));
+        assert!(sanitized.trim_end_matches("...").chars().all(|c| c == '語'));
     }
 }
