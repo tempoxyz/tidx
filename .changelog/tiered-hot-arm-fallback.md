@@ -2,4 +2,4 @@
 tidx: patch
 ---
 
-Fixed tiered split queries erroring when the hot PostgreSQL arm fails; they now degrade to the ClickHouse archive, which holds full history.
+Fixed tiered split queries erroring on PostgreSQL availability failures; they now degrade to the full-history ClickHouse archive while preserving PostgreSQL semantic errors.

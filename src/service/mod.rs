@@ -191,6 +191,18 @@ impl Default for QueryOptions {
 const MAX_QUERY_RESULT_BYTES: usize = 10 * 1024 * 1024;
 const MAX_CELL_BYTES: usize = 1024 * 1024;
 
+#[derive(Debug, thiserror::Error)]
+enum PostgresQueryFailure {
+    #[error("Query timeout")]
+    Timeout,
+    #[error("{message}")]
+    Database { code: SqlState, message: String },
+    #[error("{message}")]
+    Unavailable { message: String },
+    #[error("{message}")]
+    Processing { message: String },
+}
+
 /// Execute a query on PostgreSQL.
 pub async fn execute_query_postgres(
     pool: &Pool,
@@ -503,7 +515,7 @@ async fn try_execute_tiered_split(
         );
         let hot = match hot {
             Ok(hot) => hot,
-            Err(e) => {
+            Err(e) if is_retryable_hot_postgres_failure(&e) => {
                 return degrade_split_to_clickhouse(
                     ch,
                     sql,
@@ -516,6 +528,7 @@ async fn try_execute_tiered_split(
                 .await
                 .map(Some);
             }
+            Err(e) => return Err(e),
         };
         let mut cold_raw = cold?;
         normalize_cold_result(&mut cold_raw, &plan.selector_null_cols);
@@ -525,7 +538,7 @@ async fn try_execute_tiered_split(
         let hot_sql = plan.arm_sql(true, boundary, Some(eff_limit.max(0)));
         let hot = match execute_query_postgres(pool, &hot_sql, signatures, options).await {
             Ok(hot) => hot,
-            Err(e) => {
+            Err(e) if is_retryable_hot_postgres_failure(&e) => {
                 let Some(ch) = clickhouse else {
                     return Err(e);
                 };
@@ -541,6 +554,7 @@ async fn try_execute_tiered_split(
                 .await
                 .map(Some);
             }
+            Err(e) => return Err(e),
         };
         if hot.row_count as i64 >= eff_limit {
             return Ok(Some(finish_tiered(hot, None, false, eff_limit, start)));
@@ -719,17 +733,24 @@ async fn run_pg_query(
     session_setup: &[&str],
     engine: &str,
 ) -> Result<QueryResult> {
-    let mut conn = pool.get().await?;
-    let tx = conn.transaction().await?;
+    let mut conn = pool.get().await.map_err(|e| {
+        anyhow::Error::new(PostgresQueryFailure::Unavailable {
+            message: e.to_string(),
+        })
+    })?;
+    let tx = conn.transaction().await.map_err(classify_postgres_error)?;
 
     tx.execute(
         &format!("SET LOCAL statement_timeout = {}", options.timeout_ms),
         &[],
     )
-    .await?;
+    .await
+    .map_err(classify_postgres_error)?;
 
     for stmt in session_setup {
-        tx.execute(*stmt, &[]).await?;
+        tx.execute(*stmt, &[])
+            .await
+            .map_err(classify_postgres_error)?;
     }
 
     let start = Instant::now();
@@ -781,20 +802,12 @@ async fn run_pg_query(
             result
         }
         Ok(Err(e)) => {
-            // statement_timeout cancels surface as SQLSTATE 57014
-            // (query_canceled); reduce them to the deadline branch's marker.
-            if pg_db_error(&e).is_some_and(|db| db.code() == &SqlState::QUERY_CANCELED) {
-                return Err(anyhow!("Query timeout"));
-            }
-            return Err(anyhow!(
-                "Query error: {}",
-                sanitize_db_error(&describe_query_error(&e))
-            ));
+            return Err(classify_query_execution_error(e));
         }
-        Err(_) => return Err(anyhow!("Query timeout")),
+        Err(_) => return Err(PostgresQueryFailure::Timeout.into()),
     };
 
-    tx.commit().await?;
+    tx.commit().await.map_err(classify_postgres_error)?;
 
     if columns.is_empty() {
         columns = conn
@@ -935,19 +948,46 @@ pub fn format_column_string(row: &tokio_postgres::Row, idx: usize) -> String {
     }
 }
 
-/// The underlying PostgreSQL server error, if any.
-fn pg_db_error(e: &anyhow::Error) -> Option<&tokio_postgres::error::DbError> {
-    e.downcast_ref::<tokio_postgres::Error>()
-        .and_then(|e| e.as_db_error())
+fn classify_query_execution_error(error: anyhow::Error) -> anyhow::Error {
+    match error.downcast::<tokio_postgres::Error>() {
+        Ok(error) => classify_postgres_error(error),
+        Err(error) => PostgresQueryFailure::Processing {
+            message: format!("Query error: {}", sanitize_db_error(&format!("{error:#}"))),
+        }
+        .into(),
+    }
 }
 
-/// Expand an error to its most descriptive message. tokio-postgres `Display`
-/// flattens server errors to "db error"; the real message lives in `DbError`.
-fn describe_query_error(e: &anyhow::Error) -> String {
-    if let Some(db) = pg_db_error(e) {
-        return format!("{} ({})", db.message(), db.code().code());
+fn classify_postgres_error(error: tokio_postgres::Error) -> anyhow::Error {
+    let Some(db) = error.as_db_error() else {
+        return PostgresQueryFailure::Unavailable {
+            message: error.to_string(),
+        }
+        .into();
+    };
+    if db.code() == &SqlState::QUERY_CANCELED {
+        return PostgresQueryFailure::Timeout.into();
     }
-    format!("{e:#}")
+    PostgresQueryFailure::Database {
+        code: db.code().clone(),
+        message: format!(
+            "Query error: {}",
+            sanitize_db_error(&format!("{} ({})", db.message(), db.code().code()))
+        ),
+    }
+    .into()
+}
+
+fn is_retryable_hot_postgres_failure(error: &anyhow::Error) -> bool {
+    match error.downcast_ref::<PostgresQueryFailure>() {
+        Some(PostgresQueryFailure::Unavailable { .. }) => true,
+        Some(PostgresQueryFailure::Database { code, .. }) => {
+            let code = code.code();
+            code.starts_with("08")
+                || matches!(code, "42P01" | "57P01" | "57P02" | "57P03" | "57P04")
+        }
+        _ => false,
+    }
 }
 
 /// Sanitize database error messages to prevent information leakage.
@@ -1062,6 +1102,52 @@ mod tests {
     // ========================================================================
     // Tiered hot-engine choice
     // ========================================================================
+
+    #[test]
+    fn hot_split_retries_only_postgres_availability_failures() {
+        let unavailable = anyhow::Error::new(PostgresQueryFailure::Unavailable {
+            message: "connection closed".to_string(),
+        });
+        assert!(is_retryable_hot_postgres_failure(&unavailable));
+
+        for code in [
+            SqlState::UNDEFINED_TABLE,
+            SqlState::CONNECTION_FAILURE,
+            SqlState::ADMIN_SHUTDOWN,
+            SqlState::CRASH_SHUTDOWN,
+            SqlState::CANNOT_CONNECT_NOW,
+            SqlState::DATABASE_DROPPED,
+        ] {
+            let database = anyhow::Error::new(PostgresQueryFailure::Database {
+                code,
+                message: "availability error".to_string(),
+            });
+            assert!(is_retryable_hot_postgres_failure(&database));
+        }
+
+        for code in [
+            SqlState::from_code("22021"),
+            SqlState::QUERY_CANCELED,
+            SqlState::SYNTAX_ERROR,
+        ] {
+            let database = anyhow::Error::new(PostgresQueryFailure::Database {
+                code,
+                message: "query error".to_string(),
+            });
+            assert!(!is_retryable_hot_postgres_failure(&database));
+        }
+
+        let timeout = anyhow::Error::new(PostgresQueryFailure::Timeout);
+        assert!(!is_retryable_hot_postgres_failure(&timeout));
+
+        let processing = anyhow::Error::new(PostgresQueryFailure::Processing {
+            message: "result limit".to_string(),
+        });
+        assert!(!is_retryable_hot_postgres_failure(&processing));
+        assert!(!is_retryable_hot_postgres_failure(&anyhow!(
+            "validation error"
+        )));
+    }
 
     #[test]
     fn hot_aggregates_prefer_clickhouse_by_span() {
