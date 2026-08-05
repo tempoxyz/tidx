@@ -22,7 +22,7 @@ use sqlparser::ast::{
 };
 use sqlparser::dialect::ClickHouseDialect;
 use sqlparser::parser::Parser;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ops::ControlFlow;
 use std::sync::LazyLock;
 
@@ -79,6 +79,8 @@ pub fn convert_timestamp_literals_clickhouse(sql: &str) -> String {
 #[derive(Default)]
 struct SetOutputReferences {
     by_source: HashMap<(String, String), Option<Ident>>,
+    arm_qualifiers: HashSet<String>,
+    output_names: HashSet<String>,
 }
 
 impl SetOutputReferences {
@@ -88,15 +90,27 @@ impl SetOutputReferences {
         let Some(first) = arms.first() else {
             return Self::default();
         };
+        let mut references = Self::default();
+        references.output_names.extend(
+            first
+                .projection
+                .iter()
+                .filter_map(set_output_name)
+                .map(|output| set_reference_key(&output)),
+        );
+        for select in &arms {
+            references
+                .arm_qualifiers
+                .extend(table_qualifiers(select).iter().map(set_reference_key));
+        }
         if arms
             .iter()
             .any(|select| select.projection.iter().any(set_item_expands_columns))
         {
-            return Self::default();
+            return references;
         }
 
         let output_names: Vec<_> = first.projection.iter().map(set_output_name).collect();
-        let mut references = Self::default();
 
         for select in arms {
             let relation_qualifiers = table_qualifiers(select);
@@ -108,10 +122,10 @@ impl SetOutputReferences {
                     continue;
                 };
                 if let Some(qualifier) = qualifier {
-                    references.insert(qualifier, column, output);
+                    references.insert(&qualifier, &column, output);
                 } else {
                     for qualifier in &relation_qualifiers {
-                        references.insert(qualifier.clone(), column.clone(), output.clone());
+                        references.insert(qualifier, &column, output.clone());
                     }
                 }
             }
@@ -120,9 +134,9 @@ impl SetOutputReferences {
         references
     }
 
-    fn insert(&mut self, qualifier: String, column: String, output: Ident) {
+    fn insert(&mut self, qualifier: &Ident, column: &Ident, output: Ident) {
         self.by_source
-            .entry((qualifier, column))
+            .entry((set_reference_key(qualifier), set_reference_key(column)))
             .and_modify(|current| {
                 if current.as_ref() != Some(&output) {
                     *current = None;
@@ -135,9 +149,24 @@ impl SetOutputReferences {
         let [.., qualifier, column] = parts else {
             return None;
         };
-        self.by_source
-            .get(&(qualifier.value.clone(), column.value.clone()))
-            .and_then(Clone::clone)
+        let qualifier_key = set_reference_key(qualifier);
+        if let Some(output) = self
+            .by_source
+            .get(&(qualifier_key.clone(), set_reference_key(column)))
+        {
+            return output.clone();
+        }
+        (self.arm_qualifiers.contains(&qualifier_key)
+            && !self.output_names.contains(&qualifier_key))
+        .then(|| column.clone())
+    }
+}
+
+fn set_reference_key(identifier: &Ident) -> String {
+    if identifier.quote_style.is_some() {
+        identifier.value.clone()
+    } else {
+        identifier.value.to_ascii_lowercase()
     }
 }
 
@@ -169,24 +198,24 @@ fn set_output_name(item: &SelectItem) -> Option<Ident> {
     }
 }
 
-fn projected_source(item: &SelectItem) -> Option<(Option<String>, String)> {
+fn projected_source(item: &SelectItem) -> Option<(Option<Ident>, Ident)> {
     let expr = match item {
         SelectItem::UnnamedExpr(expr) | SelectItem::ExprWithAlias { expr, .. } => expr,
         _ => return None,
     };
     match expr {
-        Expr::Identifier(column) => Some((None, column.value.clone())),
+        Expr::Identifier(column) => Some((None, column.clone())),
         Expr::CompoundIdentifier(parts) => {
             let [.., qualifier, column] = parts.as_slice() else {
                 return None;
             };
-            Some((Some(qualifier.value.clone()), column.value.clone()))
+            Some((Some(qualifier.clone()), column.clone()))
         }
         _ => None,
     }
 }
 
-fn table_qualifiers(select: &Select) -> Vec<String> {
+fn table_qualifiers(select: &Select) -> Vec<Ident> {
     let mut qualifiers = Vec::new();
     for table in &select.from {
         collect_table_qualifier(&table.relation, &mut qualifiers);
@@ -197,17 +226,12 @@ fn table_qualifiers(select: &Select) -> Vec<String> {
     qualifiers
 }
 
-fn collect_table_qualifier(table: &TableFactor, qualifiers: &mut Vec<String>) {
+fn collect_table_qualifier(table: &TableFactor, qualifiers: &mut Vec<Ident>) {
     if let TableFactor::Table { name, alias, .. } = table {
         let qualifier = alias
             .as_ref()
-            .map(|alias| alias.name.value.clone())
-            .or_else(|| {
-                name.0
-                    .last()
-                    .and_then(|part| part.as_ident())
-                    .map(|ident| ident.value.clone())
-            });
+            .map(|alias| alias.name.clone())
+            .or_else(|| name.0.last().and_then(|part| part.as_ident()).cloned());
         if let Some(qualifier) = qualifier {
             qualifiers.push(qualifier);
         }
@@ -235,10 +259,7 @@ impl VisitorMut for SetOutputReferenceNormalizer<'_> {
     fn post_visit_expr(&mut self, expr: &mut Expr) -> ControlFlow<Self::Break> {
         if self.query_depth == 0
             && let Expr::CompoundIdentifier(parts) = expr
-            && let Some(column) = self
-                .references
-                .resolve(parts)
-                .or_else(|| parts.last().cloned())
+            && let Some(column) = self.references.resolve(parts)
         {
             *expr = Expr::Identifier(column);
         }
@@ -283,9 +304,8 @@ pub fn hoist_set_operation_order_by_clickhouse(sql: &str) -> String {
     }
     let output_references = SetOutputReferences::from_set(query.body.as_ref());
 
-    // A set operation's trailing clauses address its output columns, not the
-    // relations inside either arm. Drop arm qualifiers before those clauses
-    // move outside the derived table.
+    // Trailing clauses address set outputs, not arm relations. Rewrite only
+    // references whose projected output can be resolved unambiguously.
     if let Some(order_by) = &mut query.order_by
         && let OrderByKind::Expressions(exprs) = &mut order_by.kind
     {
@@ -415,6 +435,34 @@ mod tests {
     }
 
     #[test]
+    fn hoist_resolves_unquoted_qualifier_case_insensitively() {
+        assert_eq!(
+            hoist_set_operation_order_by_clickhouse(
+                "SELECT B.num AS height FROM blocks AS B \
+                 UNION ALL SELECT B.num AS height FROM blocks AS B \
+                 ORDER BY b.num DESC"
+            ),
+            "SELECT * FROM (SELECT B.num AS height FROM blocks AS B UNION ALL \
+             SELECT B.num AS height FROM blocks AS B) AS tidx_set_query \
+             ORDER BY height DESC"
+        );
+    }
+
+    #[test]
+    fn hoist_preserves_quoted_qualifier_case_sensitivity() {
+        assert_eq!(
+            hoist_set_operation_order_by_clickhouse(
+                "SELECT \"B\".num AS height FROM blocks AS \"B\" \
+                 UNION ALL SELECT \"B\".num AS height FROM blocks AS \"B\" \
+                 ORDER BY \"b\".num DESC"
+            ),
+            "SELECT * FROM (SELECT \"B\".num AS height FROM blocks AS \"B\" UNION ALL \
+             SELECT \"B\".num AS height FROM blocks AS \"B\") AS tidx_set_query \
+             ORDER BY \"b\".num DESC"
+        );
+    }
+
+    #[test]
     fn hoist_resolves_later_arm_reference_to_first_arm_output() {
         assert_eq!(
             hoist_set_operation_order_by_clickhouse(
@@ -438,6 +486,62 @@ mod tests {
             "SELECT * FROM (SELECT b.num FROM blocks AS b UNION ALL \
              SELECT b.num FROM blocks AS b) AS tidx_set_query \
              ORDER BY num + (SELECT max(t.idx) FROM txs AS t)"
+        );
+    }
+
+    #[test]
+    fn hoist_preserves_unresolved_compound_output_reference() {
+        assert_eq!(
+            hoist_set_operation_order_by_clickhouse(
+                "SELECT payload AS result FROM events \
+                 UNION ALL SELECT payload AS result FROM events \
+                 ORDER BY result.field"
+            ),
+            "SELECT * FROM (SELECT payload AS result FROM events UNION ALL \
+             SELECT payload AS result FROM events) AS tidx_set_query \
+             ORDER BY result.field"
+        );
+    }
+
+    #[test]
+    fn hoist_strips_qualified_wildcard_arm_reference() {
+        assert_eq!(
+            hoist_set_operation_order_by_clickhouse(
+                "SELECT b.* FROM blocks AS b \
+                 UNION ALL SELECT b.* FROM blocks AS b \
+                 ORDER BY b.num DESC"
+            ),
+            "SELECT * FROM (SELECT b.* FROM blocks AS b UNION ALL \
+             SELECT b.* FROM blocks AS b) AS tidx_set_query \
+             ORDER BY num DESC"
+        );
+    }
+
+    #[test]
+    fn hoist_strips_unqualified_wildcard_arm_reference() {
+        assert_eq!(
+            hoist_set_operation_order_by_clickhouse(
+                "SELECT * FROM blocks AS b \
+                 UNION ALL SELECT * FROM blocks AS b \
+                 ORDER BY b.num DESC"
+            ),
+            "SELECT * FROM (SELECT * FROM blocks AS b UNION ALL \
+             SELECT * FROM blocks AS b) AS tidx_set_query \
+             ORDER BY num DESC"
+        );
+    }
+
+    #[test]
+    fn hoist_preserves_ambiguous_arm_reference() {
+        assert_eq!(
+            hoist_set_operation_order_by_clickhouse(
+                "SELECT b.num AS height, b.num AS other FROM blocks AS b \
+                 UNION ALL SELECT b.num, b.num FROM blocks AS b \
+                 ORDER BY b.num DESC"
+            ),
+            "SELECT * FROM (SELECT b.num AS height, b.num AS other FROM blocks AS b UNION ALL \
+             SELECT b.num, b.num FROM blocks AS b) AS tidx_set_query \
+             ORDER BY b.num DESC"
         );
     }
 

@@ -2,4 +2,4 @@
 tidx: patch
 ---
 
-Fixed duplicate or missing ClickHouse rows across retries, reorgs, partial writes, and startup backfills using canonical deduplication tokens, exact-key repair, and durable handoffs.
+Fixed duplicate, stale, or missing ClickHouse rows across retries, reorgs, partial writes, and startup backfills using bounded canonical-row repair, fresh deduplication generations, and durable handoffs.
