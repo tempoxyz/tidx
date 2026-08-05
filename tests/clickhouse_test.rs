@@ -2462,6 +2462,34 @@ async fn set_ch_backfill_cursor(pool: &tidx::db::Pool, chain_id: u64, block: i64
     .expect("Failed to set CH backfill cursor");
 }
 
+async fn assert_replayed_transfer_block(ch: &TestClickHouse, from: &str, to: &str) {
+    for (table, expected) in [
+        ("blocks", 1),
+        ("txs", 1),
+        ("logs", 1),
+        ("receipts", 1),
+        ("token_transfers", 1),
+        ("token_holder_deltas", 2),
+        ("address_holder_deltas", 2),
+    ] {
+        assert_eq!(
+            ch.table_count_final(table).await.unwrap(),
+            expected,
+            "unexpected canonical row count for {table}"
+        );
+    }
+
+    let transfers = token_transfers(ch).await;
+    assert_eq!(transfers.len(), 1);
+    assert_eq!(
+        transfers[0].token,
+        "0xdadadadadadadadadadadadadadadadadadadada"
+    );
+    assert_eq!(transfers[0].from, from);
+    assert_eq!(transfers[0].to, to);
+    assert_eq!(transfers[0].amount, "100");
+}
+
 /// PostgreSQL hot-tier hydration reads canonical base rows from ClickHouse,
 /// preserves encoded fields, and refuses a range that its archive cannot fill.
 #[tokio::test]
@@ -2767,6 +2795,114 @@ async fn test_backfill_repairs_partial_child_table_blocks() {
     assert_eq!(ch.table_count("txs").await.unwrap(), 2);
     assert_eq!(ch.table_count("logs").await.unwrap(), 2);
     assert_eq!(ch.table_count("receipts").await.unwrap(), 2);
+}
+
+/// A stale partial write can reuse canonical child positions and retain extra
+/// rows from the replaced block. Backfill must clear the exact block and replay
+/// every canonical row, including when ClickHouse remembers the original token.
+#[tokio::test]
+#[serial(clickhouse)]
+async fn test_backfill_replays_blocks_with_stale_child_rows() {
+    let Some((_pool, sinks, ch_sink, ch)) = setup_backfill().await else {
+        return;
+    };
+
+    let blocks = vec![make_block(1)];
+    let txs: Vec<_> = (0..2).map(|idx| make_tx(1, idx)).collect();
+    let logs: Vec<_> = (0..2).map(|idx| make_log(1, idx)).collect();
+    let receipts: Vec<_> = (0..2).map(|idx| make_receipt(1, idx)).collect();
+
+    // Record the ordinary deterministic tokens, then remove the rows without
+    // evicting those tokens from ClickHouse's deduplication window.
+    sinks
+        .write_all(&blocks, &txs, &logs, &receipts)
+        .await
+        .unwrap();
+    ch_sink.delete_from(1).await.unwrap();
+
+    let mut stale_txs = txs.clone();
+    stale_txs[1].hash = vec![0xee; 32];
+    let mut stale_logs = logs.clone();
+    stale_logs[1].address = vec![0xee; 20];
+    stale_logs[1].selector = Some(vec![0xee; 4]);
+    stale_logs.push(make_log(1, 2));
+    let mut stale_receipts = receipts.clone();
+    stale_receipts[1].gas_used += 1;
+
+    ch_sink.write_txs(&stale_txs).await.unwrap();
+    ch_sink.write_logs(&stale_logs).await.unwrap();
+    ch_sink.write_receipts(&stale_receipts).await.unwrap();
+    ch_sink.write_blocks(&blocks).await.unwrap();
+
+    sinks.backfill_clickhouse(TEST_CHAIN_ID).await.unwrap();
+
+    assert_eq!(ch.table_count_final("blocks").await.unwrap(), 1);
+    assert_eq!(ch.table_count_final("txs").await.unwrap(), 2);
+    assert_eq!(ch.table_count_final("logs").await.unwrap(), 2);
+    assert_eq!(ch.table_count_final("receipts").await.unwrap(), 2);
+
+    let tx_result = ch
+        .query_json("SELECT hash FROM txs FINAL WHERE block_num = 1 AND idx = 1")
+        .await
+        .unwrap();
+    assert_eq!(
+        tx_result["data"][0]["hash"].as_str(),
+        Some(format!("0x{}", hex::encode(&txs[1].hash)).as_str())
+    );
+    let log_result = ch
+        .query_json("SELECT address FROM logs FINAL WHERE block_num = 1 AND log_idx = 1")
+        .await
+        .unwrap();
+    assert_eq!(
+        log_result["data"][0]["address"].as_str(),
+        Some(format!("0x{}", hex::encode(&logs[1].address)).as_str())
+    );
+    let receipt_result = ch
+        .query_json("SELECT gas_used FROM receipts FINAL WHERE block_num = 1 AND tx_idx = 1")
+        .await
+        .unwrap();
+    assert_eq!(receipt_result["data"][0]["gas_used"].as_i64(), Some(21_000));
+}
+
+/// Replay must recover both completed deletion and cleanup interrupted after
+/// the block marker was removed, without reusing remembered insert tokens.
+#[tokio::test]
+#[serial(clickhouse)]
+async fn test_backfill_recovers_interrupted_exact_block_repair() {
+    let Some((pool, sinks, ch_sink, ch)) = setup_backfill().await else {
+        return;
+    };
+
+    let alice = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    let bob = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    let blocks = vec![make_block(1)];
+    let txs = vec![make_tx(1, 0)];
+    let logs = vec![make_transfer_log(1, 0, alice, bob, 100)];
+    let receipts = vec![make_receipt(1, 0)];
+
+    sinks
+        .write_all(&blocks, &txs, &logs, &receipts)
+        .await
+        .unwrap();
+
+    ch_sink.delete_from(1).await.unwrap();
+    set_ch_backfill_cursor(&pool, TEST_CHAIN_ID, 0).await;
+    sinks.backfill_clickhouse(TEST_CHAIN_ID).await.unwrap();
+    assert_replayed_transfer_block(&ch, alice, bob).await;
+
+    // Simulate a crash midway through marker-first exact cleanup.
+    for sql in [
+        "ALTER TABLE blocks DELETE WHERE num = 1 SETTINGS mutations_sync = 1",
+        "ALTER TABLE token_holder_deltas DELETE WHERE block_num = 1 SETTINGS mutations_sync = 1",
+        "ALTER TABLE token_transfers DELETE WHERE block_num = 1 SETTINGS mutations_sync = 1",
+        "ALTER TABLE txs DELETE WHERE block_num = 1 SETTINGS mutations_sync = 1",
+    ] {
+        ch.query(sql).await.unwrap();
+    }
+
+    set_ch_backfill_cursor(&pool, TEST_CHAIN_ID, 0).await;
+    sinks.backfill_clickhouse(TEST_CHAIN_ID).await.unwrap();
+    assert_replayed_transfer_block(&ch, alice, bob).await;
 }
 
 /// Backfill should resume from the persisted PG cursor.

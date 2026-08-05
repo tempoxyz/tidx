@@ -1,6 +1,5 @@
 use anyhow::Result;
 use chrono::{DateTime, Utc};
-use sha3::{Digest, Keccak256};
 use std::collections::HashSet;
 use tracing::info;
 
@@ -9,7 +8,7 @@ use crate::db::partitions::PartitionCoverage;
 use crate::metrics;
 use crate::types::{BlockRow, LogRow, ReceiptRow, TxRow};
 
-use super::ch_sink::ClickHouseSink;
+use super::ch_sink::{ClickHouseSink, batch_deduplication_seed, replay_deduplication_seed};
 use super::writer;
 
 /// Storage target for a decoded sync batch.
@@ -195,8 +194,9 @@ impl SinkSet {
             logs.to_vec(),
             receipts.to_vec(),
         );
-        filter_clickhouse_rows(ch, &mut blocks, &mut txs, &mut logs, &mut receipts).await?;
-        write_clickhouse_batch(ch, &blocks, &txs, &logs, &receipts).await
+        let repair_blocks =
+            filter_clickhouse_rows(ch, &mut blocks, &mut txs, &mut logs, &mut receipts).await?;
+        write_filtered_clickhouse_batch(ch, &blocks, &txs, &logs, &receipts, &repair_blocks).await
     }
 
     /// Hydrate a PostgreSQL block range from the canonical ClickHouse archive.
@@ -280,16 +280,18 @@ impl SinkSet {
 
         match (target, &self.ch) {
             (WriteTarget::All, Some(ch)) => {
+                let seed = batch_deduplication_seed(blocks);
                 tokio::try_join!(
                     write_postgres(),
-                    write_clickhouse_batch(ch, blocks, txs, logs, receipts)
+                    write_clickhouse_batch(ch, blocks, txs, logs, receipts, seed.as_deref())
                 )?;
             }
             (WriteTarget::All | WriteTarget::Postgres, _) => {
                 write_postgres().await?;
             }
             (WriteTarget::ClickHouse, Some(ch)) => {
-                write_clickhouse_batch(ch, blocks, txs, logs, receipts).await?;
+                let seed = batch_deduplication_seed(blocks);
+                write_clickhouse_batch(ch, blocks, txs, logs, receipts, seed.as_deref()).await?;
             }
             (WriteTarget::ClickHouse, None) => {
                 anyhow::bail!("ClickHouse archive backfill requested without an active sink");
@@ -439,7 +441,8 @@ impl SinkSet {
             // live-sync path before writing.
             super::decoder::enrich_receipts_from_txs(&mut receipts, &txs);
 
-            filter_clickhouse_rows(ch, &mut blocks, &mut txs, &mut logs, &mut receipts).await?;
+            let repair_blocks =
+                filter_clickhouse_rows(ch, &mut blocks, &mut txs, &mut logs, &mut receipts).await?;
 
             // Pipeline: fetch next batch from PG while writing current batch to CH
             let next_fetch = async {
@@ -457,7 +460,14 @@ impl SinkSet {
                 Ok::<_, anyhow::Error>(Some((next_end, data)))
             };
 
-            let ch_write = write_clickhouse_batch(ch, &blocks, &txs, &logs, &receipts);
+            let ch_write = write_filtered_clickhouse_batch(
+                ch,
+                &blocks,
+                &txs,
+                &logs,
+                &receipts,
+                &repair_blocks,
+            );
 
             let (next_data, ()) = tokio::try_join!(next_fetch, ch_write)?;
 
@@ -509,11 +519,12 @@ async fn write_clickhouse_batch(
     txs: &[TxRow],
     logs: &[LogRow],
     receipts: &[ReceiptRow],
+    deduplication_seed: Option<&str>,
 ) -> Result<()> {
     // Children first, blocks last: a block row in ClickHouse then proves the
     // whole batch landed, keeping block presence checks sound when a write
     // fails partway.
-    if let Some(seed) = clickhouse_batch_deduplication_seed(blocks) {
+    if let Some(seed) = deduplication_seed {
         tokio::try_join!(
             ch.write_txs_deduplicated(txs, &seed),
             ch.write_logs_deduplicated(logs, &seed),
@@ -530,16 +541,28 @@ async fn write_clickhouse_batch(
     }
 }
 
-fn clickhouse_batch_deduplication_seed(blocks: &[BlockRow]) -> Option<String> {
-    if blocks.is_empty() {
-        return None;
+async fn write_filtered_clickhouse_batch(
+    ch: &ClickHouseSink,
+    blocks: &[BlockRow],
+    txs: &[TxRow],
+    logs: &[LogRow],
+    receipts: &[ReceiptRow],
+    repair_blocks: &[i64],
+) -> Result<()> {
+    if blocks.is_empty() && txs.is_empty() && logs.is_empty() && receipts.is_empty() {
+        return Ok(());
     }
-    let mut hasher = Keccak256::new();
-    for block in blocks {
-        hasher.update(block.num.to_le_bytes());
-        hasher.update(&block.hash);
+
+    // Presence filtering makes retries across invocations safe. A fresh seed
+    // prevents ClickHouse from suppressing rows that were deliberately deleted.
+    let seed = replay_deduplication_seed();
+    if repair_blocks.is_empty() {
+        return write_clickhouse_batch(ch, blocks, txs, logs, receipts, Some(&seed)).await;
     }
-    Some(hex::encode(hasher.finalize()))
+
+    let guard = ch.maintenance_guard().await;
+    ch.delete_blocks_exact(&guard, repair_blocks).await?;
+    write_clickhouse_batch(ch, blocks, txs, logs, receipts, Some(&seed)).await
 }
 
 async fn filter_clickhouse_rows(
@@ -548,40 +571,78 @@ async fn filter_clickhouse_rows(
     txs: &mut Vec<TxRow>,
     logs: &mut Vec<LogRow>,
     receipts: &mut Vec<ReceiptRow>,
-) -> Result<()> {
-    let range = blocks
+) -> Result<Vec<i64>> {
+    let mut block_nums = blocks
         .iter()
         .map(|row| row.num)
         .chain(txs.iter().map(|row| row.block_num))
         .chain(logs.iter().map(|row| row.block_num))
         .chain(receipts.iter().map(|row| row.block_num))
-        .fold(None, |range, num| match range {
-            None => Some((num, num)),
-            Some((lo, hi)) => Some((lo.min(num), hi.max(num))),
-        });
-    let Some((lo, hi)) = range else {
-        return Ok(());
-    };
-    let (lo, hi) = (lo.max(0) as u64, hi.max(0) as u64);
-    let (in_blocks, in_txs, in_logs, in_receipts) = tokio::try_join!(
-        ch.block_nums_in_table_range("blocks", lo, hi),
-        ch.row_keys_in_table_range("txs", lo, hi),
-        ch.row_keys_in_table_range("logs", lo, hi),
-        ch.row_keys_in_table_range("receipts", lo, hi),
-    )?;
-    let in_blocks = in_blocks
-        .into_iter()
-        .map(|num| num as i64)
-        .collect::<HashSet<_>>();
-    let in_txs = in_txs.into_iter().collect::<HashSet<_>>();
-    let in_logs = in_logs.into_iter().collect::<HashSet<_>>();
-    let in_receipts = in_receipts.into_iter().collect::<HashSet<_>>();
+        .collect::<Vec<_>>();
+    block_nums.sort_unstable();
+    block_nums.dedup();
+    if block_nums.is_empty() {
+        return Ok(Vec::new());
+    }
 
-    blocks.retain(|row| !in_blocks.contains(&row.num));
-    txs.retain(|row| !in_txs.contains(&(row.block_num, row.idx)));
-    logs.retain(|row| !in_logs.contains(&(row.block_num, row.log_idx)));
-    receipts.retain(|row| !in_receipts.contains(&(row.block_num, row.tx_idx)));
-    Ok(())
+    let (block_check, tx_check, log_check, receipt_check) = tokio::try_join!(
+        ch.canonical_blocks_present(blocks),
+        ch.canonical_txs_present(txs, &block_nums),
+        ch.canonical_logs_present(logs, &block_nums),
+        ch.canonical_receipts_present(receipts, &block_nums),
+    )?;
+
+    let mut repair_blocks = block_check.stale_blocks.clone();
+    repair_blocks.extend(tx_check.stale_blocks.iter().copied());
+    repair_blocks.extend(log_check.stale_blocks.iter().copied());
+    repair_blocks.extend(receipt_check.stale_blocks.iter().copied());
+    for (block, is_present) in blocks.iter().zip(&block_check.present) {
+        if !is_present
+            && !block_check.occupied_blocks.contains(&block.num)
+            && (tx_check.occupied_blocks.contains(&block.num)
+                || log_check.occupied_blocks.contains(&block.num)
+                || receipt_check.occupied_blocks.contains(&block.num))
+        {
+            repair_blocks.insert(block.num);
+        }
+    }
+    let mut repair_block_nums = repair_blocks.iter().copied().collect::<Vec<_>>();
+    repair_block_nums.sort_unstable();
+    if !repair_block_nums.is_empty() {
+        let source_blocks = blocks.iter().map(|block| block.num).collect::<HashSet<_>>();
+        if let Some(block_num) = repair_blocks
+            .iter()
+            .find(|block_num| !source_blocks.contains(block_num))
+        {
+            anyhow::bail!(
+                "cannot repair stale ClickHouse rows for block {block_num} without its canonical block row"
+            );
+        }
+    }
+
+    retain_missing_or_repaired(blocks, block_check.present, &repair_blocks, |row| row.num);
+    retain_missing_or_repaired(txs, tx_check.present, &repair_blocks, |row| row.block_num);
+    retain_missing_or_repaired(logs, log_check.present, &repair_blocks, |row| row.block_num);
+    retain_missing_or_repaired(receipts, receipt_check.present, &repair_blocks, |row| {
+        row.block_num
+    });
+    Ok(repair_block_nums)
+}
+
+fn retain_missing_or_repaired<T>(
+    rows: &mut Vec<T>,
+    present: Vec<bool>,
+    repair_blocks: &HashSet<i64>,
+    block_num: impl Fn(&T) -> i64,
+) {
+    assert_eq!(rows.len(), present.len());
+    let mut present = present.into_iter();
+    rows.retain(|row| {
+        let is_present = present
+            .next()
+            .expect("canonical row check must match the input length");
+        repair_blocks.contains(&block_num(row)) || !is_present
+    });
 }
 
 /// Read the source high-water mark and durable dual-write tip together.
