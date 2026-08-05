@@ -572,6 +572,11 @@ async fn filter_clickhouse_rows(
     logs: &mut Vec<LogRow>,
     receipts: &mut Vec<ReceiptRow>,
 ) -> Result<Vec<i64>> {
+    blocks.sort_unstable_by_key(|row| row.num);
+    sort_by_natural_key(txs, |row| (row.block_num, row.idx));
+    sort_by_natural_key(logs, |row| (row.block_num, row.log_idx));
+    sort_by_natural_key(receipts, |row| (row.block_num, row.tx_idx));
+
     let mut block_nums = blocks
         .iter()
         .map(|row| row.num)
@@ -627,6 +632,10 @@ async fn filter_clickhouse_rows(
         row.block_num
     });
     Ok(repair_block_nums)
+}
+
+fn sort_by_natural_key<T>(rows: &mut [T], key: impl FnMut(&T) -> (i64, i32)) {
+    rows.sort_unstable_by_key(key);
 }
 
 fn retain_missing_or_repaired<T>(
@@ -827,4 +836,16 @@ async fn fetch_receipts(
             fee_token: None,
         })
         .collect())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::sort_by_natural_key;
+
+    #[test]
+    fn replay_rows_are_sorted_by_natural_key() {
+        let mut rows = vec![(3, 1), (1, 2), (2, 0), (1, 0)];
+        sort_by_natural_key(&mut rows, |row| *row);
+        assert_eq!(rows, vec![(1, 0), (1, 2), (2, 0), (3, 1)]);
+    }
 }

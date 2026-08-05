@@ -822,24 +822,25 @@ impl ClickHouseSink {
                 .join(", ");
             let sql = format!(
                 "SELECT DISTINCT num, hash, parent_hash, timestamp, timestamp_ms, gas_limit, \
-                 gas_used, miner, extra_data, consensus_proposer FROM blocks FINAL \
+                 gas_used, miner, extra_data, consensus_proposer FROM blocks \
                  WHERE num IN ({nums})"
             );
             let existing: Vec<ChBlockWire> =
                 self.client.query(&sql).fetch_all().await.map_err(|e| {
                     anyhow!("ClickHouse canonical-row query for blocks failed: {e}")
                 })?;
-            let existing_nums = existing
-                .iter()
-                .map(|block| block.num)
-                .collect::<HashSet<_>>();
-            let existing = existing.into_iter().collect::<HashSet<_>>();
-            occupied_blocks.extend(existing_nums.iter().copied());
+            let mut existing_by_num = HashMap::<i64, HashSet<ChBlockWire>>::new();
+            for block in existing {
+                existing_by_num.entry(block.num).or_default().insert(block);
+            }
+            occupied_blocks.extend(existing_by_num.keys().copied());
 
             for block in chunk {
-                let is_present = existing.contains(&ChBlockWire::from_row(block));
+                let existing = existing_by_num.get(&block.num);
+                let is_present = existing
+                    .is_some_and(|versions| versions.contains(&ChBlockWire::from_row(block)));
                 present.push(is_present);
-                if !is_present && existing_nums.contains(&block.num) {
+                if existing.is_some_and(|versions| versions.len() > 1 || !is_present) {
                     stale_blocks.insert(block.num);
                 }
             }

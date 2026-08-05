@@ -2864,6 +2864,38 @@ async fn test_backfill_replays_blocks_with_stale_child_rows() {
     assert_eq!(receipt_result["data"][0]["gas_used"].as_i64(), Some(21_000));
 }
 
+/// A canonical block can coexist with an older distinct version until a merge.
+/// Backfill must replace the entire block instead of treating the canonical row
+/// as sufficient.
+#[tokio::test]
+#[serial(clickhouse)]
+async fn test_backfill_replays_blocks_with_extra_block_versions() {
+    let Some((pool, sinks, ch_sink, ch)) = setup_backfill().await else {
+        return;
+    };
+
+    let blocks = vec![make_block(1)];
+    writer::write_blocks(&pool, &blocks).await.unwrap();
+
+    let mut stale_blocks = blocks.clone();
+    stale_blocks[0].hash = vec![0xee; 32];
+    stale_blocks.extend(blocks.clone());
+    ch_sink.write_blocks(&stale_blocks).await.unwrap();
+    assert_eq!(ch.table_count("blocks").await.unwrap(), 2);
+
+    sinks.backfill_clickhouse(TEST_CHAIN_ID).await.unwrap();
+
+    assert_eq!(ch.table_count("blocks").await.unwrap(), 1);
+    let result = ch
+        .query_json("SELECT hash FROM blocks WHERE num = 1")
+        .await
+        .unwrap();
+    assert_eq!(
+        result["data"][0]["hash"].as_str(),
+        Some(format!("0x{}", hex::encode(&blocks[0].hash)).as_str())
+    );
+}
+
 /// Replay must recover both completed deletion and cleanup interrupted after
 /// the block marker was removed, without reusing remembered insert tokens.
 #[tokio::test]
