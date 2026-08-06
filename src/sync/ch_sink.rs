@@ -6,15 +6,19 @@
 use anyhow::{Context, Result, anyhow};
 use clickhouse::{Row, RowOwned, RowRead};
 use serde::{Deserialize, Serialize};
+use sha3::{Digest, Keccak256};
 use std::borrow::Cow;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::hash::{DefaultHasher, Hash, Hasher};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
+use tokio::sync::{Mutex, MutexGuard};
 use tracing::{debug, error, info, warn};
 
 use crate::clickhouse_schema::{
-    BackfillPolicy, ClickHouseObject, ClickHouseObjectKind, base_objects, derived_backfills,
-    derived_objects, migrations, post_derived_migrations, reorg_tables, retired_object_drops,
+    BackfillPolicy, BlockScopedTable, ClickHouseObject, ClickHouseObjectKind, base_objects,
+    derived_backfills, derived_objects, migrations, post_derived_migrations, reorg_tables,
+    retired_object_drops,
 };
 use crate::metrics;
 use crate::types::{BlockRow, LogRow, ReceiptRow, TxRow};
@@ -35,6 +39,12 @@ const SCHEMA_OBJECTS_TABLE_DDL: &str = "
 
 /// Max rows per ClickHouse INSERT to avoid unbounded memory growth during backfills.
 const CH_INSERT_CHUNK_SIZE: usize = 10_000;
+
+/// Max block numbers included in one ClickHouse replay query or mutation.
+const CH_REPLAY_BLOCK_CHUNK_SIZE: usize = 1_000;
+
+/// Target rows per streamed populated-block replay query.
+const CH_REPLAY_RESULT_CHUNK_SIZE: u64 = 50_000;
 
 /// Max retry attempts for transient ClickHouse write failures.
 const CH_MAX_RETRIES: u32 = 3;
@@ -59,6 +69,8 @@ pub struct ClickHouseSink {
     /// Create the database with `ENGINE = Replicated` and rewrite
     /// MergeTree-family table engines to their `Replicated*` counterparts.
     replicated_database: bool,
+    /// Serializes destructive repairs with derived-table backfills.
+    maintenance_lock: Arc<Mutex<()>>,
 }
 
 /// Canonical base-table rows read from a completed ClickHouse archive range.
@@ -68,6 +80,48 @@ pub(crate) struct ArchiveBatch {
     pub txs: Vec<TxRow>,
     pub logs: Vec<LogRow>,
     pub receipts: Vec<ReceiptRow>,
+}
+
+pub(crate) struct CanonicalRowCheck {
+    pub present: Vec<bool>,
+    pub stale_blocks: HashSet<i64>,
+    pub occupied_blocks: HashSet<i64>,
+}
+
+struct CanonicalChildQuery<'a> {
+    table: &'a str,
+    position_col: &'a str,
+    columns: &'a str,
+}
+
+fn exact_block_delete_tables() -> Vec<BlockScopedTable> {
+    let mut tables = reorg_tables().collect::<Vec<_>>();
+    let blocks = tables
+        .iter()
+        .position(|table| table.name == "blocks")
+        .map(|index| tables.remove(index))
+        .expect("blocks must be registered for reorg cleanup");
+    tables.insert(0, blocks);
+    tables
+}
+
+/// Stable seed for one logical realtime base-table write.
+pub(crate) fn batch_deduplication_seed(blocks: &[BlockRow]) -> Option<String> {
+    if blocks.is_empty() {
+        return None;
+    }
+
+    let mut hasher = Keccak256::new();
+    for block in blocks {
+        hasher.update(block.num.to_le_bytes());
+        hasher.update(&block.hash);
+    }
+    Some(hex::encode(hasher.finalize()))
+}
+
+/// Fresh seed for a presence-filtered write or destructive replay.
+pub(crate) fn replay_deduplication_seed() -> String {
+    format!("tidx-replay-{}", hex::encode(rand::random::<[u8; 16]>()))
 }
 
 /// A historical derived-table repair planned from the schema state observed
@@ -119,6 +173,7 @@ impl ClickHouseSink {
             base_client,
             database: database.to_string(),
             replicated_database: false,
+            maintenance_lock: Arc::new(Mutex::new(())),
         })
     }
 
@@ -159,8 +214,9 @@ impl ClickHouseSink {
 
     /// Detect and repair historical gaps in managed derived tables.
     pub async fn repair_derived_backfill_gaps(&self) -> Result<()> {
+        let _guard = self.maintenance_lock.lock().await;
         let plans = self.plan_derived_backfills().await?;
-        self.run_derived_backfill_plan(plans).await
+        self.run_derived_backfill_plan_locked(plans).await
     }
 
     async fn ensure_schema_objects(&self) -> Result<()> {
@@ -383,6 +439,14 @@ impl ClickHouseSink {
 
     /// Execute a planned derived-table backfill.
     pub async fn run_derived_backfill_plan(&self, plans: Vec<DerivedBackfillPlan>) -> Result<()> {
+        let _guard = self.maintenance_lock.lock().await;
+        self.run_derived_backfill_plan_locked(plans).await
+    }
+
+    async fn run_derived_backfill_plan_locked(
+        &self,
+        plans: Vec<DerivedBackfillPlan>,
+    ) -> Result<()> {
         if plans.is_empty() {
             return Ok(());
         }
@@ -416,6 +480,10 @@ impl ClickHouseSink {
             "ClickHouse derived table backfills complete"
         );
         Ok(())
+    }
+
+    pub(crate) async fn maintenance_guard(&self) -> MutexGuard<'_, ()> {
+        self.maintenance_lock.lock().await
     }
 
     async fn plan_derived_backfills(&self) -> Result<Vec<DerivedBackfillPlan>> {
@@ -737,39 +805,277 @@ impl ClickHouseSink {
         Ok(nums.into_iter().map(|n| n.max(0) as u64).collect())
     }
 
-    /// Natural row keys present in a child table within `[from, to]`.
-    ///
-    /// Backfill retries use these keys instead of block-level presence because
-    /// a chunked insert can commit only part of a high-throughput block.
-    pub(crate) async fn row_keys_in_table_range(
+    /// Compare incoming blocks with the canonical rows currently stored by number.
+    pub(crate) async fn canonical_blocks_present(
+        &self,
+        blocks: &[BlockRow],
+    ) -> Result<CanonicalRowCheck> {
+        let mut present = Vec::with_capacity(blocks.len());
+        let mut stale_blocks = HashSet::new();
+        let mut occupied_blocks = HashSet::new();
+
+        for chunk in blocks.chunks(CH_REPLAY_BLOCK_CHUNK_SIZE) {
+            let nums = chunk
+                .iter()
+                .map(|block| block.num.to_string())
+                .collect::<Vec<_>>()
+                .join(", ");
+            let sql = format!(
+                "SELECT DISTINCT num, hash, parent_hash, timestamp, timestamp_ms, gas_limit, \
+                 gas_used, miner, extra_data, consensus_proposer FROM blocks \
+                 WHERE num IN ({nums})"
+            );
+            let existing: Vec<ChBlockWire> =
+                self.client.query(&sql).fetch_all().await.map_err(|e| {
+                    anyhow!("ClickHouse canonical-row query for blocks failed: {e}")
+                })?;
+            let mut existing_by_num = HashMap::<i64, HashSet<ChBlockWire>>::new();
+            for block in existing {
+                existing_by_num.entry(block.num).or_default().insert(block);
+            }
+            occupied_blocks.extend(existing_by_num.keys().copied());
+
+            for block in chunk {
+                let existing = existing_by_num.get(&block.num);
+                let is_present = existing
+                    .is_some_and(|versions| versions.contains(&ChBlockWire::from_row(block)));
+                present.push(is_present);
+                if existing.is_some_and(|versions| versions.len() > 1 || !is_present) {
+                    stale_blocks.insert(block.num);
+                }
+            }
+        }
+
+        Ok(CanonicalRowCheck {
+            present,
+            stale_blocks,
+            occupied_blocks,
+        })
+    }
+
+    /// Compare transactions with complete canonical values and block row counts.
+    pub(crate) async fn canonical_txs_present(
+        &self,
+        txs: &[TxRow],
+        block_nums: &[i64],
+    ) -> Result<CanonicalRowCheck> {
+        self.canonical_child_rows_present::<_, ChTxWire, _, _, _>(
+            CanonicalChildQuery {
+                table: "txs",
+                position_col: "idx",
+                columns: "block_num, block_timestamp, idx, hash, `type`, `from`, `to`, value, \
+                          input, gas_limit, max_fee_per_gas, max_priority_fee_per_gas, gas_used, \
+                          nonce_key, nonce, fee_token, fee_payer, calls, call_count, valid_before, \
+                          valid_after, signature_type",
+            },
+            txs,
+            block_nums,
+            ChTxWire::from_row,
+            |row| (row.block_num, row.idx),
+            |row| (row.block_num, row.idx),
+        )
+        .await
+    }
+
+    /// Compare logs with complete canonical values and block row counts.
+    pub(crate) async fn canonical_logs_present(
+        &self,
+        logs: &[LogRow],
+        block_nums: &[i64],
+    ) -> Result<CanonicalRowCheck> {
+        self.canonical_child_rows_present::<_, ChLogWire, _, _, _>(
+            CanonicalChildQuery {
+                table: "logs",
+                position_col: "log_idx",
+                columns: "block_num, block_timestamp, log_idx, tx_idx, tx_hash, address, selector, \
+                          topic0, topic1, topic2, topic3, data, is_virtual_forward",
+            },
+            logs,
+            block_nums,
+            ChLogWire::from_row,
+            |row| (row.block_num, row.log_idx),
+            |row| (row.block_num, row.log_idx),
+        )
+        .await
+    }
+
+    /// Compare receipts with complete canonical values and block row counts.
+    pub(crate) async fn canonical_receipts_present(
+        &self,
+        receipts: &[ReceiptRow],
+        block_nums: &[i64],
+    ) -> Result<CanonicalRowCheck> {
+        self.canonical_child_rows_present::<_, ChReceiptWire, _, _, _>(
+            CanonicalChildQuery {
+                table: "receipts",
+                position_col: "tx_idx",
+                columns: "block_num, block_timestamp, tx_idx, tx_hash, `from`, `to`, \
+                          contract_address, gas_used, cumulative_gas_used, effective_gas_price, \
+                          status, fee_payer, `type`, fee_token",
+            },
+            receipts,
+            block_nums,
+            ChReceiptWire::from_row,
+            |row| (row.block_num, row.tx_idx),
+            |row| (row.block_num, row.tx_idx),
+        )
+        .await
+    }
+
+    async fn canonical_child_rows_present<S, W, F, K, G>(
+        &self,
+        query: CanonicalChildQuery<'_>,
+        rows: &[S],
+        block_nums: &[i64],
+        to_wire: F,
+        row_key: K,
+        wire_key: G,
+    ) -> Result<CanonicalRowCheck>
+    where
+        W: Eq + RowOwned + RowRead,
+        F: Fn(&S) -> W,
+        K: Fn(&S) -> (i64, i32),
+        G: Fn(&W) -> (i64, i32),
+    {
+        let CanonicalChildQuery {
+            table,
+            position_col,
+            columns,
+        } = query;
+        let table = validate_table_name(table)?;
+        let actual_counts = self
+            .row_counts_in_blocks(table, "block_num", block_nums)
+            .await?;
+        let occupied_blocks = actual_counts.keys().copied().collect::<HashSet<_>>();
+        let mut present = vec![false; rows.len()];
+        let mut expected_counts = HashMap::<i64, u64>::new();
+        for pair in rows.windows(2) {
+            if row_key(&pair[0]) >= row_key(&pair[1]) {
+                anyhow::bail!(
+                    "canonical source rows for {table} must be strictly ordered by block and position"
+                );
+            }
+        }
+        for row in rows {
+            *expected_counts.entry(row_key(row).0).or_default() += 1;
+        }
+
+        // Group populated blocks by FINAL row counts, then stream each result.
+        // Blocks with extras are already stale and need no full-row query.
+        let mut block_batches = Vec::<Vec<i64>>::new();
+        let mut batch = Vec::new();
+        let mut batch_rows = 0_u64;
+        for block_num in block_nums.iter().copied() {
+            let Some(&actual) = actual_counts.get(&block_num) else {
+                continue;
+            };
+            let expected = expected_counts.get(&block_num).copied().unwrap_or_default();
+            if actual > expected {
+                continue;
+            }
+            if actual > CH_REPLAY_RESULT_CHUNK_SIZE {
+                if !batch.is_empty() {
+                    block_batches.push(std::mem::take(&mut batch));
+                    batch_rows = 0;
+                }
+                block_batches.push(vec![block_num]);
+                continue;
+            }
+            if !batch.is_empty()
+                && (batch_rows + actual > CH_REPLAY_RESULT_CHUNK_SIZE
+                    || batch.len() == CH_REPLAY_BLOCK_CHUNK_SIZE)
+            {
+                block_batches.push(std::mem::take(&mut batch));
+                batch_rows = 0;
+            }
+            batch.push(block_num);
+            batch_rows += actual;
+        }
+        if !batch.is_empty() {
+            block_batches.push(batch);
+        }
+
+        let mut source_index = 0;
+        for block_batch in block_batches {
+            let nums = block_batch
+                .iter()
+                .map(i64::to_string)
+                .collect::<Vec<_>>()
+                .join(", ");
+            let sql = format!(
+                "SELECT {columns} FROM {table} FINAL WHERE block_num IN ({nums}) \
+                 ORDER BY block_num, {position_col}"
+            );
+            let mut cursor =
+                self.client.query(&sql).fetch::<W>().map_err(|e| {
+                    anyhow!("ClickHouse canonical-row query for {table} failed: {e}")
+                })?;
+            while let Some(existing) = cursor
+                .next()
+                .await
+                .map_err(|e| anyhow!("ClickHouse canonical-row query for {table} failed: {e}"))?
+            {
+                let key = wire_key(&existing);
+                while source_index < rows.len() && row_key(&rows[source_index]) < key {
+                    source_index += 1;
+                }
+                if source_index < rows.len()
+                    && row_key(&rows[source_index]) == key
+                    && existing == to_wire(&rows[source_index])
+                {
+                    present[source_index] = true;
+                }
+            }
+        }
+
+        let mut exact_counts = HashMap::<i64, u64>::new();
+        for (row, is_present) in rows.iter().zip(&present) {
+            if *is_present {
+                *exact_counts.entry(row_key(row).0).or_default() += 1;
+            }
+        }
+
+        let stale_blocks = actual_counts
+            .into_iter()
+            .filter_map(|(block_num, actual)| {
+                (actual > exact_counts.get(&block_num).copied().unwrap_or_default())
+                    .then_some(block_num)
+            })
+            .collect();
+
+        Ok(CanonicalRowCheck {
+            present,
+            stale_blocks,
+            occupied_blocks,
+        })
+    }
+
+    async fn row_counts_in_blocks(
         &self,
         table: &str,
-        from: u64,
-        to: u64,
-    ) -> Result<Vec<(i64, i32)>> {
-        if from > to {
-            return Ok(Vec::new());
+        block_column: &str,
+        block_nums: &[i64],
+    ) -> Result<HashMap<i64, u64>> {
+        let mut counts = HashMap::new();
+        for chunk in block_nums.chunks(CH_REPLAY_BLOCK_CHUNK_SIZE) {
+            let nums = chunk
+                .iter()
+                .map(i64::to_string)
+                .collect::<Vec<_>>()
+                .join(", ");
+            let sql = format!(
+                "SELECT {block_column} AS block_num, count() AS row_count FROM {table} FINAL \
+                 WHERE {block_column} IN ({nums}) GROUP BY {block_column}"
+            );
+            let rows: Vec<ChBlockRowCount> = self
+                .client
+                .query(&sql)
+                .fetch_all()
+                .await
+                .map_err(|e| anyhow!("ClickHouse row-count query for {table} failed: {e}"))?;
+            counts.extend(rows.into_iter().map(|row| (row.block_num, row.row_count)));
         }
-        let table = validate_table_name(table)?;
-        let position_col = match table {
-            "txs" => "idx",
-            "logs" => "log_idx",
-            "receipts" => "tx_idx",
-            _ => return Err(anyhow!("ClickHouse table has no child row key: {table}")),
-        };
-        let rows: Vec<ChRowKey> = self
-            .client
-            .query(&format!(
-                "SELECT block_num, {position_col} AS row_idx FROM {table} \
-                 WHERE block_num >= {from} AND block_num <= {to}"
-            ))
-            .fetch_all()
-            .await
-            .map_err(|e| anyhow!("ClickHouse query failed: {e}"))?;
-        Ok(rows
-            .into_iter()
-            .map(|row| (row.block_num, row.row_idx))
-            .collect())
+        Ok(counts)
     }
 
     /// Query the highest block number in ClickHouse, or None if empty.
@@ -934,6 +1240,72 @@ impl ClickHouseSink {
         }
     }
 
+    /// Delete exact blocks from every block-scoped table before replaying them.
+    pub(crate) async fn delete_blocks_exact(
+        &self,
+        _guard: &MutexGuard<'_, ()>,
+        block_nums: &[i64],
+    ) -> Result<()> {
+        if block_nums.is_empty() {
+            return Ok(());
+        }
+
+        // Remove the completion marker before dependent data. A retry can then
+        // recognize interrupted cleanup and replay the entire canonical block.
+        for table in exact_block_delete_tables() {
+            for chunk in block_nums.chunks(CH_REPLAY_BLOCK_CHUNK_SIZE) {
+                let nums = chunk
+                    .iter()
+                    .map(i64::to_string)
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let predicate = format!("{} IN ({nums})", table.block_column);
+                self.client
+                    .query(&format!(
+                        "ALTER TABLE {} DELETE WHERE {predicate}",
+                        table.name
+                    ))
+                    .with_option("mutations_sync", "1")
+                    .execute()
+                    .await
+                    .map_err(|e| {
+                        anyhow!(
+                            "ClickHouse exact-block delete from {} failed: {e}",
+                            table.name
+                        )
+                    })?;
+
+                let remaining: u64 = self
+                    .client
+                    .query(&format!(
+                        "SELECT count() FROM {} WHERE {predicate}",
+                        table.name
+                    ))
+                    .fetch_one()
+                    .await
+                    .map_err(|e| {
+                        anyhow!(
+                            "ClickHouse exact-block verification query for {} failed: {e}",
+                            table.name
+                        )
+                    })?;
+                if remaining > 0 {
+                    return Err(anyhow!(
+                        "ClickHouse exact-block delete on {} left {remaining} row(s); \
+                         refusing to replay atop stale rows",
+                        table.name
+                    ));
+                }
+            }
+        }
+
+        debug!(
+            blocks = block_nums.len(),
+            "ClickHouse exact-block delete complete"
+        );
+        Ok(())
+    }
+
     /// Delete all data from a given block number onwards (reorg support).
     ///
     /// Uses `mutations_sync=1` so the ALTER ... DELETE completes before this
@@ -943,6 +1315,7 @@ impl ClickHouseSink {
     /// completion but a replica still serves stale rows) — without the
     /// assertion, replay would happily start atop ghost rows.
     pub async fn delete_from(&self, block_num: u64) -> Result<()> {
+        let _guard = self.maintenance_lock.lock().await;
         for table in reorg_tables() {
             let sql = format!(
                 "ALTER TABLE {} DELETE WHERE {} >= {}",
@@ -1078,12 +1451,12 @@ struct ChSchemaObjectRow {
 }
 
 #[derive(Row, Deserialize)]
-struct ChRowKey {
+struct ChBlockRowCount {
     block_num: i64,
-    row_idx: i32,
+    row_count: u64,
 }
 
-#[derive(Hash, Row, Serialize, Deserialize)]
+#[derive(Eq, Hash, PartialEq, Row, Serialize, Deserialize)]
 struct ChBlockWire {
     num: i64,
     hash: String,
@@ -1133,7 +1506,7 @@ impl ChBlockWire {
     }
 }
 
-#[derive(Hash, Row, Serialize, Deserialize)]
+#[derive(Eq, Hash, PartialEq, Row, Serialize, Deserialize)]
 struct ChTxWire {
     block_num: i64,
     #[serde(with = "clickhouse::serde::chrono::datetime64::millis")]
@@ -1224,7 +1597,7 @@ impl ChTxWire {
     }
 }
 
-#[derive(Hash, Row, Serialize, Deserialize)]
+#[derive(Eq, Hash, PartialEq, Row, Serialize, Deserialize)]
 struct ChLogWire {
     block_num: i64,
     #[serde(with = "clickhouse::serde::chrono::datetime64::millis")]
@@ -1288,7 +1661,7 @@ impl ChLogWire {
     }
 }
 
-#[derive(Hash, Row, Serialize, Deserialize)]
+#[derive(Eq, Hash, PartialEq, Row, Serialize, Deserialize)]
 struct ChReceiptWire {
     block_num: i64,
     #[serde(with = "clickhouse::serde::chrono::datetime64::millis")]
@@ -1668,6 +2041,45 @@ mod tests {
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed["type"], 2);
         assert!(parsed.get("tx_type").is_none());
+    }
+
+    #[test]
+    fn batch_deduplication_seed_tracks_block_generation() {
+        use chrono::TimeZone;
+
+        let block = BlockRow {
+            num: 42,
+            hash: vec![0xcc; 32],
+            parent_hash: vec![0xbb; 32],
+            timestamp: chrono::Utc.with_ymd_and_hms(2024, 1, 15, 12, 0, 0).unwrap(),
+            timestamp_ms: 1_705_320_000_000,
+            gas_limit: 30_000_000,
+            gas_used: 15_000_000,
+            miner: vec![0xaa; 20],
+            extra_data: None,
+            consensus_proposer: None,
+        };
+        let ordinary = batch_deduplication_seed(std::slice::from_ref(&block))
+            .expect("non-empty writes need a seed");
+        let repeated = batch_deduplication_seed(std::slice::from_ref(&block)).unwrap();
+        assert_eq!(ordinary, repeated);
+
+        assert_eq!(batch_deduplication_seed(&[]), None);
+
+        let mut changed_block = block.clone();
+        changed_block.hash[0] ^= 0xff;
+        let changed = batch_deduplication_seed(&[changed_block]).unwrap();
+        assert_ne!(ordinary, changed);
+    }
+
+    #[test]
+    fn exact_block_cleanup_deletes_marker_first() {
+        let tables = exact_block_delete_tables();
+        assert_eq!(tables.first().map(|table| table.name), Some("blocks"));
+        assert_eq!(
+            tables.iter().filter(|table| table.name == "blocks").count(),
+            1
+        );
     }
 
     #[test]
