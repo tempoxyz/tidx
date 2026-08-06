@@ -13,7 +13,7 @@ jobs:
     if: github.event_name == 'pull_request'
     permissions:
       contents: read
-    uses: tempoxyz/gh-actions/.github/workflows/pr-audit.yml@98b1081dcf34361b576aca2ab3041772708582ef
+    uses: tempoxyz/gh-actions/.github/workflows/pr-audit.yml@483bda4a2a4b5e04a51edff03768c1590d271f80 # main
     with:
       required-labels: |
         cyclops
@@ -39,7 +39,7 @@ jobs:
       pull-requests: read
     steps:
       - name: Handle audit command
-        uses: tempoxyz/gh-actions/actions/pr-audit-comment@98b1081dcf34361b576aca2ab3041772708582ef
+        uses: tempoxyz/gh-actions/actions/pr-audit-comment@483bda4a2a4b5e04a51edff03768c1590d271f80 # main
         with:
           command-regex: '^(?:@decofe\s+)?(?:cyclops\s+audit|derek\s+audit)\b'
           permission-check-mode: association
@@ -48,4 +48,3 @@ jobs:
           events-cert: ${{ secrets.EVENTS_CERT }}
           events-args: ${{ secrets.EVENTS_ARGS }}
           github-token: ${{ github.token }}
-          allow-same-repository-author: "true"
