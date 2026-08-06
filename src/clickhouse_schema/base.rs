@@ -50,6 +50,14 @@ const TXS_MIGRATION_20260806: &str =
     include_str!("../../db/clickhouse/migrations/20260806_add_txs_fee_indexes.sql");
 const MATERIALIZE_TXS_INDEXES_20260806: &str =
     include_str!("../../db/clickhouse/migrations/20260806_materialize_txs_fee_indexes.sql");
+const TOKEN_TRANSFERS_PROJECTION_MODE_20260806: &str =
+    include_str!("../../db/clickhouse/migrations/20260806_set_token_transfers_projection_mode.sql");
+const TOKEN_TRANSFERS_RECIPIENT_PROJECTION_20260806: &str = include_str!(
+    "../../db/clickhouse/migrations/20260806_add_token_transfers_recipient_projection.sql"
+);
+const MATERIALIZE_TOKEN_TRANSFERS_RECIPIENT_PROJECTION_20260806: &str = include_str!(
+    "../../db/clickhouse/migrations/20260806_materialize_token_transfers_recipient_projection.sql"
+);
 const TOKEN_HOLDER_DELTAS_MIGRATION_20260618: &str =
     include_str!("../../db/clickhouse/migrations/20260618_delete_guard_token_holder_deltas.sql");
 const ADDRESS_HOLDER_DELTAS_MIGRATION_20260618: &str =
@@ -523,6 +531,32 @@ pub const POST_DERIVED_MIGRATIONS: &[ClickHouseObject] = &[
         name: "address_balances_snapshot_20260704_wait_after_sign_fix",
         kind: ClickHouseObjectKind::Migration(WAIT_ADDRESS_BALANCES_SNAPSHOT_20260704),
         depends_on: &["address_balances_snapshot"],
+        public_query: false,
+        block_column: None,
+        backfill: None,
+    },
+    ClickHouseObject {
+        name: "token_transfers_20260806_projection_mode",
+        kind: ClickHouseObjectKind::Migration(TOKEN_TRANSFERS_PROJECTION_MODE_20260806),
+        depends_on: &["token_transfers"],
+        public_query: false,
+        block_column: None,
+        backfill: None,
+    },
+    ClickHouseObject {
+        name: "token_transfers_20260806_recipient_projection",
+        kind: ClickHouseObjectKind::Migration(TOKEN_TRANSFERS_RECIPIENT_PROJECTION_20260806),
+        depends_on: &["token_transfers_20260806_projection_mode"],
+        public_query: false,
+        block_column: None,
+        backfill: None,
+    },
+    ClickHouseObject {
+        name: "token_transfers_20260806_materialize_recipient_projection",
+        kind: ClickHouseObjectKind::Migration(
+            MATERIALIZE_TOKEN_TRANSFERS_RECIPIENT_PROJECTION_20260806,
+        ),
+        depends_on: &["token_transfers_20260806_recipient_projection"],
         public_query: false,
         block_column: None,
         backfill: None,

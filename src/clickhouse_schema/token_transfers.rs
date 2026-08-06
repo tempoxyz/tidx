@@ -55,4 +55,17 @@ mod tests {
         assert_eq!(select_sql, TOKEN_TRANSFERS_SELECT);
         assert!(select_sql.contains("reinterpretAsUInt256"));
     }
+
+    #[test]
+    fn table_ddl_has_recipient_projection() {
+        let table = OBJECTS
+            .iter()
+            .find(|object| object.name == "token_transfers")
+            .unwrap();
+        let ddl = table.ddl();
+        assert!(ddl.contains("PROJECTION by_recipient"));
+        assert!(ddl.contains("SELECT _part_offset"));
+        assert!(ddl.contains("ORDER BY (`to`, block_num, log_idx)"));
+        assert!(ddl.contains("deduplicate_merge_projection_mode = 'rebuild'"));
+    }
 }

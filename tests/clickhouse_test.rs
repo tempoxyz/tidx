@@ -1488,6 +1488,17 @@ async fn test_sink_token_transfers_decodes_transfers_and_reorgs() {
     assert_eq!(rows[2].amount, "10");
     assert_eq!(rows[2].is_virtual_forward, 1);
 
+    let projected = ch
+        .query_json(&format!(
+            "SELECT block_num FROM token_transfers \
+             WHERE `to` = '{bob}' \
+             ORDER BY block_num DESC, log_idx DESC LIMIT 1 \
+             SETTINGS force_optimize_projection = 1"
+        ))
+        .await
+        .expect("recipient query should use a projection");
+    assert_eq!(projected["data"][0]["block_num"].as_i64(), Some(2));
+
     sink.delete_from(3).await.expect("delete_from failed");
 
     let rows = token_transfers(&ch).await;
