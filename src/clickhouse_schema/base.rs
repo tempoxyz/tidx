@@ -46,6 +46,10 @@ const LOGS_MIGRATION_20260714: &str =
     include_str!("../../db/clickhouse/migrations/20260714_add_logs_block_num_index.sql");
 const MATERIALIZE_LOGS_INDEX_20260714: &str =
     include_str!("../../db/clickhouse/migrations/20260714_materialize_logs_block_num_index.sql");
+const TXS_MIGRATION_20260806: &str =
+    include_str!("../../db/clickhouse/migrations/20260806_add_txs_fee_indexes.sql");
+const MATERIALIZE_TXS_INDEXES_20260806: &str =
+    include_str!("../../db/clickhouse/migrations/20260806_materialize_txs_fee_indexes.sql");
 const TOKEN_HOLDER_DELTAS_MIGRATION_20260618: &str =
     include_str!("../../db/clickhouse/migrations/20260618_delete_guard_token_holder_deltas.sql");
 const ADDRESS_HOLDER_DELTAS_MIGRATION_20260618: &str =
@@ -350,6 +354,22 @@ pub const MIGRATIONS: &[ClickHouseObject] = &[
         name: "token_holder_counts_20260715_drop_before_snapshot_replace",
         kind: ClickHouseObjectKind::Migration(DROP_TOKEN_HOLDER_COUNTS_20260715),
         depends_on: &[],
+        public_query: false,
+        block_column: None,
+        backfill: None,
+    },
+    ClickHouseObject {
+        name: "txs_20260806_fee_indexes",
+        kind: ClickHouseObjectKind::Migration(TXS_MIGRATION_20260806),
+        depends_on: &["txs"],
+        public_query: false,
+        block_column: None,
+        backfill: None,
+    },
+    ClickHouseObject {
+        name: "txs_20260806_materialize_fee_indexes",
+        kind: ClickHouseObjectKind::Migration(MATERIALIZE_TXS_INDEXES_20260806),
+        depends_on: &["txs_20260806_fee_indexes"],
         public_query: false,
         block_column: None,
         backfill: None,

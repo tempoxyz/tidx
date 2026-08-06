@@ -312,6 +312,33 @@ mod tests {
     }
 
     #[test]
+    fn txs_fee_indexes_are_created_and_materialized() {
+        let txs = base_objects()
+            .iter()
+            .find(|object| object.name == "txs")
+            .expect("txs table should be registered")
+            .ddl();
+        assert!(txs.contains("INDEX idx_fee_payer fee_payer TYPE bloom_filter GRANULARITY 1"));
+        assert!(txs.contains("INDEX idx_fee_token fee_token TYPE bloom_filter GRANULARITY 1"));
+
+        let add = migrations()
+            .iter()
+            .find(|object| object.name == "txs_20260806_fee_indexes")
+            .expect("txs fee index migration should be registered")
+            .ddl();
+        assert!(add.contains("ADD INDEX IF NOT EXISTS idx_fee_payer"));
+        assert!(add.contains("ADD INDEX IF NOT EXISTS idx_fee_token"));
+
+        let materialize = migrations()
+            .iter()
+            .find(|object| object.name == "txs_20260806_materialize_fee_indexes")
+            .expect("txs fee index materialization should be registered")
+            .ddl();
+        assert!(materialize.contains("MATERIALIZE INDEX idx_fee_payer"));
+        assert!(materialize.contains("MATERIALIZE INDEX idx_fee_token"));
+    }
+
+    #[test]
     fn post_derived_migrations_run_after_their_target_tables() {
         // all_objects() is the apply order; each migration must come after the
         // table it mutates.
