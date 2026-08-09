@@ -339,6 +339,94 @@ mod tests {
     }
 
     #[test]
+    fn lookup_access_paths_are_created_and_materialized() {
+        let table = |name| {
+            base_objects()
+                .iter()
+                .find(|object| object.name == name)
+                .unwrap_or_else(|| panic!("{name} table should be registered"))
+                .ddl()
+        };
+
+        for name in ["blocks", "txs", "receipts", "logs"] {
+            let ddl = table(name);
+            assert!(ddl.contains("deduplicate_merge_projection_mode = 'rebuild'"));
+        }
+
+        for (name, fragments) in [
+            (
+                "blocks",
+                &[
+                    "PROJECTION prj_hash",
+                    "SELECT _part_offset ORDER BY hash",
+                    "PROJECTION prj_timestamp_position",
+                    "SELECT _part_offset ORDER BY timestamp, num",
+                ][..],
+            ),
+            (
+                "txs",
+                &[
+                    "INDEX idx_from_nonce_key_nonce (`from`, nonce_key, nonce)",
+                    "SELECT _part_offset ORDER BY `from`, block_num, idx",
+                    "SELECT _part_offset ORDER BY `to`, block_num, idx",
+                    "SELECT _part_offset ORDER BY fee_payer, block_num, idx",
+                    "SELECT _part_offset ORDER BY fee_token, block_num, idx",
+                ][..],
+            ),
+            (
+                "receipts",
+                &[
+                    "INDEX idx_to        `to`      TYPE bloom_filter(0.01)",
+                    "SELECT _part_offset ORDER BY tx_hash",
+                    "SELECT _part_offset ORDER BY fee_payer, block_num, tx_idx",
+                ][..],
+            ),
+            (
+                "logs",
+                &[
+                    "INDEX idx_selector_topic1 (selector, topic1) TYPE bloom_filter(0.01)",
+                    "INDEX idx_selector_topic2 (selector, topic2) TYPE bloom_filter(0.01)",
+                    "INDEX idx_selector_topic3 (selector, topic3) TYPE bloom_filter(0.01)",
+                    "SELECT _part_offset ORDER BY address, block_num, log_idx",
+                    "SELECT _part_offset ORDER BY selector, address, block_num, log_idx",
+                    "SELECT _part_offset ORDER BY selector, topic1, block_num, log_idx",
+                    "SELECT _part_offset ORDER BY selector, topic2, block_num, log_idx",
+                    "SELECT _part_offset ORDER BY selector, topic3, block_num, log_idx",
+                    "SELECT _part_offset ORDER BY tx_hash",
+                ][..],
+            ),
+        ] {
+            let ddl = table(name);
+            for fragment in fragments {
+                assert!(ddl.contains(fragment), "{name} is missing `{fragment}`");
+            }
+        }
+
+        for name in ["blocks", "txs", "receipts", "logs"] {
+            let setting = migrations()
+                .iter()
+                .find(|object| object.name == format!("{name}_20260809_projection_rebuild"))
+                .unwrap_or_else(|| panic!("{name} projection rebuild migration should exist"))
+                .ddl();
+            assert!(setting.contains("deduplicate_merge_projection_mode = 'rebuild'"));
+
+            let add = migrations()
+                .iter()
+                .find(|object| object.name == format!("{name}_20260809_access_paths"))
+                .unwrap_or_else(|| panic!("{name} access path migration should exist"))
+                .ddl();
+            assert!(add.contains("ADD PROJECTION IF NOT EXISTS"));
+
+            let materialize = migrations()
+                .iter()
+                .find(|object| object.name == format!("{name}_20260809_materialize_access_paths"))
+                .unwrap_or_else(|| panic!("{name} access path materialization should exist"))
+                .ddl();
+            assert!(materialize.contains("MATERIALIZE PROJECTION"));
+        }
+    }
+
+    #[test]
     fn post_derived_migrations_run_after_their_target_tables() {
         // all_objects() is the apply order; each migration must come after the
         // table it mutates.

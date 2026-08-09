@@ -1228,7 +1228,38 @@ async fn test_sink_ensure_schema_creates_tables() {
             ddl.contains("ZSTD(1)"),
             "table {table} should use ZSTD(1) by default: {ddl}"
         );
+        if ["blocks", "txs", "logs", "receipts"].contains(&table) {
+            assert!(ddl.contains("deduplicate_merge_projection_mode"));
+            assert!(ddl.contains("rebuild"));
+            assert!(ddl.contains("PROJECTION"));
+        }
+        match table {
+            "txs" => assert!(ddl.contains("idx_from_nonce_key_nonce")),
+            "receipts" => assert!(ddl.contains("idx_to")),
+            "logs" => {
+                for index in [
+                    "idx_selector_topic1",
+                    "idx_selector_topic2",
+                    "idx_selector_topic3",
+                ] {
+                    assert!(ddl.contains(index));
+                }
+            }
+            _ => {}
+        }
     }
+
+    let projection_count = ch
+        .query(
+            "SELECT count() FROM system.projections \
+             WHERE database = currentDatabase() AND table IN ('blocks', 'txs', 'logs', 'receipts')",
+        )
+        .await
+        .expect("failed to inspect base table projections")
+        .trim()
+        .parse::<u64>()
+        .expect("projection count should be an integer");
+    assert_eq!(projection_count, 14);
 
     let tracked = ch
         .table_count("tidx_schema_objects")
@@ -1254,6 +1285,93 @@ async fn test_sink_ensure_schema_creates_tables() {
         .await
         .expect("failed to inspect retired objects");
     assert_eq!(retired["rows"], 0);
+}
+
+#[tokio::test]
+#[serial(clickhouse)]
+async fn test_access_path_indexes_are_used() {
+    let ch = TestClickHouse::new(SINK_DB)
+        .await
+        .expect("Failed to create CH client");
+    if ch.wait_for_ready().await.is_err() {
+        println!("ClickHouse not available, skipping test");
+        return;
+    }
+    ch.reset_database().await.expect("Failed to reset database");
+
+    ch.query(
+        "CREATE TABLE access_path_probe ( \
+             id UInt64, \
+             `from` String, \
+             nonce_key String, \
+             nonce Int64, \
+             selector String, \
+             topic1 Nullable(String), \
+             block_num Int64, \
+             idx Int32, \
+             INDEX idx_from_nonce_key_nonce (`from`, nonce_key, nonce) \
+                 TYPE bloom_filter(0.01) GRANULARITY 1, \
+             INDEX idx_selector_topic1 (selector, topic1) \
+                 TYPE bloom_filter(0.01) GRANULARITY 1, \
+             PROJECTION prj_from_position ( \
+                 SELECT _part_offset ORDER BY `from`, block_num, idx \
+             ) \
+         ) ENGINE = MergeTree ORDER BY id \
+         SETTINGS index_granularity = 64, max_bytes_to_merge_at_max_space_in_pool = 1",
+    )
+    .await
+    .expect("failed to create access path probe");
+    for offset in [0, 2048, 4096, 6144] {
+        ch.query(&format!(
+            "INSERT INTO access_path_probe \
+             SELECT number, concat('sender-', leftPad(toString(number), 8, '0')), \
+                 concat('nonce-key-', leftPad(toString(number), 8, '0')), toInt64(number), \
+                 concat('selector-', leftPad(toString(number), 8, '0')), \
+                 concat('topic-', leftPad(toString(number), 8, '0')), \
+                 toInt64(number), toInt32(number % 16) \
+             FROM numbers({offset}, 2048)"
+        ))
+        .await
+        .expect("failed to seed access path probe");
+    }
+
+    for (index, predicate) in [
+        (
+            "idx_from_nonce_key_nonce",
+            "`from` = 'sender-00004096' \
+             AND nonce_key = 'nonce-key-00004096' AND nonce = 4096",
+        ),
+        (
+            "idx_selector_topic1",
+            "selector = 'selector-00004096' AND topic1 = 'topic-00004096'",
+        ),
+    ] {
+        let plan = ch
+            .query(&format!(
+                "EXPLAIN indexes = 1 SELECT count() FROM access_path_probe WHERE {predicate}"
+            ))
+            .await
+            .unwrap_or_else(|_| panic!("failed to explain {index} access path"));
+        assert!(
+            plan.contains(&format!("Name: {index}")),
+            "expected {index} in plan: {plan}"
+        );
+    }
+
+    let projection_plan = ch
+        .query(
+            "EXPLAIN projections = 1 \
+             SELECT id FROM access_path_probe \
+             WHERE `from` = 'sender-00004096' \
+             ORDER BY block_num DESC, idx DESC LIMIT 11 \
+             SETTINGS use_skip_indexes = 0",
+        )
+        .await
+        .expect("failed to explain the sender-position projection");
+    assert!(
+        projection_plan.contains("Name: prj_from_position"),
+        "expected prj_from_position in plan: {projection_plan}"
+    );
 }
 
 #[tokio::test]

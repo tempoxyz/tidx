@@ -1159,7 +1159,7 @@ Gap sync finds discontinuities via SQL and adds the gap from genesis to the firs
 - [Rust 1.75+](https://rustup.rs/)
 - [Docker](https://docs.docker.com/get-started/get-docker/)
 - [PostgreSQL](https://www.postgresql.org/download/)
-- [ClickHouse 25.4+](https://clickhouse.com/docs/install) when ClickHouse OLAP is enabled
+- [ClickHouse 25.8+](https://clickhouse.com/docs/install) when ClickHouse OLAP is enabled
 
 ### Make Commands
 
