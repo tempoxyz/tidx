@@ -50,6 +50,12 @@ const TXS_MIGRATION_20260806: &str =
     include_str!("../../db/clickhouse/migrations/20260806_add_txs_fee_indexes.sql");
 const MATERIALIZE_TXS_INDEXES_20260806: &str =
     include_str!("../../db/clickhouse/migrations/20260806_materialize_txs_fee_indexes.sql");
+const BLOCKS_ACCESS_PATHS_20260809: &str =
+    include_str!("../../db/clickhouse/migrations/20260809_add_blocks_access_paths.sql");
+const TXS_ACCESS_PATHS_20260809: &str =
+    include_str!("../../db/clickhouse/migrations/20260809_add_txs_access_paths.sql");
+const RECEIPTS_ACCESS_PATHS_20260809: &str =
+    include_str!("../../db/clickhouse/migrations/20260809_add_receipts_access_paths.sql");
 const TOKEN_HOLDER_DELTAS_MIGRATION_20260618: &str =
     include_str!("../../db/clickhouse/migrations/20260618_delete_guard_token_holder_deltas.sql");
 const ADDRESS_HOLDER_DELTAS_MIGRATION_20260618: &str =
@@ -370,6 +376,30 @@ pub const MIGRATIONS: &[ClickHouseObject] = &[
         name: "txs_20260806_materialize_fee_indexes",
         kind: ClickHouseObjectKind::Migration(MATERIALIZE_TXS_INDEXES_20260806),
         depends_on: &["txs_20260806_fee_indexes"],
+        public_query: false,
+        block_column: None,
+        backfill: None,
+    },
+    ClickHouseObject {
+        name: "blocks_20260809_access_paths",
+        kind: ClickHouseObjectKind::Migration(BLOCKS_ACCESS_PATHS_20260809),
+        depends_on: &["blocks"],
+        public_query: false,
+        block_column: None,
+        backfill: None,
+    },
+    ClickHouseObject {
+        name: "txs_20260809_access_paths",
+        kind: ClickHouseObjectKind::Migration(TXS_ACCESS_PATHS_20260809),
+        depends_on: &["txs"],
+        public_query: false,
+        block_column: None,
+        backfill: None,
+    },
+    ClickHouseObject {
+        name: "receipts_20260809_access_paths",
+        kind: ClickHouseObjectKind::Migration(RECEIPTS_ACCESS_PATHS_20260809),
+        depends_on: &["receipts"],
         public_query: false,
         block_column: None,
         backfill: None,

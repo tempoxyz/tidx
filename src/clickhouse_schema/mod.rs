@@ -249,7 +249,7 @@ mod tests {
     }
 
     #[test]
-    fn refresh_dependencies_use_clickhouse_25_8_compatible_schedule() {
+    fn refresh_dependencies_use_supported_schedule() {
         for object in derived_objects() {
             let ddl = object.ddl();
             if ddl.contains("DEPENDS ON") {
@@ -336,6 +336,64 @@ mod tests {
             .ddl();
         assert!(materialize.contains("MATERIALIZE INDEX idx_fee_payer"));
         assert!(materialize.contains("MATERIALIZE INDEX idx_fee_token"));
+    }
+
+    #[test]
+    fn lookup_skip_indexes_are_created_without_automatic_backfills() {
+        let table = |name| {
+            base_objects()
+                .iter()
+                .find(|object| object.name == name)
+                .unwrap_or_else(|| panic!("{name} table should be registered"))
+                .ddl()
+        };
+
+        for (name, fragments) in [
+            (
+                "blocks",
+                &["INDEX idx_timestamp timestamp TYPE minmax GRANULARITY 1"][..],
+            ),
+            (
+                "txs",
+                &["INDEX idx_from_nonce_key_nonce (`from`, nonce_key, nonce)"][..],
+            ),
+            (
+                "receipts",
+                &["INDEX idx_to        `to`      TYPE bloom_filter(0.01)"][..],
+            ),
+            (
+                "logs",
+                &[
+                    "INDEX idx_selector selector TYPE bloom_filter GRANULARITY 1",
+                    "INDEX idx_topic1 topic1 TYPE bloom_filter GRANULARITY 1",
+                    "INDEX idx_topic2 topic2 TYPE bloom_filter GRANULARITY 1",
+                    "INDEX idx_topic3 topic3 TYPE bloom_filter GRANULARITY 1",
+                ][..],
+            ),
+        ] {
+            let ddl = table(name);
+            for fragment in fragments {
+                assert!(ddl.contains(fragment), "{name} is missing `{fragment}`");
+            }
+        }
+
+        for name in ["blocks", "txs", "receipts", "logs"] {
+            assert!(!table(name).contains("PROJECTION"));
+        }
+
+        for name in ["blocks", "txs", "receipts"] {
+            let add = migrations()
+                .iter()
+                .find(|object| object.name == format!("{name}_20260809_access_paths"))
+                .unwrap_or_else(|| panic!("{name} access path migration should exist"))
+                .ddl();
+            assert!(add.contains("ADD INDEX IF NOT EXISTS"));
+        }
+
+        assert!(migrations().iter().all(|object| {
+            !object.name.ends_with("20260809_materialize_access_paths")
+                && !object.ddl().contains("MATERIALIZE PROJECTION")
+        }));
     }
 
     #[test]

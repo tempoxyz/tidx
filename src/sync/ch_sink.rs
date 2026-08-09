@@ -59,6 +59,9 @@ const CH_DERIVED_QUERY_MAX_ATTEMPTS: u32 = 6;
 const CH_DERIVED_QUERY_RETRY_BASE_MS: u64 = 500;
 const CH_DERIVED_QUERY_RETRY_MAX_MS: u64 = 10_000;
 
+/// Oldest ClickHouse release supported by the schema catalog.
+const MIN_CLICKHOUSE_VERSION: (u64, u64) = (25, 4);
+
 /// Direct-write ClickHouse sink using RowBinary format with LZ4 compression.
 #[derive(Clone)]
 pub struct ClickHouseSink {
@@ -220,6 +223,8 @@ impl ClickHouseSink {
     }
 
     async fn ensure_schema_objects(&self) -> Result<()> {
+        self.ensure_supported_version().await?;
+
         self.base_client
             .query(&self.create_database_ddl())
             .execute()
@@ -274,6 +279,16 @@ impl ClickHouseSink {
         Ok(())
     }
 
+    async fn ensure_supported_version(&self) -> Result<()> {
+        let version: String = self
+            .base_client
+            .query("SELECT version()")
+            .fetch_one()
+            .await
+            .map_err(|e| anyhow!("Failed to query ClickHouse server version: {e}"))?;
+        validate_clickhouse_version(&version)
+    }
+
     async fn ensure_retired_objects_absent(&self) -> Result<()> {
         for ddl in retired_object_drops() {
             self.client.query(ddl).execute().await.map_err(|e| {
@@ -294,7 +309,6 @@ impl ClickHouseSink {
             .map_err(|e| anyhow!("Failed to create tidx_schema_objects: {e}"))?;
         Ok(())
     }
-
     /// `CREATE DATABASE` DDL honoring `replicated_database`.
     ///
     /// The ZooKeeper path is derived from the database name (instead of the
@@ -1840,6 +1854,30 @@ fn validate_table_name(table: &str) -> Result<&str> {
         .ok_or_else(|| anyhow!("Unknown ClickHouse table: {table}"))
 }
 
+fn clickhouse_major_minor(version: &str) -> Result<(u64, u64)> {
+    let mut components = version.split('.');
+    let major = components
+        .next()
+        .and_then(|component| component.parse().ok())
+        .ok_or_else(|| anyhow!("Invalid ClickHouse server version `{version}`"))?;
+    let minor = components
+        .next()
+        .and_then(|component| component.parse().ok())
+        .ok_or_else(|| anyhow!("Invalid ClickHouse server version `{version}`"))?;
+    Ok((major, minor))
+}
+
+fn validate_clickhouse_version(version: &str) -> Result<()> {
+    if clickhouse_major_minor(version)? < MIN_CLICKHOUSE_VERSION {
+        return Err(anyhow!(
+            "ClickHouse {version} is unsupported; TIDX requires ClickHouse {}.{} or newer",
+            MIN_CLICKHOUSE_VERSION.0,
+            MIN_CLICKHOUSE_VERSION.1
+        ));
+    }
+    Ok(())
+}
+
 /// Validate that a string is a safe SQL identifier (for table/database names
 /// interpolated into DDL/queries). Allows `[a-zA-Z_][a-zA-Z0-9_]{0,63}`.
 fn is_valid_identifier(name: &str) -> bool {
@@ -2095,6 +2133,24 @@ mod tests {
         assert!(!is_valid_identifier("db; DROP TABLE x"));
         assert!(!is_valid_identifier("db name"));
         assert!(!is_valid_identifier(&"a".repeat(65)));
+    }
+
+    #[test]
+    fn clickhouse_version_parses_major_and_minor() {
+        assert_eq!(clickhouse_major_minor("26.7.3.19").unwrap(), (26, 7));
+        assert_eq!(clickhouse_major_minor("26.1.1.1-stable").unwrap(), (26, 1));
+        assert!(clickhouse_major_minor("invalid").is_err());
+    }
+
+    #[test]
+    fn clickhouse_version_rejects_unsupported_server() {
+        assert!(validate_clickhouse_version("25.4.1.1").is_ok());
+        assert!(
+            validate_clickhouse_version("25.3.9.1")
+                .unwrap_err()
+                .to_string()
+                .contains("requires ClickHouse 25.4 or newer")
+        );
     }
 
     #[test]

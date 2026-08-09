@@ -10,8 +10,7 @@ CREATE TABLE IF NOT EXISTS blocks (
     extra_data      Nullable(String),
     consensus_proposer Nullable(String),
 
-    INDEX idx_hash hash TYPE bloom_filter GRANULARITY 1,
-    INDEX idx_timestamp timestamp TYPE minmax GRANULARITY 1
+    INDEX idx_hash hash TYPE bloom_filter GRANULARITY 1
 ) ENGINE = ReplacingMergeTree()
 PARTITION BY toYYYYMM(timestamp)
 ORDER BY (num)

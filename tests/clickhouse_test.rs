@@ -1068,6 +1068,15 @@ async fn setup_sink() -> Option<(ClickHouseSink, TestClickHouse)> {
     Some((sink, ch))
 }
 
+async fn access_path_catalog(ch: &TestClickHouse, system_table: &str) -> anyhow::Result<String> {
+    ch.query(&format!(
+        "SELECT arrayStringConcat(arraySort(groupArray(concat(table, '.', name))), ',') \
+         FROM system.{system_table} WHERE database = currentDatabase() \
+         AND table IN ('blocks', 'txs', 'logs', 'receipts')"
+    ))
+    .await
+}
+
 fn make_block(num: i64) -> BlockRow {
     use chrono::TimeZone;
     let ts = chrono::Utc.with_ymd_and_hms(2025, 1, 15, 12, 0, 0).unwrap()
@@ -1228,7 +1237,32 @@ async fn test_sink_ensure_schema_creates_tables() {
             ddl.contains("ZSTD(1)"),
             "table {table} should use ZSTD(1) by default: {ddl}"
         );
+        assert!(!ddl.contains("PROJECTION"));
+        match table {
+            "blocks" => assert!(ddl.contains("idx_timestamp")),
+            "txs" => assert!(ddl.contains("idx_from_nonce_key_nonce")),
+            "receipts" => assert!(ddl.contains("idx_to")),
+            "logs" => {
+                assert!(!ddl.contains("PROJECTION"));
+                for index in ["idx_selector", "idx_topic1", "idx_topic2", "idx_topic3"] {
+                    assert!(ddl.contains(index));
+                }
+            }
+            _ => {}
+        }
     }
+
+    let projection_count = ch
+        .query(
+            "SELECT count() FROM system.projections \
+             WHERE database = currentDatabase() AND table IN ('blocks', 'txs', 'logs', 'receipts')",
+        )
+        .await
+        .expect("failed to inspect base table projections")
+        .trim()
+        .parse::<u64>()
+        .expect("projection count should be an integer");
+    assert_eq!(projection_count, 0);
 
     let tracked = ch
         .table_count("tidx_schema_objects")
@@ -1254,6 +1288,138 @@ async fn test_sink_ensure_schema_creates_tables() {
         .await
         .expect("failed to inspect retired objects");
     assert_eq!(retired["rows"], 0);
+}
+
+#[tokio::test]
+#[serial(clickhouse)]
+async fn test_access_path_migrations_match_fresh_schema() {
+    let upgraded = TestClickHouse::new("tidx_access_path_upgrade_test")
+        .await
+        .expect("Failed to create upgrade ClickHouse client");
+    if upgraded.wait_for_ready().await.is_err() {
+        println!("ClickHouse not available, skipping test");
+        return;
+    }
+    upgraded
+        .reset_database()
+        .await
+        .expect("Failed to reset upgrade database");
+
+    for ddl in [
+        include_str!("fixtures/clickhouse/pre_access_paths/blocks.sql"),
+        include_str!("fixtures/clickhouse/pre_access_paths/txs.sql"),
+        include_str!("fixtures/clickhouse/pre_access_paths/receipts.sql"),
+        include_str!("fixtures/clickhouse/pre_access_paths/logs.sql"),
+    ] {
+        upgraded
+            .query(ddl)
+            .await
+            .expect("Failed to create pre-access-path table");
+    }
+
+    let upgraded_sink =
+        ClickHouseSink::new(&upgraded.url, "tidx_access_path_upgrade_test", None, None)
+            .expect("Failed to create upgrade sink");
+    upgraded_sink
+        .ensure_schema_only()
+        .await
+        .expect("Failed to upgrade ClickHouse schema");
+
+    let fresh = TestClickHouse::new("tidx_access_path_fresh_test")
+        .await
+        .expect("Failed to create fresh ClickHouse client");
+    fresh
+        .reset_database()
+        .await
+        .expect("Failed to reset fresh database");
+    let fresh_sink = ClickHouseSink::new(&fresh.url, "tidx_access_path_fresh_test", None, None)
+        .expect("Failed to create fresh sink");
+    fresh_sink
+        .ensure_schema_only()
+        .await
+        .expect("Failed to create fresh ClickHouse schema");
+
+    for system_table in ["projections", "data_skipping_indices"] {
+        let upgraded_catalog = access_path_catalog(&upgraded, system_table)
+            .await
+            .unwrap_or_else(|_| panic!("Failed to inspect upgraded {system_table}"));
+        let fresh_catalog = access_path_catalog(&fresh, system_table)
+            .await
+            .unwrap_or_else(|_| panic!("Failed to inspect fresh {system_table}"));
+        assert_eq!(upgraded_catalog, fresh_catalog, "{system_table} differ");
+    }
+
+    let pending_mutations = upgraded
+        .query(
+            "SELECT count() FROM system.mutations \
+             WHERE database = currentDatabase() AND is_done = 0",
+        )
+        .await
+        .expect("Failed to inspect upgrade mutations")
+        .trim()
+        .parse::<u64>()
+        .expect("mutation count should be an integer");
+    assert_eq!(pending_mutations, 0);
+}
+
+#[tokio::test]
+#[serial(clickhouse)]
+async fn test_access_path_indexes_are_used() {
+    let Some((sink, ch)) = setup_sink().await else {
+        return;
+    };
+
+    let row_count = 50_000;
+    let mut txs = Vec::with_capacity(row_count);
+    let mut logs = Vec::with_capacity(row_count);
+    for block_num in 0..row_count as i64 {
+        let mut tx = make_tx(block_num, 0);
+        tx.nonce_key = block_num.to_be_bytes().repeat(3)[4..24].to_vec();
+        txs.push(tx);
+
+        let mut log = make_log(block_num, 0);
+        log.topic1 = Some(block_num.to_be_bytes().repeat(4));
+        logs.push(log);
+    }
+    sink.write_txs(&txs)
+        .await
+        .expect("failed to seed production txs table");
+    sink.write_logs(&logs)
+        .await
+        .expect("failed to seed production logs table");
+
+    let target = 25_000_i64;
+    let nonce_key = hex::encode(&target.to_be_bytes().repeat(3)[4..24]);
+    let tx_plan = ch
+        .query(&format!(
+            "EXPLAIN indexes = 1 SELECT hash FROM txs \
+             WHERE `from` = '0x{}' AND nonce_key = '0x{nonce_key}' AND nonce = {target} \
+             ORDER BY block_num DESC, idx DESC LIMIT 11",
+            "11".repeat(20)
+        ))
+        .await
+        .expect("failed to explain sender and nonce lookup");
+    assert!(
+        tx_plan.contains("Name: idx_from_nonce_key_nonce"),
+        "expected composite transaction Bloom index in plan: {tx_plan}"
+    );
+
+    let topic1 = hex::encode(target.to_be_bytes().repeat(4));
+    let log_plan = ch
+        .query(&format!(
+            "EXPLAIN indexes = 1 SELECT tx_hash FROM logs \
+             WHERE selector = '0x{}' AND topic1 = '0x{topic1}' \
+             ORDER BY block_num DESC, log_idx DESC LIMIT 11",
+            "ddf252ad"
+        ))
+        .await
+        .expect("failed to explain selector and topic lookup");
+    for index in ["idx_selector", "idx_topic1"] {
+        assert!(
+            log_plan.contains(&format!("Name: {index}")),
+            "expected {index} in production logs plan: {log_plan}"
+        );
+    }
 }
 
 #[tokio::test]

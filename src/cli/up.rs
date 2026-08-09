@@ -408,8 +408,9 @@ fn spawn_sync_engine(
                                 error!(
                                     error = %e,
                                     chain = %chain.name,
-                                    "Failed to initialize ClickHouse schema (continuing without CH sink)"
+                                    "Failed to initialize required ClickHouse schema; chain sync stopped"
                                 );
+                                return;
                             }
                         },
                         Err(e) => {

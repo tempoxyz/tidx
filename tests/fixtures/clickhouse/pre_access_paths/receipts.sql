@@ -16,7 +16,6 @@ CREATE TABLE IF NOT EXISTS receipts (
 
     INDEX idx_tx_hash   tx_hash   TYPE bloom_filter GRANULARITY 1,
     INDEX idx_from      `from`    TYPE bloom_filter GRANULARITY 1,
-    INDEX idx_to        `to`      TYPE bloom_filter(0.01) GRANULARITY 1,
     INDEX idx_fee_payer fee_payer TYPE bloom_filter GRANULARITY 1,
     INDEX idx_contract_address contract_address TYPE bloom_filter GRANULARITY 1
 ) ENGINE = ReplacingMergeTree()

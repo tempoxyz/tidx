@@ -638,6 +638,8 @@ On startup, tidx verifies built-in materialized tables after base ClickHouse bac
 
 For self-hosted multi-replica ClickHouse (coordinated by Keeper/ZooKeeper), set `replicated_database = true` under `[chains.clickhouse]`. The sink then creates the database with `ENGINE = Replicated` and rewrites MergeTree-family table engines to their `Replicated*` counterparts, so both DDL and data reach every replica. Leave it off for ClickHouse Cloud (replication is implicit) and single-node instances. The flag only affects newly created objects. Point it at a fresh database when enabling replication for an existing chain.
 
+New data-skipping indexes apply to new parts automatically. Backfill existing history with the partition-scoped [access-path rollout](db/clickhouse/access-path-rollout.md); tidx does not enqueue full-table index rebuilds during startup.
+
 | Name | Purpose |
 |------|---------|
 | [`address_balances`](#address_balances) | Current positive balance per `(holder, token)`. |
@@ -1159,7 +1161,7 @@ Gap sync finds discontinuities via SQL and adds the gap from genesis to the firs
 - [Rust 1.75+](https://rustup.rs/)
 - [Docker](https://docs.docker.com/get-started/get-docker/)
 - [PostgreSQL](https://www.postgresql.org/download/)
-- [ClickHouse 25.4+](https://clickhouse.com/docs/install) when ClickHouse OLAP is enabled
+- [ClickHouse 25.4+](https://clickhouse.com/docs/install) when ClickHouse OLAP is enabled (tested with 25.8.29.51 and 26.7.3.19)
 
 ### Make Commands
 
