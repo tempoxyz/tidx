@@ -12,12 +12,8 @@ CREATE TABLE IF NOT EXISTS blocks (
 
     INDEX idx_hash hash TYPE bloom_filter GRANULARITY 1,
 
-    PROJECTION prj_hash (
-        SELECT _part_offset ORDER BY hash
-    ),
-    PROJECTION prj_timestamp_position (
-        SELECT _part_offset ORDER BY timestamp, num
-    )
+    PROJECTION prj_hash INDEX hash TYPE basic,
+    PROJECTION prj_timestamp_position INDEX (timestamp, num) TYPE basic
 ) ENGINE = ReplacingMergeTree()
 PARTITION BY toYYYYMM(timestamp)
 ORDER BY (num)

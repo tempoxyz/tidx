@@ -1232,6 +1232,7 @@ async fn test_sink_ensure_schema_creates_tables() {
             assert!(ddl.contains("deduplicate_merge_projection_mode"));
             assert!(ddl.contains("rebuild"));
             assert!(ddl.contains("PROJECTION"));
+            assert!(ddl.contains("TYPE basic"));
         }
         match table {
             "txs" => assert!(ddl.contains("idx_from_nonce_key_nonce")),
@@ -1313,9 +1314,8 @@ async fn test_access_path_indexes_are_used() {
                  TYPE bloom_filter(0.01) GRANULARITY 1, \
              INDEX idx_selector_topic1 (selector, topic1) \
                  TYPE bloom_filter(0.01) GRANULARITY 1, \
-             PROJECTION prj_from_position ( \
-                 SELECT _part_offset ORDER BY `from`, block_num, idx \
-             ) \
+             PROJECTION prj_from_position \
+                 INDEX (`from`, block_num, idx) TYPE basic \
          ) ENGINE = MergeTree ORDER BY id \
          SETTINGS index_granularity = 64, max_bytes_to_merge_at_max_space_in_pool = 1",
     )

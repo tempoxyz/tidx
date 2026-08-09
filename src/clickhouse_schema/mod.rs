@@ -249,7 +249,7 @@ mod tests {
     }
 
     #[test]
-    fn refresh_dependencies_use_clickhouse_25_8_compatible_schedule() {
+    fn refresh_dependencies_use_supported_schedule() {
         for object in derived_objects() {
             let ddl = object.ddl();
             if ddl.contains("DEPENDS ON") {
@@ -357,28 +357,26 @@ mod tests {
             (
                 "blocks",
                 &[
-                    "PROJECTION prj_hash",
-                    "SELECT _part_offset ORDER BY hash",
-                    "PROJECTION prj_timestamp_position",
-                    "SELECT _part_offset ORDER BY timestamp, num",
+                    "PROJECTION prj_hash INDEX hash TYPE basic",
+                    "PROJECTION prj_timestamp_position INDEX (timestamp, num) TYPE basic",
                 ][..],
             ),
             (
                 "txs",
                 &[
                     "INDEX idx_from_nonce_key_nonce (`from`, nonce_key, nonce)",
-                    "SELECT _part_offset ORDER BY `from`, block_num, idx",
-                    "SELECT _part_offset ORDER BY `to`, block_num, idx",
-                    "SELECT _part_offset ORDER BY fee_payer, block_num, idx",
-                    "SELECT _part_offset ORDER BY fee_token, block_num, idx",
+                    "PROJECTION prj_from_position INDEX (`from`, block_num, idx) TYPE basic",
+                    "PROJECTION prj_to_position INDEX (`to`, block_num, idx) TYPE basic",
+                    "PROJECTION prj_fee_payer_position INDEX (fee_payer, block_num, idx) TYPE basic",
+                    "PROJECTION prj_fee_token_position INDEX (fee_token, block_num, idx) TYPE basic",
                 ][..],
             ),
             (
                 "receipts",
                 &[
                     "INDEX idx_to        `to`      TYPE bloom_filter(0.01)",
-                    "SELECT _part_offset ORDER BY tx_hash",
-                    "SELECT _part_offset ORDER BY fee_payer, block_num, tx_idx",
+                    "PROJECTION prj_tx_hash INDEX tx_hash TYPE basic",
+                    "PROJECTION prj_fee_payer_position INDEX (fee_payer, block_num, tx_idx) TYPE basic",
                 ][..],
             ),
             (
@@ -387,12 +385,12 @@ mod tests {
                     "INDEX idx_selector_topic1 (selector, topic1) TYPE bloom_filter(0.01)",
                     "INDEX idx_selector_topic2 (selector, topic2) TYPE bloom_filter(0.01)",
                     "INDEX idx_selector_topic3 (selector, topic3) TYPE bloom_filter(0.01)",
-                    "SELECT _part_offset ORDER BY address, block_num, log_idx",
-                    "SELECT _part_offset ORDER BY selector, address, block_num, log_idx",
-                    "SELECT _part_offset ORDER BY selector, topic1, block_num, log_idx",
-                    "SELECT _part_offset ORDER BY selector, topic2, block_num, log_idx",
-                    "SELECT _part_offset ORDER BY selector, topic3, block_num, log_idx",
-                    "SELECT _part_offset ORDER BY tx_hash",
+                    "PROJECTION prj_address_position INDEX (address, block_num, log_idx) TYPE basic",
+                    "INDEX (selector, address, block_num, log_idx) TYPE basic",
+                    "INDEX (selector, topic1, block_num, log_idx) TYPE basic",
+                    "INDEX (selector, topic2, block_num, log_idx) TYPE basic",
+                    "INDEX (selector, topic3, block_num, log_idx) TYPE basic",
+                    "PROJECTION prj_tx_hash INDEX tx_hash TYPE basic",
                 ][..],
             ),
         ] {

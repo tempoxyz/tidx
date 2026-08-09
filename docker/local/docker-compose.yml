@@ -110,7 +110,7 @@ services:
     restart: always
 
   clickhouse:
-    image: clickhouse/clickhouse-server:latest
+    image: clickhouse/clickhouse-server:26.7.3.19
     ports:
       - "8123:8123"   # HTTP interface
       - "9000:9000"   # Native interface

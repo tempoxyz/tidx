@@ -25,24 +25,16 @@ CREATE TABLE IF NOT EXISTS logs (
     INDEX idx_selector_topic3 (selector, topic3) TYPE bloom_filter(0.01) GRANULARITY 1,
     INDEX idx_virtual_forward is_virtual_forward TYPE set(2) GRANULARITY 1,
 
-    PROJECTION prj_address_position (
-        SELECT _part_offset ORDER BY address, block_num, log_idx
-    ),
-    PROJECTION prj_selector_address_position (
-        SELECT _part_offset ORDER BY selector, address, block_num, log_idx
-    ),
-    PROJECTION prj_selector_topic1_position (
-        SELECT _part_offset ORDER BY selector, topic1, block_num, log_idx
-    ),
-    PROJECTION prj_selector_topic2_position (
-        SELECT _part_offset ORDER BY selector, topic2, block_num, log_idx
-    ),
-    PROJECTION prj_selector_topic3_position (
-        SELECT _part_offset ORDER BY selector, topic3, block_num, log_idx
-    ),
-    PROJECTION prj_tx_hash (
-        SELECT _part_offset ORDER BY tx_hash
-    )
+    PROJECTION prj_address_position INDEX (address, block_num, log_idx) TYPE basic,
+    PROJECTION prj_selector_address_position
+        INDEX (selector, address, block_num, log_idx) TYPE basic,
+    PROJECTION prj_selector_topic1_position
+        INDEX (selector, topic1, block_num, log_idx) TYPE basic,
+    PROJECTION prj_selector_topic2_position
+        INDEX (selector, topic2, block_num, log_idx) TYPE basic,
+    PROJECTION prj_selector_topic3_position
+        INDEX (selector, topic3, block_num, log_idx) TYPE basic,
+    PROJECTION prj_tx_hash INDEX tx_hash TYPE basic
 ) ENGINE = ReplacingMergeTree()
 PARTITION BY toYYYYMM(block_timestamp)
 ORDER BY (address, selector, block_num, log_idx)

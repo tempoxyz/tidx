@@ -30,18 +30,10 @@ CREATE TABLE IF NOT EXISTS txs (
     INDEX idx_from_nonce_key_nonce (`from`, nonce_key, nonce)
         TYPE bloom_filter(0.01) GRANULARITY 1,
 
-    PROJECTION prj_from_position (
-        SELECT _part_offset ORDER BY `from`, block_num, idx
-    ),
-    PROJECTION prj_to_position (
-        SELECT _part_offset ORDER BY `to`, block_num, idx
-    ),
-    PROJECTION prj_fee_payer_position (
-        SELECT _part_offset ORDER BY fee_payer, block_num, idx
-    ),
-    PROJECTION prj_fee_token_position (
-        SELECT _part_offset ORDER BY fee_token, block_num, idx
-    )
+    PROJECTION prj_from_position INDEX (`from`, block_num, idx) TYPE basic,
+    PROJECTION prj_to_position INDEX (`to`, block_num, idx) TYPE basic,
+    PROJECTION prj_fee_payer_position INDEX (fee_payer, block_num, idx) TYPE basic,
+    PROJECTION prj_fee_token_position INDEX (fee_token, block_num, idx) TYPE basic
 ) ENGINE = ReplacingMergeTree()
 PARTITION BY toYYYYMM(block_timestamp)
 ORDER BY (block_num, idx)

@@ -20,12 +20,8 @@ CREATE TABLE IF NOT EXISTS receipts (
     INDEX idx_fee_payer fee_payer TYPE bloom_filter GRANULARITY 1,
     INDEX idx_contract_address contract_address TYPE bloom_filter GRANULARITY 1,
 
-    PROJECTION prj_tx_hash (
-        SELECT _part_offset ORDER BY tx_hash
-    ),
-    PROJECTION prj_fee_payer_position (
-        SELECT _part_offset ORDER BY fee_payer, block_num, tx_idx
-    )
+    PROJECTION prj_tx_hash INDEX tx_hash TYPE basic,
+    PROJECTION prj_fee_payer_position INDEX (fee_payer, block_num, tx_idx) TYPE basic
 ) ENGINE = ReplacingMergeTree()
 PARTITION BY toYYYYMM(block_timestamp)
 ORDER BY (block_num, tx_idx)

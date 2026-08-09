@@ -85,7 +85,7 @@ services:
       start_period: 20s
 
   clickhouse:
-    image: clickhouse/clickhouse-server:latest
+    image: clickhouse/clickhouse-server:26.7.3.19
     ports:
       - "8124:8123"
       - "9001:9000"
