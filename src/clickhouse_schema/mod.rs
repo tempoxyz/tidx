@@ -436,6 +436,16 @@ mod tests {
                     .contains("MODIFY SETTING deduplicate_merge_projection_mode = 'rebuild'"),
                 "{projection_mode_name} should enable projection rebuilds"
             );
+            if matches!(table, "logs" | "receipts" | "txs") {
+                assert!(
+                    schema.contains("allow_nullable_key = 1"),
+                    "{table} schema should allow nullable projection keys"
+                );
+                assert!(
+                    projection_mode.contains("allow_nullable_key = 1"),
+                    "{projection_mode_name} should allow nullable projection keys"
+                );
+            }
 
             let migration = migrations()
                 .iter()

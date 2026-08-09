@@ -1,2 +1,3 @@
 ALTER TABLE txs
-    MODIFY SETTING deduplicate_merge_projection_mode = 'rebuild';
+    MODIFY SETTING deduplicate_merge_projection_mode = 'rebuild',
+        allow_nullable_key = 1;

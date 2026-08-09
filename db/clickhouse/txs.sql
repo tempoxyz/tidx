@@ -45,4 +45,5 @@ CREATE TABLE IF NOT EXISTS txs (
 PARTITION BY toYYYYMM(block_timestamp)
 ORDER BY (block_num, idx)
 SETTINGS default_compression_codec = 'ZSTD(1)',
+    allow_nullable_key = 1,
     deduplicate_merge_projection_mode = 'rebuild'
