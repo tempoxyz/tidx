@@ -1497,6 +1497,61 @@ async fn test_sink_token_transfers_decodes_transfers_and_reorgs() {
 
 #[tokio::test]
 #[serial(clickhouse)]
+async fn test_api_recipient_query_executes() {
+    let Some((sink, ch)) = setup_sink().await else {
+        return;
+    };
+
+    let alice = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    let bob = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    let logs = vec![
+        make_transfer_log(1, 0, alice, bob, 40),
+        make_transfer_log(2, 0, alice, bob, 60),
+    ];
+    sink.write_logs(&logs).await.expect("write_logs failed");
+
+    let config = ClickHouseConfig {
+        enabled: true,
+        url: ch.url.clone(),
+        database: Some(ch.database.clone()),
+        ..Default::default()
+    };
+    let engine = ClickHouseEngine::new(&config, 4217).expect("Failed to create engine");
+
+    // Keep this query in sync with the recipient path in tempo-api's transfer route.
+    let sql = format!(
+        r#"SELECT DISTINCT "from", "to", token AS address, amount AS value, tx_hash, block_num, log_idx, block_timestamp
+           FROM token_transfers
+           WHERE "to" = '{bob}'
+           ORDER BY block_num DESC, log_idx DESC
+           LIMIT 256"#
+    );
+    let result = engine
+        .query_user(&sql, &[], 5_000, 256)
+        .await
+        .expect("API recipient query should execute");
+
+    assert_eq!(
+        result.columns,
+        [
+            "from",
+            "to",
+            "address",
+            "value",
+            "tx_hash",
+            "block_num",
+            "log_idx",
+            "block_timestamp",
+        ]
+    );
+    assert_eq!(result.rows.len(), 2);
+    assert_eq!(result.rows[0][1].as_str(), Some(bob));
+    assert_eq!(result.rows[0][5].as_i64(), Some(2));
+    assert_eq!(result.rows[1][5].as_i64(), Some(1));
+}
+
+#[tokio::test]
+#[serial(clickhouse)]
 async fn test_sink_token_balances_view_tracks_balances_and_reorgs() {
     let Some((sink, ch)) = setup_sink().await else {
         return;
