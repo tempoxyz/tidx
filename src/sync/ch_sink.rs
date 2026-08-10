@@ -54,6 +54,7 @@ const CH_SEND_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Timeout for waiting for ClickHouse to acknowledge the INSERT.
 const CH_END_TIMEOUT: Duration = Duration::from_secs(120);
+const MIN_CLICKHOUSE_VERSION: (u64, u64) = (25, 11);
 const DERIVED_BACKFILL_BLOCK_BATCH_SIZE: i64 = 100_000;
 const CH_DERIVED_QUERY_MAX_ATTEMPTS: u32 = 6;
 const CH_DERIVED_QUERY_RETRY_BASE_MS: u64 = 500;
@@ -220,6 +221,8 @@ impl ClickHouseSink {
     }
 
     async fn ensure_schema_objects(&self) -> Result<()> {
+        self.ensure_supported_server_version().await?;
+
         self.base_client
             .query(&self.create_database_ddl())
             .execute()
@@ -272,6 +275,16 @@ impl ClickHouseSink {
 
         info!(database = %self.database, "ClickHouse schema ready");
         Ok(())
+    }
+
+    async fn ensure_supported_server_version(&self) -> Result<()> {
+        let row: ChVersionRow = self
+            .base_client
+            .query("SELECT version() AS version")
+            .fetch_one()
+            .await
+            .map_err(|e| anyhow!("Failed to query ClickHouse server version: {e}"))?;
+        validate_clickhouse_version(&row.version)
     }
 
     async fn ensure_retired_objects_absent(&self) -> Result<()> {
@@ -1451,6 +1464,11 @@ struct ChSchemaObjectRow {
 }
 
 #[derive(Row, Deserialize)]
+struct ChVersionRow {
+    version: String,
+}
+
+#[derive(Row, Deserialize)]
 struct ChBlockRowCount {
     block_num: i64,
     row_count: u64,
@@ -1750,6 +1768,29 @@ fn checksum_of(ddl: &str) -> String {
     format!("{:016x}", hasher.finish())
 }
 
+fn validate_clickhouse_version(version: &str) -> Result<()> {
+    let mut components = version.split('.');
+    let major = components
+        .next()
+        .and_then(|value| value.parse::<u64>().ok());
+    let minor = components
+        .next()
+        .and_then(|value| value.parse::<u64>().ok());
+    let Some(found) = major.zip(minor) else {
+        return Err(anyhow!(
+            "Could not parse ClickHouse server version `{version}`"
+        ));
+    };
+    if found < MIN_CLICKHOUSE_VERSION {
+        return Err(anyhow!(
+            "Unsupported ClickHouse server version {version}: tidx requires ClickHouse {}.{} or newer",
+            MIN_CLICKHOUSE_VERSION.0,
+            MIN_CLICKHOUSE_VERSION.1
+        ));
+    }
+    Ok(())
+}
+
 fn bounded_backfill_sql(plan: &DerivedBackfillPlan) -> String {
     ranged_backfill_sql(
         plan.target,
@@ -1868,6 +1909,16 @@ fn archive_range_predicate(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn validates_minimum_clickhouse_version() {
+        validate_clickhouse_version("25.11.1.1").unwrap();
+        validate_clickhouse_version("26.7.2.59").unwrap();
+
+        let error = validate_clickhouse_version("25.10.9.1").unwrap_err();
+        assert!(error.to_string().contains("requires ClickHouse 25.11"));
+        assert!(validate_clickhouse_version("invalid").is_err());
+    }
 
     #[test]
     fn archive_wire_conversion_restores_postgres_values() {

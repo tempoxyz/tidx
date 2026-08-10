@@ -58,6 +58,30 @@ const TOKEN_TRANSFERS_RECIPIENT_PROJECTION_20260806: &str = include_str!(
 const MATERIALIZE_TOKEN_TRANSFERS_RECIPIENT_PROJECTION_20260806: &str = include_str!(
     "../../db/clickhouse/migrations/20260806_materialize_token_transfers_recipient_projection.sql"
 );
+const BLOCKS_PROJECTION_MODE_20260809: &str =
+    include_str!("../../db/clickhouse/migrations/20260809_set_blocks_projection_mode.sql");
+const LOGS_PROJECTION_MODE_20260809: &str =
+    include_str!("../../db/clickhouse/migrations/20260809_set_logs_projection_mode.sql");
+const RECEIPTS_PROJECTION_MODE_20260809: &str =
+    include_str!("../../db/clickhouse/migrations/20260809_set_receipts_projection_mode.sql");
+const TXS_PROJECTION_MODE_20260809: &str =
+    include_str!("../../db/clickhouse/migrations/20260809_set_txs_projection_mode.sql");
+const BLOCKS_MIGRATION_20260809: &str =
+    include_str!("../../db/clickhouse/migrations/20260809_add_blocks_access_paths.sql");
+const LOGS_MIGRATION_20260809: &str =
+    include_str!("../../db/clickhouse/migrations/20260809_add_logs_access_paths.sql");
+const RECEIPTS_MIGRATION_20260809: &str =
+    include_str!("../../db/clickhouse/migrations/20260809_add_receipts_access_paths.sql");
+const TXS_MIGRATION_20260809: &str =
+    include_str!("../../db/clickhouse/migrations/20260809_add_txs_access_paths.sql");
+const MATERIALIZE_BLOCKS_ACCESS_PATHS_20260809: &str =
+    include_str!("../../db/clickhouse/migrations/20260809_materialize_blocks_access_paths.sql");
+const MATERIALIZE_LOGS_ACCESS_PATHS_20260809: &str =
+    include_str!("../../db/clickhouse/migrations/20260809_materialize_logs_access_paths.sql");
+const MATERIALIZE_RECEIPTS_ACCESS_PATHS_20260809: &str =
+    include_str!("../../db/clickhouse/migrations/20260809_materialize_receipts_access_paths.sql");
+const MATERIALIZE_TXS_ACCESS_PATHS_20260809: &str =
+    include_str!("../../db/clickhouse/migrations/20260809_materialize_txs_access_paths.sql");
 const TOKEN_HOLDER_DELTAS_MIGRATION_20260618: &str =
     include_str!("../../db/clickhouse/migrations/20260618_delete_guard_token_holder_deltas.sql");
 const ADDRESS_HOLDER_DELTAS_MIGRATION_20260618: &str =
@@ -378,6 +402,102 @@ pub const MIGRATIONS: &[ClickHouseObject] = &[
         name: "txs_20260806_materialize_fee_indexes",
         kind: ClickHouseObjectKind::Migration(MATERIALIZE_TXS_INDEXES_20260806),
         depends_on: &["txs_20260806_fee_indexes"],
+        public_query: false,
+        block_column: None,
+        backfill: None,
+    },
+    ClickHouseObject {
+        name: "blocks_20260809_projection_mode",
+        kind: ClickHouseObjectKind::Migration(BLOCKS_PROJECTION_MODE_20260809),
+        depends_on: &["blocks"],
+        public_query: false,
+        block_column: None,
+        backfill: None,
+    },
+    ClickHouseObject {
+        name: "logs_20260809_projection_mode",
+        kind: ClickHouseObjectKind::Migration(LOGS_PROJECTION_MODE_20260809),
+        depends_on: &["logs"],
+        public_query: false,
+        block_column: None,
+        backfill: None,
+    },
+    ClickHouseObject {
+        name: "receipts_20260809_projection_mode",
+        kind: ClickHouseObjectKind::Migration(RECEIPTS_PROJECTION_MODE_20260809),
+        depends_on: &["receipts"],
+        public_query: false,
+        block_column: None,
+        backfill: None,
+    },
+    ClickHouseObject {
+        name: "txs_20260809_projection_mode",
+        kind: ClickHouseObjectKind::Migration(TXS_PROJECTION_MODE_20260809),
+        depends_on: &["txs"],
+        public_query: false,
+        block_column: None,
+        backfill: None,
+    },
+    ClickHouseObject {
+        name: "blocks_20260809_access_paths",
+        kind: ClickHouseObjectKind::Migration(BLOCKS_MIGRATION_20260809),
+        depends_on: &["blocks_20260809_projection_mode"],
+        public_query: false,
+        block_column: None,
+        backfill: None,
+    },
+    ClickHouseObject {
+        name: "logs_20260809_access_paths",
+        kind: ClickHouseObjectKind::Migration(LOGS_MIGRATION_20260809),
+        depends_on: &["logs_20260809_projection_mode"],
+        public_query: false,
+        block_column: None,
+        backfill: None,
+    },
+    ClickHouseObject {
+        name: "receipts_20260809_access_paths",
+        kind: ClickHouseObjectKind::Migration(RECEIPTS_MIGRATION_20260809),
+        depends_on: &["receipts_20260809_projection_mode"],
+        public_query: false,
+        block_column: None,
+        backfill: None,
+    },
+    ClickHouseObject {
+        name: "txs_20260809_access_paths",
+        kind: ClickHouseObjectKind::Migration(TXS_MIGRATION_20260809),
+        depends_on: &["txs_20260809_projection_mode"],
+        public_query: false,
+        block_column: None,
+        backfill: None,
+    },
+    ClickHouseObject {
+        name: "blocks_20260809_materialize_access_paths",
+        kind: ClickHouseObjectKind::Migration(MATERIALIZE_BLOCKS_ACCESS_PATHS_20260809),
+        depends_on: &["blocks_20260809_access_paths"],
+        public_query: false,
+        block_column: None,
+        backfill: None,
+    },
+    ClickHouseObject {
+        name: "logs_20260809_materialize_access_paths",
+        kind: ClickHouseObjectKind::Migration(MATERIALIZE_LOGS_ACCESS_PATHS_20260809),
+        depends_on: &["logs_20260809_access_paths"],
+        public_query: false,
+        block_column: None,
+        backfill: None,
+    },
+    ClickHouseObject {
+        name: "receipts_20260809_materialize_access_paths",
+        kind: ClickHouseObjectKind::Migration(MATERIALIZE_RECEIPTS_ACCESS_PATHS_20260809),
+        depends_on: &["receipts_20260809_access_paths"],
+        public_query: false,
+        block_column: None,
+        backfill: None,
+    },
+    ClickHouseObject {
+        name: "txs_20260809_materialize_access_paths",
+        kind: ClickHouseObjectKind::Migration(MATERIALIZE_TXS_ACCESS_PATHS_20260809),
+        depends_on: &["txs_20260809_access_paths"],
         public_query: false,
         block_column: None,
         backfill: None,

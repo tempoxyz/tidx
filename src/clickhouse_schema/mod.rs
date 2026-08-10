@@ -339,6 +339,150 @@ mod tests {
     }
 
     #[test]
+    fn base_access_paths_are_created_and_migrated() {
+        for (table, schema_paths, migration_name, migration_paths) in [
+            (
+                "blocks",
+                &["PROJECTION prj_hash", "PROJECTION prj_timestamp_position"][..],
+                "blocks_20260809_access_paths",
+                &[
+                    "ADD PROJECTION IF NOT EXISTS prj_hash",
+                    "ADD PROJECTION IF NOT EXISTS prj_timestamp_position",
+                ][..],
+            ),
+            (
+                "logs",
+                &[
+                    "INDEX idx_selector_topic1",
+                    "INDEX idx_selector_topic2",
+                    "INDEX idx_selector_topic3",
+                    "PROJECTION prj_address_position",
+                    "PROJECTION prj_selector_address_position",
+                    "PROJECTION prj_selector_topic1_position",
+                    "PROJECTION prj_selector_topic2_position",
+                    "PROJECTION prj_selector_topic3_position",
+                    "PROJECTION prj_tx_hash",
+                ][..],
+                "logs_20260809_access_paths",
+                &[
+                    "ADD INDEX IF NOT EXISTS idx_selector_topic1",
+                    "ADD INDEX IF NOT EXISTS idx_selector_topic2",
+                    "ADD INDEX IF NOT EXISTS idx_selector_topic3",
+                    "ADD PROJECTION IF NOT EXISTS prj_address_position",
+                    "ADD PROJECTION IF NOT EXISTS prj_selector_address_position",
+                    "ADD PROJECTION IF NOT EXISTS prj_selector_topic1_position",
+                    "ADD PROJECTION IF NOT EXISTS prj_selector_topic2_position",
+                    "ADD PROJECTION IF NOT EXISTS prj_selector_topic3_position",
+                    "ADD PROJECTION IF NOT EXISTS prj_tx_hash",
+                ][..],
+            ),
+            (
+                "receipts",
+                &[
+                    "INDEX idx_to",
+                    "PROJECTION prj_tx_hash",
+                    "PROJECTION prj_fee_payer_position",
+                ][..],
+                "receipts_20260809_access_paths",
+                &[
+                    "ADD INDEX IF NOT EXISTS idx_to",
+                    "ADD PROJECTION IF NOT EXISTS prj_tx_hash",
+                    "ADD PROJECTION IF NOT EXISTS prj_fee_payer_position",
+                ][..],
+            ),
+            (
+                "txs",
+                &[
+                    "INDEX idx_from_nonce_key_nonce",
+                    "PROJECTION prj_from_position",
+                    "PROJECTION prj_to_position",
+                    "PROJECTION prj_fee_payer_position",
+                    "PROJECTION prj_fee_token_position",
+                ][..],
+                "txs_20260809_access_paths",
+                &[
+                    "ADD INDEX IF NOT EXISTS idx_from_nonce_key_nonce",
+                    "ADD PROJECTION IF NOT EXISTS prj_from_position",
+                    "ADD PROJECTION IF NOT EXISTS prj_to_position",
+                    "ADD PROJECTION IF NOT EXISTS prj_fee_payer_position",
+                    "ADD PROJECTION IF NOT EXISTS prj_fee_token_position",
+                ][..],
+            ),
+        ] {
+            let schema = base_objects()
+                .iter()
+                .find(|object| object.name == table)
+                .unwrap_or_else(|| panic!("{table} table should be registered"))
+                .ddl();
+            assert!(
+                schema.contains("deduplicate_merge_projection_mode = 'rebuild'"),
+                "{table} schema should rebuild projections during deduplication"
+            );
+            for path in schema_paths {
+                assert!(
+                    schema.contains(path),
+                    "{table} schema should contain {path}"
+                );
+            }
+
+            let projection_mode_name = format!("{table}_20260809_projection_mode");
+            let projection_mode = migrations()
+                .iter()
+                .find(|object| object.name == projection_mode_name)
+                .unwrap_or_else(|| panic!("{projection_mode_name} should be registered"))
+                .ddl();
+            assert!(
+                projection_mode
+                    .contains("MODIFY SETTING deduplicate_merge_projection_mode = 'rebuild'"),
+                "{projection_mode_name} should enable projection rebuilds"
+            );
+            if matches!(table, "logs" | "receipts" | "txs") {
+                assert!(
+                    schema.contains("allow_nullable_key = 1"),
+                    "{table} schema should allow nullable projection keys"
+                );
+                assert!(
+                    projection_mode.contains("allow_nullable_key = 1"),
+                    "{projection_mode_name} should allow nullable projection keys"
+                );
+            }
+
+            let migration = migrations()
+                .iter()
+                .find(|object| object.name == migration_name)
+                .unwrap_or_else(|| panic!("{migration_name} should be registered"))
+                .ddl();
+            for path in migration_paths {
+                assert!(
+                    migration.contains(path),
+                    "{migration_name} should contain {path}"
+                );
+            }
+
+            let materialize_name = format!("{table}_20260809_materialize_access_paths");
+            let materialize = migrations()
+                .iter()
+                .find(|object| object.name == materialize_name)
+                .unwrap_or_else(|| panic!("{materialize_name} should be registered"))
+                .ddl();
+            for path in migration_paths {
+                let path = path
+                    .strip_prefix("ADD INDEX IF NOT EXISTS ")
+                    .map(|name| format!("MATERIALIZE INDEX {name}"))
+                    .or_else(|| {
+                        path.strip_prefix("ADD PROJECTION IF NOT EXISTS ")
+                            .map(|name| format!("MATERIALIZE PROJECTION {name}"))
+                    })
+                    .unwrap_or_else(|| panic!("unsupported access path assertion: {path}"));
+                assert!(
+                    materialize.contains(&path),
+                    "{materialize_name} should contain {path}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn post_derived_migrations_run_after_their_target_tables() {
         // all_objects() is the apply order; each migration must come after the
         // table it mutates.

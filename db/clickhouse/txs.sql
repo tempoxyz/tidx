@@ -26,8 +26,24 @@ CREATE TABLE IF NOT EXISTS txs (
     INDEX idx_from `from` TYPE bloom_filter GRANULARITY 1,
     INDEX idx_to   `to`   TYPE bloom_filter GRANULARITY 1,
     INDEX idx_fee_payer fee_payer TYPE bloom_filter GRANULARITY 1,
-    INDEX idx_fee_token fee_token TYPE bloom_filter GRANULARITY 1
+    INDEX idx_fee_token fee_token TYPE bloom_filter GRANULARITY 1,
+    INDEX idx_from_nonce_key_nonce (`from`, nonce_key, nonce) TYPE bloom_filter(0.01) GRANULARITY 1,
+
+    PROJECTION prj_from_position (
+        SELECT _part_offset ORDER BY `from`, block_num, idx
+    ),
+    PROJECTION prj_to_position (
+        SELECT _part_offset ORDER BY `to`, block_num, idx
+    ),
+    PROJECTION prj_fee_payer_position (
+        SELECT _part_offset ORDER BY fee_payer, block_num, idx
+    ),
+    PROJECTION prj_fee_token_position (
+        SELECT _part_offset ORDER BY fee_token, block_num, idx
+    )
 ) ENGINE = ReplacingMergeTree()
 PARTITION BY toYYYYMM(block_timestamp)
 ORDER BY (block_num, idx)
-SETTINGS default_compression_codec = 'ZSTD(1)'
+SETTINGS default_compression_codec = 'ZSTD(1)',
+    allow_nullable_key = 1,
+    deduplicate_merge_projection_mode = 'rebuild'

@@ -88,25 +88,6 @@ pub async fn run(args: Args) -> Result<()> {
             default_chain_id = chain.chain_id;
         }
 
-        // Initialize ClickHouse if configured (for each chain)
-        if let Some(ref ch_config) = chain.clickhouse {
-            if ch_config.enabled {
-                match ClickHouseEngine::new(ch_config, chain.chain_id) {
-                    Ok(engine) => {
-                        let engine = Arc::new(engine);
-                        clickhouse_engines
-                            .write()
-                            .await
-                            .insert(chain.chain_id, engine);
-                        info!(chain = %chain.name, chain_id = chain.chain_id, "ClickHouse OLAP engine initialized");
-                    }
-                    Err(e) => {
-                        error!(error = %e, chain = %chain.name, "Failed to create ClickHouse engine");
-                    }
-                }
-            }
-        }
-
         // Use a separate read-only API pool if API credentials are configured,
         // otherwise fall back to the shared pool.
         let api_pool = match chain.resolved_api_pg_url()? {
@@ -122,6 +103,7 @@ pub async fn run(args: Args) -> Result<()> {
             chain.clone(),
             throttled_pool,
             broadcaster.clone(),
+            Arc::clone(&clickhouse_engines),
             shutdown_tx.subscribe(),
         );
     }
@@ -165,6 +147,7 @@ pub async fn run(args: Args) -> Result<()> {
 
         let pools_for_watcher = Arc::clone(&pools);
         let clickhouse_configs_for_watcher = Arc::clone(&clickhouse_configs);
+        let clickhouse_engines_for_watcher = Arc::clone(&clickhouse_engines);
         let broadcaster_for_watcher = broadcaster.clone();
         let shutdown_tx_for_watcher = shutdown_tx.clone();
 
@@ -190,6 +173,7 @@ pub async fn run(args: Args) -> Result<()> {
                             event.chain,
                             throttled_pool,
                             broadcaster_for_watcher.clone(),
+                            Arc::clone(&clickhouse_engines_for_watcher),
                             shutdown_tx_for_watcher.subscribe(),
                         );
                     }
@@ -286,6 +270,7 @@ fn spawn_sync_engine(
     chain: ChainConfig,
     throttled_pool: ThrottledPool,
     broadcaster: Arc<Broadcaster>,
+    clickhouse_engines: SharedClickHouseEngines,
     shutdown_rx: tokio::sync::broadcast::Receiver<()>,
 ) {
     let rpc_url = match chain.resolved_rpc_url() {
@@ -348,6 +333,26 @@ fn spawn_sync_engine(
                     {
                         Ok(ch_sink) => match ch_sink.ensure_schema_only().await {
                             Ok(()) => {
+                                match ClickHouseEngine::new(ch_config, chain.chain_id) {
+                                    Ok(engine) => {
+                                        clickhouse_engines
+                                            .write()
+                                            .await
+                                            .insert(chain.chain_id, Arc::new(engine));
+                                        info!(
+                                            chain = %chain.name,
+                                            chain_id = chain.chain_id,
+                                            "ClickHouse OLAP engine initialized"
+                                        );
+                                    }
+                                    Err(e) => {
+                                        error!(
+                                            error = %e,
+                                            chain = %chain.name,
+                                            "Failed to create ClickHouse engine"
+                                        );
+                                    }
+                                }
                                 info!(
                                     chain = %chain.name,
                                     database = %database,
