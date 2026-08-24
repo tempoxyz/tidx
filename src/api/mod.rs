@@ -44,7 +44,7 @@ pub struct ChainClickHouseConfig {
 
 pub type SharedClickHouseConfigs = Arc<RwLock<HashMap<u64, ChainClickHouseConfig>>>;
 pub type SharedTrustedCidrs = Arc<StdRwLock<Vec<(IpAddr, u8)>>>;
-const MAX_CONCURRENT_API_QUERIES: usize = 8;
+const MAX_CONCURRENT_API_QUERIES: usize = 32;
 
 #[derive(Clone)]
 pub struct AppState {
