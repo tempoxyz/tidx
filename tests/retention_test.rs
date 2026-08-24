@@ -144,9 +144,7 @@ fn retention(require_clickhouse: bool) -> RetentionConfig {
 
 /// Set up ClickHouse sink for archive tests. Returns None if CH unavailable.
 async fn setup_clickhouse() -> Option<(ClickHouseSink, TestClickHouse)> {
-    let ch = TestClickHouse::new(CH_DB)
-        .await
-        .expect("Failed to create CH client");
+    let ch = TestClickHouse::new(CH_DB).expect("Failed to create CH client");
     if ch.wait_for_ready().await.is_err() {
         println!("ClickHouse not available, skipping test");
         return None;
