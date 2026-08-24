@@ -17,7 +17,7 @@ pub struct TestClickHouse {
 impl TestClickHouse {
     /// Create a new test ClickHouse connection.
     /// Uses CLICKHOUSE_URL env var or defaults to http://localhost:8123
-    pub async fn new(database: &str) -> Result<Self> {
+    pub fn new(database: &str) -> Result<Self> {
         let url = get_clickhouse_url();
         let http_client = reqwest::Client::builder()
             .pool_max_idle_per_host(4)

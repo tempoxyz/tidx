@@ -28,9 +28,7 @@ const TEST_DB: &str = "tidx_test";
 #[tokio::test]
 #[serial(clickhouse)]
 async fn test_clickhouse_connection() {
-    let ch = TestClickHouse::new(TEST_DB)
-        .await
-        .expect("Failed to create ClickHouse client");
+    let ch = TestClickHouse::new(TEST_DB).expect("Failed to create ClickHouse client");
 
     if ch.wait_for_ready().await.is_err() {
         println!("ClickHouse not available, skipping test");
@@ -44,9 +42,7 @@ async fn test_clickhouse_connection() {
 #[tokio::test]
 #[serial(clickhouse)]
 async fn test_clickhouse_database_creation() {
-    let ch = TestClickHouse::new(TEST_DB)
-        .await
-        .expect("Failed to create ClickHouse client");
+    let ch = TestClickHouse::new(TEST_DB).expect("Failed to create ClickHouse client");
 
     if ch.wait_for_ready().await.is_err() {
         println!("ClickHouse not available, skipping test");
@@ -74,9 +70,7 @@ async fn test_clickhouse_database_creation() {
 #[tokio::test]
 #[serial(clickhouse)]
 async fn test_transfer_cte_execution() {
-    let ch = TestClickHouse::new(TEST_DB)
-        .await
-        .expect("Failed to create ClickHouse client");
+    let ch = TestClickHouse::new(TEST_DB).expect("Failed to create ClickHouse client");
 
     if ch.wait_for_ready().await.is_err() {
         println!("ClickHouse not available, skipping test");
@@ -127,9 +121,7 @@ async fn test_transfer_cte_execution() {
 #[tokio::test]
 #[serial(clickhouse)]
 async fn test_approval_cte_execution() {
-    let ch = TestClickHouse::new(TEST_DB)
-        .await
-        .expect("Failed to create ClickHouse client");
+    let ch = TestClickHouse::new(TEST_DB).expect("Failed to create ClickHouse client");
 
     if ch.wait_for_ready().await.is_err() {
         println!("ClickHouse not available, skipping test");
@@ -184,9 +176,7 @@ async fn test_approval_cte_execution() {
 #[tokio::test]
 #[serial(clickhouse)]
 async fn test_hex_literal_filter_execution() {
-    let ch = TestClickHouse::new(TEST_DB)
-        .await
-        .expect("Failed to create ClickHouse client");
+    let ch = TestClickHouse::new(TEST_DB).expect("Failed to create ClickHouse client");
 
     if ch.wait_for_ready().await.is_err() {
         println!("ClickHouse not available, skipping test");
@@ -249,9 +239,7 @@ async fn test_hex_literal_filter_execution() {
 #[tokio::test]
 #[serial(clickhouse)]
 async fn test_aggregation_query() {
-    let ch = TestClickHouse::new(TEST_DB)
-        .await
-        .expect("Failed to create ClickHouse client");
+    let ch = TestClickHouse::new(TEST_DB).expect("Failed to create ClickHouse client");
 
     if ch.wait_for_ready().await.is_err() {
         println!("ClickHouse not available, skipping test");
@@ -305,9 +293,7 @@ async fn test_aggregation_query() {
 #[tokio::test]
 #[serial(clickhouse)]
 async fn test_create_materialized_view_transfer_counts() {
-    let ch = TestClickHouse::new(TEST_DB)
-        .await
-        .expect("Failed to create ClickHouse client");
+    let ch = TestClickHouse::new(TEST_DB).expect("Failed to create ClickHouse client");
 
     if ch.wait_for_ready().await.is_err() {
         println!("ClickHouse not available, skipping test");
@@ -404,9 +390,7 @@ async fn test_create_materialized_view_transfer_counts() {
 #[tokio::test]
 #[serial(clickhouse)]
 async fn test_create_materialized_view_token_supply() {
-    let ch = TestClickHouse::new(TEST_DB)
-        .await
-        .expect("Failed to create ClickHouse client");
+    let ch = TestClickHouse::new(TEST_DB).expect("Failed to create ClickHouse client");
 
     if ch.wait_for_ready().await.is_err() {
         println!("ClickHouse not available, skipping test");
@@ -488,9 +472,7 @@ async fn test_create_materialized_view_token_supply() {
 #[tokio::test]
 #[serial(clickhouse)]
 async fn test_create_materialized_view_daily_stats() {
-    let ch = TestClickHouse::new(TEST_DB)
-        .await
-        .expect("Failed to create ClickHouse client");
+    let ch = TestClickHouse::new(TEST_DB).expect("Failed to create ClickHouse client");
 
     if ch.wait_for_ready().await.is_err() {
         println!("ClickHouse not available, skipping test");
@@ -557,9 +539,7 @@ async fn test_create_materialized_view_daily_stats() {
 #[tokio::test]
 #[serial(clickhouse)]
 async fn test_uniswap_swap_cte() {
-    let ch = TestClickHouse::new(TEST_DB)
-        .await
-        .expect("Failed to create ClickHouse client");
+    let ch = TestClickHouse::new(TEST_DB).expect("Failed to create ClickHouse client");
 
     if ch.wait_for_ready().await.is_err() {
         println!("ClickHouse not available, skipping test");
@@ -624,9 +604,7 @@ async fn test_uniswap_swap_cte() {
 #[tokio::test]
 #[serial(clickhouse)]
 async fn test_role_granted_cte() {
-    let ch = TestClickHouse::new(TEST_DB)
-        .await
-        .expect("Failed to create ClickHouse client");
+    let ch = TestClickHouse::new(TEST_DB).expect("Failed to create ClickHouse client");
 
     if ch.wait_for_ready().await.is_err() {
         println!("ClickHouse not available, skipping test");
@@ -681,9 +659,8 @@ async fn test_role_granted_cte() {
 #[tokio::test]
 #[serial(clickhouse)]
 async fn test_query_user_union_with_trailing_order_by() {
-    let ch = TestClickHouse::new("tidx_repro_union_ch")
-        .await
-        .expect("Failed to create ClickHouse client");
+    let ch =
+        TestClickHouse::new("tidx_repro_union_ch").expect("Failed to create ClickHouse client");
 
     if ch.wait_for_ready().await.is_err() {
         println!("ClickHouse not available, skipping test");
@@ -733,7 +710,6 @@ async fn test_query_user_union_with_trailing_order_by() {
 #[serial(clickhouse)]
 async fn test_query_user_union_with_qualified_trailing_order_by() {
     let ch = TestClickHouse::new("tidx_repro_union_ch_qualified")
-        .await
         .expect("Failed to create ClickHouse client");
 
     if ch.wait_for_ready().await.is_err() {
@@ -786,7 +762,6 @@ async fn test_query_user_union_with_qualified_trailing_order_by() {
 #[serial(clickhouse)]
 async fn test_query_user_parenthesized_union_with_trailing_order_by() {
     let ch = TestClickHouse::new("tidx_repro_union_ch_paren")
-        .await
         .expect("Failed to create ClickHouse client");
 
     if ch.wait_for_ready().await.is_err() {
@@ -836,9 +811,7 @@ async fn test_query_user_parenthesized_union_with_trailing_order_by() {
 #[tokio::test]
 #[serial(clickhouse)]
 async fn test_predicate_pushdown_indexed_param() {
-    let ch = TestClickHouse::new(TEST_DB)
-        .await
-        .expect("Failed to create ClickHouse client");
+    let ch = TestClickHouse::new(TEST_DB).expect("Failed to create ClickHouse client");
 
     if ch.wait_for_ready().await.is_err() {
         println!("ClickHouse not available, skipping test");
@@ -910,9 +883,7 @@ async fn test_predicate_pushdown_indexed_param() {
 #[tokio::test]
 #[serial(clickhouse)]
 async fn test_case_insensitive_table_reference() {
-    let ch = TestClickHouse::new(TEST_DB)
-        .await
-        .expect("Failed to create ClickHouse client");
+    let ch = TestClickHouse::new(TEST_DB).expect("Failed to create ClickHouse client");
 
     if ch.wait_for_ready().await.is_err() {
         println!("ClickHouse not available, skipping test");
@@ -1053,9 +1024,7 @@ async fn assert_retired_clickhouse_objects_absent(ch: &TestClickHouse) {
 
 /// Helper: create a ClickHouseSink pointed at the test instance, with a clean DB.
 async fn setup_sink() -> Option<(ClickHouseSink, TestClickHouse)> {
-    let ch = TestClickHouse::new(SINK_DB)
-        .await
-        .expect("Failed to create CH client");
+    let ch = TestClickHouse::new(SINK_DB).expect("Failed to create CH client");
     if ch.wait_for_ready().await.is_err() {
         println!("ClickHouse not available, skipping test");
         return None;
@@ -1259,9 +1228,7 @@ async fn test_sink_ensure_schema_creates_tables() {
 #[tokio::test]
 #[serial(clickhouse)]
 async fn test_sink_ensure_schema_drops_retired_objects() {
-    let ch = TestClickHouse::new(SINK_DB)
-        .await
-        .expect("Failed to create CH client");
+    let ch = TestClickHouse::new(SINK_DB).expect("Failed to create CH client");
     if ch.wait_for_ready().await.is_err() {
         println!("ClickHouse not available, skipping test");
         return;
@@ -1608,9 +1575,7 @@ async fn test_sink_token_balances_view_tracks_balances_and_reorgs() {
 #[tokio::test]
 #[serial(clickhouse)]
 async fn test_sink_ensure_schema_backfills_token_transfer_views() {
-    let ch = TestClickHouse::new(SINK_DB)
-        .await
-        .expect("Failed to create CH client");
+    let ch = TestClickHouse::new(SINK_DB).expect("Failed to create CH client");
     if ch.wait_for_ready().await.is_err() {
         println!("ClickHouse not available, skipping test");
         return;
@@ -1774,9 +1739,7 @@ async fn test_sink_token_balances_handles_amount_above_int256_max() {
 #[tokio::test]
 #[serial(clickhouse)]
 async fn test_post_derived_migrations_repair_legacy_signed_holder_deltas() {
-    let ch = TestClickHouse::new(SINK_DB)
-        .await
-        .expect("Failed to create CH client");
+    let ch = TestClickHouse::new(SINK_DB).expect("Failed to create CH client");
     if ch.wait_for_ready().await.is_err() {
         println!("ClickHouse not available, skipping test");
         return;
@@ -2444,9 +2407,7 @@ async fn test_hex_filter_against_sink_data() {
 /// if infrastructure is unavailable.
 async fn setup_backfill() -> Option<(tidx::db::Pool, SinkSet, ClickHouseSink, TestClickHouse)> {
     // Set up CH
-    let ch = TestClickHouse::new(SINK_DB)
-        .await
-        .expect("Failed to create CH client");
+    let ch = TestClickHouse::new(SINK_DB).expect("Failed to create CH client");
     if ch.wait_for_ready().await.is_err() {
         println!("ClickHouse not available, skipping test");
         return None;

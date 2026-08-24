@@ -54,7 +54,7 @@ fn make_block(num: i64, ts: chrono::DateTime<Utc>) -> BlockRow {
 /// Seeds ClickHouse with blocks 1..=20 and sets the hot boundary at block 10.
 /// Returns None when ClickHouse is unavailable.
 async fn setup_tiered_store() -> Option<(TestClickHouse, TestDb, ClickHouseEngine)> {
-    let ch = TestClickHouse::new(CH_DB).await.expect("CH client");
+    let ch = TestClickHouse::new(CH_DB).expect("CH client");
     if ch.wait_for_ready().await.is_err() {
         println!("ClickHouse not available, skipping test");
         return None;
