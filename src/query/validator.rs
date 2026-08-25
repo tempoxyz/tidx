@@ -324,6 +324,9 @@ fn validate_clickhouse_set_expr(
             for window in &select.named_window {
                 validate_clickhouse_named_window(window, cte_names, depth)?;
             }
+            if let Some(qualify) = &select.qualify {
+                validate_clickhouse_expr(qualify, cte_names, depth)?;
+            }
             Ok(())
         }
         SetExpr::Query(query) => validate_clickhouse_query_ast(query, cte_names, depth + 1),
@@ -1813,6 +1816,23 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn test_clickhouse_validates_qualify_expressions() {
+        assert!(
+            validate_clickhouse_query(
+                "SELECT row_number() OVER () AS row_num FROM logs QUALIFY row_num = 1"
+            )
+            .is_ok()
+        );
+
+        let error = validate_clickhouse_query(
+            "SELECT row_number() OVER () AS row_num FROM logs \
+             QUALIFY row_num IN (SELECT * FROM url('http://169.254.169.254/'))",
+        )
+        .unwrap_err();
+        assert_eq!(error.to_string(), "Table functions are not allowed");
     }
 
     #[test]
