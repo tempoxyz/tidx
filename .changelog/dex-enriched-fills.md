@@ -1,0 +1,5 @@
+---
+tidx: minor
+---
+
+Added `dex_order_events` and `dex_fills_enriched`, two ClickHouse objects that resolve each DEX fill's point-in-time order state. `dex_order_events` decodes the union of `OrderPlaced` and `OrderFlipped` into one positioned state stream (the existing `dex_orders` captures `OrderPlaced` only, so it is stale for flip orders). `dex_fills_enriched` is a plain view that ASOF-joins each fill to the latest order-state event strictly before it, exposing each fill book-natively: `token`/`quote_token`, `isBid`, `tick`, `at_peg`, `price`, and the base/quote amounts (`amountFilled`/`quote_amount`). Resolving the join at query time over the already-decoded, sort-keyed source tables keeps it realtime (no refresh lag) and correct for same-block flips and reorgs, letting the swaps feed restore its at-peg and token filters as plain SQL predicates instead of replaying the raw `logs` order-state stream per request. Taker source→destination orientation is left to swap assembly in the API, since it is a swap-level (route) notion rather than a per-fill property.
