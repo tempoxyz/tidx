@@ -77,6 +77,12 @@ async fn test_head_page_sort_served_by_ordered_index() {
                ORDER BY block_num DESC, tx_idx DESC LIMIT 10"#,
         ),
         (
+            "receipts by from",
+            r#"SELECT tx_hash FROM receipts
+               WHERE "from" = '\x0000000000000000000000000000000000000001'
+               ORDER BY block_num DESC, tx_idx DESC LIMIT 10"#,
+        ),
+        (
             "logs by selector + indexed address (topic1)",
             r#"SELECT tx_hash FROM logs
                WHERE selector = '\xddf252ad'

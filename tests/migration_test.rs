@@ -14,6 +14,7 @@ const MANAGED_INDEX_NAMES: &[&str] = &[
     "idx_logs_tx_hash_virtual_forward",
     "idx_logs_virtual_forward",
     "idx_receipts_fee_payer_block",
+    "idx_receipts_from_block",
     "idx_txs_fee_payer_block",
     "idx_txs_from_block",
 ];
@@ -301,7 +302,8 @@ async fn test_pg_upgrade_adds_missing_postgres_ddl() {
                   AND indexname IN (
                     'idx_txs_from_block',
                     'idx_txs_fee_payer_block',
-                    'idx_receipts_fee_payer_block'
+                    'idx_receipts_fee_payer_block',
+                    'idx_receipts_from_block'
                   )
                 ORDER BY indexname
                 "#,
@@ -317,6 +319,7 @@ async fn test_pg_upgrade_adds_missing_postgres_ddl() {
             indexes,
             vec![
                 "idx_receipts_fee_payer_block".to_string(),
+                "idx_receipts_from_block".to_string(),
                 "idx_txs_fee_payer_block".to_string(),
                 "idx_txs_from_block".to_string(),
             ]
@@ -391,6 +394,7 @@ async fn test_partitioned_post_startup_indexes_attach_valid_children() {
                     'idx_logs_tx_hash_virtual_forward',
                     'idx_logs_virtual_forward',
                     'idx_receipts_fee_payer_block',
+                    'idx_receipts_from_block',
                     'idx_txs_fee_payer_block',
                     'idx_txs_from_block'
                   )
@@ -423,6 +427,7 @@ async fn test_partitioned_post_startup_indexes_attach_valid_children() {
                         ('idx_logs_tx_hash_virtual_forward'),
                         ('idx_logs_virtual_forward'),
                         ('idx_receipts_fee_payer_block'),
+                        ('idx_receipts_from_block'),
                         ('idx_txs_fee_payer_block'),
                         ('idx_txs_from_block')
                 )
@@ -494,6 +499,7 @@ async fn assert_managed_indexes_valid(conn: &tokio_postgres::Client) {
                 'idx_logs_tx_hash_virtual_forward',
                 'idx_logs_virtual_forward',
                 'idx_receipts_fee_payer_block',
+                'idx_receipts_from_block',
                 'idx_txs_fee_payer_block',
                 'idx_txs_from_block'
               )

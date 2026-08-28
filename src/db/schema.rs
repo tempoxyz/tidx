@@ -17,6 +17,8 @@ const TXS_FEE_PAYER_BLOCK_INDEX_SQL: &str =
     include_str!("../../db/migrations/20260723_add_txs_fee_payer_block_index.sql");
 const RECEIPTS_FEE_PAYER_BLOCK_INDEX_SQL: &str =
     include_str!("../../db/migrations/20260723_add_receipts_fee_payer_block_index.sql");
+const RECEIPTS_FROM_BLOCK_INDEX_SQL: &str =
+    include_str!("../../db/migrations/20260828_add_receipts_from_block_index.sql");
 const LOGS_SELECTOR_TOPIC1_BLOCK_INDEX_SQL: &str =
     include_str!("../../db/migrations/20260723_add_logs_selector_topic1_block_index.sql");
 const LOGS_SELECTOR_TOPIC2_BLOCK_INDEX_SQL: &str =
@@ -32,6 +34,7 @@ const POST_STARTUP_INDEXES: &[&str] = &[
     TXS_FROM_BLOCK_INDEX_SQL,
     TXS_FEE_PAYER_BLOCK_INDEX_SQL,
     RECEIPTS_FEE_PAYER_BLOCK_INDEX_SQL,
+    RECEIPTS_FROM_BLOCK_INDEX_SQL,
     LOGS_SELECTOR_TOPIC1_BLOCK_INDEX_SQL,
     LOGS_SELECTOR_TOPIC2_BLOCK_INDEX_SQL,
     LOGS_SELECTOR_TOPIC3_BLOCK_INDEX_SQL,
