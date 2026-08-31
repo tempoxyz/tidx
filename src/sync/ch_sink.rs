@@ -785,10 +785,13 @@ impl ClickHouseSink {
             });
 
         let sql = format!(
-            "WITH toStartOfInterval(\
-                 timestamp + INTERVAL 30 SECOND - INTERVAL 1 MILLISECOND, \
-                 INTERVAL 15 MINUTE\
-             ) + INTERVAL 15 MINUTE AS bucket \
+            "WITH toDateTime64(\
+                 toStartOfInterval(\
+                     timestamp + INTERVAL 30 SECOND - INTERVAL 1 MILLISECOND, \
+                     INTERVAL 15 MINUTE\
+                 ) + INTERVAL 15 MINUTE, \
+                 3, 'UTC'\
+             ) AS bucket \
              SELECT bucket, \
                     argMax(num, tuple(timestamp, num)) AS block_num, \
                     argMax(hash, tuple(timestamp, num)) AS block_hash, \

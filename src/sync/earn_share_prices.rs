@@ -204,7 +204,15 @@ fn decode_uint256(output: &str) -> Result<U256> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use alloy::consensus::BlockHeader as _;
+    use alloy::primitives::Address;
+    use clickhouse::Row;
+    use serde::Deserialize;
     use sha3::{Digest, Keccak256};
+    use std::str::FromStr;
+
+    use crate::sync::decoder::decode_block;
+    use crate::types::LogRow;
 
     #[test]
     fn deployment_selectors_match_supported_event_versions() {
@@ -252,5 +260,168 @@ mod tests {
             ("b".to_string(), Ok(4)),
         ];
         assert_eq!(contiguous_successes(results), vec![1, 4]);
+    }
+
+    /// Manual smoke test against a live Tempo RPC and a real local ClickHouse.
+    ///
+    /// Required:
+    /// - `TIDX_EARN_LIVE_VAULT`: a live EarnVault address
+    /// - ClickHouse at `TIDX_CLICKHOUSE_URL` (defaults to localhost:8123)
+    ///
+    /// Optional: `TIDX_EARN_LIVE_RPC_URL` overrides the public Tempo testnet RPC;
+    /// `TIDX_EARN_LIVE_SAMPLE_BLOCK` selects an older archive block; and
+    /// `TIDX_CLICKHOUSE_USER` / `TIDX_CLICKHOUSE_PASSWORD` set local credentials.
+    #[tokio::test]
+    #[ignore = "requires local ClickHouse and a live Tempo RPC"]
+    async fn live_rpc_materializes_preview_redeem_into_clickhouse() {
+        let rpc_url = std::env::var("TIDX_EARN_LIVE_RPC_URL")
+            .unwrap_or_else(|_| "https://rpc.testnet.tempo.xyz".to_string());
+        let clickhouse_url = std::env::var("TIDX_CLICKHOUSE_URL")
+            .unwrap_or_else(|_| "http://localhost:8123".to_string());
+        let clickhouse_user = std::env::var("TIDX_CLICKHOUSE_USER").ok();
+        let clickhouse_password = std::env::var("TIDX_CLICKHOUSE_PASSWORD").ok();
+        let vault = std::env::var("TIDX_EARN_LIVE_VAULT")
+            .expect("TIDX_EARN_LIVE_VAULT must name a live EarnVault");
+        let vault_address = Address::from_str(&vault).expect("invalid TIDX_EARN_LIVE_VAULT");
+        let database = format!("tidx_earn_live_{}", hex::encode(rand::random::<[u8; 8]>()));
+
+        let sink = ClickHouseSink::new(
+            &clickhouse_url,
+            &database,
+            clickhouse_user.as_deref(),
+            clickhouse_password.as_deref(),
+        )
+        .expect("create live-smoke ClickHouse sink");
+        sink.ensure_schema_only()
+            .await
+            .expect("initialize live-smoke ClickHouse schema");
+
+        let materializer = EarnSharePriceMaterializer::new(sink.clone(), &rpc_url);
+        let sample_block = match std::env::var("TIDX_EARN_LIVE_SAMPLE_BLOCK") {
+            Ok(block_num) => materializer
+                .rpc
+                .get_block(
+                    block_num
+                        .parse()
+                        .expect("invalid TIDX_EARN_LIVE_SAMPLE_BLOCK"),
+                    false,
+                )
+                .await
+                .expect("fetch configured live sample block"),
+            Err(_) => latest_confirmed_boundary_block(&materializer.rpc)
+                .await
+                .expect("find live sample block"),
+        };
+        let block_row = decode_block(&sample_block);
+        sink.write_blocks(std::slice::from_ref(&block_row))
+            .await
+            .expect("seed live sample block");
+
+        let selector = hex::decode(
+            EARN_STACK_DEPLOYED_SELECTORS
+                .last()
+                .unwrap()
+                .trim_start_matches("0x"),
+        )
+        .unwrap();
+        let mut vault_topic = vec![0_u8; 12];
+        vault_topic.extend_from_slice(vault_address.as_slice());
+        sink.write_logs(&[LogRow {
+            block_num: block_row.num,
+            block_timestamp: block_row.timestamp,
+            log_idx: 0,
+            tx_idx: 0,
+            tx_hash: vec![0_u8; 32],
+            address: vec![0_u8; 20],
+            selector: Some(selector.clone()),
+            topic0: Some(selector),
+            topic1: Some(vault_topic),
+            topic2: None,
+            topic3: None,
+            data: Vec::new(),
+            is_virtual_forward: false,
+        }])
+        .await
+        .expect("seed Earn deployment discovery log");
+
+        assert_eq!(
+            materializer.materialize_batch().await.unwrap(),
+            1,
+            "one live observation should be materialized"
+        );
+
+        let mut clickhouse_client = clickhouse::Client::default()
+            .with_url(&clickhouse_url)
+            .with_database(&database);
+        if let Some(user) = &clickhouse_user {
+            clickhouse_client = clickhouse_client.with_user(user);
+        }
+        if let Some(password) = &clickhouse_password {
+            clickhouse_client = clickhouse_client.with_password(password);
+        }
+        let stored = clickhouse_client
+            .query(
+                "SELECT vault, toString(bucket) AS bucket, block_num, block_hash, \
+                        toString(quoted_assets) AS quoted_assets \
+                 FROM earn_share_prices FINAL",
+            )
+            .fetch_one::<LiveObservationRow>()
+            .await
+            .expect("read materialized live observation");
+        let direct = materializer
+            .rpc
+            .call_contract(&vault, PREVIEW_REDEEM_CALLDATA, block_row.num as u64)
+            .await
+            .expect("repeat direct live previewRedeem call");
+
+        assert_eq!(stored.vault, vault.to_lowercase());
+        assert_eq!(stored.block_num, block_row.num);
+        assert_eq!(
+            stored.block_hash,
+            format!("0x{}", hex::encode(&block_row.hash))
+        );
+        assert_eq!(
+            stored.quoted_assets,
+            decode_uint256(&direct).unwrap().to_string()
+        );
+        eprintln!(
+            "live Earn quote verified: vault={}, bucket={}, block={}, assets={}",
+            stored.vault, stored.bucket, stored.block_num, stored.quoted_assets
+        );
+
+        clickhouse_client
+            .query(&format!("DROP DATABASE {database} SYNC"))
+            .execute()
+            .await
+            .expect("drop live-smoke ClickHouse database");
+    }
+
+    async fn latest_confirmed_boundary_block(rpc: &RpcClient) -> Result<crate::tempo::Block> {
+        let latest = rpc.latest_block_number().await?;
+        let boundary = Utc::now().timestamp().div_euclid(15 * 60) * 15 * 60;
+        let cutoff = u64::try_from(boundary - 30).context("sample cutoff predates Unix epoch")?;
+        let mut low = 0_u64;
+        let mut high = latest;
+
+        while low < high {
+            let mid = low + (high - low).div_ceil(2);
+            let block = rpc.get_block(mid, false).await?;
+            if block.header.timestamp() <= cutoff {
+                low = mid;
+            } else {
+                high = mid - 1;
+            }
+        }
+
+        rpc.get_block(low, false).await
+    }
+
+    #[derive(Row, Deserialize)]
+    struct LiveObservationRow {
+        vault: String,
+        bucket: String,
+        block_num: i64,
+        block_hash: String,
+        quoted_assets: String,
     }
 }
