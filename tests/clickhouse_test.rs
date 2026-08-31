@@ -1181,6 +1181,7 @@ async fn test_sink_ensure_schema_creates_tables() {
         "token_transfers",
         "token_holder_deltas",
         "token_balances_snapshot",
+        "earn_share_prices",
     ] {
         let count = ch
             .table_count(table)

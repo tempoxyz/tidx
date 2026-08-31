@@ -648,6 +648,7 @@ For self-hosted multi-replica ClickHouse (coordinated by Keeper/ZooKeeper), set 
 | [`dex_orders`](#dex_orders) | Decoded stablecoin-DEX `OrderPlaced` events. |
 | [`dex_pair_liquidity`](#dex_pair_liquidity) | Pairs joined to their on-DEX base liquidity. |
 | [`dex_pairs`](#dex_pairs) | Decoded stablecoin-DEX `PairCreated` events. |
+| [`earn_share_prices`](#earn_share_prices) | Confirmed 15-minute historical `EarnVault.previewRedeem` observations. |
 | [`token_balances`](#token_balances) | Current positive balance per `(token, holder)`. |
 | [`token_balances_snapshot`](#token_balances_snapshot) | Pre-aggregated `token_balances`, refreshed on a schedule. |
 | [`token_holder_counts`](#token_holder_counts) | Holder count per token, refreshed on a schedule. |
@@ -658,6 +659,33 @@ For self-hosted multi-replica ClickHouse (coordinated by Keeper/ZooKeeper), set 
 | [`token_transfers`](#token_transfers) | Decoded `Transfer` events. |
 
 User-defined views registered through the [`/views` API](#views-api) live alongside these in `analytics_{chainId}` and are queryable the same way.
+
+#### earn_share_prices
+
+TIDX discovers Earn vaults from all supported `EarnStackDeployed` event versions and samples `previewRedeem(10^18)` at confirmed 15-minute UTC boundaries. Each boundary uses the latest indexed block at least 30 seconds older than the boundary. The exact share input and asset output are stored as uint256 values so consumers can calculate prices or returns without floating-point loss.
+
+This table is populated by an RPC-backed materializer rather than a ClickHouse materialized view because the quote requires EVM execution at an exact historical block. The configured chain RPC must retain historical state for the requested backfill range. Backfill is bounded and restartable from each vault's last stored block. TIDX's normal block-scoped reorg cleanup deletes affected observations; the worker then resamples the replacement canonical history.
+
+| Column | Type | Description |
+|--------|------|-------------|
+| `vault` | `String` | EarnVault address |
+| `bucket` | `DateTime64(3, 'UTC')` | 15-minute observation boundary |
+| `block_num` | `Int64` | Confirmed historical block used for the call |
+| `block_hash` | `String` | Canonical hash rechecked immediately before insert |
+| `block_timestamp` | `DateTime64(3, 'UTC')` | Timestamp of the sampled block |
+| `quoted_shares` | `UInt256` | Exact `previewRedeem` input (`1000000000000000000`) |
+| `quoted_assets` | `UInt256` | Exact uint256 returned by `previewRedeem` |
+
+```bash
+curl -G "https://indexer.tempo.xyz/query" \
+  --data-urlencode "chainId=4217" \
+  --data-urlencode "engine=clickhouse" \
+  --data-urlencode "sql=SELECT bucket, quoted_shares, quoted_assets
+    FROM earn_share_prices FINAL
+    WHERE vault = '0x...'
+    ORDER BY bucket DESC
+    LIMIT 96"
+```
 
 #### address_balances
 

@@ -4,6 +4,7 @@
 //! via the official `clickhouse` crate using RowBinary format with LZ4 compression.
 
 use anyhow::{Context, Result, anyhow};
+use clickhouse::types::UInt256 as ChUInt256;
 use clickhouse::{Row, RowOwned, RowRead};
 use serde::{Deserialize, Serialize};
 use sha3::{Digest, Keccak256};
@@ -21,6 +22,9 @@ use crate::clickhouse_schema::{
     retired_object_drops,
 };
 use crate::metrics;
+use crate::sync::earn_share_prices::{
+    EARN_STACK_DEPLOYED_SELECTORS, EarnSharePriceCandidate, EarnSharePriceObservation, EarnVault,
+};
 use crate::types::{BlockRow, LogRow, ReceiptRow, TxRow};
 
 /// DDL for the catalog state table that records the checksum of every
@@ -265,6 +269,22 @@ impl ClickHouseSink {
         }
 
         self.ensure_derived_objects(&mut tracking).await?;
+
+        // This RPC-backed derived table is also written through RowBinary and
+        // uses stable insert tokens for retry safety. It is created after the
+        // base-table dedup settings above, so configure its window here.
+        if !self.replicated_database {
+            self.client
+                .query(
+                    "ALTER TABLE earn_share_prices MODIFY SETTING \
+                     non_replicated_deduplication_window = 100",
+                )
+                .execute()
+                .await
+                .map_err(|e| {
+                    anyhow!("Failed to set deduplication window on earn_share_prices: {e}")
+                })?;
+        }
 
         // Run after derived tables exist, since these migrations mutate them.
         for migration in post_derived_migrations() {
@@ -694,6 +714,177 @@ impl ClickHouseSink {
             metrics::update_sink_watermark(self.name(), "receipts", max);
         }
         Ok(())
+    }
+
+    /// Discover Earn vaults from the factory's final atomic deployment event.
+    pub(crate) async fn earn_vaults(&self) -> Result<Vec<EarnVault>> {
+        let selectors = EARN_STACK_DEPLOYED_SELECTORS
+            .iter()
+            .map(|selector| format!("'{selector}'"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sql = format!(
+            "SELECT concat('0x', lower(right(assumeNotNull(topic1), 40))) AS address, \
+             min(block_num) AS deployment_block \
+             FROM logs FINAL \
+             WHERE selector IN ({selectors}) AND topic1 IS NOT NULL \
+             GROUP BY address ORDER BY deployment_block, address"
+        );
+        let rows = self
+            .client
+            .query(&sql)
+            .fetch_all::<ChEarnVaultRow>()
+            .await
+            .context("discover Earn vaults from ClickHouse logs")?;
+        Ok(rows
+            .into_iter()
+            .map(|row| EarnVault {
+                address: row.address,
+                deployment_block: row.deployment_block,
+            })
+            .collect())
+    }
+
+    /// Return the next confirmed 15-minute sample points after a vault's
+    /// durable high-water mark. Reorg cleanup deletes observations by block,
+    /// which automatically rewinds this cursor before the replacement replay.
+    pub(crate) async fn earn_share_price_candidates(
+        &self,
+        vault: &EarnVault,
+        limit: usize,
+    ) -> Result<Vec<EarnSharePriceCandidate>> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        if vault.address.len() != 42
+            || !vault.address.starts_with("0x")
+            || !vault.address[2..]
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit())
+        {
+            return Err(anyhow!(
+                "Invalid Earn vault address in indexed deployment log"
+            ));
+        }
+
+        let cursor_sql = format!(
+            "SELECT maxOrNull(block_num) AS block_num \
+             FROM earn_share_prices FINAL WHERE vault = '{}'",
+            vault.address
+        );
+        let cursor = self
+            .client
+            .query(&cursor_sql)
+            .fetch_one::<ChOptionalBlockNumber>()
+            .await
+            .context("read Earn share-price high-water mark")?;
+        let from_block = cursor
+            .block_num
+            .map_or(vault.deployment_block, |block_num| {
+                block_num.saturating_add(1)
+            });
+
+        let sql = format!(
+            "WITH toStartOfInterval(\
+                 timestamp + INTERVAL 30 SECOND - INTERVAL 1 MILLISECOND, \
+                 INTERVAL 15 MINUTE\
+             ) + INTERVAL 15 MINUTE AS bucket \
+             SELECT bucket, \
+                    argMax(num, tuple(timestamp, num)) AS block_num, \
+                    argMax(hash, tuple(timestamp, num)) AS block_hash, \
+                    argMax(timestamp, tuple(timestamp, num)) AS block_timestamp \
+             FROM blocks FINAL \
+             WHERE num >= {from_block} \
+               AND timestamp <= now64(3) - INTERVAL 30 SECOND \
+             GROUP BY bucket \
+             HAVING bucket <= toStartOfInterval(now64(3), INTERVAL 15 MINUTE) \
+             ORDER BY bucket \
+             LIMIT {limit}"
+        );
+        let rows = self
+            .client
+            .query(&sql)
+            .fetch_all::<ChEarnSharePriceCandidateRow>()
+            .await
+            .with_context(|| {
+                format!(
+                    "select Earn share-price sample blocks for {}",
+                    vault.address
+                )
+            })?;
+        Ok(rows
+            .into_iter()
+            .map(|row| EarnSharePriceCandidate {
+                vault: vault.address.clone(),
+                bucket: row.bucket,
+                block_num: row.block_num,
+                block_hash: row.block_hash,
+                block_timestamp: row.block_timestamp,
+            })
+            .collect())
+    }
+
+    pub(crate) async fn write_earn_share_prices(
+        &self,
+        observations: &[EarnSharePriceObservation],
+    ) -> Result<usize> {
+        if observations.is_empty() {
+            return Ok(0);
+        }
+        let _guard = self.maintenance_guard().await;
+
+        // Candidate discovery and historical RPC execution happen outside the
+        // maintenance lock. Re-check hashes after acquiring it so a reorg that
+        // landed in between cannot reinsert an orphaned observation after the
+        // reorg mutation has completed.
+        let block_nums = observations
+            .iter()
+            .map(|observation| observation.block_num.to_string())
+            .collect::<HashSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>()
+            .join(", ");
+        let canonical = self
+            .client
+            .query(&format!(
+                "SELECT num, hash FROM blocks FINAL WHERE num IN ({block_nums})"
+            ))
+            .fetch_all::<ChCanonicalEarnBlock>()
+            .await
+            .context("verify Earn sample blocks before insert")?
+            .into_iter()
+            .map(|block| (block.num, block.hash))
+            .collect::<HashMap<_, _>>();
+        let canonical_observations = observations
+            .iter()
+            .filter(|observation| {
+                canonical.get(&observation.block_num) == Some(&observation.block_hash)
+            })
+            .collect::<Vec<_>>();
+        if canonical_observations.is_empty() {
+            return Ok(0);
+        }
+
+        let seed = canonical_observations
+            .iter()
+            .map(|observation| {
+                format!(
+                    "{}:{}:{}",
+                    observation.vault,
+                    observation.bucket.timestamp_millis(),
+                    observation.block_hash
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("|");
+        self.insert_chunked(
+            "earn_share_prices",
+            &canonical_observations,
+            |observation| ChEarnSharePriceWire::from_observation(observation),
+            Some(&seed),
+        )
+        .await?;
+        Ok(canonical_observations.len())
     }
 
     /// Read a canonical base-table range for PostgreSQL hot-tier hydration.
@@ -1472,6 +1663,72 @@ struct ChVersionRow {
 struct ChBlockRowCount {
     block_num: i64,
     row_count: u64,
+}
+
+#[derive(Row, Deserialize)]
+struct ChEarnVaultRow {
+    address: String,
+    deployment_block: i64,
+}
+
+#[derive(Row, Deserialize)]
+struct ChOptionalBlockNumber {
+    block_num: Option<i64>,
+}
+
+#[derive(Row, Deserialize)]
+struct ChEarnSharePriceCandidateRow {
+    #[serde(with = "clickhouse::serde::chrono::datetime64::millis")]
+    bucket: chrono::DateTime<chrono::Utc>,
+    block_num: i64,
+    block_hash: String,
+    #[serde(with = "clickhouse::serde::chrono::datetime64::millis")]
+    block_timestamp: chrono::DateTime<chrono::Utc>,
+}
+
+#[derive(Row, Deserialize)]
+struct ChCanonicalEarnBlock {
+    num: i64,
+    hash: String,
+}
+
+#[derive(Eq, PartialEq, Row, Serialize)]
+struct ChEarnSharePriceWire {
+    vault: String,
+    #[serde(with = "clickhouse::serde::chrono::datetime64::millis")]
+    bucket: chrono::DateTime<chrono::Utc>,
+    block_num: i64,
+    block_hash: String,
+    #[serde(with = "clickhouse::serde::chrono::datetime64::millis")]
+    block_timestamp: chrono::DateTime<chrono::Utc>,
+    quoted_shares: ChUInt256,
+    quoted_assets: ChUInt256,
+}
+
+impl Hash for ChEarnSharePriceWire {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.vault.hash(state);
+        self.bucket.hash(state);
+        self.block_num.hash(state);
+        self.block_hash.hash(state);
+        self.block_timestamp.hash(state);
+        self.quoted_shares.to_string().hash(state);
+        self.quoted_assets.to_string().hash(state);
+    }
+}
+
+impl ChEarnSharePriceWire {
+    fn from_observation(observation: &EarnSharePriceObservation) -> Self {
+        Self {
+            vault: observation.vault.clone(),
+            bucket: observation.bucket,
+            block_num: observation.block_num,
+            block_hash: observation.block_hash.clone(),
+            block_timestamp: observation.block_timestamp,
+            quoted_shares: ChUInt256::from(1_000_000_000_000_000_000_u64),
+            quoted_assets: ChUInt256::from_le_bytes(observation.quoted_assets.to_le_bytes()),
+        }
+    }
 }
 
 #[derive(Eq, Hash, PartialEq, Row, Serialize, Deserialize)]

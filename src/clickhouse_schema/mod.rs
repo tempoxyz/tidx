@@ -2,6 +2,7 @@ mod address_balances;
 mod base;
 mod catalog;
 mod dex;
+mod earn_share_prices;
 mod token_balances;
 mod token_metadata;
 mod token_supply;
@@ -40,6 +41,7 @@ pub fn derived_objects() -> impl DoubleEndedIterator<Item = &'static ClickHouseO
         .chain(token_transfer_stats::OBJECTS.iter())
         .chain(address_balances::OBJECTS.iter())
         .chain(dex::OBJECTS.iter())
+        .chain(earn_share_prices::OBJECTS.iter())
 }
 
 /// Tables and views that the public `/query` HTTP surface may reference.
@@ -137,6 +139,17 @@ mod tests {
         // Pairs joined to their DEX-escrow base liquidity — public so the
         // "pairs by liquidity" endpoint reads ranked pairs directly.
         assert!(is_public_query_table("dex_pair_liquidity"));
+    }
+
+    #[test]
+    fn earn_share_prices_are_registered_for_public_query_and_reorgs() {
+        assert!(is_public_query_table("earn_share_prices"));
+        assert!(is_known_table("earn_share_prices"));
+        assert_eq!(block_column("earn_share_prices"), Some("block_num"));
+        assert!(
+            reorg_tables().any(|table| table.name == "earn_share_prices"
+                && table.block_column == "block_num")
+        );
     }
 
     #[test]

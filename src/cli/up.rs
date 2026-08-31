@@ -16,6 +16,7 @@ use tidx::clickhouse::ClickHouseEngine;
 use tidx::config::{ChainConfig, Config, ConfigWatcher, NewChainEvent};
 use tidx::db::{self, ThrottledPool};
 use tidx::sync::ch_sink::ClickHouseSink;
+use tidx::sync::earn_share_prices::EarnSharePriceMaterializer;
 use tidx::sync::engine::SyncEngine;
 use tidx::sync::pruner::Pruner;
 use tidx::sync::sink::{ClickHouseBackfillPlan, SinkSet};
@@ -301,6 +302,7 @@ fn spawn_sync_engine(
         // Build SinkSet with PG (always) + optional ClickHouse direct-write sink
         let mut sinks = SinkSet::new(throttled_pool.inner().clone());
         let mut derived_repair_sink = None;
+        let mut earn_share_price_sink = None;
 
         if let Some(ref ch_config) = chain.clickhouse {
             if ch_config.enabled {
@@ -373,6 +375,7 @@ fn spawn_sync_engine(
                                     );
                                 }
                                 seed_metrics_from_clickhouse(&ch_sink).await;
+                                earn_share_price_sink = Some(ch_sink.clone());
                                 sinks = sinks.with_clickhouse(ch_sink);
 
                                 // Tiered storage: pg_clickhouse foreign tables
@@ -545,6 +548,11 @@ fn spawn_sync_engine(
                     error!(error = %e, chain = %chain.name, "Invalid retention config; pruner disabled");
                 }
             }
+        }
+
+        if let Some(earn_share_price_sink) = earn_share_price_sink {
+            let materializer = EarnSharePriceMaterializer::new(earn_share_price_sink, &rpc_url);
+            tokio::spawn(materializer.run(shutdown_rx.resubscribe()));
         }
 
         // Create sync engine with throttled pool and configured sinks (retry on transient RPC failures)

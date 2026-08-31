@@ -1,6 +1,7 @@
 pub mod ch_sink;
 pub mod compress;
 pub mod decoder;
+pub mod earn_share_prices;
 pub mod engine;
 pub mod fetcher;
 pub mod pruner;

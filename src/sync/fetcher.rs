@@ -98,6 +98,30 @@ impl RpcClient {
         resp.result.ok_or_else(|| anyhow!("Block {num} not found"))
     }
 
+    /// Execute a read-only contract call against an exact historical block.
+    pub async fn call_contract(
+        &self,
+        address: &str,
+        input: &str,
+        block_num: u64,
+    ) -> Result<String> {
+        let resp: RpcResponse<String> = self
+            .call(
+                "eth_call",
+                serde_json::json!([
+                    { "to": address, "data": input },
+                    format!("0x{block_num:x}")
+                ]),
+            )
+            .await?;
+
+        if let Some(error) = resp.error {
+            return Err(anyhow!("eth_call failed: {}", error.message));
+        }
+        resp.result
+            .ok_or_else(|| anyhow!("No result for eth_call at block {block_num}"))
+    }
+
     pub async fn get_blocks_batch(&self, range: RangeInclusive<u64>) -> Result<Vec<Block>> {
         // Acquire permit (batch counts as one request for concurrency limiting)
         let _permit = self
