@@ -330,11 +330,13 @@ pub struct SinkWatermarks {
     pub txs: AtomicI64,
     pub logs: AtomicI64,
     pub receipts: AtomicI64,
+    pub earn_share_prices: AtomicI64,
     // Cumulative row counts (since process start)
     pub blocks_rows: AtomicU64,
     pub txs_rows: AtomicU64,
     pub logs_rows: AtomicU64,
     pub receipts_rows: AtomicU64,
+    pub earn_share_prices_rows: AtomicU64,
 }
 
 impl SinkWatermarks {
@@ -344,10 +346,12 @@ impl SinkWatermarks {
             txs: AtomicI64::new(-1),
             logs: AtomicI64::new(-1),
             receipts: AtomicI64::new(-1),
+            earn_share_prices: AtomicI64::new(-1),
             blocks_rows: AtomicU64::new(0),
             txs_rows: AtomicU64::new(0),
             logs_rows: AtomicU64::new(0),
             receipts_rows: AtomicU64::new(0),
+            earn_share_prices_rows: AtomicU64::new(0),
         }
     }
 
@@ -357,6 +361,7 @@ impl SinkWatermarks {
             "txs" => &self.txs,
             "logs" => &self.logs,
             "receipts" => &self.receipts,
+            "earn_share_prices" => &self.earn_share_prices,
             _ => &self.blocks,
         }
     }
@@ -367,6 +372,7 @@ impl SinkWatermarks {
             "txs" => &self.txs_rows,
             "logs" => &self.logs_rows,
             "receipts" => &self.receipts_rows,
+            "earn_share_prices" => &self.earn_share_prices_rows,
             _ => &self.blocks_rows,
         }
     }
@@ -505,6 +511,25 @@ fn format_eta(secs: Option<f64>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn earn_share_price_metrics_do_not_change_block_metrics() {
+        let watermarks = SinkWatermarks::new();
+        watermarks.blocks.store(100, Ordering::Relaxed);
+        watermarks.blocks_rows.store(10, Ordering::Relaxed);
+
+        watermarks
+            .get_table("earn_share_prices")
+            .store(50, Ordering::Relaxed);
+        watermarks
+            .get_row_counter("earn_share_prices")
+            .store(3, Ordering::Relaxed);
+
+        assert_eq!(watermarks.blocks.load(Ordering::Relaxed), 100);
+        assert_eq!(watermarks.blocks_rows.load(Ordering::Relaxed), 10);
+        assert_eq!(watermarks.earn_share_prices.load(Ordering::Relaxed), 50);
+        assert_eq!(watermarks.earn_share_prices_rows.load(Ordering::Relaxed), 3);
+    }
 
     #[test]
     fn gap_fill_remaining_counts_down_from_total_blocks() {
