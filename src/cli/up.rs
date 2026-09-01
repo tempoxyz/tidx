@@ -647,7 +647,7 @@ async fn run_clickhouse_derived_repair_loop(sink: ClickHouseSink, chain_name: St
 
 /// Seed in-memory ClickHouse watermarks and row counts from existing data.
 async fn seed_metrics_from_clickhouse(sink: &ClickHouseSink) {
-    for table in ["blocks", "txs", "logs", "receipts"] {
+    for table in ["blocks", "txs", "logs", "receipts", "earn_share_prices"] {
         if let Ok(Some(max)) = sink.max_block_in_table(table).await {
             tidx::metrics::update_sink_watermark("clickhouse", table, max);
         }

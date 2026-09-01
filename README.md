@@ -662,7 +662,7 @@ User-defined views registered through the [`/views` API](#views-api) live alongs
 
 #### earn_share_prices
 
-TIDX discovers Earn vaults from all supported `EarnStackDeployed` event versions and samples `previewRedeem(10^18)` at confirmed 15-minute UTC boundaries. Each boundary uses the latest indexed block at least 30 seconds older than the boundary. The exact share input and asset output are stored as uint256 values so consumers can calculate prices or returns without floating-point loss.
+TIDX discovers Earn vaults from all supported `EarnStackDeployed` event versions and samples `previewRedeem(10^18)` at confirmed 15-minute UTC boundaries. Each boundary is withheld for 30 seconds, then uses the latest indexed block at or before that boundary. The fixed input is intentionally large to reduce integer quantization; it cancels when consumers compare quote growth across two boundaries. The exact share input and asset output are stored as uint256 values so consumers can calculate rates without floating-point loss.
 
 This table is populated by an RPC-backed materializer rather than a ClickHouse materialized view because the quote requires EVM execution at an exact historical block. The configured chain RPC must retain historical state for the requested backfill range. Backfill is bounded and restartable from each vault's last stored block. TIDX's normal block-scoped reorg cleanup deletes affected observations; the worker then resamples the replacement canonical history.
 
@@ -673,7 +673,7 @@ This table is populated by an RPC-backed materializer rather than a ClickHouse m
 | `block_num` | `Int64` | Confirmed historical block used for the call |
 | `block_hash` | `String` | Canonical hash rechecked immediately before insert |
 | `block_timestamp` | `DateTime64(3, 'UTC')` | Timestamp of the sampled block |
-| `quoted_shares` | `UInt256` | Exact `previewRedeem` input (`1000000000000000000`) |
+| `quoted_shares` | `UInt256` | Exact large `previewRedeem` input (`1000000000000000000`) |
 | `quoted_assets` | `UInt256` | Exact uint256 returned by `previewRedeem` |
 
 ```bash

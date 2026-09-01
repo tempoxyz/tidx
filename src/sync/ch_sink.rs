@@ -24,6 +24,7 @@ use crate::clickhouse_schema::{
 use crate::metrics;
 use crate::sync::earn_share_prices::{
     EARN_STACK_DEPLOYED_SELECTORS, EarnSharePriceCandidate, EarnSharePriceObservation, EarnVault,
+    QUOTED_SHARES,
 };
 use crate::types::{BlockRow, LogRow, ReceiptRow, TxRow};
 
@@ -97,6 +98,31 @@ struct CanonicalChildQuery<'a> {
     table: &'a str,
     position_col: &'a str,
     columns: &'a str,
+}
+
+fn earn_share_price_candidates_sql(from_block: i64, limit: usize) -> String {
+    format!(
+        "WITH toDateTime64(\
+             toStartOfInterval(\
+                 timestamp - INTERVAL 1 MILLISECOND, \
+                 INTERVAL 15 MINUTE\
+             ) + INTERVAL 15 MINUTE, \
+             3, 'UTC'\
+         ) AS bucket \
+         SELECT bucket, \
+                argMax(num, tuple(timestamp, num)) AS block_num, \
+                argMax(hash, tuple(timestamp, num)) AS block_hash, \
+                argMax(timestamp, tuple(timestamp, num)) AS block_timestamp \
+         FROM blocks FINAL \
+         WHERE num >= {from_block} \
+           AND timestamp <= now64(3) - INTERVAL 30 SECOND \
+         GROUP BY bucket \
+         HAVING bucket <= toStartOfInterval(\
+             now64(3) - INTERVAL 30 SECOND, INTERVAL 15 MINUTE\
+         ) \
+         ORDER BY bucket \
+         LIMIT {limit}"
+    )
 }
 
 fn exact_block_delete_tables() -> Vec<BlockScopedTable> {
@@ -784,26 +810,7 @@ impl ClickHouseSink {
                 block_num.saturating_add(1)
             });
 
-        let sql = format!(
-            "WITH toDateTime64(\
-                 toStartOfInterval(\
-                     timestamp + INTERVAL 30 SECOND - INTERVAL 1 MILLISECOND, \
-                     INTERVAL 15 MINUTE\
-                 ) + INTERVAL 15 MINUTE, \
-                 3, 'UTC'\
-             ) AS bucket \
-             SELECT bucket, \
-                    argMax(num, tuple(timestamp, num)) AS block_num, \
-                    argMax(hash, tuple(timestamp, num)) AS block_hash, \
-                    argMax(timestamp, tuple(timestamp, num)) AS block_timestamp \
-             FROM blocks FINAL \
-             WHERE num >= {from_block} \
-               AND timestamp <= now64(3) - INTERVAL 30 SECOND \
-             GROUP BY bucket \
-             HAVING bucket <= toStartOfInterval(now64(3), INTERVAL 15 MINUTE) \
-             ORDER BY bucket \
-             LIMIT {limit}"
-        );
+        let sql = earn_share_price_candidates_sql(from_block, limit);
         let rows = self
             .client
             .query(&sql)
@@ -880,6 +887,7 @@ impl ClickHouseSink {
             })
             .collect::<Vec<_>>()
             .join("|");
+        let start = Instant::now();
         self.insert_chunked(
             "earn_share_prices",
             &canonical_observations,
@@ -887,7 +895,18 @@ impl ClickHouseSink {
             Some(&seed),
         )
         .await?;
-        Ok(canonical_observations.len())
+        let written = canonical_observations.len();
+        metrics::record_sink_write_duration(self.name(), "earn_share_prices", start.elapsed());
+        metrics::record_sink_write_rows(self.name(), "earn_share_prices", written as u64);
+        metrics::increment_sink_row_count(self.name(), "earn_share_prices", written as u64);
+        if let Some(max) = canonical_observations
+            .iter()
+            .map(|observation| observation.block_num)
+            .max()
+        {
+            metrics::update_sink_watermark(self.name(), "earn_share_prices", max);
+        }
+        Ok(written)
     }
 
     /// Read a canonical base-table range for PostgreSQL hot-tier hydration.
@@ -1728,7 +1747,7 @@ impl ChEarnSharePriceWire {
             block_num: observation.block_num,
             block_hash: observation.block_hash.clone(),
             block_timestamp: observation.block_timestamp,
-            quoted_shares: ChUInt256::from(1_000_000_000_000_000_000_u64),
+            quoted_shares: ChUInt256::from(QUOTED_SHARES),
             quoted_assets: ChUInt256::from_le_bytes(observation.quoted_assets.to_le_bytes()),
         }
     }
@@ -2169,6 +2188,17 @@ fn archive_range_predicate(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn earn_candidates_withhold_the_boundary_without_shifting_the_sample() {
+        let sql = earn_share_price_candidates_sql(42, 7);
+
+        assert!(sql.contains("timestamp - INTERVAL 1 MILLISECOND"));
+        assert!(!sql.contains("timestamp + INTERVAL 30 SECOND"));
+        assert!(sql.contains("HAVING bucket <= toStartOfInterval(now64(3) - INTERVAL 30 SECOND"));
+        assert!(sql.contains("WHERE num >= 42"));
+        assert!(sql.ends_with("LIMIT 7"));
+    }
 
     #[test]
     fn validates_minimum_clickhouse_version() {

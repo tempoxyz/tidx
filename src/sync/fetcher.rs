@@ -99,7 +99,7 @@ impl RpcClient {
     }
 
     /// Execute a read-only contract call against an exact historical block.
-    pub async fn call_contract(
+    pub(crate) async fn call_contract(
         &self,
         address: &str,
         input: &str,

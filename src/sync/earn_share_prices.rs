@@ -2,7 +2,9 @@
 //!
 //! ClickHouse identifies confirmed 15-minute sample blocks from canonical
 //! indexed history. The RPC supplies the one value that cannot be derived from
-//! logs: `EarnVault.previewRedeem(10^18)` at each exact historical block.
+//! logs: `EarnVault.previewRedeem(10^18)` at each exact historical block. The
+//! large fixed input reduces integer quantization and cancels when consumers
+//! compare quote growth across two boundaries.
 
 use std::collections::HashSet;
 use std::time::Duration;
@@ -19,7 +21,7 @@ use super::fetcher::RpcClient;
 
 /// Historical and current `EarnStackDeployed` event versions. The indexed
 /// `earnVault` remains topic1 across releases.
-pub const EARN_STACK_DEPLOYED_SELECTORS: &[&str] = &[
+pub(crate) const EARN_STACK_DEPLOYED_SELECTORS: &[&str] = &[
     // Initial release.
     "0x420632dca5c7b108ec3fe8f96f06644917f70c8682f8f66cadc3b03e1fe9301d",
     // Added transferPolicyId.
@@ -27,7 +29,7 @@ pub const EARN_STACK_DEPLOYED_SELECTORS: &[&str] = &[
     // Added maxManagedAssets.
     "0x950acdb981ae9ee0189b7bba6d347b4fb9b24f0e4f630a1b9a388bc5702fd67b",
 ];
-pub const QUOTED_SHARES: &str = "1000000000000000000";
+pub(crate) const QUOTED_SHARES: u64 = 1_000_000_000_000_000_000;
 const PREVIEW_REDEEM_CALLDATA: &str =
     "0x4cdad5060000000000000000000000000000000000000000000000000de0b6b3a7640000";
 const SAMPLE_BATCH_SIZE: usize = 128;
@@ -78,7 +80,7 @@ impl EarnSharePriceMaterializer {
             database = %self.sink.database(),
             interval_minutes = 15,
             confirmation_seconds = 30,
-            quoted_shares = QUOTED_SHARES,
+            quoted_shares = %QUOTED_SHARES,
             "Starting Earn share-price materializer"
         );
 
@@ -227,11 +229,11 @@ mod tests {
     }
 
     #[test]
-    fn preview_redeem_calldata_quotes_one_share() {
+    fn preview_redeem_calldata_uses_the_precision_probe() {
         assert_eq!(&PREVIEW_REDEEM_CALLDATA[..10], "0x4cdad506");
         assert_eq!(
             U256::from_str_radix(&PREVIEW_REDEEM_CALLDATA[10..], 16).unwrap(),
-            U256::from(1_000_000_000_000_000_000_u64)
+            U256::from(QUOTED_SHARES)
         );
     }
 

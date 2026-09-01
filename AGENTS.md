@@ -123,3 +123,4 @@ cargo bench
 - Commit after each logical change (new feature, optimization, refactor, test)
 - Use conventional commit messages: `feat:`, `fix:`, `refactor:`, `test:`, `docs:`, `perf:`
 - Each commit should be independently reviewable and revertable
+- Add `.changelog/<slug>.md` for user-visible changes; release automation consumes its `tidx: minor|patch` frontmatter.
