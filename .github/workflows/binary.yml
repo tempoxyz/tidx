@@ -67,13 +67,13 @@ jobs:
           path: artifacts
           merge-multiple: true
           pattern: tidx-*
-      - uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
+      - uses: tempoxyz/gh-actions/actions/gh-release@ab45d76f6e7420a094281a22aee1973ecc0754f8
         with:
-          tag_name: ${{ inputs.tag || github.ref_name }}
+          tag: ${{ inputs.tag || github.ref_name }}
           files: artifacts/*
-      - uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
+      - uses: tempoxyz/gh-actions/actions/gh-release@ab45d76f6e7420a094281a22aee1973ecc0754f8
         with:
-          tag_name: latest
+          tag: latest
           prerelease: true
           files: artifacts/*
           body: "Latest build from ${{ inputs.tag || github.ref_name }}. Updated on every release."
