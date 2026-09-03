@@ -18,7 +18,7 @@ jobs:
         with:
           fetch-depth: 0
       - id: changelogs
-        uses: wevm/changelogs-rs@a19f62e3fdbd6d07b8900eb0568ed09b868bf84d
+        uses: tempoxyz/changelogs@a19f62e3fdbd6d07b8900eb0568ed09b868bf84d
         with:
           conventional-commit: true
         env:
