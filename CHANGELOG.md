@@ -1,5 +1,63 @@
 # Changelog
 
+## `tidx@1.0.0`
+
+### Major Changes
+
+**Breaking:** Moved PostgreSQL chain settings into a nested `[chains.postgres]` section (`url`, `password_env`, `api_url`, `api_password_env`), removing the root-level `pg_url`, `pg_password_env`, `api_pg_url`, and `api_pg_password_env` fields.
+  ```diff
+   [[chains]]
+   name = "mainnet"
+   chain_id = 4217
+   rpc_url = "https://rpc.tempo.xyz"
+  -pg_url = "postgres://user@host:5432/tidx_mainnet"
+  -pg_password_env = "TIDX_PG_PASSWORD"
+  -api_pg_url = "postgres://user@host:5432/tidx_mainnet_r"
+  -api_pg_password_env = "TIDX_API_PG_PASSWORD"
+  +
+  +[chains.postgres]
+  +url = "postgres://user@host:5432/tidx_mainnet"
+  +password_env = "TIDX_PG_PASSWORD"
+  +api_url = "postgres://user@host:5432/tidx_mainnet_r"
+  +api_password_env = "TIDX_API_PG_PASSWORD"
+  ```
+  (by @jxom, [#254](https://github.com/tempoxyz/tidx/pull/254))
+
+### Minor Changes
+
+- Changed tiered-storage backfill to write full history directly from RPC to ClickHouse, then hydrate PostgreSQL's configured hot window from checkpointed ClickHouse archive ranges. PostgreSQL storage is now bounded during initial sync, historical RPC work is not duplicated, and increasing `pg_keep` restores the additional hot range before moving the query boundary. (by @KamilSzczygieł, [#261](https://github.com/tempoxyz/tidx/pull/261))
+- Added `dex_ohlc_1m`, a refreshable ClickHouse materialized view that rolls `dex_fills` into per-minute OHLC candles keyed by `(token, bucket)`, removing the 1000-fill in-memory bucketing cap on the OHLC endpoint and enabling multi-month windows with the work moved off the request path. (by @jxom, [#228](https://github.com/tempoxyz/tidx/pull/228))
+- Added support for the Tempo T6 network upgrade (TIP-1028 receive policies, TIP-1049 admin keys). Excluded the `ReceivePolicyGuard` precompile (`0xb10c...`) from holder/balance derivation so blocked transfers no longer credit the guard as a fake holder, while leaving raw `token_transfers`/`token_supply` movement intact. Added a one-time post-derived migration that deletes any pre-existing guard rows from `token_holder_deltas`/`address_holder_deltas` (a no-op on fresh deployments) so historical balances and refreshable holder aggregates stop counting the guard. Pinned the Tempo crates to the T6 release commit. (by @stevencartavia, [#244](https://github.com/tempoxyz/tidx/pull/244))
+- Added tiered storage: with `[chains.retention]`, PostgreSQL keeps a hot window of recent blocks and prunes the rest once durable in the ClickHouse archive.
+  ```diff
+   [[chains]]
+   name = "mainnet"
+   chain_id = 4217
+   rpc_url = "https://rpc.tempo.xyz"
+  
+   [chains.clickhouse]
+   enabled = true
+   url = "http://clickhouse:8123"
+  +
+  +[chains.retention]
+  +pg_keep = "30d"
+  ```
+  (by @jxom, [#254](https://github.com/tempoxyz/tidx/pull/254))
+
+### Patch Changes
+
+- Added ClickHouse projections and bloom filters for common block, log, receipt, and transaction access paths, requiring ClickHouse 25.11 or newer. (by @jxom, [#297](https://github.com/tempoxyz/tidx/pull/297))
+- Added `replicated_database` option under `[chains.clickhouse]`. When enabled, the sink creates the database with `ENGINE = Replicated` and rewrites MergeTree-family table engines to their `Replicated*` counterparts, so schema and data replicate across self-hosted multi-replica clusters coordinated by Keeper. Defaults to off; ClickHouse Cloud and single-node deployments are unaffected. (by @KamilSzczygieł, [#252](https://github.com/tempoxyz/tidx/pull/252))
+- Fixed ClickHouse failover classification so client timeouts stop immediately while non-timeout transport and protocol failures try a healthy secondary. (by @jxom, [#287](https://github.com/tempoxyz/tidx/pull/287))
+- Fixed duplicate, stale, or missing ClickHouse rows across retries, reorgs, partial writes, and startup backfills using bounded canonical-row repair, fresh deduplication generations, and durable handoffs. (by @jxom, [#280](https://github.com/tempoxyz/tidx/pull/280))
+- Fixed ClickHouse set operations with trailing ordering or limits, including case-insensitive aliases and unresolved compound outputs, by hoisting clauses into a derived-table wrapper. (by @jxom, [#285](https://github.com/tempoxyz/tidx/pull/285))
+- Raised the public `/query` concurrency limit from eight to 32 requests. (by @jxom, [#299](https://github.com/tempoxyz/tidx/pull/299))
+- Added PostgreSQL head-page indexes for sender, fee payer, and indexed-address lookups, built concurrently per partition with interrupted-build recovery. (by @jxom, [#288](https://github.com/tempoxyz/tidx/pull/288))
+- Added PostgreSQL log indexes for contract event history and indexed-address lookups, built concurrently per partition with interrupted-build recovery. (by @jxom, [#282](https://github.com/tempoxyz/tidx/pull/282))
+- Fixed `/query` errors flattening PostgreSQL failures to `db error`; the server message and SQLSTATE code (e.g. `division by zero (22012)`) now surface, and statement timeouts classify as timeouts. (by @jxom, [#284](https://github.com/tempoxyz/tidx/pull/284))
+- Fixed tiered split queries erroring on PostgreSQL availability failures; they now degrade to the full-history ClickHouse archive while preserving PostgreSQL semantic errors. (by @jxom, [#286](https://github.com/tempoxyz/tidx/pull/286))
+- Stored holder balance deltas as unsigned `UInt256` magnitude with the sign carried in `leg`. (by @jxom, [#247](https://github.com/tempoxyz/tidx/pull/247))
+
 ## `tidx@0.7.0`
 
 ### Minor Changes
