@@ -53,7 +53,7 @@ jobs:
           echo "tags=${image}:${PG_VERSION}-minimal-trixie-${short_sha},${image}:${PG_VERSION}-minimal-trixie" >> "$GITHUB_OUTPUT"
 
       - name: Set up QEMU
-        uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130 # v3
+        uses: tempoxyz/gh-actions/vendor/docker/setup-qemu-action@b411ce7fe18d0775ae614ad5c4b873c768364979
 
       - name: Set up Docker Buildx
         uses: tempoxyz/gh-actions/vendor/docker/setup-buildx-action@6f436eb3a168279692739e8c0c9fdb52b94bfae7
