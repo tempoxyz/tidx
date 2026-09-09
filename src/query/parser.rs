@@ -1,6 +1,9 @@
 use anyhow::{Result, anyhow};
 use sha3::{Digest, Keccak256};
-use sqlparser::ast::{BinaryOperator, Expr, Statement, Value, visit_expressions};
+use sqlparser::ast::{
+    BinaryOperator, Expr, Query, SelectItem, SetExpr, Statement, TableFactor, Value, Visit,
+    Visitor, visit_expressions,
+};
 use sqlparser::dialect::{ClickHouseDialect, Dialect, GenericDialect};
 use sqlparser::parser::Parser;
 use sqlparser::tokenizer::{Location, Token, Tokenizer};
@@ -561,10 +564,13 @@ fn apply_event_signature_ctes(
         rewritten_sql = sig.rewrite_filters_for_pushdown(&rewritten_sql);
     }
 
-    let pushdown = extract_raw_column_predicates_with_qualifier(
-        &rewritten_sql,
-        matches!(dialect, EventCteDialect::ClickHouse).then_some("logs"),
-    );
+    let pushdown = |sig: &EventSignature| {
+        extract_raw_column_predicates_for_table(
+            &rewritten_sql,
+            matches!(dialect, EventCteDialect::ClickHouse).then_some("logs"),
+            Some(&sig.name),
+        )
+    };
     let ctes: Vec<String> = match dialect {
         EventCteDialect::Postgres => {
             let used_columns = extract_column_references(&rewritten_sql);
@@ -574,12 +580,12 @@ fn apply_event_signature_ctes(
                 Some(&used_columns)
             };
             sigs.iter()
-                .map(|sig| sig.to_cte_sql_postgres_with_pushdown(filter, &pushdown))
+                .map(|sig| sig.to_cte_sql_postgres_with_pushdown(filter, &pushdown(sig)))
                 .collect()
         }
         EventCteDialect::ClickHouse => sigs
             .iter()
-            .map(|sig| sig.to_cte_sql_clickhouse_with_pushdown(None, &pushdown))
+            .map(|sig| sig.to_cte_sql_clickhouse_with_pushdown(None, &pushdown(sig)))
             .collect(),
         EventCteDialect::Tiered => {
             let used_columns = extract_column_references(&rewritten_sql);
@@ -589,7 +595,7 @@ fn apply_event_signature_ctes(
                 Some(&used_columns)
             };
             sigs.iter()
-                .map(|sig| sig.to_cte_sql_tiered_with_pushdown(filter, &pushdown))
+                .map(|sig| sig.to_cte_sql_tiered_with_pushdown(filter, &pushdown(sig)))
                 .collect()
         }
     };
@@ -907,7 +913,7 @@ fn extract_ident_from_expr(expr: &Expr, columns: &mut HashSet<String>) {
     }
 }
 
-/// Extract WHERE predicates on raw `logs` columns that can be pushed into the CTE.
+/// Extract required WHERE conjuncts on raw `logs` columns from a single table reference.
 ///
 /// Returns SQL fragments like `block_num >= 100`, `address = '0x...'` etc.
 /// Only extracts simple comparisons (=, >=, <=, >, <) and IN lists on known
@@ -917,21 +923,122 @@ pub fn extract_raw_column_predicates(sql: &str) -> Vec<String> {
 }
 
 fn extract_raw_column_predicates_with_qualifier(sql: &str, qualifier: Option<&str>) -> Vec<String> {
-    let mut predicates = Vec::new();
+    extract_raw_column_predicates_for_table(sql, qualifier, None)
+}
 
+fn extract_raw_column_predicates_for_table(
+    sql: &str,
+    qualifier: Option<&str>,
+    table: Option<&str>,
+) -> Vec<String> {
     let dialect = GenericDialect {};
     let Ok(statements) = Parser::parse_sql(&dialect, sql) else {
-        return predicates;
+        return Vec::new();
     };
+    let mut visitor = RawPredicateVisitor {
+        predicates: Vec::new(),
+        qualifier,
+        references: 0,
+        table,
+    };
+    let _ = statements.visit(&mut visitor);
+    // A shared CTE cannot be restricted by just one of its consumers.
+    if visitor.references == 1 {
+        visitor.predicates
+    } else {
+        Vec::new()
+    }
+}
 
-    for stmt in &statements {
-        let _ = visit_expressions(stmt, |expr| {
-            extract_raw_predicate(expr, &mut predicates, qualifier);
-            ControlFlow::<()>::Continue(())
-        });
+struct RawPredicateVisitor<'a> {
+    predicates: Vec<String>,
+    qualifier: Option<&'a str>,
+    references: usize,
+    table: Option<&'a str>,
+}
+
+impl RawPredicateVisitor<'_> {
+    fn matches(&self, factor: &TableFactor) -> bool {
+        let TableFactor::Table { name, .. } = factor else {
+            return false;
+        };
+        let [part] = name.0.as_slice() else {
+            return false;
+        };
+        part.as_ident().is_some_and(|name| {
+            self.table
+                .is_none_or(|table| name.value.eq_ignore_ascii_case(table))
+        })
     }
 
-    predicates
+    fn collect(&mut self, body: &SetExpr) {
+        match body {
+            SetExpr::SetOperation { left, right, .. } => {
+                self.collect(left);
+                self.collect(right);
+            }
+            SetExpr::Select(select) => {
+                let [source] = select.from.as_slice() else {
+                    return;
+                };
+                let TableFactor::Table { alias, args, .. } = &source.relation else {
+                    return;
+                };
+                // Joins and output aliases can change which column an unqualified name denotes.
+                if !source.joins.is_empty()
+                    || !self.matches(&source.relation)
+                    || args.is_some()
+                    || alias
+                        .as_ref()
+                        .is_some_and(|alias| !alias.columns.is_empty())
+                    || select.projection.iter().any(|item| {
+                        matches!(item,
+                        SelectItem::ExprWithAlias { alias, .. }
+                            if RAW_PUSHDOWN_COLUMNS.contains(&alias.value.to_lowercase().as_str()))
+                    })
+                {
+                    return;
+                }
+                if let Some(selection) = &select.selection {
+                    self.collect_conjuncts(selection);
+                }
+            }
+            // Nested queries are visited independently by the AST visitor.
+            _ => {}
+        }
+    }
+
+    fn collect_conjuncts(&mut self, expr: &Expr) {
+        match expr {
+            Expr::Nested(expr) => self.collect_conjuncts(expr),
+            Expr::BinaryOp {
+                left,
+                op: BinaryOperator::And,
+                right,
+            } => {
+                self.collect_conjuncts(left);
+                self.collect_conjuncts(right);
+            }
+            // Never descend into OR, NOT, functions, or subqueries: their children need not hold.
+            _ => extract_raw_predicate(expr, &mut self.predicates, self.qualifier),
+        }
+    }
+}
+
+impl Visitor for RawPredicateVisitor<'_> {
+    type Break = ();
+
+    fn pre_visit_query(&mut self, query: &Query) -> ControlFlow<Self::Break> {
+        self.collect(&query.body);
+        ControlFlow::Continue(())
+    }
+
+    fn pre_visit_table_factor(&mut self, factor: &TableFactor) -> ControlFlow<Self::Break> {
+        if self.matches(factor) {
+            self.references += 1;
+        }
+        ControlFlow::Continue(())
+    }
 }
 
 /// Extract a single raw-column predicate from an expression.
@@ -1994,6 +2101,95 @@ mod tests {
     // ========================================================================
     // Raw Column Predicate Pushdown Tests
     // ========================================================================
+
+    #[test]
+    fn test_reward_cursor_does_not_filter_out_incremental_deposits() {
+        let query = r#"SELECT * FROM (
+            SELECT block_num, tx_idx, log_idx, assets FROM Deposited
+            WHERE block_num <= 200 AND (block_num > 100 OR
+                (block_num = 100 AND (tx_idx > 1 OR (tx_idx = 1 AND log_idx > 5))))
+            UNION ALL
+            SELECT block_num, tx_idx, log_idx, amount AS assets FROM token_transfers
+            WHERE block_num <= 200 AND (block_num > 100 OR
+                (block_num = 100 AND (tx_idx > 1 OR (tx_idx = 1 AND log_idx > 5))))
+        ) ORDER BY block_num, tx_idx, log_idx"#;
+        let signature = "Deposited(address indexed caller,address indexed receiver,uint256 assets,uint256 earnShares)";
+        for dialect in [
+            EventCteDialect::Postgres,
+            EventCteDialect::ClickHouse,
+            EventCteDialect::Tiered,
+        ] {
+            let rewritten = apply_event_signature_ctes(query, &[signature], dialect).unwrap();
+            let cte = rewritten.split(") SELECT").next().unwrap();
+            assert!(!cte.contains("block_num > 100"), "{rewritten}");
+            assert!(!cte.contains("block_num = 100"), "{rewritten}");
+            assert!(cte.contains("block_num <= 200"), "{rewritten}");
+            assert!(
+                rewritten.ends_with(query),
+                "cursor must remain intact: {rewritten}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_raw_pushdown_only_uses_required_where_conjuncts() {
+        for query in [
+            "SELECT * FROM Deposited WHERE block_num = 1 OR block_num = 2",
+            "SELECT * FROM Deposited WHERE NOT (block_num = 1)",
+            "SELECT block_num = 1 FROM Deposited",
+            "SELECT * FROM Deposited ORDER BY block_num = 1",
+            "SELECT count(*) FROM Deposited HAVING max(block_num) > 1",
+        ] {
+            assert!(extract_raw_column_predicates(query).is_empty(), "{query}");
+        }
+        assert_eq!(
+            extract_raw_column_predicates(
+                "SELECT * FROM Deposited WHERE (block_num <= 200 AND (block_num > 100 OR block_num = 100))"
+            ),
+            vec!["block_num <= 200"]
+        );
+    }
+
+    #[test]
+    fn test_raw_pushdown_does_not_cross_event_scopes() {
+        let query = "SELECT * FROM Deposited WHERE block_num > 100 UNION ALL SELECT * FROM Redeemed WHERE block_num < 50";
+        let rewritten = apply_event_signature_ctes_clickhouse(
+            query,
+            &["Deposited(uint256 assets)", "Redeemed(uint256 assets)"],
+        )
+        .unwrap();
+        let deposit_cte = rewritten.split("Redeemed AS (").next().unwrap();
+        assert!(deposit_cte.contains("logs.block_num > 100"));
+        assert!(!deposit_cte.contains("logs.block_num < 50"));
+        let redeem_cte = rewritten
+            .split("Redeemed AS (")
+            .nth(1)
+            .unwrap()
+            .split(") SELECT")
+            .next()
+            .unwrap();
+        assert!(redeem_cte.contains("logs.block_num < 50"));
+        assert!(!redeem_cte.contains("logs.block_num > 100"));
+    }
+
+    #[test]
+    fn test_raw_pushdown_skips_shared_events_and_ambiguous_sources() {
+        for query in [
+            "SELECT * FROM Deposited WHERE block_num > 100 UNION ALL SELECT * FROM Deposited WHERE block_num < 50",
+            "SELECT * FROM Deposited d JOIN blocks b ON d.block_num = b.num WHERE block_num > 100",
+            "SELECT * FROM (SELECT block_num + 1 AS block_num FROM Deposited) d WHERE block_num > 100",
+            "SELECT assets AS block_num FROM Deposited WHERE block_num > 100",
+            "SELECT * FROM Deposited AS d(block_num) WHERE block_num > 100",
+            "SELECT * FROM Deposited WHERE EXISTS (SELECT 1 FROM blocks WHERE block_num > 100)",
+        ] {
+            let rewritten =
+                apply_event_signature_ctes_clickhouse(query, &["Deposited(uint256 assets)"])
+                    .unwrap();
+            let cte = rewritten.split(") SELECT").next().unwrap();
+            assert!(!cte.contains("logs.block_num > 100"), "{rewritten}");
+            assert!(!cte.contains("logs.block_num < 50"), "{rewritten}");
+        }
+    }
 
     #[test]
     fn test_extract_raw_predicates_block_num_range() {

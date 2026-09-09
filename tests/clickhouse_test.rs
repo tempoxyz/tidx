@@ -21,6 +21,90 @@ use tidx::types::{BlockRow, LogRow, ReceiptRow, TxRow};
 
 const TEST_DB: &str = "tidx_test";
 
+#[tokio::test]
+#[serial(clickhouse)]
+async fn test_reward_cursor_keeps_later_deposits_and_transfers() {
+    let ch = TestClickHouse::new(TEST_DB).expect("Failed to create ClickHouse client");
+    if ch.wait_for_ready().await.is_err() {
+        println!("ClickHouse not available, skipping test");
+        return;
+    }
+    ch.reset_database().await.unwrap();
+    ch.create_mock_logs_table().await.unwrap();
+    let signature = "Deposited(address indexed caller,address indexed receiver,uint256 assets,uint256 earnShares)";
+    let selector = format!(
+        "0x{}",
+        EventSignature::parse(signature).unwrap().topic0_hex()
+    );
+    let vault = "0x1111111111111111111111111111111111111111";
+    let receiver = "0x2222222222222222222222222222222222222222";
+    let topic = format!("0x{:0>64}", &receiver[2..]);
+    // Before/at the cursor, each cursor alternative, and beyond the closing boundary.
+    for (block, tx, log, assets) in [
+        (99, 0, 0, 100_u128),
+        (100, 1, 5, 100),
+        (100, 1, 6, 1_000),
+        (100, 2, 0, 2_000),
+        (101, 0, 0, 10_000),
+        (201, 0, 0, 20_000),
+    ] {
+        let assets = assets * 1_000_000;
+        ch.insert_mock_log(
+            block,
+            log,
+            tx,
+            &format!("0x{block:064x}"),
+            vault,
+            &selector,
+            &topic,
+            &topic,
+            "0x",
+            &format!("0x{assets:064x}{:064x}", assets / 2),
+        )
+        .await
+        .unwrap();
+    }
+    ch.query("CREATE TABLE token_transfers (block_num Int64, tx_idx Int32, log_idx Int32, token String, `from` String, `to` String, amount UInt256) ENGINE = Memory")
+        .await.unwrap();
+    ch.query(&format!("INSERT INTO token_transfers VALUES (101, 0, 1, '{vault}', '{receiver}', '{vault}', 5000000000)"))
+        .await.unwrap();
+
+    let query = format!(
+        r#"SELECT kind, block_num, tx_idx, log_idx, assets FROM (
+        SELECT 'deposit' AS kind, block_num, tx_idx, log_idx,
+               toString(toUInt256(assets)) AS assets
+        FROM Deposited
+        WHERE lower(address) = '{vault}' AND lower(receiver) = '{receiver}'
+          AND toUInt256(assets) > 0 AND toUInt256("earnShares") > 0
+          AND block_num <= 200 AND (block_num > 100 OR
+            (block_num = 100 AND (tx_idx > 1 OR (tx_idx = 1 AND log_idx > 5))))
+        UNION ALL
+        SELECT 'transfer' AS kind, block_num, tx_idx, log_idx, '0' AS assets
+        FROM token_transfers
+        WHERE lower(token) = '{vault}'
+          AND (lower("from") = '{receiver}' OR lower("to") = '{receiver}')
+          AND lower("from") != lower("to") AND toUInt256(amount) > 0
+          AND block_num <= 200 AND (block_num > 100 OR
+            (block_num = 100 AND (tx_idx > 1 OR (tx_idx = 1 AND log_idx > 5))))
+    ) ORDER BY block_num, tx_idx, log_idx"#
+    );
+    let sql = apply_event_signature_ctes_clickhouse(&query, &[signature]).unwrap();
+    let result = ch.query_json(&sql).await.unwrap();
+    let rows = result["data"].as_array().unwrap();
+    assert_eq!(
+        rows.len(),
+        4,
+        "all three later deposits and the transfer must survive: {result}"
+    );
+    assert_eq!(
+        rows.iter()
+            .map(|row| row["assets"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        vec!["1000000000", "2000000000", "10000000000", "0"]
+    );
+    assert_eq!(rows[3]["kind"], "transfer");
+}
+
 // ============================================================================
 // Basic ClickHouse Connection Tests
 // ============================================================================
