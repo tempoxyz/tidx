@@ -97,10 +97,51 @@ jobs:
       - name: Run unit tests
         run: cargo test --lib --bins --locked
 
+  archive-api-test:
+    name: archive API login regression
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    services:
+      postgres:
+        image: ghcr.io/tempoxyz/pg_clickhouse:16-02505c4
+        env:
+          POSTGRES_USER: tidx
+          POSTGRES_PASSWORD: tidx
+          POSTGRES_DB: tidx
+        ports:
+          - 5433:5432
+        options: >-
+          --health-cmd "pg_isready -U tidx -d tidx"
+          --health-interval 2s --health-timeout 5s --health-retries 20
+      clickhouse:
+        image: clickhouse/clickhouse-server:latest
+        env:
+          CLICKHOUSE_SKIP_USER_SETUP: 1
+        ports:
+          - 8123:8123
+        options: >-
+          --health-cmd "clickhouse-client --query 'SELECT 1'"
+          --health-interval 2s --health-timeout 5s --health-retries 20
+    env:
+      DATABASE_URL: postgresql://tidx:tidx@localhost:5433/tidx
+      CLICKHOUSE_URL: http://localhost:8123
+      CLICKHOUSE_FDW_URL: http://clickhouse:8123
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: Install Rust
+        uses: tempoxyz/gh-actions/vendor/dtolnay/rust-toolchain@6f436eb3a168279692739e8c0c9fdb52b94bfae7
+      - name: Cache cargo
+        uses: tempoxyz/gh-actions/vendor/Swatinem/rust-cache@6f436eb3a168279692739e8c0c9fdb52b94bfae7
+      - name: Test real archive queries with a separate API login
+        run: cargo test --locked --test tiered_api_role_test
+
   ci-gate:
     name: CI Gate
     if: always()
-    needs: [fmt, cargo-check, clippy, unit-test]
+    needs: [fmt, cargo-check, clippy, unit-test, archive-api-test]
     runs-on: ubuntu-latest
     permissions: {}
     steps:
