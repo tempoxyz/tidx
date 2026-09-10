@@ -1,0 +1,7 @@
+# Allow only this repository's Release workflow on main to manage releases.
+subject: repo:tempoxyz@211589300/tidx@1139477625:ref:refs/heads/main
+claim_pattern:
+  workflow_ref: tempoxyz/tidx/\.github/workflows/release\.yml@refs/heads/main
+permissions:
+  contents: write
+  pull_requests: write

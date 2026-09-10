@@ -6,10 +6,11 @@ on:
 
 jobs:
   release:
+    if: github.repository == 'tempoxyz/tidx' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     permissions:
-      contents: write
-      pull-requests: write
+      contents: read
+      id-token: write
     outputs:
       published: ${{ steps.changelogs.outputs.published }}
       tag: ${{ steps.get-tag.outputs.tag }}
@@ -17,19 +18,25 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           fetch-depth: 0
+          persist-credentials: false
+      - name: Fetch GitHub token via STS
+        id: app-token
+        uses: tempoxyz/gh-actions/actions/github-sts@c0292122e255def866c64c55e5844d1e7d5fe7ad
+        with:
+          policy: release
       - id: changelogs
-        uses: tempoxyz/changelogs@a19f62e3fdbd6d07b8900eb0568ed09b868bf84d
+        uses: tempoxyz/changelogs@83e69646d7ef76c5f35364d3a06fce3a6fe62bf9
         with:
           conventional-commit: true
+          github-token: ${{ steps.app-token.outputs.token }}
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
       
       # Get the tag that was just created (if any)
       - name: Get release tag
         id: get-tag
         if: steps.changelogs.outputs.published == 'true'
         run: |
-          git fetch --tags
           tag=$(git tag --points-at HEAD | grep '^tidx@' | head -1)
           echo "tag=$tag" >> $GITHUB_OUTPUT
           echo "Released tag: $tag"

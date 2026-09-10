@@ -1,6 +1,7 @@
 name: Publish Docker
 
 on:
+  # Release calls this workflow directly; its App-token tag push must not run it twice.
   workflow_dispatch:
   workflow_call:
     inputs:
@@ -8,9 +9,6 @@ on:
         description: 'Release tag'
         required: true
         type: string
-  push:
-    tags:
-      - 'tidx@*'
 
 env:
   CARGO_TERM_COLOR: always
