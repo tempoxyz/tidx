@@ -4,7 +4,7 @@ on:
   push:
     tags:
       - 'v*'
-      - 'tidx@*'
+  # Release calls this workflow directly for tidx@ tags to avoid duplicate App-token builds.
   workflow_call:
     inputs:
       tag:
