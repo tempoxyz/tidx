@@ -357,6 +357,27 @@ pub async fn is_bootstrapped(pool: &Pool) -> Result<bool> {
 /// config changes. Requires the pg_clickhouse extension to be installable
 /// on the PostgreSQL server. Returns the boundary baked into the views.
 pub async fn bootstrap(pool: &Pool, target: &FdwTarget, chain_id: u64) -> Result<i64> {
+    bootstrap_with_api_pool(pool, target, chain_id, pool).await
+}
+
+/// Bootstrap the archive mappings for both the sync owner and the actual API
+/// login. A dedicated API pool does not inherit the owner's FDW user mapping.
+/// Recreate its mapping on every bootstrap because DROP SERVER CASCADE removes
+/// all mappings. Existing schema/table grants remain the operator's responsibility.
+pub async fn bootstrap_with_api_pool(
+    pool: &Pool,
+    target: &FdwTarget,
+    chain_id: u64,
+    api_pool: &Pool,
+) -> Result<i64> {
+    // Read the effective role rather than parsing a URL (which may omit the
+    // username or use connection options). Resolve before changing any DDL.
+    let api_role: String = api_pool
+        .get()
+        .await?
+        .query_one("SELECT current_user::text", &[])
+        .await?
+        .get(0);
     let mut ddl = vec![
         "CREATE EXTENSION IF NOT EXISTS pg_clickhouse".to_string(),
         "CREATE SCHEMA IF NOT EXISTS ch".to_string(),
@@ -376,6 +397,7 @@ pub async fn bootstrap(pool: &Pool, target: &FdwTarget, chain_id: u64) -> Result
             user = sql_literal(&target.user),
             password = sql_literal(&target.password),
         ),
+        api_user_mapping_sql(&api_role, target),
     ];
     ddl.extend(TABLES.iter().map(|t| foreign_table_sql(t)));
 
@@ -394,6 +416,17 @@ pub async fn bootstrap(pool: &Pool, target: &FdwTarget, chain_id: u64) -> Result
         "Tiered storage bootstrapped (ch.* foreign tables + tiered.* views)"
     );
     Ok(boundary)
+}
+
+fn api_user_mapping_sql(role: &str, target: &FdwTarget) -> String {
+    // Quote the role as an identifier, not a SQL literal. IF NOT EXISTS also
+    // handles deployments where the sync and API pools use the same login.
+    format!(
+        "CREATE USER MAPPING IF NOT EXISTS FOR \"{role}\" SERVER {SERVER} OPTIONS (user '{user}', password '{password}')",
+        role = role.replace('"', "\"\""),
+        user = sql_literal(&target.user),
+        password = sql_literal(&target.password),
+    )
 }
 
 /// Rebake the boundary constraints and tiered views at the current hot-tier
@@ -427,6 +460,21 @@ pub async fn refresh_boundary(pool: &Pool, chain_id: u64) -> Result<i64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_api_mapping_is_scoped_and_quotes_identifiers_and_options() {
+        let target = FdwTarget::new(
+            "http://clickhouse:8123",
+            "archive".into(),
+            Some("read'er".into()),
+            Some("pa'ss".into()),
+        )
+        .unwrap();
+        assert_eq!(
+            api_user_mapping_sql("api\"role", &target),
+            "CREATE USER MAPPING IF NOT EXISTS FOR \"api\"\"role\" SERVER tidx_clickhouse OPTIONS (user 'read''er', password 'pa''ss')",
+        );
+    }
 
     #[test]
     fn test_fdw_target_parses_http_url() {
