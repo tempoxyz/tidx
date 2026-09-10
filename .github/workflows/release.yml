@@ -28,6 +28,7 @@ jobs:
         uses: tempoxyz/changelogs@83e69646d7ef76c5f35364d3a06fce3a6fe62bf9
         with:
           conventional-commit: true
+          post-version-command: cargo update --workspace
           github-token: ${{ steps.app-token.outputs.token }}
         env:
           GH_TOKEN: ${{ steps.app-token.outputs.token }}
