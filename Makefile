@@ -1,4 +1,4 @@
-.PHONY: help up down logs seed build check fmt-check cargo-check clippy unit-test test bench bench-gen bench-open clean compose-up compose-down compose-logs
+.PHONY: help up down logs seed build check fmt-check cargo-check clippy unit-test test bench bench-gen bench-log-indexes bench-open clean compose-up compose-down compose-logs
 
 .DEFAULT_GOAL := help
 
@@ -127,6 +127,9 @@ test:
 # Benchmark parameters
 BENCH_TXS ?= 5000000
 BENCH_ARTIFACT ?= .bench_seed.dump
+LOG_INDEX_BENCH_ROWS ?= 5000000
+LOG_INDEX_BENCH_SAMPLES ?= 20
+LOG_INDEX_BENCH_WRITE_ROWS ?= 10000
 
 # Check if benchmark data exists, restore from artifact or generate fresh
 define check_bench_data
@@ -195,6 +198,19 @@ bench:
 	@echo "=== Running Query Benchmarks ==="
 	@DATABASE_URL=postgres://tidx:tidx@localhost:5433/tidx cargo bench --bench query_bench
 	@echo "Report: target/criterion/report/index.html"
+
+# Compare PostgreSQL log-query indexes on an isolated synthetic corpus.
+bench-log-indexes:
+	@$(LOCALNET_COMPOSE) up -d postgres
+	@until $(LOCALNET_COMPOSE) exec -T postgres pg_isready -U tidx -d postgres > /dev/null 2>&1; do sleep 1; done
+	@$(LOCALNET_COMPOSE) exec -T postgres psql -U tidx -d postgres -c "DROP DATABASE IF EXISTS tidx_log_index_bench WITH (FORCE)" > /dev/null
+	@$(LOCALNET_COMPOSE) exec -T postgres psql -U tidx -d postgres -c "CREATE DATABASE tidx_log_index_bench" > /dev/null
+	@LOG_INDEX_BENCH_ROWS=$(LOG_INDEX_BENCH_ROWS) \
+		LOG_INDEX_BENCH_SAMPLES=$(LOG_INDEX_BENCH_SAMPLES) \
+		LOG_INDEX_BENCH_WRITE_ROWS=$(LOG_INDEX_BENCH_WRITE_ROWS) \
+		DATABASE_URL=postgres://tidx:tidx@localhost:5433/tidx_log_index_bench \
+		cargo bench --bench log_index_bench
+	@echo "Report: target/log-index-bench/report.json"
 
 # Run benchmarks and open report
 bench-open: bench
