@@ -1538,8 +1538,7 @@ async fn tick_receipt_backfill(sinks: &SinkSet, rpc: &RpcClient, chain_id: u64) 
     // Group consecutive blocks into ranges for batch fetching
     let ranges = group_consecutive_blocks(&blocks_missing);
 
-    let mut min_block: Option<u64> = None;
-    let mut max_block: Option<u64> = None;
+    let mut repaired_blocks = Vec::new();
 
     for (from, to) in ranges {
         // Fetch receipts for this range, splitting on "too large" errors
@@ -1637,20 +1636,7 @@ async fn tick_receipt_backfill(sinks: &SinkSet, rpc: &RpcClient, chain_id: u64) 
                 chunk_max_block = Some(chunk_max_block.map_or(block_num, |m| m.max(block_num)));
             }
 
-            if let Some(block_num) = block_receipt_rows
-                .iter()
-                .map(|receipt| receipt.block_num as u64)
-                .min()
-            {
-                min_block = Some(min_block.map_or(block_num, |m: u64| m.min(block_num)));
-            }
-            if let Some(block_num) = block_receipt_rows
-                .iter()
-                .map(|receipt| receipt.block_num as u64)
-                .max()
-            {
-                max_block = Some(max_block.map_or(block_num, |m: u64| m.max(block_num)));
-            }
+            repaired_blocks.extend(block_receipt_rows.iter().map(|receipt| receipt.block_num));
 
             chunk_logs.extend(block_logs);
             chunk_receipts.extend(block_receipt_rows);
@@ -1667,16 +1653,20 @@ async fn tick_receipt_backfill(sinks: &SinkSet, rpc: &RpcClient, chain_id: u64) 
         .await?;
     }
 
-    // Single UPDATE txs covering all processed ranges (instead of per-range)
-    if let (Some(lo), Some(hi)) = (min_block, max_block) {
+    repaired_blocks.sort_unstable();
+    repaired_blocks.dedup();
+
+    if !repaired_blocks.is_empty() {
         let conn = pool.get().await?;
         conn.execute(
             "UPDATE txs SET gas_used = r.gas_used, fee_payer = r.fee_payer \
-             FROM receipts r \
-             WHERE txs.block_num = r.block_num AND txs.idx = r.tx_idx \
-               AND txs.block_num >= $1 AND txs.block_num <= $2 \
-               AND txs.gas_used IS NULL",
-            &[&(lo as i64), &(hi as i64)],
+              FROM receipts r \
+              WHERE txs.block_timestamp = r.block_timestamp \
+                AND txs.block_num = r.block_num AND txs.idx = r.tx_idx \
+                AND txs.block_num = ANY($1) \
+                AND r.block_num = ANY($1) \
+                AND txs.gas_used IS NULL",
+            &[&repaired_blocks],
         )
         .await?;
     }
