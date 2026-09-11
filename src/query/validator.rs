@@ -263,6 +263,25 @@ fn validate_clickhouse_query_ast(
         if let sqlparser::ast::OrderByKind::Expressions(exprs) = &order_by.kind {
             for order_expr in exprs {
                 validate_clickhouse_expr(&order_expr.expr, &all_cte_names, depth)?;
+                if let Some(with_fill) = &order_expr.with_fill {
+                    for expr in [&with_fill.from, &with_fill.to, &with_fill.step]
+                        .into_iter()
+                        .flatten()
+                    {
+                        validate_clickhouse_expr(expr, &all_cte_names, depth)?;
+                    }
+                }
+            }
+        }
+        if let Some(exprs) = order_by
+            .interpolate
+            .as_ref()
+            .and_then(|interpolate| interpolate.exprs.as_ref())
+        {
+            for interpolate_expr in exprs {
+                if let Some(expr) = &interpolate_expr.expr {
+                    validate_clickhouse_expr(expr, &all_cte_names, depth)?;
+                }
             }
         }
     }
@@ -1833,6 +1852,40 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(error.to_string(), "Table functions are not allowed");
+    }
+
+    #[test]
+    fn test_clickhouse_validates_order_by_interpolate_expressions() {
+        assert!(
+            validate_clickhouse_query(
+                "SELECT num FROM blocks ORDER BY num WITH FILL INTERPOLATE (num AS 0)"
+            )
+            .is_ok()
+        );
+
+        let error = validate_clickhouse_query(
+            "SELECT num FROM blocks ORDER BY num WITH FILL \
+             INTERPOLATE (num AS sleepEachRow(1))",
+        )
+        .unwrap_err();
+        assert_eq!(error.to_string(), "Function 'sleepEachRow' is not allowed");
+    }
+
+    #[test]
+    fn test_clickhouse_validates_order_by_with_fill_expressions() {
+        assert!(
+            validate_clickhouse_query(
+                "SELECT num FROM blocks ORDER BY num WITH FILL FROM 0 TO 10 STEP 1"
+            )
+            .is_ok()
+        );
+
+        let error = validate_clickhouse_query(
+            "SELECT num FROM blocks ORDER BY num WITH FILL \
+             FROM 0 TO 10 STEP sleepEachRow(1)",
+        )
+        .unwrap_err();
+        assert_eq!(error.to_string(), "Function 'sleepEachRow' is not allowed");
     }
 
     #[test]
