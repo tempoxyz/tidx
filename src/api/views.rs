@@ -21,7 +21,7 @@ fn require_admin_mutation(
     addr: &SocketAddr,
 ) -> Result<(), ApiError> {
     let client_ip = admin_client_ip(headers, state, addr);
-    if !state.is_trusted_ip(&client_ip) {
+    if !client_ip.is_some_and(|ip| state.is_trusted_ip(&ip)) {
         return Err(ApiError::Forbidden(
             "Mutations only allowed from trusted IPs".to_string(),
         ));
@@ -40,28 +40,52 @@ fn require_admin_mutation(
     Ok(())
 }
 
-fn admin_client_ip(headers: &HeaderMap, state: &AppState, addr: &SocketAddr) -> IpAddr {
+/// Resolve the client IP for admin checks.
+///
+/// Returns `None` when the peer is a trusted proxy but the forwarded client
+/// cannot be determined (malformed headers), so callers fail closed.
+fn admin_client_ip(headers: &HeaderMap, state: &AppState, addr: &SocketAddr) -> Option<IpAddr> {
     let peer_ip = addr.ip();
     if !state.is_trusted_ip(&peer_ip) {
-        return peer_ip;
+        return Some(peer_ip);
     }
 
-    forwarded_client_ip(headers).unwrap_or(peer_ip)
+    if headers.contains_key("x-forwarded-for") {
+        return forwarded_client_ip(headers, state);
+    }
+
+    match headers.get("x-real-ip") {
+        Some(value) => value
+            .to_str()
+            .ok()
+            .and_then(|value| value.trim().parse().ok()),
+        None => Some(peer_ip),
+    }
 }
 
-fn forwarded_client_ip(headers: &HeaderMap) -> Option<IpAddr> {
-    headers
-        .get("x-forwarded-for")
-        .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.split(',').next())
-        .map(str::trim)
-        .and_then(|value| value.parse().ok())
-        .or_else(|| {
-            headers
-                .get("x-real-ip")
-                .and_then(|value| value.to_str().ok())
-                .and_then(|value| value.trim().parse().ok())
-        })
+/// Resolve the client IP from `X-Forwarded-For`.
+///
+/// Proxies append the address they accepted the connection from, so only the
+/// rightmost entries are trustworthy: the rightmost one was written by the
+/// trusted proxy we are talking to, the one left of it by the next trusted hop,
+/// and so on. Walk the chain from the right, skip trusted hops, and treat the
+/// first untrusted hop as the client. Any malformed entry before that point
+/// makes the client unresolvable.
+fn forwarded_client_ip(headers: &HeaderMap, state: &AppState) -> Option<IpAddr> {
+    let mut hops = Vec::new();
+    for value in headers.get_all("x-forwarded-for") {
+        hops.extend(value.to_str().ok()?.split(',').map(str::trim));
+    }
+
+    let mut client = None;
+    for hop in hops.into_iter().rev() {
+        let ip: IpAddr = hop.parse().ok()?;
+        client = Some(ip);
+        if !state.is_trusted_ip(&ip) {
+            break;
+        }
+    }
+    client
 }
 
 /// Validate view name (alphanumeric + underscore only)
@@ -560,6 +584,84 @@ mod tests {
             "100.64.12.34, 127.0.0.1".parse().unwrap(),
         );
         assert!(require_admin_mutation(&headers, &state, &addr).is_ok());
+    }
+
+    #[test]
+    fn test_rejects_spoofed_forwarded_chain_from_trusted_proxy() {
+        // An appending proxy turns a client-supplied "127.0.0.1" into
+        // "127.0.0.1, <client>"; the leftmost entry must not be trusted.
+        let state = test_state_with_trusted_localhost();
+        let addr: SocketAddr = "127.0.0.1:8080".parse().unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert(ADMIN_MUTATION_HEADER, "1".parse().unwrap());
+        headers.insert(
+            "x-forwarded-for",
+            "127.0.0.1, 203.0.113.10".parse().unwrap(),
+        );
+        assert!(require_admin_mutation(&headers, &state, &addr).is_err());
+    }
+
+    #[test]
+    fn test_rejects_spoofed_forwarded_chain_across_multiple_headers() {
+        let state = test_state_with_trusted_localhost();
+        let addr: SocketAddr = "127.0.0.1:8080".parse().unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert(ADMIN_MUTATION_HEADER, "1".parse().unwrap());
+        headers.append("x-forwarded-for", "127.0.0.1".parse().unwrap());
+        headers.append("x-forwarded-for", "203.0.113.10".parse().unwrap());
+        assert!(require_admin_mutation(&headers, &state, &addr).is_err());
+    }
+
+    #[test]
+    fn test_accepts_trusted_client_behind_multiple_trusted_proxies() {
+        let state = test_state_with_trusted_cidrs(vec![
+            ("127.0.0.1".parse::<IpAddr>().unwrap(), 32),
+            ("100.64.0.0".parse::<IpAddr>().unwrap(), 10),
+        ]);
+        let addr: SocketAddr = "127.0.0.1:8080".parse().unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert(ADMIN_MUTATION_HEADER, "1".parse().unwrap());
+        headers.insert(
+            "x-forwarded-for",
+            "100.64.12.34, 100.64.0.1".parse().unwrap(),
+        );
+        assert!(require_admin_mutation(&headers, &state, &addr).is_ok());
+    }
+
+    #[test]
+    fn test_rejects_malformed_forwarded_header_from_trusted_proxy() {
+        let state = test_state_with_trusted_localhost();
+        let addr: SocketAddr = "127.0.0.1:8080".parse().unwrap();
+        for value in ["not-an-ip", "", "not-an-ip, 203.0.113.10"] {
+            let mut headers = HeaderMap::new();
+            headers.insert(ADMIN_MUTATION_HEADER, "1".parse().unwrap());
+            headers.insert("x-forwarded-for", value.parse().unwrap());
+            assert!(
+                require_admin_mutation(&headers, &state, &addr).is_err(),
+                "x-forwarded-for {value:?} should be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn test_forwarded_for_takes_precedence_over_real_ip() {
+        let state = test_state_with_trusted_localhost();
+        let addr: SocketAddr = "127.0.0.1:8080".parse().unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert(ADMIN_MUTATION_HEADER, "1".parse().unwrap());
+        headers.insert("x-forwarded-for", "203.0.113.10".parse().unwrap());
+        headers.insert("x-real-ip", "127.0.0.1".parse().unwrap());
+        assert!(require_admin_mutation(&headers, &state, &addr).is_err());
+    }
+
+    #[test]
+    fn test_rejects_malformed_real_ip_from_trusted_proxy() {
+        let state = test_state_with_trusted_localhost();
+        let addr: SocketAddr = "127.0.0.1:8080".parse().unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert(ADMIN_MUTATION_HEADER, "1".parse().unwrap());
+        headers.insert("x-real-ip", "not-an-ip".parse().unwrap());
+        assert!(require_admin_mutation(&headers, &state, &addr).is_err());
     }
 
     #[test]
