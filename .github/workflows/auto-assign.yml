@@ -10,4 +10,4 @@ permissions:
 
 jobs:
   assign:
-    uses: tempoxyz/ci/.github/workflows/auto-assign-pr.yml@main
+    uses: tempoxyz/ci/.github/workflows/auto-assign-pr.yml@b73270c9ac67ef4b74ad6ae8ec2ad409b78623ff # main

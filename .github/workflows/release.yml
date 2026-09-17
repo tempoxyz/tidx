@@ -15,6 +15,9 @@ jobs:
       published: ${{ steps.changelogs.outputs.published }}
       tag: ${{ steps.get-tag.outputs.tag }}
     steps:
+      - name: Secure runner
+        uses: tempoxyz/gh-actions/actions/secure-runner@077919669f220320ec1cd44cc18ceff33440c8f0 # main
+
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           fetch-depth: 0
@@ -31,14 +34,14 @@ jobs:
           github-token: ${{ steps.app-token.outputs.token }}
         env:
           GH_TOKEN: ${{ steps.app-token.outputs.token }}
-      
+
       # Get the tag that was just created (if any)
       - name: Get release tag
         id: get-tag
         if: steps.changelogs.outputs.published == 'true'
         run: |
           tag=$(git tag --points-at HEAD | grep '^tidx@' | head -1)
-          echo "tag=$tag" >> $GITHUB_OUTPUT
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
           echo "Released tag: $tag"
 
   # Build and upload binaries after release
@@ -50,6 +53,7 @@ jobs:
       tag: ${{ needs.release.outputs.tag }}
     permissions:
       contents: write
+      id-token: write
 
   # Build and push Docker image after release
   docker:
@@ -60,4 +64,5 @@ jobs:
       tag: ${{ needs.release.outputs.tag }}
     permissions:
       contents: read
+      id-token: write
       packages: write

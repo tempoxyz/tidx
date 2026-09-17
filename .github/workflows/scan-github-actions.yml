@@ -1,0 +1,15 @@
+name: Scan GitHub Actions
+
+on:
+  pull_request:
+
+permissions: {}
+
+jobs:
+  scan:
+    name: Scan GitHub Actions
+    uses: tempoxyz/gh-actions/.github/workflows/scan-github-actions.yml@1d24cba4cc91d718c9dada1c397baf11dc188fc1 # main
+    permissions:
+      actions: read
+      contents: read
+      id-token: write

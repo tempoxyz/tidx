@@ -35,16 +35,25 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: read
+      id-token: write
       issues: write
       pull-requests: read
     steps:
+      - name: Secure runner
+        uses: tempoxyz/gh-actions/actions/secure-runner@077919669f220320ec1cd44cc18ceff33440c8f0 # main
+
       - name: Handle audit command
         uses: tempoxyz/gh-actions/actions/pr-audit-comment@183a02178c660ce295e9a262edc5857cb7135f06 # main
+        env:
+          # The pinned action checks the commenter's repository permission before using these.
+          EVENTS_ARGS: ${{ secrets.EVENTS_ARGS }} # zizmor: ignore[secrets-outside-env]
+          EVENTS_CERT: ${{ secrets.EVENTS_CERT }} # zizmor: ignore[secrets-outside-env]
+          EVENTS_KEY: ${{ secrets.EVENTS_KEY }} # zizmor: ignore[secrets-outside-env]
         with:
           command-regex: '^(?:@decofe\s+)?(?:cyclops\s+audit|derek\s+audit)\b'
           permission-check-mode: association
           organization: tempoxyz
-          events-key: ${{ secrets.EVENTS_KEY }}
-          events-cert: ${{ secrets.EVENTS_CERT }}
-          events-args: ${{ secrets.EVENTS_ARGS }}
+          events-key: ${{ env.EVENTS_KEY }}
+          events-cert: ${{ env.EVENTS_CERT }}
+          events-args: ${{ env.EVENTS_ARGS }}
           github-token: ${{ github.token }}

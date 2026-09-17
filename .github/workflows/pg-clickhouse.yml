@@ -31,11 +31,17 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: read
+      id-token: write
       packages: write
 
     steps:
+      - name: Secure runner
+        uses: tempoxyz/gh-actions/actions/secure-runner@077919669f220320ec1cd44cc18ceff33440c8f0 # main
+
       - name: Checkout tidx
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
 
       - name: Checkout ClickHouse/pg_clickhouse
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
@@ -43,6 +49,7 @@ jobs:
           repository: ClickHouse/pg_clickhouse
           ref: ${{ env.UPSTREAM_REF }}
           path: docker/pg-clickhouse/src
+          persist-credentials: false
           submodules: recursive
 
       - name: Compute tags
