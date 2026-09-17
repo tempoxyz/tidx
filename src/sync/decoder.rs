@@ -1,10 +1,11 @@
 use alloy::consensus::transaction::Recovered;
-use alloy::consensus::{Transaction as TransactionTrait, Typed2718};
+use alloy::consensus::{BlockHeader as _, Transaction as TransactionTrait, Typed2718};
 use alloy::network::{ReceiptResponse, TransactionResponse};
+use alloy::primitives::B256;
 use chrono::{DateTime, TimeZone, Utc};
 use tempo_alloy::primitives::transaction::SignatureType;
 
-use crate::tempo::{Block, Log, Receipt, Transaction, TempoTxEnvelope};
+use crate::tempo::{Block, Log, Receipt, TempoTxEnvelope, Transaction};
 use crate::types::{BlockRow, LogRow, ReceiptRow, TxRow};
 
 pub fn timestamp_from_secs(secs: u64) -> DateTime<Utc> {
@@ -14,25 +15,30 @@ pub fn timestamp_from_secs(secs: u64) -> DateTime<Utc> {
 }
 
 pub fn decode_block(block: &Block) -> BlockRow {
-    let timestamp_secs = block.header.timestamp;
+    let header = &block.header;
+    let timestamp_secs = header.timestamp();
     let timestamp = timestamp_from_secs(timestamp_secs);
     let timestamp_ms = (timestamp_secs * 1000) as i64;
 
     BlockRow {
-        num: block.header.number as i64,
-        hash: block.header.hash.as_slice().to_vec(),
-        parent_hash: block.header.parent_hash.as_slice().to_vec(),
+        num: header.number() as i64,
+        hash: header.hash.as_slice().to_vec(),
+        parent_hash: header.parent_hash().as_slice().to_vec(),
         timestamp,
         timestamp_ms,
-        gas_limit: block.header.gas_limit as i64,
-        gas_used: block.header.gas_used as i64,
-        miner: block.header.beneficiary.as_slice().to_vec(),
-        extra_data: Some(block.header.extra_data.to_vec()),
+        gas_limit: header.gas_limit() as i64,
+        gas_used: header.gas_used() as i64,
+        miner: header.beneficiary().as_slice().to_vec(),
+        extra_data: Some(header.extra_data().to_vec()),
+        consensus_proposer: header
+            .consensus_context
+            .as_ref()
+            .map(|consensus_context| B256::from(&consensus_context.proposer).0.to_vec()),
     }
 }
 
 pub fn decode_transaction(tx: &Transaction, block: &Block, idx: u32) -> TxRow {
-    let block_timestamp = timestamp_from_secs(block.header.timestamp);
+    let block_timestamp = timestamp_from_secs(block.header.timestamp());
     let inner: &Recovered<TempoTxEnvelope> = &tx.inner;
 
     // Extract Tempo-specific fields if this is a 0x76 transaction
@@ -57,7 +63,7 @@ pub fn decode_transaction(tx: &Transaction, block: &Block, idx: u32) -> TxRow {
         };
 
     TxRow {
-        block_num: block.header.number as i64,
+        block_num: block.header.number() as i64,
         block_timestamp,
         idx: idx as i32,
         hash: tx.tx_hash().as_slice().to_vec(),
@@ -68,7 +74,9 @@ pub fn decode_transaction(tx: &Transaction, block: &Block, idx: u32) -> TxRow {
         input: inner.input().to_vec(),
         gas_limit: inner.gas_limit() as i64,
         max_fee_per_gas: inner.max_fee_per_gas().to_string(),
-        max_priority_fee_per_gas: inner.max_priority_fee_per_gas().map_or("0".into(), |v| v.to_string()),
+        max_priority_fee_per_gas: inner
+            .max_priority_fee_per_gas()
+            .map_or("0".into(), |v| v.to_string()),
         gas_used: None,
         nonce_key,
         nonce: inner.nonce() as i64,
@@ -102,6 +110,7 @@ pub fn decode_log(log: &Log, block_timestamp: DateTime<Utc>) -> LogRow {
         topic2: topics.get(2).map(|t| t.as_slice().to_vec()),
         topic3: topics.get(3).map(|t| t.as_slice().to_vec()),
         data: log.data().data.to_vec(),
+        is_virtual_forward: false,
     }
 }
 
@@ -116,8 +125,44 @@ pub fn enrich_txs_from_receipts(txs: &mut [TxRow], receipts: &[ReceiptRow]) {
     for tx in txs.iter_mut() {
         if let Some(r) = receipt_map.get(&(tx.block_num, tx.idx)) {
             tx.gas_used = Some(r.gas_used);
-            tx.fee_payer = r.fee_payer.clone();
+            tx.fee_payer.clone_from(&r.fee_payer);
         }
+    }
+}
+
+/// Enrich receipt rows with fields that come from txs (`type`, `fee_token`).
+/// Denormalizing these onto receipts lets the API serve receipt lists without
+/// joining `receipts` to `txs`. Must be called after both txs and receipts are
+/// decoded. Mirror of `enrich_txs_from_receipts`.
+pub fn enrich_receipts_from_txs(receipts: &mut [ReceiptRow], txs: &[TxRow]) {
+    use std::collections::HashMap;
+    let tx_map: HashMap<(i64, i32), &TxRow> =
+        txs.iter().map(|t| ((t.block_num, t.idx), t)).collect();
+    for receipt in receipts.iter_mut() {
+        if let Some(t) = tx_map.get(&(receipt.block_num, receipt.tx_idx)) {
+            receipt.tx_type = Some(t.tx_type);
+            receipt.fee_token.clone_from(&t.fee_token);
+        }
+    }
+}
+
+pub fn decode_receipt(receipt: &Receipt, block_timestamp: DateTime<Utc>) -> ReceiptRow {
+    ReceiptRow {
+        block_num: receipt.block_number().unwrap_or(0) as i64,
+        block_timestamp,
+        tx_idx: receipt.transaction_index().unwrap_or(0) as i32,
+        tx_hash: receipt.transaction_hash().as_slice().to_vec(),
+        from: receipt.from().as_slice().to_vec(),
+        to: receipt.to().map(|a| a.as_slice().to_vec()),
+        contract_address: receipt.contract_address().map(|a| a.as_slice().to_vec()),
+        gas_used: receipt.gas_used() as i64,
+        cumulative_gas_used: receipt.cumulative_gas_used() as i64,
+        effective_gas_price: Some(receipt.effective_gas_price().to_string()),
+        status: if receipt.status() { Some(1) } else { Some(0) },
+        fee_payer: Some(receipt.fee_payer.as_slice().to_vec()),
+        // Denormalized from the matching tx by `enrich_receipts_from_txs`.
+        tx_type: None,
+        fee_token: None,
     }
 }
 
@@ -133,7 +178,12 @@ mod tests {
         }
     }
 
-    fn make_receipt(block_num: i64, tx_idx: i32, gas_used: i64, fee_payer: Option<Vec<u8>>) -> ReceiptRow {
+    fn make_receipt(
+        block_num: i64,
+        tx_idx: i32,
+        gas_used: i64,
+        fee_payer: Option<Vec<u8>>,
+    ) -> ReceiptRow {
         ReceiptRow {
             block_num,
             tx_idx,
@@ -188,11 +238,7 @@ mod tests {
 
     #[test]
     fn enrich_multi_block_batch() {
-        let mut txs = vec![
-            make_tx(10, 0),
-            make_tx(10, 1),
-            make_tx(11, 0),
-        ];
+        let mut txs = vec![make_tx(10, 0), make_tx(10, 1), make_tx(11, 0)];
         let receipts = vec![
             make_receipt(10, 0, 21000, Some(vec![0x01; 20])),
             make_receipt(10, 1, 42000, None),
@@ -208,21 +254,56 @@ mod tests {
         assert_eq!(txs[2].gas_used, Some(63000));
         assert_eq!(txs[2].fee_payer, Some(vec![0x02; 20]));
     }
-}
 
-pub fn decode_receipt(receipt: &Receipt, block_timestamp: DateTime<Utc>) -> ReceiptRow {
-    ReceiptRow {
-        block_num: receipt.block_number().unwrap_or(0) as i64,
-        block_timestamp,
-        tx_idx: receipt.transaction_index().unwrap_or(0) as i32,
-        tx_hash: receipt.transaction_hash().as_slice().to_vec(),
-        from: receipt.from().as_slice().to_vec(),
-        to: receipt.to().map(|a| a.as_slice().to_vec()),
-        contract_address: receipt.contract_address().map(|a| a.as_slice().to_vec()),
-        gas_used: receipt.gas_used() as i64,
-        cumulative_gas_used: receipt.cumulative_gas_used() as i64,
-        effective_gas_price: Some(receipt.effective_gas_price().to_string()),
-        status: if receipt.status() { Some(1) } else { Some(0) },
-        fee_payer: Some(receipt.fee_payer.as_slice().to_vec()),
+    fn make_tx_full(block_num: i64, idx: i32, tx_type: i16, fee_token: Option<Vec<u8>>) -> TxRow {
+        TxRow {
+            block_num,
+            idx,
+            tx_type,
+            fee_token,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn enrich_receipts_sets_type_and_fee_token() {
+        let mut receipts = vec![
+            make_receipt(1, 0, 21000, None),
+            make_receipt(1, 1, 50000, None),
+        ];
+        let txs = vec![
+            make_tx_full(1, 0, 2, Some(vec![0xcc; 20])),
+            make_tx_full(1, 1, 4, None),
+        ];
+
+        enrich_receipts_from_txs(&mut receipts, &txs);
+
+        assert_eq!(receipts[0].tx_type, Some(2));
+        assert_eq!(receipts[0].fee_token, Some(vec![0xcc; 20]));
+        assert_eq!(receipts[1].tx_type, Some(4));
+        assert_eq!(receipts[1].fee_token, None);
+    }
+
+    #[test]
+    fn enrich_receipts_leaves_unmatched_as_none() {
+        let mut receipts = vec![
+            make_receipt(1, 0, 21000, None),
+            make_receipt(2, 0, 21000, None),
+        ];
+        let txs = vec![make_tx_full(1, 0, 2, Some(vec![0xcc; 20]))];
+
+        enrich_receipts_from_txs(&mut receipts, &txs);
+
+        assert_eq!(receipts[0].tx_type, Some(2));
+        assert_eq!(receipts[1].tx_type, None);
+        assert_eq!(receipts[1].fee_token, None);
+    }
+
+    #[test]
+    fn enrich_receipts_empty_txs_is_noop() {
+        let mut receipts = vec![make_receipt(1, 0, 21000, None)];
+        enrich_receipts_from_txs(&mut receipts, &[]);
+        assert_eq!(receipts[0].tx_type, None);
+        assert_eq!(receipts[0].fee_token, None);
     }
 }

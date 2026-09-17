@@ -1,5 +1,64 @@
 # Changelog
 
+## `tidx@0.7.0`
+
+### Minor Changes
+
+- Added `address_balances_snapshot`, a refreshable ClickHouse materialized view that pre-aggregates per-address token balances from `address_holder_deltas`, so hot account balance pages and counts hit a holder-keyed range instead of re-aggregating tens of millions of delta rows.
+- Added decoded stablecoin-DEX event tables `dex_pairs`, `dex_orders`, and `dex_fills` as insert-time ClickHouse materialized views over `logs`. `dex_fills` denormalizes the `OrderFilled`/`OrderPlaced` join at ingest (token, side, tick attached per fill, ordered by `(token, block_num, log_idx)`), turning pair-swap and OHLC scans into a primary-key range read instead of a join plus correlated subquery. (by @jxom, [#227](https://github.com/tempoxyz/tidx/pull/227))
+- Added `dex_pair_liquidity`, a ClickHouse view that joins `dex_pairs` to the DEX escrow balances in `token_balances_snapshot`, so the exchange pairs-by-liquidity endpoint can read ranked pairs directly instead of over-fetching escrow balances and intersecting base/quote pairs in memory. (by @jxom, [#227](https://github.com/tempoxyz/tidx/pull/227))
+- Added `token_holder_counts`, a refreshable ClickHouse materialized view that pre-aggregates per-token holder counts from `token_balances_snapshot`, so token detail and holder endpoints hit a point lookup instead of a high-cardinality `count()` scan over every holder row. (by @jxom, [#226](https://github.com/tempoxyz/tidx/pull/226))
+
+### Patch Changes
+
+- Denormalized the tx-level `type` and `fee_token` onto the ClickHouse `receipts` table (populated from the matching tx at ingest, with a migration for existing deployments), so receipt-list queries no longer have to join `txs` to read those fields. (by @jxom, [#230](https://github.com/tempoxyz/tidx/pull/230))
+
+## `tidx@0.6.1`
+
+### Patch Changes
+
+- Added `token_balances_snapshot`, a refreshable ClickHouse materialized view that pre-aggregates holder balances from `token_holder_deltas` on a schedule so holder counts and listings hit the primary key instead of timing out on high-cardinality tokens. (by @jxom, [#208](https://github.com/tempoxyz/tidx/pull/208))
+
+## `tidx@0.6.0`
+
+### Minor Changes
+
+- Added ClickHouse materialized views for token and address analytics: `token_transfers`, `token_balances`, `token_supply`, `token_approvals`, `token_transfer_stats`, `token_metadata`, `address_transfers`, `address_balances`, `address_txs`, and `contract_creations`. Available when running with `engine="clickhouse"`. (by @jxom, [#198](https://github.com/tempoxyz/tidx/pull/198))
+- Removed pgroll runtime support so PostgreSQL schema upgrades are handled by tidx's idempotent startup migrations.
+
+## `tidx@0.5.6`
+
+### Patch Changes
+
+- Added a `consensus_proposer` column to the `blocks` table for `TIP-1031` (by @0xrusowsky, [#178](https://github.com/tempoxyz/tidx/pull/178))
+
+## `tidx@0.5.5`
+
+### Patch Changes
+
+- Harden PostgreSQL SQL validation by fixing CTE scope handling, schema-qualified table checks, recursive depth accounting, LIMIT ALL rejection, and traversal of previously unchecked AST clauses. (by @BrendanRyan, [#179](https://github.com/tempoxyz/tidx/pull/179))
+- Validate public ClickHouse queries, block system catalogs and dangerous table functions, enforce ClickHouse request timeouts, and validate view SELECT SQL before execution. (by @BrendanRyan, [#180](https://github.com/tempoxyz/tidx/pull/180))
+- Bound PostgreSQL query result processing by streaming rows with a hard request limit and appending automatic LIMIT clauses on a separate line. (by @BrendanRyan, [#181](https://github.com/tempoxyz/tidx/pull/181))
+- Hardened view administration by failing closed for trusted CIDR checks, rejecting malformed CIDR configuration, hot-reloading active trusted CIDRs, and requiring an explicit admin mutation header. (by @BrendanRyan, [#182](https://github.com/tempoxyz/tidx/pull/182))
+
+## `tidx@0.5.4`
+
+### Patch Changes
+
+- Added pgroll support to the tidx binary and Docker image, including bundled (by @o-az, [#175](https://github.com/tempoxyz/tidx/pull/175))
+
+## `tidx@0.5.3`
+
+### Patch Changes
+
+- Fixed a migration ordering issue. (by @o-az, [#172](https://github.com/tempoxyz/tidx/pull/172))
+
+## `tidx@0.5.2`
+
+### Patch Changes
+
+- Added support for virtual address detection (by @o-az, [#170](https://github.com/tempoxyz/tidx/pull/170))
+
 ## `tidx@0.5.1`
 
 ### Patch Changes
@@ -144,4 +203,3 @@
 ### Patch Changes
 
 - Initial release. (by @jxom, [9bba8d5](https://github.com/tempoxyz/tidx/commit/9bba8d5))
-

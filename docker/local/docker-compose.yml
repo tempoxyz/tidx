@@ -1,6 +1,12 @@
 services:
   postgres:
-    image: postgres:16
+    # Stock postgres:16 + the pg_clickhouse extension (ClickHouse FDW),
+    # required for the tiered query engine (engine=tiered).
+    # Pinned build of unreleased 0.4 (ClickHouse/pg_clickhouse@02505c4),
+    # published by .github/workflows/pg-clickhouse.yml: released 0.3.2
+    # crashes on LATERAL / correlated subqueries over foreign tables
+    # (ClickHouse/pg_clickhouse#296).
+    image: ghcr.io/tempoxyz/pg_clickhouse:16-02505c4
     environment:
       POSTGRES_USER: tidx
       POSTGRES_PASSWORD: tidx

@@ -11,8 +11,9 @@ CREATE TABLE IF NOT EXISTS logs (
     topic2          BYTEA,
     topic3          BYTEA,
     data            BYTEA NOT NULL,
+    is_virtual_forward BOOLEAN NOT NULL DEFAULT FALSE,
     PRIMARY KEY (block_timestamp, block_num, log_idx)
-);
+) PARTITION BY RANGE (block_timestamp);
 
 CREATE INDEX IF NOT EXISTS idx_logs_block_num ON logs (block_num DESC);
 DROP INDEX IF EXISTS idx_logs_block_num_asc;

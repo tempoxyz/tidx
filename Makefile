@@ -1,4 +1,4 @@
-.PHONY: help up down logs seed build check test bench bench-gen bench-open clean
+.PHONY: help up down logs seed build check fmt-check cargo-check clippy unit-test test bench bench-gen bench-open clean compose-up compose-down compose-logs
 
 .DEFAULT_GOAL := help
 
@@ -10,6 +10,9 @@ COMPOSE := docker compose -f docker/local/docker-compose.yml
 else
 COMPOSE := docker compose -f docker/prod/docker-compose.override.yml
 endif
+
+# Forked testnet compose at repo root (Anvil fork + PostgreSQL + ClickHouse + tidx)
+FORK_COMPOSE := docker compose -f compose.yml
 
 # Default seed parameters
 DURATION ?= 30
@@ -35,6 +38,18 @@ down:
 # Tail indexer logs
 logs:
 	@$(COMPOSE) logs -f tidx
+
+# Start forked testnet stack from compose.yml
+compose-up:
+	@$(FORK_COMPOSE) up -d --build
+
+# Stop forked testnet stack from compose.yml
+compose-down:
+	@$(FORK_COMPOSE) down
+
+# Tail forked testnet stack logs
+compose-logs:
+	@$(FORK_COMPOSE) logs -f
 
 # ============================================================================
 # Data
@@ -76,9 +91,20 @@ seed-heavy:
 build:
 	@$(COMPOSE) build tidx
 
-# Run clippy lints
-check:
-	@cargo clippy --all-targets
+# Run CI-safe checks
+check: fmt-check cargo-check clippy unit-test
+
+fmt-check:
+	@cargo fmt --all -- --check
+
+cargo-check:
+	@cargo check --all-targets --locked
+
+clippy:
+	@cargo clippy --all-targets --locked -- -D warnings
+
+unit-test:
+	@cargo test --lib --bins --locked
 
 # Localnet compose for tests
 LOCALNET_COMPOSE := docker compose -f docker/local/docker-compose.yml
@@ -281,6 +307,9 @@ help:
 	@echo "  make down              Stop all services"
 	@echo "  make logs              Tail indexer logs"
 	@echo "  make build             Build Docker image"
+	@echo "  make compose-up        Start repo-root compose stack"
+	@echo "  make compose-down      Stop repo-root compose stack"
+	@echo "  make compose-logs      Tail repo-root compose logs"
 	@echo ""
 	@echo "  make test              Run all tests (PostgreSQL + ClickHouse)"
 	@echo "  make check             Run clippy lints"

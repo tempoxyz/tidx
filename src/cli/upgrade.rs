@@ -10,9 +10,7 @@ pub fn run() -> Result<()> {
     let os = detect_os()?;
     let arch = detect_arch()?;
     let asset = format!("tidx-{os}-{arch}");
-    let url = format!(
-        "https://github.com/tempoxyz/tidx/releases/download/latest/{asset}"
-    );
+    let url = format!("https://github.com/tempoxyz/tidx/releases/download/latest/{asset}");
 
     println!("Updating tidx...");
     println!("Downloading from {url}...");

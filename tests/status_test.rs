@@ -4,19 +4,19 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
+use axum::Router;
 use axum::body::Body;
 use axum::extract::connect_info::IntoMakeServiceWithConnectInfo;
 use axum::http::{Request, StatusCode};
-use axum::Router;
 use deadpool_postgres::{Config as PgConfig, Runtime};
 use tokio_postgres::NoTls;
 use tower::Service;
 
+use common::testdb::TestDb;
+use serial_test::serial;
 use tidx::api;
 use tidx::broadcast::Broadcaster;
 use tidx::metrics;
-use common::testdb::TestDb;
-use serial_test::serial;
 
 fn make_pools(pool: tidx::db::Pool) -> (HashMap<u64, tidx::db::Pool>, u64) {
     let mut pools = HashMap::new();
@@ -33,6 +33,7 @@ async fn make_test_service(
 {
     let mut svc: IntoMakeServiceWithConnectInfo<Router, SocketAddr> =
         api::router(pools, chain_id, broadcaster)
+            .unwrap()
             .into_make_service_with_connect_info::<SocketAddr>();
     svc.call(SocketAddr::from(([127, 0, 0, 1], 0)))
         .await
@@ -136,6 +137,126 @@ async fn test_status_includes_configured_chain_when_sync_state_is_empty() {
 }
 
 #[tokio::test]
+#[serial(db)]
+async fn test_status_uses_in_memory_gap_results() {
+    let db = TestDb::empty().await;
+    db.truncate_all().await;
+    metrics::set_gap_ranges(1, "postgres", &[(2, 2)]);
+
+    let conn = db.pool.get().await.expect("failed to get connection");
+    for num in [1i64, 3] {
+        conn.execute(
+            r#"INSERT INTO blocks (num, hash, parent_hash, timestamp, timestamp_ms, gas_limit, gas_used, miner)
+               VALUES ($1, $2, $3, NOW(), $4, 1000000, 100000, $5)"#,
+            &[
+                &num,
+                &vec![num as u8; 32],
+                &vec![(num - 1) as u8; 32],
+                &(num * 1000),
+                &vec![0u8; 20],
+            ],
+        )
+        .await
+        .expect("failed to insert block");
+    }
+    drop(conn);
+
+    tidx::sync::writer::save_sync_state(
+        &db.pool,
+        &tidx::types::SyncState {
+            chain_id: 1,
+            head_num: 3,
+            synced_num: 1,
+            tip_num: 3,
+            backfill_num: Some(1),
+            sync_rate: None,
+            started_at: Some(chrono::Utc::now()),
+            pruned_below: 0,
+        },
+    )
+    .await
+    .expect("failed to seed sync state");
+    let broadcaster = Arc::new(Broadcaster::new());
+    let (pools, chain_id) = make_pools(db.pool.clone());
+    let mut app = make_test_service(pools, chain_id, broadcaster).await;
+
+    let response = app
+        .call(
+            Request::builder()
+                .uri("/status")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let chain = &json["chains"].as_array().unwrap()[0];
+
+    assert_eq!(
+        chain["gap_blocks"].as_i64(),
+        Some(2),
+        "status should still return the cheap live lag estimate"
+    );
+    assert_eq!(
+        chain["gaps"],
+        serde_json::json!([[2, 2]]),
+        "status should return exact gaps already reported by the sync loop",
+    );
+}
+
+#[tokio::test]
+#[serial(db)]
+async fn test_get_all_status_uses_single_pool_connection() {
+    let db = TestDb::empty().await;
+    db.truncate_all().await;
+    metrics::set_gap_ranges(1, "postgres", &[]);
+
+    tidx::sync::writer::save_sync_state(
+        &db.pool,
+        &tidx::types::SyncState {
+            chain_id: 1,
+            head_num: 20,
+            synced_num: 10,
+            tip_num: 20,
+            backfill_num: Some(1),
+            sync_rate: None,
+            started_at: Some(chrono::Utc::now()),
+            pruned_below: 0,
+        },
+    )
+    .await
+    .expect("failed to seed sync state");
+    tidx::sync::writer::save_archive_state(&db.pool, 1, 5, 20)
+        .await
+        .expect("failed to seed archive state");
+
+    let url = std::env::var("DATABASE_URL").expect("DATABASE_URL must be set");
+    let pool = tidx::db::create_pool_with_size(&url, 1)
+        .await
+        .expect("failed to create single-connection pool");
+
+    let statuses = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        tidx::service::get_all_status(&pool),
+    )
+    .await
+    .expect("status query timed out with a single-connection pool")
+    .expect("status query failed");
+
+    assert_eq!(statuses.len(), 1);
+    assert_eq!(statuses[0].chain_id, 1);
+    assert_eq!(statuses[0].archive_backfill_num, Some(5));
+    assert_eq!(statuses[0].archive_tip_num, Some(20));
+    assert_eq!(statuses[0].archive_backfill_remaining, Some(4));
+    assert!(statuses[0].gaps.is_empty());
+}
+
+#[tokio::test]
 async fn test_status_surfaces_query_failures() {
     let broadcaster = Arc::new(Broadcaster::new());
     let mut pools = HashMap::new();
@@ -193,6 +314,7 @@ async fn test_cli_proxy_via_http_server() {
     metrics::update_sink_watermark("postgres", "txs", 1_000_000);
 
     let router = api::router(pools, chain_id, broadcaster)
+        .unwrap()
         .into_make_service_with_connect_info::<SocketAddr>();
 
     // Bind to a random available port
@@ -203,9 +325,7 @@ async fn test_cli_proxy_via_http_server() {
 
     // Spawn server in background
     let server = tokio::spawn(async move {
-        axum::serve(listener, router)
-            .await
-            .expect("Server failed");
+        axum::serve(listener, router).await.expect("Server failed");
     });
 
     // Wait for server to be ready

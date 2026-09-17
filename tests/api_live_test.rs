@@ -3,17 +3,18 @@ mod common;
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::Duration;
 
+use axum::Router;
 use axum::body::Body;
 use axum::extract::connect_info::IntoMakeServiceWithConnectInfo;
 use axum::http::{Request, StatusCode};
-use axum::Router;
 use tower::Service;
 
-use tidx::api::{self, inject_block_filter};
-use tidx::broadcast::Broadcaster;
 use common::testdb::TestDb;
 use serial_test::serial;
+use tidx::api::{self, inject_block_filter};
+use tidx::broadcast::Broadcaster;
 
 fn make_pools(pool: tidx::db::Pool) -> (HashMap<u64, tidx::db::Pool>, u64) {
     let mut pools = HashMap::new();
@@ -29,8 +30,10 @@ async fn make_test_service(
     broadcaster: Arc<Broadcaster>,
 ) -> impl Service<Request<Body>, Response = axum::response::Response, Error = std::convert::Infallible>
 {
-    let mut svc: IntoMakeServiceWithConnectInfo<Router, SocketAddr> = api::router(pools, chain_id, broadcaster)
-        .into_make_service_with_connect_info::<SocketAddr>();
+    let mut svc: IntoMakeServiceWithConnectInfo<Router, SocketAddr> =
+        api::router(pools, chain_id, broadcaster)
+            .unwrap()
+            .into_make_service_with_connect_info::<SocketAddr>();
     svc.call(SocketAddr::from(([127, 0, 0, 1], 0)))
         .await
         .unwrap()
@@ -123,7 +126,10 @@ async fn test_query_select_blocks() {
 
     assert_eq!(json["ok"], true);
     assert_eq!(json["columns"], serde_json::json!(["num", "hash"]));
-    assert!(json["row_count"].as_u64().unwrap() > 0, "expected indexed blocks");
+    assert!(
+        json["row_count"].as_u64().unwrap() > 0,
+        "expected indexed blocks"
+    );
 }
 
 #[tokio::test]
@@ -153,7 +159,10 @@ async fn test_query_select_txs() {
     let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
 
     assert_eq!(json["ok"], true);
-    assert_eq!(json["columns"], serde_json::json!(["block_num", "hash", "from"]));
+    assert_eq!(
+        json["columns"],
+        serde_json::json!(["block_num", "hash", "from"])
+    );
 }
 
 #[tokio::test]
@@ -186,7 +195,10 @@ async fn test_query_select_logs() {
     // Logs table may be empty if no contracts emitted events
     let columns = json["columns"].as_array().unwrap();
     if !columns.is_empty() {
-        assert_eq!(json["columns"], serde_json::json!(["block_num", "address", "selector"]));
+        assert_eq!(
+            json["columns"],
+            serde_json::json!(["block_num", "address", "selector"])
+        );
     }
 }
 
@@ -200,7 +212,8 @@ async fn test_query_with_signature_cte() {
 
     // URL encode: spaces=%20, commas=%2C, parens=%28/%29
     let sig = "Transfer(address%20indexed%20from%2Caddress%20indexed%20to%2Cuint256%20value)";
-    let uri = format!("/query?sql=SELECT%20*%20FROM%20Transfer%20LIMIT%205&chainId=1&signature={sig}");
+    let uri =
+        format!("/query?sql=SELECT%20*%20FROM%20Transfer%20LIMIT%205&chainId=1&signature={sig}");
 
     let response = app
         .call(
@@ -224,9 +237,15 @@ async fn test_query_with_signature_cte() {
         assert_eq!(json["ok"], true);
         let columns = json["columns"].as_array().unwrap();
         if !columns.is_empty() {
-            assert!(columns.iter().any(|c| c == "from"), "expected 'from' column");
+            assert!(
+                columns.iter().any(|c| c == "from"),
+                "expected 'from' column"
+            );
             assert!(columns.iter().any(|c| c == "to"), "expected 'to' column");
-            assert!(columns.iter().any(|c| c == "value"), "expected 'value' column");
+            assert!(
+                columns.iter().any(|c| c == "value"),
+                "expected 'value' column"
+            );
         }
     } else {
         // 422 is acceptable if no matching logs exist
@@ -360,6 +379,38 @@ async fn test_query_live_returns_sse() {
     );
 }
 
+#[tokio::test]
+#[serial(db)]
+async fn test_query_live_rejects_when_stream_capacity_reached() {
+    let broadcaster = Arc::new(Broadcaster::new());
+    let _receivers: Vec<_> = (0..20).map(|_| broadcaster.subscribe()).collect();
+    let mut app = make_test_service(HashMap::new(), 1, broadcaster).await;
+
+    let response = app
+        .call(
+            Request::builder()
+                .method("GET")
+                .uri("/query?sql=SELECT%20num%20FROM%20blocks%20LIMIT%201&chainId=1&live=true")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let body = tokio::time::timeout(
+        Duration::from_secs(1),
+        axum::body::to_bytes(response.into_body(), usize::MAX),
+    )
+    .await
+    .expect("capacity stream should end")
+    .unwrap();
+    let body = std::str::from_utf8(&body).unwrap();
+    assert!(body.contains("event: error"), "got: {body}");
+    assert!(body.contains("Live stream capacity reached"), "got: {body}");
+}
+
 // Unit tests for inject_block_filter (no DB required)
 
 #[test]
@@ -382,7 +433,10 @@ fn test_inject_block_filter_logs_table() {
     let sql = "SELECT * FROM logs WHERE address = '0x123' ORDER BY block_num DESC";
     let filtered = inject_block_filter(sql, 300).unwrap();
     assert!(filtered.contains("logs.block_num = 300"), "got: {filtered}");
-    assert!(filtered.contains("address = '0x123'"), "should preserve existing WHERE");
+    assert!(
+        filtered.contains("address = '0x123'"),
+        "should preserve existing WHERE"
+    );
 }
 
 #[test]
@@ -390,7 +444,24 @@ fn test_inject_block_filter_with_existing_where() {
     let sql = "SELECT * FROM txs WHERE gas_used > 21000 ORDER BY block_num DESC";
     let filtered = inject_block_filter(sql, 400).unwrap();
     assert!(filtered.contains("txs.block_num = 400"), "got: {filtered}");
-    assert!(filtered.contains("gas_used > 21000"), "should preserve existing condition");
+    assert!(
+        filtered.contains("gas_used > 21000"),
+        "should preserve existing condition"
+    );
+}
+
+#[test]
+fn test_inject_block_filter_with_user_cte() {
+    let sql = "WITH filtered AS (SELECT * FROM txs WHERE gas_used > 21000) SELECT * FROM filtered";
+    let filtered = inject_block_filter(sql, 450).unwrap();
+    assert!(
+        filtered.contains("filtered.block_num = 450"),
+        "got: {filtered}"
+    );
+    assert!(
+        filtered.contains("WITH filtered AS"),
+        "should preserve user CTE"
+    );
 }
 
 #[test]
@@ -417,5 +488,8 @@ fn test_inject_block_filter_where_keyword_in_string_literal() {
     let sql = "SELECT * FROM txs WHERE input = 'WHERE clause test'";
     let filtered = inject_block_filter(sql, 100).unwrap();
     assert!(filtered.contains("txs.block_num = 100"), "got: {filtered}");
-    assert!(filtered.contains("'WHERE clause test'"), "should preserve string literal");
+    assert!(
+        filtered.contains("'WHERE clause test'"),
+        "should preserve string literal"
+    );
 }

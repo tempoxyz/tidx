@@ -1,4 +1,6 @@
 use metrics::{counter, gauge, histogram};
+use std::sync::OnceLock;
+use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::time::Instant;
 
 // Per-chain metrics with chain_id label
@@ -34,13 +36,34 @@ pub fn set_sync_lag(chain_id: u64, lag: u64) {
 }
 
 pub fn set_backfill_block(chain_id: u64, sink: &str, block_num: u64) {
-    let labels = [("chain_id", chain_id.to_string()), ("sink", sink.to_string())];
+    let labels = [
+        ("chain_id", chain_id.to_string()),
+        ("sink", sink.to_string()),
+    ];
     gauge!("tidx_backfill_block", &labels).set(block_num as f64);
 }
 
 pub fn set_backfill_remaining(chain_id: u64, sink: &str, remaining: u64) {
-    let labels = [("chain_id", chain_id.to_string()), ("sink", sink.to_string())];
+    let labels = [
+        ("chain_id", chain_id.to_string()),
+        ("sink", sink.to_string()),
+    ];
     gauge!("tidx_backfill_remaining_blocks", &labels).set(remaining as f64);
+}
+
+pub fn set_pruned_below(chain_id: u64, block_num: u64) {
+    let labels = [("chain_id", chain_id.to_string())];
+    gauge!("tidx_pruned_below_block", &labels).set(block_num as f64);
+}
+
+pub fn record_prune_partitions_dropped(chain_id: u64, count: u64) {
+    let labels = [("chain_id", chain_id.to_string())];
+    counter!("tidx_prune_partitions_dropped_total", &labels).increment(count);
+}
+
+pub fn set_last_prune(chain_id: u64) {
+    let labels = [("chain_id", chain_id.to_string())];
+    gauge!("tidx_last_prune_timestamp_seconds", &labels).set(chrono::Utc::now().timestamp() as f64);
 }
 
 pub fn set_sync_rate(chain_id: u64, blocks_per_sec: f64) {
@@ -54,13 +77,80 @@ pub fn set_synced(chain_id: u64, synced: bool) {
 }
 
 pub fn set_gap_blocks(chain_id: u64, sink: &str, blocks: u64) {
-    let labels = [("chain_id", chain_id.to_string()), ("sink", sink.to_string())];
+    let labels = [
+        ("chain_id", chain_id.to_string()),
+        ("sink", sink.to_string()),
+    ];
     gauge!("tidx_gap_blocks", &labels).set(blocks as f64);
+    let statuses =
+        GAP_STATUSES.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+    let mut statuses = statuses.lock().unwrap();
+    statuses
+        .entry((chain_id, sink.to_string()))
+        .or_default()
+        .blocks = blocks;
 }
 
 pub fn set_gap_count(chain_id: u64, sink: &str, count: u64) {
-    let labels = [("chain_id", chain_id.to_string()), ("sink", sink.to_string())];
+    let labels = [
+        ("chain_id", chain_id.to_string()),
+        ("sink", sink.to_string()),
+    ];
     gauge!("tidx_gap_count", &labels).set(count as f64);
+    let statuses =
+        GAP_STATUSES.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+    let mut statuses = statuses.lock().unwrap();
+    let status = statuses.entry((chain_id, sink.to_string())).or_default();
+    status.count = count;
+    if count == 0 {
+        status.ranges.clear();
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct GapStatus {
+    pub blocks: u64,
+    pub count: u64,
+    pub ranges: Vec<(u64, u64)>,
+}
+
+static GAP_STATUSES: OnceLock<
+    std::sync::Mutex<std::collections::HashMap<(u64, String), GapStatus>>,
+> = OnceLock::new();
+
+pub fn set_gap_ranges(chain_id: u64, sink: &str, ranges: &[(u64, u64)]) {
+    let blocks = ranges
+        .iter()
+        .map(|(start, end)| end.saturating_sub(*start) + 1)
+        .sum();
+    let count = ranges.len() as u64;
+    let labels = [
+        ("chain_id", chain_id.to_string()),
+        ("sink", sink.to_string()),
+    ];
+    gauge!("tidx_gap_blocks", &labels).set(blocks as f64);
+    gauge!("tidx_gap_count", &labels).set(count as f64);
+
+    let statuses =
+        GAP_STATUSES.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+    let mut statuses = statuses.lock().unwrap();
+    statuses.insert(
+        (chain_id, sink.to_string()),
+        GapStatus {
+            blocks,
+            count,
+            ranges: ranges.to_vec(),
+        },
+    );
+}
+
+pub fn get_gap_status(chain_id: u64, sink: &str) -> Option<GapStatus> {
+    let statuses = GAP_STATUSES.get()?;
+    statuses
+        .lock()
+        .unwrap()
+        .get(&(chain_id, sink.to_string()))
+        .cloned()
 }
 
 pub fn record_rpc_request(method: &str, duration: std::time::Duration, success: bool) {
@@ -113,34 +203,60 @@ impl SyncProgress {
     }
 
     pub fn report_backfill(&mut self, current_block: u64, target_block: u64, blocks_synced: u64) {
+        let remaining = reverse_backfill_remaining(current_block, target_block);
+        if let Some(rate) = self.record_backfill_step(current_block, remaining, blocks_synced) {
+            tracing::info!(
+                chain_id = self.chain_id,
+                block = current_block,
+                remaining = remaining,
+                rate = format!("{:.1} blk/s", rate),
+                eta = format_eta(backfill_eta_secs(remaining, rate)),
+                "Backfill progress"
+            );
+        }
+    }
+
+    pub fn report_gap_fill(
+        &mut self,
+        completed_blocks: u64,
+        total_blocks: u64,
+        blocks_synced: u64,
+    ) {
+        let remaining = gap_fill_remaining(completed_blocks, total_blocks);
+        if let Some(rate) = self.record_backfill_step(completed_blocks, remaining, blocks_synced) {
+            tracing::info!(
+                chain_id = self.chain_id,
+                completed = completed_blocks,
+                total = total_blocks,
+                remaining = remaining,
+                rate = format!("{:.1} blk/s", rate),
+                eta = format_eta(backfill_eta_secs(remaining, rate)),
+                "Gap-fill progress"
+            );
+        }
+    }
+
+    fn record_backfill_step(
+        &mut self,
+        progress_block: u64,
+        remaining: u64,
+        blocks_synced: u64,
+    ) -> Option<f64> {
         self.blocks_since_report += blocks_synced;
-        set_backfill_block(self.chain_id, "postgres", current_block);
-        set_backfill_remaining(self.chain_id, "postgres", current_block.saturating_sub(target_block));
+        set_backfill_block(self.chain_id, "postgres", progress_block);
+        set_backfill_remaining(self.chain_id, "postgres", remaining);
 
         let elapsed = self.last_report.elapsed();
         if elapsed.as_secs() >= 5 {
             let rate = self.blocks_since_report as f64 / elapsed.as_secs_f64();
             set_sync_rate(self.chain_id, rate);
 
-            let remaining = current_block.saturating_sub(target_block);
-            let eta_secs = if rate > 0.0 {
-                remaining as f64 / rate
-            } else {
-                0.0
-            };
-
-            tracing::info!(
-                chain_id = self.chain_id,
-                block = current_block,
-                remaining = remaining,
-                rate = format!("{:.1} blk/s", rate),
-                eta = format_eta(eta_secs),
-                "Backfill progress"
-            );
-
             self.last_report = Instant::now();
-            self.last_block = current_block;
+            self.last_block = progress_block;
             self.blocks_since_report = 0;
+            Some(rate)
+        } else {
+            None
         }
     }
 
@@ -176,18 +292,12 @@ impl SyncProgress {
 // Sink metrics (dual-sink write path)
 
 pub fn record_sink_write_duration(sink: &str, table: &str, duration: std::time::Duration) {
-    let labels = [
-        ("sink", sink.to_string()),
-        ("table", table.to_string()),
-    ];
+    let labels = [("sink", sink.to_string()), ("table", table.to_string())];
     histogram!("tidx_sink_write_duration_seconds", &labels).record(duration.as_secs_f64());
 }
 
 pub fn record_sink_write_rows(sink: &str, table: &str, count: u64) {
-    let labels = [
-        ("sink", sink.to_string()),
-        ("table", table.to_string()),
-    ];
+    let labels = [("sink", sink.to_string()), ("table", table.to_string())];
     counter!("tidx_sink_write_rows_total", &labels).increment(count);
 }
 
@@ -213,9 +323,6 @@ pub fn record_clickhouse_rows(count: u64) {
 // Tracks the highest block number written to each table in each sink.
 // Updated atomically on every write, queried by status endpoints for
 // instant per-table progress without touching the actual tables.
-
-use std::sync::OnceLock;
-use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 
 /// Per-table high-water marks for a single sink.
 pub struct SinkWatermarks {
@@ -305,7 +412,8 @@ pub fn get_sink_watermarks(sink: &str) -> (Option<i64>, Option<i64>, Option<i64>
 /// Increment the cumulative row count for a table in a sink.
 pub fn increment_sink_row_count(sink: &str, table: &str, count: u64) {
     let wm = watermarks_for(sink);
-    wm.get_row_counter(table).fetch_add(count, Ordering::Relaxed);
+    wm.get_row_counter(table)
+        .fetch_add(count, Ordering::Relaxed);
 }
 
 /// Get cumulative row counts for a sink as (blocks, txs, logs, receipts).
@@ -334,13 +442,11 @@ static SINK_RATES: OnceLock<std::sync::Mutex<std::collections::HashMap<String, R
 pub fn update_sink_block_rate(sink: &str, count: u64) {
     let rates = SINK_RATES.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
     let mut map = rates.lock().unwrap();
-    let entry = map
-        .entry(sink.to_string())
-        .or_insert_with(|| RateWindow {
-            last_reset: Instant::now(),
-            rows_since_reset: 0,
-            current_rate: 0.0,
-        });
+    let entry = map.entry(sink.to_string()).or_insert_with(|| RateWindow {
+        last_reset: Instant::now(),
+        rows_since_reset: 0,
+        current_rate: 0.0,
+    });
     entry.rows_since_reset += count;
     let elapsed = entry.last_reset.elapsed();
     if elapsed.as_secs() >= 3 {
@@ -354,13 +460,33 @@ pub fn update_sink_block_rate(sink: &str, count: u64) {
 pub fn get_sink_block_rate(sink: &str) -> Option<f64> {
     let rates = SINK_RATES.get()?;
     let map = rates.lock().unwrap();
-    map.get(sink)
-        .map(|w| w.current_rate)
-        .filter(|r| *r > 0.0)
+    map.get(sink).map(|w| w.current_rate).filter(|r| *r > 0.0)
 }
 
-fn format_eta(secs: f64) -> String {
-    if secs <= 0.0 || secs.is_nan() || secs.is_infinite() {
+fn reverse_backfill_remaining(current_block: u64, target_block: u64) -> u64 {
+    current_block.saturating_sub(target_block)
+}
+
+fn gap_fill_remaining(completed_blocks: u64, total_blocks: u64) -> u64 {
+    total_blocks.saturating_sub(completed_blocks)
+}
+
+fn backfill_eta_secs(remaining: u64, rate: f64) -> Option<f64> {
+    if remaining == 0 {
+        Some(0.0)
+    } else if rate > 0.0 && rate.is_finite() {
+        Some(remaining as f64 / rate)
+    } else {
+        None
+    }
+}
+
+fn format_eta(secs: Option<f64>) -> String {
+    let Some(secs) = secs else {
+        return "unknown".to_string();
+    };
+
+    if secs < 0.0 || secs.is_nan() || secs.is_infinite() {
         return "unknown".to_string();
     }
 
@@ -373,5 +499,34 @@ fn format_eta(secs: f64) -> String {
         format!("{}h {}m", secs / 3600, (secs % 3600) / 60)
     } else {
         format!("{}d {}h", secs / 86400, (secs % 86400) / 3600)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn gap_fill_remaining_counts_down_from_total_blocks() {
+        assert_eq!(gap_fill_remaining(83_900, 100_000), 16_100);
+        assert_eq!(gap_fill_remaining(100_000, 100_000), 0);
+    }
+
+    #[test]
+    fn reverse_backfill_remaining_counts_down_to_target_block() {
+        assert_eq!(reverse_backfill_remaining(83_900, 0), 83_900);
+        assert_eq!(reverse_backfill_remaining(83_900, 83_900), 0);
+    }
+
+    #[test]
+    fn backfill_eta_reports_zero_when_complete() {
+        assert_eq!(backfill_eta_secs(0, 0.0), Some(0.0));
+        assert_eq!(format_eta(backfill_eta_secs(0, 0.0)), "0s");
+    }
+
+    #[test]
+    fn backfill_eta_is_unknown_when_remaining_work_has_no_rate() {
+        assert_eq!(backfill_eta_secs(10, 0.0), None);
+        assert_eq!(format_eta(backfill_eta_secs(10, 0.0)), "unknown");
     }
 }

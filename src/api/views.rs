@@ -1,14 +1,68 @@
 //! Views API for managing ClickHouse materialized views
 
 use axum::{
-    extract::{ConnectInfo, Path, Query, State},
     Json,
+    extract::{ConnectInfo, Path, Query, State},
+    http::HeaderMap,
 };
 use serde::{Deserialize, Serialize};
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 
-use super::{AppState, ApiError};
-use crate::query::EventSignature;
+use super::{ApiError, AppState};
+use crate::query::{
+    EventSignature, apply_event_signature_ctes_clickhouse, validate_clickhouse_query,
+};
+
+const ADMIN_MUTATION_HEADER: &str = "x-tidx-admin";
+
+fn require_admin_mutation(
+    headers: &HeaderMap,
+    state: &AppState,
+    addr: &SocketAddr,
+) -> Result<(), ApiError> {
+    let client_ip = admin_client_ip(headers, state, addr);
+    if !state.is_trusted_ip(&client_ip) {
+        return Err(ApiError::Forbidden(
+            "Mutations only allowed from trusted IPs".to_string(),
+        ));
+    }
+
+    if headers
+        .get(ADMIN_MUTATION_HEADER)
+        .and_then(|value| value.to_str().ok())
+        != Some("1")
+    {
+        return Err(ApiError::Forbidden(
+            "Missing admin mutation header".to_string(),
+        ));
+    }
+
+    Ok(())
+}
+
+fn admin_client_ip(headers: &HeaderMap, state: &AppState, addr: &SocketAddr) -> IpAddr {
+    let peer_ip = addr.ip();
+    if !state.is_trusted_ip(&peer_ip) {
+        return peer_ip;
+    }
+
+    forwarded_client_ip(headers).unwrap_or(peer_ip)
+}
+
+fn forwarded_client_ip(headers: &HeaderMap) -> Option<IpAddr> {
+    headers
+        .get("x-forwarded-for")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.split(',').next())
+        .map(str::trim)
+        .and_then(|value| value.parse().ok())
+        .or_else(|| {
+            headers
+                .get("x-real-ip")
+                .and_then(|value| value.to_str().ok())
+                .and_then(|value| value.trim().parse().ok())
+        })
+}
 
 /// Validate view name (alphanumeric + underscore only)
 fn is_valid_view_name(name: &str) -> bool {
@@ -68,42 +122,66 @@ pub async fn list_views(
     let clickhouse = state
         .get_clickhouse(Some(params.chain_id))
         .await
-        .ok_or_else(|| ApiError::BadRequest(format!(
-            "ClickHouse not configured for chain_id: {}",
-            params.chain_id
-        )))?;
+        .ok_or_else(|| {
+            ApiError::BadRequest(format!(
+                "ClickHouse not configured for chain_id: {}",
+                params.chain_id
+            ))
+        })?;
 
     let database = format!("analytics_{}", params.chain_id);
-    
+
     // Query system.tables for views in analytics database
     let sql = format!(
         "SELECT name, engine FROM system.tables WHERE database = '{}' AND engine IN ('View', 'MaterializedView') ORDER BY name",
         database
     );
 
-    let result = clickhouse.query(&sql, &[]).await
+    let result = clickhouse
+        .query(&sql, &[])
+        .await
         .map_err(|e| ApiError::QueryError(e.to_string()))?;
 
     let mut views = Vec::new();
     for row in &result.rows {
-        let name = row.first().and_then(|v| v.as_str()).unwrap_or("").to_string();
-        let engine = row.get(1).and_then(|v| v.as_str()).unwrap_or("").to_string();
-        
+        let name = row
+            .first()
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let engine = row
+            .get(1)
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+
         // Get columns for this view
         let columns_sql = format!(
             "SELECT name, type FROM system.columns WHERE database = '{}' AND table = '{}' ORDER BY position",
             database, name
         );
-        let columns_result = clickhouse.query(&columns_sql, &[]).await
+        let columns_result = clickhouse
+            .query(&columns_sql, &[])
+            .await
             .map_err(|e| ApiError::QueryError(e.to_string()))?;
-        
-        let columns: Vec<ColumnInfo> = columns_result.rows.iter().map(|col_row| {
-            ColumnInfo {
-                name: col_row.first().and_then(|v| v.as_str()).unwrap_or("").to_string(),
-                col_type: col_row.get(1).and_then(|v| v.as_str()).unwrap_or("").to_string(),
-            }
-        }).collect();
-        
+
+        let columns: Vec<ColumnInfo> = columns_result
+            .rows
+            .iter()
+            .map(|col_row| ColumnInfo {
+                name: col_row
+                    .first()
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string(),
+                col_type: col_row
+                    .get(1)
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string(),
+            })
+            .collect();
+
         views.push(ViewInfo {
             name,
             engine,
@@ -146,16 +224,16 @@ pub struct CreateViewResponse {
 pub async fn create_view(
     State(state): State<AppState>,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
     Json(req): Json<CreateViewRequest>,
 ) -> Result<Json<CreateViewResponse>, ApiError> {
-    // Check trusted IP access
-    if !state.is_trusted_ip(&addr) {
-        return Err(ApiError::Forbidden("Mutations only allowed from trusted IPs".to_string()));
-    }
+    require_admin_mutation(&headers, &state, &addr)?;
 
     // Validate view name
     if !is_valid_view_name(&req.name) {
-        return Err(ApiError::BadRequest("Invalid view name: must be alphanumeric with underscores".to_string()));
+        return Err(ApiError::BadRequest(
+            "Invalid view name: must be alphanumeric with underscores".to_string(),
+        ));
     }
 
     // Validate order_by columns are safe identifiers
@@ -178,16 +256,12 @@ pub async fn create_view(
         )));
     }
 
-    // Validate SQL is SELECT only
-    let sql_upper = req.sql.trim().to_uppercase();
-    if !sql_upper.starts_with("SELECT") {
-        return Err(ApiError::BadRequest("SQL must be a SELECT statement".to_string()));
-    }
-
     // Parse signature if provided
     let signature = if let Some(ref sig_str) = req.signature {
-        Some(EventSignature::parse(sig_str)
-            .map_err(|e| ApiError::BadRequest(format!("Invalid signature: {}", e)))?)
+        Some(
+            EventSignature::parse(sig_str)
+                .map_err(|e| ApiError::BadRequest(format!("Invalid signature: {}", e)))?,
+        )
     } else {
         None
     };
@@ -195,29 +269,34 @@ pub async fn create_view(
     let clickhouse = state
         .get_clickhouse(Some(req.chain_id))
         .await
-        .ok_or_else(|| ApiError::BadRequest(format!(
-            "ClickHouse not configured for chain_id: {}",
-            req.chain_id
-        )))?;
+        .ok_or_else(|| {
+            ApiError::BadRequest(format!(
+                "ClickHouse not configured for chain_id: {}",
+                req.chain_id
+            ))
+        })?;
 
     let database = format!("analytics_{}", req.chain_id);
     let table_name = &req.name;
     let mv_name = format!("{}_mv", req.name);
     let order_by = req.order_by.join(", ");
 
-    // If signature provided, generate CTE with decoded columns and apply predicate pushdown
-    let sql = if let Some(ref sig) = signature {
-        let sql = sig.normalize_table_references(&req.sql);
-        let sql = sig.rewrite_filters_for_pushdown(&sql);
-        let cte = sig.to_cte_sql_clickhouse();
-        format!("WITH {} {}", cte, sql)
+    // If signature provided, generate event CTEs and merge them with any user CTEs.
+    let sql = if signature.is_some() {
+        let sig = req.signature.as_deref().expect("signature parsed above");
+        apply_event_signature_ctes_clickhouse(&req.sql, &[sig])
+            .map_err(|e| ApiError::BadRequest(format!("Invalid view SQL: {e}")))?
     } else {
         req.sql.clone()
     };
-    
+    validate_clickhouse_query(&sql)
+        .map_err(|e| ApiError::BadRequest(format!("Unsafe view SQL: {e}")))?;
+
     // 1. Ensure database exists
     let create_db = format!("CREATE DATABASE IF NOT EXISTS {}", database);
-    clickhouse.query(&create_db, &[]).await
+    clickhouse
+        .query(&create_db, &[])
+        .await
         .map_err(|e| ApiError::QueryError(format!("Failed to create database: {}", e)))?;
 
     // 2. Create target table (infer schema from SELECT ... LIMIT 0)
@@ -225,7 +304,9 @@ pub async fn create_view(
         "CREATE TABLE IF NOT EXISTS {}.{} ENGINE = {} ORDER BY ({}) AS {} LIMIT 0",
         database, table_name, req.engine, order_by, sql
     );
-    clickhouse.query(&create_table, &[]).await
+    clickhouse
+        .query(&create_table, &[])
+        .await
         .map_err(|e| ApiError::QueryError(format!("Failed to create table: {}", e)))?;
 
     // 3. Create materialized view
@@ -233,23 +314,27 @@ pub async fn create_view(
         "CREATE MATERIALIZED VIEW IF NOT EXISTS {}.{} TO {}.{} AS {}",
         database, mv_name, database, table_name, sql
     );
-    clickhouse.query(&create_mv, &[]).await
+    clickhouse
+        .query(&create_mv, &[])
+        .await
         .map_err(|e| ApiError::QueryError(format!("Failed to create materialized view: {}", e)))?;
 
     // 4. Backfill existing data
-    let backfill = format!(
-        "INSERT INTO {}.{} {}",
-        database, table_name, sql
-    );
-    clickhouse.query(&backfill, &[]).await
+    let backfill = format!("INSERT INTO {}.{} {}", database, table_name, sql);
+    clickhouse
+        .query(&backfill, &[])
+        .await
         .map_err(|e| ApiError::QueryError(format!("Failed to backfill: {}", e)))?;
 
     // 5. Get row count
     let count_sql = format!("SELECT count() FROM {}.{}", database, table_name);
-    let count_result = clickhouse.query(&count_sql, &[]).await
+    let count_result = clickhouse
+        .query(&count_sql, &[])
+        .await
         .map_err(|e| ApiError::QueryError(format!("Failed to get count: {}", e)))?;
-    
-    let backfill_rows = count_result.rows
+
+    let backfill_rows = count_result
+        .rows
         .first()
         .and_then(|r| r.first())
         .and_then(|v| v.as_str())
@@ -278,13 +363,11 @@ pub struct DeleteViewResponse {
 pub async fn delete_view(
     State(state): State<AppState>,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
     Path(name): Path<String>,
     Query(params): Query<ChainQuery>,
 ) -> Result<Json<DeleteViewResponse>, ApiError> {
-    // Check trusted IP access
-    if !state.is_trusted_ip(&addr) {
-        return Err(ApiError::Forbidden("Mutations only allowed from trusted IPs".to_string()));
-    }
+    require_admin_mutation(&headers, &state, &addr)?;
 
     // Validate view name
     if !is_valid_view_name(&name) {
@@ -294,10 +377,12 @@ pub async fn delete_view(
     let clickhouse = state
         .get_clickhouse(Some(params.chain_id))
         .await
-        .ok_or_else(|| ApiError::BadRequest(format!(
-            "ClickHouse not configured for chain_id: {}",
-            params.chain_id
-        )))?;
+        .ok_or_else(|| {
+            ApiError::BadRequest(format!(
+                "ClickHouse not configured for chain_id: {}",
+                params.chain_id
+            ))
+        })?;
 
     let database = format!("analytics_{}", params.chain_id);
     let mv_name = format!("{}_mv", name);
@@ -339,10 +424,12 @@ pub async fn get_view(
     let clickhouse = state
         .get_clickhouse(Some(params.chain_id))
         .await
-        .ok_or_else(|| ApiError::BadRequest(format!(
-            "ClickHouse not configured for chain_id: {}",
-            params.chain_id
-        )))?;
+        .ok_or_else(|| {
+            ApiError::BadRequest(format!(
+                "ClickHouse not configured for chain_id: {}",
+                params.chain_id
+            ))
+        })?;
 
     let database = format!("analytics_{}", params.chain_id);
 
@@ -351,7 +438,9 @@ pub async fn get_view(
         "SELECT engine, create_table_query FROM system.tables WHERE database = '{}' AND name = '{}'",
         database, name
     );
-    let result = clickhouse.query(&sql, &[]).await
+    let result = clickhouse
+        .query(&sql, &[])
+        .await
         .map_err(|e| ApiError::QueryError(e.to_string()))?;
 
     if result.rows.is_empty() {
@@ -359,8 +448,16 @@ pub async fn get_view(
     }
 
     let row = &result.rows[0];
-    let engine = row.first().and_then(|v| v.as_str()).unwrap_or("").to_string();
-    let definition = row.get(1).and_then(|v| v.as_str()).unwrap_or("").to_string();
+    let engine = row
+        .first()
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let definition = row
+        .get(1)
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
 
     // Get row count
     let count_sql = format!("SELECT count() FROM {}.{}", database, name);
@@ -388,31 +485,101 @@ pub async fn get_view(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::broadcast::Broadcaster;
     use insta::assert_snapshot;
+    use std::collections::HashMap;
+    use std::net::IpAddr;
+    use std::sync::{Arc, RwLock as StdRwLock};
+    use tokio::sync::RwLock;
 
     #[test]
     fn test_valid_view_name() {
-        assert!(is_valid_view_name("token_holders"));
+        assert!(is_valid_view_name("token_balances"));
         assert!(is_valid_view_name("my_view_123"));
         assert!(is_valid_view_name("View1"));
-        
+
         assert!(!is_valid_view_name(""));
         assert!(!is_valid_view_name("123view")); // Starts with number
         assert!(!is_valid_view_name("my-view")); // Has hyphen
         assert!(!is_valid_view_name("my view")); // Has space
     }
 
+    fn test_state_with_trusted_localhost() -> AppState {
+        test_state_with_trusted_cidrs(vec![("127.0.0.1".parse::<IpAddr>().unwrap(), 32)])
+    }
+
+    fn test_state_with_trusted_cidrs(trusted_cidrs: Vec<(IpAddr, u8)>) -> AppState {
+        AppState {
+            pools: Arc::new(RwLock::new(HashMap::new())),
+            default_chain_id: 0,
+            broadcaster: Arc::new(Broadcaster::new()),
+            clickhouse_configs: Arc::new(RwLock::new(HashMap::new())),
+            clickhouse_engines: Arc::new(RwLock::new(HashMap::new())),
+            trusted_cidrs: Arc::new(StdRwLock::new(trusted_cidrs)),
+        }
+    }
+
+    #[test]
+    fn test_requires_admin_mutation_header() {
+        let state = test_state_with_trusted_localhost();
+        let addr: SocketAddr = "127.0.0.1:8080".parse().unwrap();
+        let headers = HeaderMap::new();
+        assert!(require_admin_mutation(&headers, &state, &addr).is_err());
+    }
+
+    #[test]
+    fn test_accepts_admin_mutation_header_from_trusted_ip() {
+        let state = test_state_with_trusted_localhost();
+        let addr: SocketAddr = "127.0.0.1:8080".parse().unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert(ADMIN_MUTATION_HEADER, "1".parse().unwrap());
+        assert!(require_admin_mutation(&headers, &state, &addr).is_ok());
+    }
+
+    #[test]
+    fn test_rejects_untrusted_forwarded_client_from_trusted_proxy() {
+        let state = test_state_with_trusted_localhost();
+        let addr: SocketAddr = "127.0.0.1:8080".parse().unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert(ADMIN_MUTATION_HEADER, "1".parse().unwrap());
+        headers.insert("x-forwarded-for", "203.0.113.10".parse().unwrap());
+        assert!(require_admin_mutation(&headers, &state, &addr).is_err());
+    }
+
+    #[test]
+    fn test_accepts_trusted_forwarded_client_from_trusted_proxy() {
+        let state = test_state_with_trusted_cidrs(vec![
+            ("127.0.0.1".parse::<IpAddr>().unwrap(), 32),
+            ("100.64.0.0".parse::<IpAddr>().unwrap(), 10),
+        ]);
+        let addr: SocketAddr = "127.0.0.1:8080".parse().unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert(ADMIN_MUTATION_HEADER, "1".parse().unwrap());
+        headers.insert(
+            "x-forwarded-for",
+            "100.64.12.34, 127.0.0.1".parse().unwrap(),
+        );
+        assert!(require_admin_mutation(&headers, &state, &addr).is_ok());
+    }
+
+    #[test]
+    fn test_ignores_forwarded_headers_from_untrusted_peer() {
+        let state = test_state_with_trusted_localhost();
+        let addr: SocketAddr = "203.0.113.10:8080".parse().unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert(ADMIN_MUTATION_HEADER, "1".parse().unwrap());
+        headers.insert("x-forwarded-for", "127.0.0.1".parse().unwrap());
+        assert!(require_admin_mutation(&headers, &state, &addr).is_err());
+    }
+
     // ========================================================================
     // Helper to generate full SQL from signature + user query
     // ========================================================================
-    
+
     fn generate_view_sql(signature: &str, user_sql: &str) -> String {
-        let sig = EventSignature::parse(signature).unwrap();
-        let sql = sig.rewrite_filters_for_pushdown(user_sql);
-        let cte = sig.to_cte_sql_clickhouse();
-        format!("WITH {} {}", cte, sql)
+        apply_event_signature_ctes_clickhouse(user_sql, &[signature]).unwrap()
     }
-    
+
     /// Generate runtime SQL (what actually gets executed against ClickHouse)
     fn generate_runtime_sql(signature: &str, user_sql: &str) -> String {
         generate_view_sql(signature, user_sql)
@@ -453,8 +620,9 @@ mod tests {
     #[test]
     fn test_cte_bytes32_indexed() {
         let sig = EventSignature::parse(
-            "RoleGranted(bytes32 indexed role, address indexed account, address indexed sender)"
-        ).unwrap();
+            "RoleGranted(bytes32 indexed role, address indexed account, address indexed sender)",
+        )
+        .unwrap();
         assert_snapshot!(sig.to_cte_sql_clickhouse());
     }
 
@@ -467,24 +635,22 @@ mod tests {
     #[test]
     fn test_cte_approval() {
         let sig = EventSignature::parse(
-            "Approval(address indexed owner, address indexed spender, uint256 value)"
-        ).unwrap();
+            "Approval(address indexed owner, address indexed spender, uint256 value)",
+        )
+        .unwrap();
         assert_snapshot!(sig.to_cte_sql_clickhouse());
     }
 
     #[test]
     fn test_cte_unnamed_params() {
-        let sig = EventSignature::parse(
-            "Transfer(address indexed, address indexed, uint256)"
-        ).unwrap();
+        let sig =
+            EventSignature::parse("Transfer(address indexed, address indexed, uint256)").unwrap();
         assert_snapshot!(sig.to_cte_sql_clickhouse());
     }
 
     #[test]
     fn test_cte_deposit() {
-        let sig = EventSignature::parse(
-            "Deposit(address indexed dst, uint256 wad)"
-        ).unwrap();
+        let sig = EventSignature::parse("Deposit(address indexed dst, uint256 wad)").unwrap();
         assert_snapshot!(sig.to_cte_sql_clickhouse());
     }
 
@@ -513,8 +679,9 @@ mod tests {
     #[test]
     fn test_pushdown_non_indexed_unchanged() {
         let sig = EventSignature::parse(
-            "Transfer(address indexed from, address indexed to, uint256 value)"
-        ).unwrap();
+            "Transfer(address indexed from, address indexed to, uint256 value)",
+        )
+        .unwrap();
         let user_sql = r#"SELECT * FROM Transfer WHERE "value" > 1000000"#;
         let rewritten = sig.rewrite_filters_for_pushdown(user_sql);
         assert_eq!(user_sql, rewritten); // Should be unchanged
@@ -523,8 +690,9 @@ mod tests {
     #[test]
     fn test_pushdown_invalid_address_unchanged() {
         let sig = EventSignature::parse(
-            "Transfer(address indexed from, address indexed to, uint256 value)"
-        ).unwrap();
+            "Transfer(address indexed from, address indexed to, uint256 value)",
+        )
+        .unwrap();
         let user_sql = r#"SELECT * FROM Transfer WHERE "from" = '0xabc'"#;
         let rewritten = sig.rewrite_filters_for_pushdown(user_sql);
         assert_eq!(user_sql, rewritten); // Should be unchanged
@@ -550,6 +718,19 @@ mod tests {
             r#"SELECT * FROM Transfer LIMIT 1"#,
         );
         assert_snapshot!(sql);
+    }
+
+    #[test]
+    fn test_runtime_sql_merges_user_cte() {
+        let sql = generate_runtime_sql(
+            "Transfer(address indexed from, address indexed to, uint256 value)",
+            r#"WITH filtered AS (SELECT * FROM transfer WHERE block_num > 1) SELECT * FROM filtered"#,
+        );
+
+        assert!(sql.starts_with("WITH Transfer AS ("));
+        assert!(sql.contains("), filtered AS ("));
+        assert_eq!(sql.matches("WITH ").count(), 1);
+        assert!(validate_clickhouse_query(&sql).is_ok(), "got: {sql}");
     }
 
     // ========================================================================

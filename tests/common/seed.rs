@@ -65,8 +65,8 @@ pub async fn seed(pool: &Pool, config: &SeedConfig) -> Result<(u64, i64, u64)> {
                 break;
             }
 
-            let timestamp = chrono::Utc::now()
-                - chrono::Duration::seconds((config.txs - txs_written) as i64);
+            let timestamp =
+                chrono::Utc::now() - chrono::Duration::seconds((config.txs - txs_written) as i64);
             let block_hash = generate_hash(block_num as u64, 0xB10C);
 
             blocks.push(BlockRow {
@@ -79,6 +79,7 @@ pub async fn seed(pool: &Pool, config: &SeedConfig) -> Result<(u64, i64, u64)> {
                 gas_used: rng.random_range(10_000_000..25_000_000),
                 miner: generate_address(block_num as u64),
                 extra_data: None,
+                consensus_proposer: None,
             });
 
             prev_block_hash = block_hash;
@@ -139,6 +140,7 @@ pub async fn seed(pool: &Pool, config: &SeedConfig) -> Result<(u64, i64, u64)> {
                         topic2: Some(generate_hash(rng.random(), 0x10C2)),
                         topic3: None,
                         data: vec![0u8; rng.random_range(32..128)],
+                        is_virtual_forward: false,
                     });
                 }
                 logs_written += num_logs as u64;
@@ -156,18 +158,14 @@ pub async fn seed(pool: &Pool, config: &SeedConfig) -> Result<(u64, i64, u64)> {
         if txs_written % 100_000 == 0 || txs_written >= config.txs {
             let elapsed = start_time.elapsed().as_secs();
             let pct = (txs_written * 100) / config.txs;
-            let eta = if pct > 0 {
-                let total_estimated = elapsed * 100 / pct;
-                let remaining = total_estimated.saturating_sub(elapsed);
-                format!("{}m {}s", remaining / 60, remaining % 60)
-            } else {
-                "calculating...".to_string()
-            };
-            let rate = if elapsed > 0 {
-                txs_written / elapsed
-            } else {
-                0
-            };
+            let eta = (elapsed * 100)
+                .checked_div(pct)
+                .map(|total_estimated| {
+                    let remaining = total_estimated.saturating_sub(elapsed);
+                    format!("{}m {}s", remaining / 60, remaining % 60)
+                })
+                .unwrap_or_else(|| "calculating...".to_string());
+            let rate = txs_written.checked_div(elapsed).unwrap_or(0);
 
             info!(
                 txs = txs_written,

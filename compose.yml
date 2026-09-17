@@ -1,0 +1,176 @@
+name: tidx-fork
+
+x-tidx-command: &tidx-command
+  - |
+    cat >/tmp/config.toml <<EOF
+    [http]
+    enabled = true
+    port = 8080
+    bind = "0.0.0.0"
+
+    [prometheus]
+    enabled = true
+    port = 9090
+
+    [[chains]]
+    name = "$${TIDX_CHAIN_NAME:-local-testnet}"
+    chain_id = $${TIDX_CHAIN_ID:-42431}
+    rpc_url = "$${TIDX_RPC_URL:-http://anvil:8545}"
+    pg_url = "$${TIDX_PG_URL:-postgres://tidx:tidx@postgres:5432/tidx}"
+    backfill = $${TIDX_BACKFILL:-false}
+    batch_size = $${TIDX_BATCH_SIZE:-25}
+    concurrency = $${TIDX_CONCURRENCY:-1}
+
+    [chains.clickhouse]
+    enabled = $${TIDX_CLICKHOUSE_ENABLED:-true}
+    url = "$${TIDX_CLICKHOUSE_URL:-http://clickhouse:8123}"
+    EOF
+    exec tidx up --config /tmp/config.toml
+
+services:
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_DB: tidx
+      POSTGRES_USER: tidx
+      POSTGRES_PASSWORD: tidx
+      POSTGRES_HOST_AUTH_METHOD: md5
+    ports:
+      - "5410:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    command:
+      - postgres
+      - -c
+      - max_wal_size=4GB
+      - -c
+      - checkpoint_timeout=30min
+      - -c
+      - synchronous_commit=off
+      - -c
+      - wal_level=minimal
+      - -c
+      - max_wal_senders=0
+    healthcheck:
+      timeout: 5s
+      retries: 20
+      interval: 2s
+      test: ["CMD-SHELL", "pg_isready -U tidx -d tidx"]
+
+  anvil:
+    image: ghcr.io/foundry-rs/foundry:latest
+    entrypoint: ["sh", "-ec"]
+    command:
+      - |
+        FORK_URL="$${ANVIL_FORK_URL:-https://rpc.testnet.tempo.xyz}"
+        CHAIN_ID="$${ANVIL_CHAIN_ID:-42431}"
+        BLOCK_NUMBER="$${FORK_BLOCK_NUMBER:-$$(cast block-number --rpc-url "$$FORK_URL")}"
+        echo "Forking $$FORK_URL from block $$BLOCK_NUMBER"
+        exec anvil \
+          --tempo \
+          --host 0.0.0.0 \
+          --port 8545 \
+          --fork-url "$$FORK_URL" \
+          --fork-block-number "$$BLOCK_NUMBER" \
+          --chain-id "$$CHAIN_ID"
+    ports:
+      - "8500:8545"
+    environment:
+      FOUNDRY_DISABLE_NIGHTLY_WARNING: "1"
+    healthcheck:
+      test: ["CMD-SHELL", "FOUNDRY_DISABLE_NIGHTLY_WARNING=1 cast block-number --rpc-url http://127.0.0.1:8545 >/dev/null"]
+      interval: 10s
+      timeout: 30s
+      retries: 10
+      start_period: 20s
+
+  clickhouse:
+    image: clickhouse/clickhouse-server:latest
+    ports:
+      - "8124:8123"
+      - "9001:9000"
+    volumes:
+      - clickhouse_data:/var/lib/clickhouse
+    environment:
+      CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: "1"
+    healthcheck:
+      test: ["CMD", "clickhouse-client", "--query", "SELECT 1"]
+      interval: 5s
+      timeout: 10s
+      retries: 20
+      start_period: 10s
+
+  legacy-schema:
+    profiles: ["migration-e2e"]
+    image: postgres:16
+    environment:
+      PGPASSWORD: tidx
+      POSTGRES_URL: postgres://tidx:tidx@postgres:5432/tidx?sslmode=disable
+    volumes:
+      - ./db:/db:ro
+    entrypoint: ["sh", "-ec"]
+    command:
+      - |
+        until psql "$${POSTGRES_URL}" --command 'SELECT 1' >/dev/null 2>&1; do
+          sleep 1
+        done
+        for sql in blocks txs logs receipts sync_state functions extensions; do
+          psql "$${POSTGRES_URL}" --file "/db/$${sql}.sql"
+        done
+        psql "$${POSTGRES_URL}" <<'SQL'
+        ALTER TABLE blocks DROP COLUMN IF EXISTS consensus_proposer;
+        ALTER TABLE logs DROP COLUMN IF EXISTS is_virtual_forward;
+        DROP INDEX IF EXISTS idx_logs_virtual_forward;
+        DROP INDEX IF EXISTS idx_logs_tx_hash_virtual_forward;
+        SQL
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  tidx:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    entrypoint: ["sh", "-ec"]
+    command: *tidx-command
+    ports:
+      - "8080:8080"
+      - "9090:9090"
+    environment:
+      RUST_LOG: tidx=info
+    depends_on:
+      postgres:
+        condition: service_healthy
+      anvil:
+        condition: service_healthy
+      clickhouse:
+        condition: service_healthy
+    restart: on-failure
+
+  tidx-devnet-e2e:
+    profiles: ["migration-e2e"]
+    build:
+      context: .
+      dockerfile: Dockerfile
+    entrypoint: ["sh", "-ec"]
+    command: *tidx-command
+    ports:
+      - "8080:8080"
+      - "9090:9090"
+    environment:
+      RUST_LOG: tidx=info
+      TIDX_CHAIN_NAME: devnet
+      TIDX_CHAIN_ID: "31318"
+      TIDX_RPC_URL: ${TIDX_DEVNET_RPC_URL:?set TIDX_DEVNET_RPC_URL}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      legacy-schema:
+        condition: service_completed_successfully
+      clickhouse:
+        condition: service_healthy
+    restart: on-failure
+
+volumes:
+  postgres_data:
+  clickhouse_data:

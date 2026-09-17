@@ -1,4 +1,4 @@
-use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
+use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 use tokio::runtime::Runtime;
 
 use tidx::db::{create_pool, run_migrations};
@@ -207,7 +207,9 @@ fn bench_olap_materialized(c: &mut Criterion) {
 
     let pool = rt.block_on(async {
         let pool = create_pool(&db_url).await.expect("Failed to create pool");
-        run_migrations(&pool).await.expect("Failed to run migrations");
+        run_migrations(&pool)
+            .await
+            .expect("Failed to run migrations");
 
         // Create materialized views for benchmarking
         let conn = pool.get().await.expect("Failed to get connection");

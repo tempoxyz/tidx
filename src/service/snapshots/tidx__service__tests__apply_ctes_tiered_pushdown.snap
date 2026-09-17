@@ -1,0 +1,9 @@
+---
+source: src/service/mod.rs
+expression: "apply_event_signature_ctes_tiered(sql, &sigs).unwrap()"
+---
+WITH Transfer AS (
+    SELECT block_num, block_timestamp, log_idx, tx_idx, tx_hash, address, selector, topic1, topic2, topic3, data, '0x' || lower(substring(topic1 FROM 27)) AS "from", '0x' || lower(substring(topic2 FROM 27)) AS "to", abi_uint(decode(substring(data FROM 3 FOR 64), 'hex')) AS "value"
+    FROM logs
+    WHERE selector = '0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef' AND address = '0x20c54c5f742f123abb49a982ffe9ba3d82fd8a86' AND block_num > 100
+) SELECT "from", "to", value FROM Transfer WHERE address = '0x20c54c5f742f123abb49a982ffe9ba3d82fd8a86' AND block_num > 100

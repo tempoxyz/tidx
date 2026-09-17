@@ -12,10 +12,13 @@ port = 9090
 [[chains]]
 name = "moderato"
 chain_id = 42431
-rpc_url = "https://eng:aphex-twin-jeff-mills@rpc.testnet.tempo.xyz"
-pg_url = "postgres://tidx:tidx@postgres:5432/tidx_moderato"
+rpc_url = "https://rpc.testnet.tempo.xyz"
+rpc_auth_env = "TEMPO_RPC_AUTH_MODERATO"
 backfill = true
 batch_size = 100
+
+[chains.postgres]
+url = "postgres://tidx:tidx@postgres:5432/tidx_moderato"
 
 # ClickHouse OLAP engine (optional)
 [chains.clickhouse]
@@ -25,10 +28,13 @@ url = "http://clickhouse:8123"
 [[chains]]
 name = "mainnet"
 chain_id = 4217
-rpc_url = "https://eng:aphex-twin-jeff-mills@rpc.tempo.xyz"
-pg_url = "postgres://tidx:tidx@postgres:5432/tidx_mainnet"
+rpc_url = "https://rpc.tempo.xyz"
+rpc_auth_env = "TEMPO_RPC_AUTH_MAINNET"
 backfill = true
 batch_size = 100
+
+[chains.postgres]
+url = "postgres://tidx:tidx@postgres:5432/tidx_mainnet"
 
 # ClickHouse OLAP engine (optional)
 [chains.clickhouse]

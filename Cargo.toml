@@ -1,6 +1,6 @@
 [package]
 name = "tidx"
-version = "0.5.1"
+version = "0.7.0"
 edition = "2024"
 license = "MIT"
 repository = "https://github.com/tempoxyz/tidx"
@@ -23,7 +23,7 @@ futures = "0.3"
 # HTTP
 axum = "0.8"
 reqwest = { version = "0.12", default-features = false, features = ["json", "gzip", "rustls-tls"] }
-tower = "0.5"
+tower = { version = "0.5", features = ["limit"] }
 tower-http = { version = "0.6", features = ["cors", "trace"] }
 
 # Database
@@ -33,8 +33,9 @@ postgres-types = { version = "0.2", features = ["derive"] }
 
 
 # Ethereum/Tempo primitives
-alloy = { version = "1", features = ["full"] }
-tempo-alloy = { git = "https://github.com/tempoxyz/tempo", default-features = false }
+alloy = { version = "2", features = ["full"] }
+tempo-alloy = { git = "https://github.com/tempoxyz/tempo", tag = "v1.9.0", default-features = false }
+tempo-primitives = { git = "https://github.com/tempoxyz/tempo", tag = "v1.9.0", package = "tempo-primitives", default-features = false, features = ["serde"] }
 
 # URL parsing
 form_urlencoded = "1"
@@ -64,7 +65,7 @@ thiserror = "2"
 anyhow = "1"
 
 # Time
-chrono = { version = "0.4", features = ["serde"] }
+chrono = { version = "0.4", features = ["std", "serde"] }
 
 # ClickHouse
 clickhouse = { version = "0.14", features = ["lz4", "chrono", "rustls-tls"] }

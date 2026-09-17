@@ -13,9 +13,11 @@ port = 9090
 name = "dev"
 chain_id = 1337
 rpc_url = "http://tempo:8545"
-pg_url = "postgres://tidx:tidx@postgres:5432/tidx"
 backfill = true
 batch_size = 100
+
+[chains.postgres]
+url = "postgres://tidx:tidx@postgres:5432/tidx"
 
 # ClickHouse OLAP engine
 [chains.clickhouse]

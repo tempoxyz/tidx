@@ -1,0 +1,85 @@
+name: Publish pg_clickhouse for CloudNativePG
+
+# Adds ClickHouse/pg_clickhouse to the CloudNativePG PostgreSQL 18.3 minimal
+# Trixie operand image and publishes the result as ghcr.io/tempoxyz/pg_clickhouse.
+# The extension is pinned because the fix for LATERAL / correlated-subquery
+# crashes over foreign tables (ClickHouse/pg_clickhouse#296) is only on main
+# (unreleased 0.4).
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: 'ClickHouse/pg_clickhouse commit SHA to build'
+        required: true
+        default: '02505c48130e3fd7d13bf4ffb2de6bfeca76a84b'
+        type: string
+  push:
+    paths:
+      - '.github/workflows/pg-clickhouse.yml'
+      - 'docker/pg-clickhouse/**'
+
+env:
+  CNPG_BASE: ghcr.io/cloudnative-pg/postgresql:18.3-minimal-trixie
+  UPSTREAM_REF: ${{ inputs.ref || '02505c48130e3fd7d13bf4ffb2de6bfeca76a84b' }}
+  PG_MAJOR: '18'
+  PG_VERSION: '18.3'
+
+jobs:
+  docker:
+    name: Build pg_clickhouse
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - name: Checkout tidx
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Checkout ClickHouse/pg_clickhouse
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          repository: ClickHouse/pg_clickhouse
+          ref: ${{ env.UPSTREAM_REF }}
+          path: docker/pg-clickhouse/src
+          submodules: recursive
+
+      - name: Compute tags
+        id: meta
+        run: |
+          short_sha=$(printf '%s' "$UPSTREAM_REF" | cut -c1-7)
+          image=ghcr.io/${{ github.repository_owner }}/pg_clickhouse
+          echo "tags=${image}:${PG_VERSION}-minimal-trixie-${short_sha},${image}:${PG_VERSION}-minimal-trixie" >> "$GITHUB_OUTPUT"
+
+      - name: Set up QEMU
+        uses: tempoxyz/gh-actions/vendor/docker/setup-qemu-action@b411ce7fe18d0775ae614ad5c4b873c768364979
+
+      - name: Set up Docker Buildx
+        uses: tempoxyz/gh-actions/vendor/docker/setup-buildx-action@6f436eb3a168279692739e8c0c9fdb52b94bfae7
+
+      - name: Log in to GHCR
+        uses: tempoxyz/gh-actions/vendor/docker/login-action@6f436eb3a168279692739e8c0c9fdb52b94bfae7
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push
+        uses: tempoxyz/gh-actions/vendor/docker/build-push-action@6f436eb3a168279692739e8c0c9fdb52b94bfae7
+        with:
+          context: docker/pg-clickhouse
+          file: docker/pg-clickhouse/Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          build-args: |
+            CNPG_BASE=${{ env.CNPG_BASE }}
+            PG_MAJOR=${{ env.PG_MAJOR }}
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.base.name=${{ env.CNPG_BASE }}
+            org.opencontainers.image.description=CloudNativePG PostgreSQL ${{ env.PG_VERSION }} minimal Trixie with pg_clickhouse built from ClickHouse/pg_clickhouse@${{ env.UPSTREAM_REF }}
+            org.opencontainers.image.revision=${{ env.UPSTREAM_REF }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max

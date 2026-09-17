@@ -1,0 +1,1 @@
+SYSTEM REFRESH VIEW address_balances_snapshot

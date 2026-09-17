@@ -1,0 +1,9 @@
+---
+source: src/service/mod.rs
+expression: sig.to_cte_sql_tiered()
+---
+Transfer AS (
+    SELECT block_num, block_timestamp, log_idx, tx_idx, tx_hash, address, selector, topic1, topic2, topic3, data, '0x' || lower(substring(topic1 FROM 27)) AS "from", '0x' || lower(substring(topic2 FROM 27)) AS "to", abi_uint(decode(substring(data FROM 3 FOR 64), 'hex')) AS "value"
+    FROM logs
+    WHERE selector = '0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef'
+)

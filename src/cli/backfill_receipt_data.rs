@@ -58,7 +58,13 @@ pub async fn run(args: Args) -> Result<()> {
     }
 
     let total_range = max_block - min_block + 1;
-    info!(min_block, max_block, total_range, batch_size = args.batch_size, "Starting gas_used backfill");
+    info!(
+        min_block,
+        max_block,
+        total_range,
+        batch_size = args.batch_size,
+        "Starting gas_used backfill"
+    );
 
     let mut lo = min_block;
     let mut total_updated: u64 = 0;

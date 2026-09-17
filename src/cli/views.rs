@@ -129,9 +129,12 @@ pub async fn run(args: Args) -> Result<()> {
         ViewsCommand::List { chain_id } => {
             let url = format!("{}/views?chainId={}", base_url, chain_id);
             let resp: ListViewsResponse = client.get(&url).send().await?.json().await?;
-            
+
             if !resp.ok {
-                anyhow::bail!("{}", resp.error.unwrap_or_else(|| "Unknown error".to_string()));
+                anyhow::bail!(
+                    "{}",
+                    resp.error.unwrap_or_else(|| "Unknown error".to_string())
+                );
             }
 
             if resp.views.is_empty() {
@@ -151,7 +154,10 @@ pub async fn run(args: Args) -> Result<()> {
             let resp: GetViewResponse = client.get(&url).send().await?.json().await?;
 
             if !resp.ok {
-                anyhow::bail!("{}", resp.error.unwrap_or_else(|| "Unknown error".to_string()));
+                anyhow::bail!(
+                    "{}",
+                    resp.error.unwrap_or_else(|| "Unknown error".to_string())
+                );
             }
 
             if let Some(view) = resp.view {
@@ -165,7 +171,14 @@ pub async fn run(args: Args) -> Result<()> {
             }
         }
 
-        ViewsCommand::Create { chain_id, name, sql, order_by, engine, signature } => {
+        ViewsCommand::Create {
+            chain_id,
+            name,
+            sql,
+            order_by,
+            engine,
+            signature,
+        } => {
             let url = format!("{}/views", base_url);
             let req = CreateViewRequest {
                 chain_id,
@@ -176,16 +189,14 @@ pub async fn run(args: Args) -> Result<()> {
                 signature,
             };
 
-            let resp: CreateViewResponse = client
-                .post(&url)
-                .json(&req)
-                .send()
-                .await?
-                .json()
-                .await?;
+            let resp: CreateViewResponse =
+                client.post(&url).json(&req).send().await?.json().await?;
 
             if !resp.ok {
-                anyhow::bail!("{}", resp.error.unwrap_or_else(|| "Unknown error".to_string()));
+                anyhow::bail!(
+                    "{}",
+                    resp.error.unwrap_or_else(|| "Unknown error".to_string())
+                );
             }
 
             println!("Created view: {}", name);
@@ -196,15 +207,13 @@ pub async fn run(args: Args) -> Result<()> {
 
         ViewsCommand::Delete { chain_id, name } => {
             let url = format!("{}/views/{}?chainId={}", base_url, name, chain_id);
-            let resp: DeleteViewResponse = client
-                .delete(&url)
-                .send()
-                .await?
-                .json()
-                .await?;
+            let resp: DeleteViewResponse = client.delete(&url).send().await?.json().await?;
 
             if !resp.ok {
-                anyhow::bail!("{}", resp.error.unwrap_or_else(|| "Unknown error".to_string()));
+                anyhow::bail!(
+                    "{}",
+                    resp.error.unwrap_or_else(|| "Unknown error".to_string())
+                );
             }
 
             println!("Deleted: {}", resp.deleted.join(", "));

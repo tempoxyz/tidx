@@ -1,4 +1,4 @@
-use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
+use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use tokio::runtime::Runtime;
 
 use tidx::db::{create_pool, run_migrations};
@@ -19,6 +19,7 @@ fn generate_blocks(count: usize, offset: usize) -> Vec<BlockRow> {
                 gas_used: 15_000_000,
                 miner: vec![0u8; 20],
                 extra_data: Some(vec![0u8; 32]),
+                consensus_proposer: None,
             }
         })
         .collect()
@@ -68,6 +69,7 @@ fn generate_logs(count: usize, block_num: i64) -> Vec<LogRow> {
             topic2: Some(vec![2u8; 32]),
             topic3: None,
             data: vec![0u8; 64],
+            is_virtual_forward: false,
         })
         .collect()
 }
@@ -79,7 +81,9 @@ fn bench_batch_writes(c: &mut Criterion) {
 
     let pool = rt.block_on(async {
         let pool = create_pool(&db_url).await.expect("Failed to create pool");
-        run_migrations(&pool).await.expect("Failed to run migrations");
+        run_migrations(&pool)
+            .await
+            .expect("Failed to run migrations");
         pool
     });
 
@@ -156,7 +160,9 @@ fn bench_mixed_workload(c: &mut Criterion) {
 
     let pool = rt.block_on(async {
         let pool = create_pool(&db_url).await.expect("Failed to create pool");
-        run_migrations(&pool).await.expect("Failed to run migrations");
+        run_migrations(&pool)
+            .await
+            .expect("Failed to run migrations");
         pool
     });
 
@@ -220,7 +226,9 @@ fn bench_copy_throughput(c: &mut Criterion) {
 
     let pool = rt.block_on(async {
         let pool = create_pool(&db_url).await.expect("Failed to create pool");
-        run_migrations(&pool).await.expect("Failed to run migrations");
+        run_migrations(&pool)
+            .await
+            .expect("Failed to run migrations");
         pool
     });
 
@@ -274,5 +282,10 @@ fn bench_copy_throughput(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, bench_batch_writes, bench_mixed_workload, bench_copy_throughput);
+criterion_group!(
+    benches,
+    bench_batch_writes,
+    bench_mixed_workload,
+    bench_copy_throughput
+);
 criterion_main!(benches);

@@ -2,26 +2,28 @@ mod views;
 
 use std::collections::HashMap;
 use std::convert::Infallible;
-use std::net::{IpAddr, SocketAddr};
-use std::sync::Arc;
+use std::net::IpAddr;
+use std::sync::{Arc, RwLock as StdRwLock};
 
 use tokio::sync::RwLock;
 
+use anyhow::{Result as AnyhowResult, anyhow};
 use axum::{
+    Json, Router,
     extract::{Query, State},
-    http::{header, Method, StatusCode},
+    http::{Method, StatusCode, header},
     response::{
-        sse::{Event as SseEvent, KeepAlive, KeepAliveStream},
         IntoResponse, Response, Sse,
+        sse::{Event as SseEvent, KeepAlive, KeepAliveStream},
     },
     routing::get,
-    Json, Router,
 };
+use chrono::Utc;
 use futures::Stream;
 use serde::{Deserialize, Serialize};
+use tower::limit::ConcurrencyLimitLayer;
 use tower_http::cors::CorsLayer;
 use tower_http::trace::TraceLayer;
-use chrono::Utc;
 
 use crate::broadcast::Broadcaster;
 use crate::clickhouse::ClickHouseEngine;
@@ -41,6 +43,8 @@ pub struct ChainClickHouseConfig {
 }
 
 pub type SharedClickHouseConfigs = Arc<RwLock<HashMap<u64, ChainClickHouseConfig>>>;
+pub type SharedTrustedCidrs = Arc<StdRwLock<Vec<(IpAddr, u8)>>>;
+const MAX_CONCURRENT_API_QUERIES: usize = 32;
 
 #[derive(Clone)]
 pub struct AppState {
@@ -54,7 +58,7 @@ pub struct AppState {
     /// ClickHouse engines for OLAP queries (per chain)
     pub clickhouse_engines: SharedClickHouseEngines,
     /// Parsed trusted CIDRs for admin operations
-    pub trusted_cidrs: Arc<Vec<(IpAddr, u8)>>,
+    pub trusted_cidrs: SharedTrustedCidrs,
 }
 
 impl AppState {
@@ -62,34 +66,48 @@ impl AppState {
         let id = chain_id.unwrap_or(self.default_chain_id);
         self.pools.read().await.get(&id).cloned()
     }
-    
+
     async fn get_clickhouse(&self, chain_id: Option<u64>) -> Option<Arc<ClickHouseEngine>> {
         let id = chain_id.unwrap_or(self.default_chain_id);
         self.clickhouse_engines.read().await.get(&id).cloned()
     }
 
     /// Check if an IP address is in the trusted CIDRs
-    pub fn is_trusted_ip(&self, addr: &SocketAddr) -> bool {
-        if self.trusted_cidrs.is_empty() {
-            return true;
-        }
-        let ip = addr.ip();
-        self.trusted_cidrs.iter().any(|(network, prefix)| ip_in_cidr(&ip, network, *prefix))
+    pub fn is_trusted_ip(&self, ip: &IpAddr) -> bool {
+        self.trusted_cidrs
+            .read()
+            .map(|cidrs| {
+                cidrs
+                    .iter()
+                    .any(|(network, prefix)| ip_in_cidr(ip, network, *prefix))
+            })
+            .unwrap_or(false)
     }
 }
 
 /// Parse CIDR strings into (network, prefix_len) tuples
-pub fn parse_cidrs(cidrs: &[String]) -> Vec<(IpAddr, u8)> {
+pub fn parse_cidrs(cidrs: &[String]) -> AnyhowResult<Vec<(IpAddr, u8)>> {
     cidrs
         .iter()
-        .filter_map(|cidr| {
-            let parts: Vec<&str> = cidr.split('/').collect();
-            if parts.len() != 2 {
-                return None;
+        .map(|cidr| {
+            let (ip, prefix) = cidr
+                .split_once('/')
+                .ok_or_else(|| anyhow!("Invalid CIDR '{cidr}': missing prefix"))?;
+            let ip: IpAddr = ip
+                .parse()
+                .map_err(|e| anyhow!("Invalid CIDR '{cidr}': invalid IP address: {e}"))?;
+            let prefix: u8 = prefix
+                .parse()
+                .map_err(|e| anyhow!("Invalid CIDR '{cidr}': invalid prefix: {e}"))?;
+            match ip {
+                IpAddr::V4(_) if prefix > 32 => {
+                    Err(anyhow!("Invalid CIDR '{cidr}': IPv4 prefix exceeds 32"))
+                }
+                IpAddr::V6(_) if prefix > 128 => {
+                    Err(anyhow!("Invalid CIDR '{cidr}': IPv6 prefix exceeds 128"))
+                }
+                _ => Ok((ip, prefix)),
             }
-            let ip: IpAddr = parts[0].parse().ok()?;
-            let prefix: u8 = parts[1].parse().ok()?;
-            Some((ip, prefix))
         })
         .collect()
 }
@@ -101,7 +119,11 @@ fn ip_in_cidr(ip: &IpAddr, network: &IpAddr, prefix_len: u8) -> bool {
             if prefix_len > 32 {
                 return false;
             }
-            let mask = if prefix_len == 0 { 0 } else { u32::MAX << (32 - prefix_len) };
+            let mask = if prefix_len == 0 {
+                0
+            } else {
+                u32::MAX << (32 - prefix_len)
+            };
             (u32::from(*ip) & mask) == (u32::from(*net) & mask)
         }
         (IpAddr::V6(ip), IpAddr::V6(net)) => {
@@ -110,15 +132,29 @@ fn ip_in_cidr(ip: &IpAddr, network: &IpAddr, prefix_len: u8) -> bool {
             }
             let ip_bits = u128::from(*ip);
             let net_bits = u128::from(*net);
-            let mask = if prefix_len == 0 { 0 } else { u128::MAX << (128 - prefix_len) };
+            let mask = if prefix_len == 0 {
+                0
+            } else {
+                u128::MAX << (128 - prefix_len)
+            };
             (ip_bits & mask) == (net_bits & mask)
         }
         _ => false,
     }
 }
 
-pub fn router(pools: HashMap<u64, Pool>, default_chain_id: u64, broadcaster: Arc<Broadcaster>) -> Router<()> {
-    router_with_options(pools, default_chain_id, broadcaster, HashMap::new(), &HttpConfig::default())
+pub fn router(
+    pools: HashMap<u64, Pool>,
+    default_chain_id: u64,
+    broadcaster: Arc<Broadcaster>,
+) -> AnyhowResult<Router<()>> {
+    router_with_options(
+        pools,
+        default_chain_id,
+        broadcaster,
+        HashMap::new(),
+        &HttpConfig::default(),
+    )
 }
 
 pub fn router_with_options(
@@ -127,8 +163,8 @@ pub fn router_with_options(
     broadcaster: Arc<Broadcaster>,
     clickhouse_configs: HashMap<u64, ChainClickHouseConfig>,
     http_config: &HttpConfig,
-) -> Router<()> {
-    let trusted_cidrs = Arc::new(parse_cidrs(&http_config.trusted_cidrs));
+) -> AnyhowResult<Router<()>> {
+    let trusted_cidrs = Arc::new(StdRwLock::new(parse_cidrs(&http_config.trusted_cidrs)?));
 
     let state = AppState {
         pools: Arc::new(RwLock::new(pools)),
@@ -139,7 +175,7 @@ pub fn router_with_options(
         trusted_cidrs,
     };
 
-    build_router(state)
+    Ok(build_router(state))
 }
 
 pub fn router_shared(
@@ -148,10 +184,8 @@ pub fn router_shared(
     broadcaster: Arc<Broadcaster>,
     clickhouse_configs: SharedClickHouseConfigs,
     clickhouse_engines: SharedClickHouseEngines,
-    trusted_cidrs: Vec<String>,
+    trusted_cidrs: SharedTrustedCidrs,
 ) -> Router<()> {
-    let trusted_cidrs = Arc::new(parse_cidrs(&trusted_cidrs));
-
     let state = AppState {
         pools,
         default_chain_id,
@@ -166,16 +200,22 @@ pub fn router_shared(
 
 fn build_router(state: AppState) -> Router<()> {
     let cors = CorsLayer::new()
-        .allow_methods([Method::GET, Method::POST, Method::DELETE, Method::OPTIONS])
+        .allow_methods([Method::GET, Method::OPTIONS])
         .allow_headers([header::CONTENT_TYPE, header::AUTHORIZATION])
         .allow_origin(tower_http::cors::Any);
 
     Router::new()
         .route("/health", get(handle_health))
         .route("/status", get(handle_status))
-        .route("/query", get(handle_query))
+        .route(
+            "/query",
+            get(handle_query).layer(ConcurrencyLimitLayer::new(MAX_CONCURRENT_API_QUERIES)),
+        )
         .route("/views", get(views::list_views).post(views::create_view))
-        .route("/views/{name}", get(views::get_view).delete(views::delete_view))
+        .route(
+            "/views/{name}",
+            get(views::get_view).delete(views::delete_view),
+        )
         .layer(cors)
         .layer(TraceLayer::new_for_http())
         .with_state(state)
@@ -194,17 +234,27 @@ struct StatusResponse {
 }
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
-const GIT_REV: &str = if let Some(rev) = option_env!("GIT_REV") { rev } else { "dev" };
+const GIT_REV: &str = if let Some(rev) = option_env!("GIT_REV") {
+    rev
+} else {
+    "dev"
+};
 
 async fn handle_status(State(state): State<AppState>) -> Result<Json<StatusResponse>, ApiError> {
     let mut all_chains = Vec::new();
-    let pools = state.pools.read().await;
-    for (chain_id, pool) in pools.iter() {
-        let chains = crate::service::get_all_status(pool)
-            .await
-            .map_err(|e| ApiError::QueryError(format!("Failed to load status for chain {chain_id}: {e}")))?;
+    let pools: Vec<(u64, Pool)> = state
+        .pools
+        .read()
+        .await
+        .iter()
+        .map(|(chain_id, pool)| (*chain_id, pool.clone()))
+        .collect();
+    for (chain_id, pool) in pools {
+        let chains = crate::service::get_all_status(&pool).await.map_err(|e| {
+            ApiError::QueryError(format!("Failed to load status for chain {chain_id}: {e}"))
+        })?;
         if chains.is_empty() {
-            all_chains.push(empty_status(*chain_id));
+            all_chains.push(empty_status(chain_id));
         } else {
             all_chains.extend(chains);
         }
@@ -217,27 +267,40 @@ async fn handle_status(State(state): State<AppState>) -> Result<Json<StatusRespo
         let chain_id = chain.chain_id as u64;
 
         // PostgreSQL per-table watermarks (from in-memory atomics, no table scans)
-        let (pg_blocks, pg_txs, pg_logs, pg_receipts) = crate::metrics::get_sink_watermarks("postgres");
+        let (pg_blocks, pg_txs, pg_logs, pg_receipts) =
+            crate::metrics::get_sink_watermarks("postgres");
         let (pg_bc, pg_tc, pg_lc, pg_rc) = crate::metrics::get_sink_row_counts("postgres");
         if pg_blocks.is_some() || pg_txs.is_some() || pg_logs.is_some() || pg_receipts.is_some() {
             chain.postgres = Some(crate::service::StoreStatus {
-                blocks: pg_blocks, txs: pg_txs, logs: pg_logs, receipts: pg_receipts,
+                blocks: pg_blocks,
+                txs: pg_txs,
+                logs: pg_logs,
+                receipts: pg_receipts,
                 rate: crate::metrics::get_sink_block_rate("postgres"),
-                blocks_count: Some(pg_bc), txs_count: Some(pg_tc),
-                logs_count: Some(pg_lc), receipts_count: Some(pg_rc),
+                blocks_count: Some(pg_bc),
+                txs_count: Some(pg_tc),
+                logs_count: Some(pg_lc),
+                receipts_count: Some(pg_rc),
             });
         }
 
         // ClickHouse per-table watermarks (from in-memory atomics, no table scans)
         if ch_configs.get(&chain_id).is_some_and(|c| c.enabled) {
-            let (ch_blocks, ch_txs, ch_logs, ch_receipts) = crate::metrics::get_sink_watermarks("clickhouse");
+            let (ch_blocks, ch_txs, ch_logs, ch_receipts) =
+                crate::metrics::get_sink_watermarks("clickhouse");
             let (ch_bc, ch_tc, ch_lc, ch_rc) = crate::metrics::get_sink_row_counts("clickhouse");
-            if ch_blocks.is_some() || ch_txs.is_some() || ch_logs.is_some() || ch_receipts.is_some() {
+            if ch_blocks.is_some() || ch_txs.is_some() || ch_logs.is_some() || ch_receipts.is_some()
+            {
                 chain.clickhouse = Some(crate::service::StoreStatus {
-                    blocks: ch_blocks, txs: ch_txs, logs: ch_logs, receipts: ch_receipts,
+                    blocks: ch_blocks,
+                    txs: ch_txs,
+                    logs: ch_logs,
+                    receipts: ch_receipts,
                     rate: crate::metrics::get_sink_block_rate("clickhouse"),
-                    blocks_count: Some(ch_bc), txs_count: Some(ch_tc),
-                    logs_count: Some(ch_lc), receipts_count: Some(ch_rc),
+                    blocks_count: Some(ch_bc),
+                    txs_count: Some(ch_tc),
+                    logs_count: Some(ch_lc),
+                    receipts_count: Some(ch_rc),
                 });
             }
         }
@@ -262,6 +325,9 @@ fn empty_status(chain_id: u64) -> SyncStatus {
         gaps: Vec::new(),
         backfill_num: None,
         backfill_remaining: 0,
+        archive_backfill_num: None,
+        archive_tip_num: None,
+        archive_backfill_remaining: None,
         sync_rate: None,
         eta_secs: None,
         updated_at: Utc::now(),
@@ -287,9 +353,17 @@ pub struct QueryParams {
     /// Maximum rows to return
     #[serde(default = "default_limit")]
     limit: i64,
-    /// Force a specific engine: "postgres" or "clickhouse"
+    /// Query executor: "postgres" (default) or "clickhouse".
+    /// "tiered" is a legacy alias for engine=postgres&source=postgres-clickhouse.
     #[serde(default)]
     engine: Option<String>,
+    /// Where the data lives: "postgres" (hot window), "clickhouse" (full
+    /// archive via pg_clickhouse when engine=postgres), or
+    /// "postgres-clickhouse" (tiered: hot PG window + cold ClickHouse
+    /// archive). Defaults to "postgres-clickhouse" for engine=postgres and
+    /// "clickhouse" for engine=clickhouse.
+    #[serde(default)]
+    source: Option<String>,
 }
 
 fn default_timeout() -> u64 {
@@ -323,15 +397,36 @@ async fn handle_query(
 ) -> Response {
     let signatures = extract_signatures(uri.query());
 
-    if params.live {
-        if params.engine.as_deref() == Some("clickhouse") {
-            return ApiError::BadRequest(
-                "engine=clickhouse is not supported with live=true (use PostgreSQL for real-time streaming)".to_string()
-            ).into_response();
-        }
-        handle_query_live(state, params, signatures).await.into_response()
+    // Live streaming serves the hot PostgreSQL window, so bare ?live=true
+    // stays on plain PostgreSQL instead of the tiered default source.
+    let source = if params.live
+        && params.source.is_none()
+        && matches!(params.engine.as_deref(), None | Some("postgres"))
+    {
+        Some("postgres")
     } else {
-        handle_query_once(state, params, signatures).await.into_response()
+        params.source.as_deref()
+    };
+
+    let route = match crate::query::QueryRoute::resolve(params.engine.as_deref(), source) {
+        Ok(route) => route,
+        Err(e) => return ApiError::BadRequest(e).into_response(),
+    };
+
+    if params.live {
+        if route != crate::query::QueryRoute::Postgres {
+            return ApiError::BadRequest(format!(
+                "{route} is not supported with live=true (use plain PostgreSQL for real-time streaming)"
+            ))
+            .into_response();
+        }
+        handle_query_live(state, params, signatures)
+            .await
+            .into_response()
+    } else {
+        handle_query_once(state, params, signatures, route)
+            .await
+            .into_response()
     }
 }
 
@@ -339,57 +434,87 @@ async fn handle_query_once(
     state: AppState,
     params: QueryParams,
     signatures: Vec<String>,
+    route: crate::query::QueryRoute,
 ) -> Result<Json<QueryResponse>, ApiError> {
     let pool = state
         .get_pool(Some(params.chain_id))
         .await
-        .ok_or_else(|| ApiError::BadRequest(format!(
-            "Unknown chain_id: {}",
-            params.chain_id,
-        )))?;
+        .ok_or_else(|| ApiError::BadRequest(format!("Unknown chain_id: {}", params.chain_id)))?;
 
     let options = QueryOptions {
         timeout_ms: params.timeout_ms.clamp(100, 30000),
         limit: params.limit.clamp(1, crate::query::HARD_LIMIT_MAX),
     };
 
-    // Route to appropriate engine
-    let use_clickhouse = matches!(
-        params.engine.as_deref(),
-        Some("clickhouse")
-    );
-
     let sigs: Vec<&str> = signatures.iter().map(String::as_str).collect();
 
-    let result = if use_clickhouse {
-        // Use ClickHouse engine for OLAP queries
-        let clickhouse = state.get_clickhouse(Some(params.chain_id)).await
-            .ok_or_else(|| ApiError::BadRequest(format!(
-                "ClickHouse not configured for chain_id: {}",
-                params.chain_id
-            )))?;
+    let map_pg_err = |e: anyhow::Error| {
+        // run_pg_query reduces timeouts (elapsed deadline, SQLSTATE 57014
+        // cancels) to exactly this marker; server text must not match.
+        if e.to_string() == "Query timeout" {
+            ApiError::Timeout
+        } else {
+            ApiError::QueryError(e.to_string())
+        }
+    };
 
-        clickhouse.query(&params.sql, &sigs)
+    let result = match route {
+        crate::query::QueryRoute::ClickHouse => {
+            // ClickHouse directly for OLAP queries
+            let clickhouse = state
+                .get_clickhouse(Some(params.chain_id))
+                .await
+                .ok_or_else(|| {
+                    ApiError::BadRequest(format!(
+                        "ClickHouse not configured for chain_id: {}",
+                        params.chain_id
+                    ))
+                })?;
+
+            clickhouse
+                .query_user(&params.sql, &sigs, options.timeout_ms, options.limit)
+                .await
+                .map(|r| QueryResult {
+                    columns: r.columns,
+                    rows: r.rows,
+                    row_count: r.row_count,
+                    engine: r.engine,
+                    query_time_ms: r.query_time_ms,
+                })
+                .map_err(|e| ApiError::QueryError(e.to_string()))?
+        }
+        crate::query::QueryRoute::Tiered => {
+            // Split hot/cold at the prune boundary when possible; otherwise
+            // PostgreSQL over tiered.* views (hot PG window + ClickHouse archive).
+            let clickhouse = state.get_clickhouse(Some(params.chain_id)).await;
+            crate::service::execute_query_tiered(
+                &pool,
+                clickhouse.as_deref(),
+                params.chain_id,
+                &params.sql,
+                &sigs,
+                &options,
+            )
             .await
-            .map(|r| QueryResult {
-                columns: r.columns,
-                rows: r.rows,
-                row_count: r.row_count,
-                engine: r.engine,
-                query_time_ms: r.query_time_ms,
-            })
-            .map_err(|e| ApiError::QueryError(e.to_string()))?
-    } else {
-        // Use PostgreSQL
-        crate::service::execute_query_postgres(&pool, &params.sql, &sigs, &options)
+            .map_err(map_pg_err)?
+        }
+        crate::query::QueryRoute::PostgresViaClickHouse => {
+            // PostgreSQL over the ch.* pg_clickhouse foreign tables: full
+            // ClickHouse archive, no hot PostgreSQL arm.
+            crate::service::execute_query_postgres_via_clickhouse(
+                &pool,
+                &params.sql,
+                &sigs,
+                &options,
+            )
             .await
-            .map_err(|e| {
-                if e.to_string().contains("timeout") {
-                    ApiError::Timeout
-                } else {
-                    ApiError::QueryError(e.to_string())
-                }
-            })?
+            .map_err(map_pg_err)?
+        }
+        crate::query::QueryRoute::Postgres => {
+            crate::service::execute_query_postgres(&pool, &params.sql, &sigs, &options)
+                .await
+                .map_err(map_pg_err)?
+        }
     };
 
     Ok(Json(QueryResponse { result, ok: true }))
@@ -399,12 +524,24 @@ type SseStream = std::pin::Pin<Box<dyn Stream<Item = Result<SseEvent, Infallible
 
 /// Maximum blocks to catch up in a single update (prevents query multiplication attack)
 const MAX_CATCHUP_BLOCKS: u64 = 10;
+const MAX_LIVE_CONNECTIONS: usize = 20;
 
 async fn handle_query_live(
     state: AppState,
     params: QueryParams,
     signatures: Vec<String>,
 ) -> Sse<KeepAliveStream<SseStream>> {
+    let mut rx = state.broadcaster.subscribe();
+    if state.broadcaster.receiver_count() > MAX_LIVE_CONNECTIONS {
+        let stream: SseStream = Box::pin(async_stream::stream! {
+            yield Ok(SseEvent::default()
+                .event("error")
+                .json_data(serde_json::json!({ "ok": false, "error": "Live stream capacity reached" }))
+                .unwrap());
+        });
+        return Sse::new(stream).keep_alive(KeepAlive::default());
+    }
+
     let pool = match state.get_pool(Some(params.chain_id)).await {
         Some(p) => p,
         None => {
@@ -418,7 +555,6 @@ async fn handle_query_live(
         }
     };
 
-    let mut rx = state.broadcaster.subscribe();
     let sql = params.sql;
     let options = QueryOptions {
         timeout_ms: params.timeout_ms.clamp(100, 30000),
@@ -457,6 +593,10 @@ async fn handle_query_live(
         loop {
             match rx.recv().await {
                 Ok(update) => {
+                    if update.chain_id != params.chain_id {
+                        continue;
+                    }
+
                     if update.block_num <= last_block_num {
                         continue;
                     }
@@ -532,9 +672,7 @@ async fn handle_query_live(
 /// avoiding SQL injection risks from string-based splicing.
 #[doc(hidden)]
 pub fn inject_block_filter(sql: &str, block_num: u64) -> Result<String, ApiError> {
-    use sqlparser::ast::{
-        BinaryOperator, Expr, Ident, SetExpr, Statement, Value,
-    };
+    use sqlparser::ast::{BinaryOperator, Expr, Ident, SetExpr, Statement, Value};
     use sqlparser::dialect::GenericDialect;
     use sqlparser::parser::Parser;
 
@@ -554,7 +692,7 @@ pub fn inject_block_filter(sql: &str, block_num: u64) -> Result<String, ApiError
         _ => {
             return Err(ApiError::BadRequest(
                 "Live mode requires a SELECT query".to_string(),
-            ))
+            ));
         }
     };
 
@@ -564,7 +702,7 @@ pub fn inject_block_filter(sql: &str, block_num: u64) -> Result<String, ApiError
             return Err(ApiError::BadRequest(
                 "Live mode requires a simple SELECT query (UNION/INTERSECT not supported)"
                     .to_string(),
-            ))
+            ));
         }
     };
 
@@ -572,28 +710,31 @@ pub fn inject_block_filter(sql: &str, block_num: u64) -> Result<String, ApiError
         .from
         .first()
         .and_then(|twj| match &twj.relation {
-            sqlparser::ast::TableFactor::Table { name, .. } => {
-                name.0.last().and_then(|part| part.as_ident()).map(|ident| ident.value.to_lowercase())
-            }
+            sqlparser::ast::TableFactor::Table { name, .. } => name
+                .0
+                .last()
+                .and_then(|part| part.as_ident())
+                .map(|ident| ident.value.to_lowercase()),
             _ => None,
         })
         .ok_or_else(|| {
-            ApiError::BadRequest(
-                "Live mode requires a query with a FROM table clause".to_string(),
-            )
+            ApiError::BadRequest("Live mode requires a query with a FROM table clause".to_string())
         })?;
 
-    let col_name = if table_name == "blocks" { "num" } else { "block_num" };
+    let col_name = if table_name == "blocks" {
+        "num"
+    } else {
+        "block_num"
+    };
 
-    let col_expr = Expr::CompoundIdentifier(vec![
-        Ident::new(&table_name),
-        Ident::new(col_name),
-    ]);
+    let col_expr = Expr::CompoundIdentifier(vec![Ident::new(&table_name), Ident::new(col_name)]);
 
     let block_filter = Expr::BinaryOp {
         left: Box::new(col_expr),
         op: BinaryOperator::Eq,
-        right: Box::new(Expr::Value(Value::Number(block_num.to_string(), false).into())),
+        right: Box::new(Expr::Value(
+            Value::Number(block_num.to_string(), false).into(),
+        )),
     };
 
     select.selection = Some(match select.selection.take() {
@@ -663,7 +804,7 @@ mod tests {
             "10.0.0.0/8".to_string(),
             "192.168.1.0/24".to_string(),
         ];
-        let parsed = parse_cidrs(&cidrs);
+        let parsed = parse_cidrs(&cidrs).unwrap();
         assert_eq!(parsed.len(), 3);
         assert_eq!(parsed[0], ("100.64.0.0".parse().unwrap(), 10));
         assert_eq!(parsed[1], ("10.0.0.0".parse().unwrap(), 8));
@@ -674,22 +815,65 @@ mod tests {
     fn test_parse_cidrs_invalid() {
         let cidrs = vec![
             "invalid".to_string(),
-            "100.64.0.0".to_string(),  // Missing prefix
-            "100.64.0.0/abc".to_string(),  // Invalid prefix
+            "100.64.0.0".to_string(),     // Missing prefix
+            "100.64.0.0/abc".to_string(), // Invalid prefix
         ];
-        let parsed = parse_cidrs(&cidrs);
-        assert_eq!(parsed.len(), 0);
+        assert!(parse_cidrs(&cidrs).is_err());
+        assert!(parse_cidrs(&["100.64.0.0/33".to_string()]).is_err());
+        assert!(parse_cidrs(&["fd7a:115c:a1e0::/129".to_string()]).is_err());
+    }
+
+    #[test]
+    fn test_router_with_options_rejects_invalid_trusted_cidr() {
+        let http_config = HttpConfig {
+            trusted_cidrs: vec!["100.64.0.0/33".to_string()],
+            ..Default::default()
+        };
+
+        let result = router_with_options(
+            HashMap::new(),
+            0,
+            Arc::new(Broadcaster::new()),
+            HashMap::new(),
+            &http_config,
+        );
+
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_trusted_ip_fails_closed_when_empty() {
+        let state = AppState {
+            pools: Arc::new(RwLock::new(HashMap::new())),
+            default_chain_id: 0,
+            broadcaster: Arc::new(Broadcaster::new()),
+            clickhouse_configs: Arc::new(RwLock::new(HashMap::new())),
+            clickhouse_engines: Arc::new(RwLock::new(HashMap::new())),
+            trusted_cidrs: Arc::new(std::sync::RwLock::new(Vec::new())),
+        };
+        assert!(!state.is_trusted_ip(&"127.0.0.1".parse().unwrap()));
+    }
+
+    #[test]
+    fn test_http_config_default_trusts_only_loopback() {
+        let parsed = parse_cidrs(&HttpConfig::default().trusted_cidrs).unwrap();
+        assert!(parsed.contains(&("127.0.0.1".parse().unwrap(), 32)));
+        assert!(parsed.contains(&("::1".parse().unwrap(), 128)));
     }
 
     #[test]
     fn test_ip_in_cidr_v4() {
         let network: IpAddr = "100.64.0.0".parse().unwrap();
-        
+
         // Inside 100.64.0.0/10
         assert!(ip_in_cidr(&"100.64.0.1".parse().unwrap(), &network, 10));
         assert!(ip_in_cidr(&"100.100.50.25".parse().unwrap(), &network, 10));
-        assert!(ip_in_cidr(&"100.127.255.255".parse().unwrap(), &network, 10));
-        
+        assert!(ip_in_cidr(
+            &"100.127.255.255".parse().unwrap(),
+            &network,
+            10
+        ));
+
         // Outside 100.64.0.0/10
         assert!(!ip_in_cidr(&"100.0.0.1".parse().unwrap(), &network, 10));
         assert!(!ip_in_cidr(&"100.128.0.0".parse().unwrap(), &network, 10));
@@ -699,13 +883,25 @@ mod tests {
     #[test]
     fn test_ip_in_cidr_v6() {
         let network: IpAddr = "fd7a:115c:a1e0::".parse().unwrap();
-        
+
         // Inside fd7a:115c:a1e0::/48
-        assert!(ip_in_cidr(&"fd7a:115c:a1e0::1".parse().unwrap(), &network, 48));
-        assert!(ip_in_cidr(&"fd7a:115c:a1e0:ffff::1".parse().unwrap(), &network, 48));
-        
+        assert!(ip_in_cidr(
+            &"fd7a:115c:a1e0::1".parse().unwrap(),
+            &network,
+            48
+        ));
+        assert!(ip_in_cidr(
+            &"fd7a:115c:a1e0:ffff::1".parse().unwrap(),
+            &network,
+            48
+        ));
+
         // Outside fd7a:115c:a1e0::/48
-        assert!(!ip_in_cidr(&"fd7a:115c:a1e1::1".parse().unwrap(), &network, 48));
+        assert!(!ip_in_cidr(
+            &"fd7a:115c:a1e1::1".parse().unwrap(),
+            &network,
+            48
+        ));
         assert!(!ip_in_cidr(&"2001:db8::1".parse().unwrap(), &network, 48));
     }
 }

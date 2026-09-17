@@ -10,13 +10,100 @@ mod common;
 
 use common::clickhouse::TestClickHouse;
 use serial_test::serial;
-use tidx::query::EventSignature;
+use tidx::clickhouse::ClickHouseEngine;
+use tidx::clickhouse_schema::{base_objects, migrations, post_derived_migrations};
+use tidx::config::ClickHouseConfig;
+use tidx::query::{EventSignature, apply_event_signature_ctes_clickhouse};
 use tidx::sync::ch_sink::ClickHouseSink;
 use tidx::sync::sink::SinkSet;
 use tidx::sync::writer;
 use tidx::types::{BlockRow, LogRow, ReceiptRow, TxRow};
 
 const TEST_DB: &str = "tidx_test";
+
+#[tokio::test]
+#[serial(clickhouse)]
+async fn test_reward_cursor_keeps_later_deposits_and_transfers() {
+    let ch = TestClickHouse::new(TEST_DB).expect("Failed to create ClickHouse client");
+    if ch.wait_for_ready().await.is_err() {
+        println!("ClickHouse not available, skipping test");
+        return;
+    }
+    ch.reset_database().await.unwrap();
+    ch.create_mock_logs_table().await.unwrap();
+    let signature = "Deposited(address indexed caller,address indexed receiver,uint256 assets,uint256 earnShares)";
+    let selector = format!(
+        "0x{}",
+        EventSignature::parse(signature).unwrap().topic0_hex()
+    );
+    let vault = "0x1111111111111111111111111111111111111111";
+    let receiver = "0x2222222222222222222222222222222222222222";
+    let topic = format!("0x{:0>64}", &receiver[2..]);
+    // Before/at the cursor, each cursor alternative, and beyond the closing boundary.
+    for (block, tx, log, assets) in [
+        (99, 0, 0, 100_u128),
+        (100, 1, 5, 100),
+        (100, 1, 6, 1_000),
+        (100, 2, 0, 2_000),
+        (101, 0, 0, 10_000),
+        (201, 0, 0, 20_000),
+    ] {
+        let assets = assets * 1_000_000;
+        ch.insert_mock_log(
+            block,
+            log,
+            tx,
+            &format!("0x{block:064x}"),
+            vault,
+            &selector,
+            &topic,
+            &topic,
+            "0x",
+            &format!("0x{assets:064x}{:064x}", assets / 2),
+        )
+        .await
+        .unwrap();
+    }
+    ch.query("CREATE TABLE token_transfers (block_num Int64, tx_idx Int32, log_idx Int32, token String, `from` String, `to` String, amount UInt256) ENGINE = Memory")
+        .await.unwrap();
+    ch.query(&format!("INSERT INTO token_transfers VALUES (101, 0, 1, '{vault}', '{receiver}', '{vault}', 5000000000)"))
+        .await.unwrap();
+
+    let query = format!(
+        r#"SELECT kind, block_num, tx_idx, log_idx, assets FROM (
+        SELECT 'deposit' AS kind, block_num, tx_idx, log_idx,
+               toString(toUInt256(assets)) AS assets
+        FROM Deposited
+        WHERE lower(address) = '{vault}' AND lower(receiver) = '{receiver}'
+          AND toUInt256(assets) > 0 AND toUInt256("earnShares") > 0
+          AND block_num <= 200 AND (block_num > 100 OR
+            (block_num = 100 AND (tx_idx > 1 OR (tx_idx = 1 AND log_idx > 5))))
+        UNION ALL
+        SELECT 'transfer' AS kind, block_num, tx_idx, log_idx, '0' AS assets
+        FROM token_transfers
+        WHERE lower(token) = '{vault}'
+          AND (lower("from") = '{receiver}' OR lower("to") = '{receiver}')
+          AND lower("from") != lower("to") AND toUInt256(amount) > 0
+          AND block_num <= 200 AND (block_num > 100 OR
+            (block_num = 100 AND (tx_idx > 1 OR (tx_idx = 1 AND log_idx > 5))))
+    ) ORDER BY block_num, tx_idx, log_idx"#
+    );
+    let sql = apply_event_signature_ctes_clickhouse(&query, &[signature]).unwrap();
+    let result = ch.query_json(&sql).await.unwrap();
+    let rows = result["data"].as_array().unwrap();
+    assert_eq!(
+        rows.len(),
+        4,
+        "all three later deposits and the transfer must survive: {result}"
+    );
+    assert_eq!(
+        rows.iter()
+            .map(|row| row["assets"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        vec!["1000000000", "2000000000", "10000000000", "0"]
+    );
+    assert_eq!(rows[3]["kind"], "transfer");
+}
 
 // ============================================================================
 // Basic ClickHouse Connection Tests
@@ -25,9 +112,7 @@ const TEST_DB: &str = "tidx_test";
 #[tokio::test]
 #[serial(clickhouse)]
 async fn test_clickhouse_connection() {
-    let ch = TestClickHouse::new(TEST_DB)
-        .await
-        .expect("Failed to create ClickHouse client");
+    let ch = TestClickHouse::new(TEST_DB).expect("Failed to create ClickHouse client");
 
     if ch.wait_for_ready().await.is_err() {
         println!("ClickHouse not available, skipping test");
@@ -41,9 +126,7 @@ async fn test_clickhouse_connection() {
 #[tokio::test]
 #[serial(clickhouse)]
 async fn test_clickhouse_database_creation() {
-    let ch = TestClickHouse::new(TEST_DB)
-        .await
-        .expect("Failed to create ClickHouse client");
+    let ch = TestClickHouse::new(TEST_DB).expect("Failed to create ClickHouse client");
 
     if ch.wait_for_ready().await.is_err() {
         println!("ClickHouse not available, skipping test");
@@ -71,9 +154,7 @@ async fn test_clickhouse_database_creation() {
 #[tokio::test]
 #[serial(clickhouse)]
 async fn test_transfer_cte_execution() {
-    let ch = TestClickHouse::new(TEST_DB)
-        .await
-        .expect("Failed to create ClickHouse client");
+    let ch = TestClickHouse::new(TEST_DB).expect("Failed to create ClickHouse client");
 
     if ch.wait_for_ready().await.is_err() {
         println!("ClickHouse not available, skipping test");
@@ -124,9 +205,7 @@ async fn test_transfer_cte_execution() {
 #[tokio::test]
 #[serial(clickhouse)]
 async fn test_approval_cte_execution() {
-    let ch = TestClickHouse::new(TEST_DB)
-        .await
-        .expect("Failed to create ClickHouse client");
+    let ch = TestClickHouse::new(TEST_DB).expect("Failed to create ClickHouse client");
 
     if ch.wait_for_ready().await.is_err() {
         println!("ClickHouse not available, skipping test");
@@ -181,9 +260,7 @@ async fn test_approval_cte_execution() {
 #[tokio::test]
 #[serial(clickhouse)]
 async fn test_hex_literal_filter_execution() {
-    let ch = TestClickHouse::new(TEST_DB)
-        .await
-        .expect("Failed to create ClickHouse client");
+    let ch = TestClickHouse::new(TEST_DB).expect("Failed to create ClickHouse client");
 
     if ch.wait_for_ready().await.is_err() {
         println!("ClickHouse not available, skipping test");
@@ -246,9 +323,7 @@ async fn test_hex_literal_filter_execution() {
 #[tokio::test]
 #[serial(clickhouse)]
 async fn test_aggregation_query() {
-    let ch = TestClickHouse::new(TEST_DB)
-        .await
-        .expect("Failed to create ClickHouse client");
+    let ch = TestClickHouse::new(TEST_DB).expect("Failed to create ClickHouse client");
 
     if ch.wait_for_ready().await.is_err() {
         println!("ClickHouse not available, skipping test");
@@ -302,9 +377,7 @@ async fn test_aggregation_query() {
 #[tokio::test]
 #[serial(clickhouse)]
 async fn test_create_materialized_view_transfer_counts() {
-    let ch = TestClickHouse::new(TEST_DB)
-        .await
-        .expect("Failed to create ClickHouse client");
+    let ch = TestClickHouse::new(TEST_DB).expect("Failed to create ClickHouse client");
 
     if ch.wait_for_ready().await.is_err() {
         println!("ClickHouse not available, skipping test");
@@ -401,9 +474,7 @@ async fn test_create_materialized_view_transfer_counts() {
 #[tokio::test]
 #[serial(clickhouse)]
 async fn test_create_materialized_view_token_supply() {
-    let ch = TestClickHouse::new(TEST_DB)
-        .await
-        .expect("Failed to create ClickHouse client");
+    let ch = TestClickHouse::new(TEST_DB).expect("Failed to create ClickHouse client");
 
     if ch.wait_for_ready().await.is_err() {
         println!("ClickHouse not available, skipping test");
@@ -485,9 +556,7 @@ async fn test_create_materialized_view_token_supply() {
 #[tokio::test]
 #[serial(clickhouse)]
 async fn test_create_materialized_view_daily_stats() {
-    let ch = TestClickHouse::new(TEST_DB)
-        .await
-        .expect("Failed to create ClickHouse client");
+    let ch = TestClickHouse::new(TEST_DB).expect("Failed to create ClickHouse client");
 
     if ch.wait_for_ready().await.is_err() {
         println!("ClickHouse not available, skipping test");
@@ -554,9 +623,7 @@ async fn test_create_materialized_view_daily_stats() {
 #[tokio::test]
 #[serial(clickhouse)]
 async fn test_uniswap_swap_cte() {
-    let ch = TestClickHouse::new(TEST_DB)
-        .await
-        .expect("Failed to create ClickHouse client");
+    let ch = TestClickHouse::new(TEST_DB).expect("Failed to create ClickHouse client");
 
     if ch.wait_for_ready().await.is_err() {
         println!("ClickHouse not available, skipping test");
@@ -621,9 +688,7 @@ async fn test_uniswap_swap_cte() {
 #[tokio::test]
 #[serial(clickhouse)]
 async fn test_role_granted_cte() {
-    let ch = TestClickHouse::new(TEST_DB)
-        .await
-        .expect("Failed to create ClickHouse client");
+    let ch = TestClickHouse::new(TEST_DB).expect("Failed to create ClickHouse client");
 
     if ch.wait_for_ready().await.is_err() {
         println!("ClickHouse not available, skipping test");
@@ -671,6 +736,158 @@ async fn test_role_granted_cte() {
     assert_eq!(data.unwrap().len(), 1);
 }
 
+/// `query_user` (the public /query path) must execute parenthesized UNION arms
+/// with a trailing ORDER BY/LIMIT, a shape valid in PostgreSQL. ClickHouse
+/// grammar rejects the trailing clauses (Code 62) unless they are hoisted
+/// into a derived-table wrapper.
+#[tokio::test]
+#[serial(clickhouse)]
+async fn test_query_user_union_with_trailing_order_by() {
+    let ch =
+        TestClickHouse::new("tidx_repro_union_ch").expect("Failed to create ClickHouse client");
+
+    if ch.wait_for_ready().await.is_err() {
+        println!("ClickHouse not available, skipping test");
+        return;
+    }
+
+    ch.reset_database().await.expect("Failed to reset database");
+    ch.create_mock_blocks_table()
+        .await
+        .expect("Failed to create blocks table");
+    ch.query("INSERT INTO blocks (num, hash) VALUES (1, '0x01'), (2, '0x02'), (3, '0x03')")
+        .await
+        .expect("Failed to insert blocks");
+
+    let config = ClickHouseConfig {
+        enabled: true,
+        url: ch.url.clone(),
+        database: Some(ch.database.clone()),
+        ..Default::default()
+    };
+    let engine = ClickHouseEngine::new(&config, 4217).expect("Failed to create engine");
+
+    let sql = "(SELECT num FROM blocks ORDER BY num DESC LIMIT 2) \
+               UNION (SELECT num FROM blocks ORDER BY num DESC LIMIT 2) \
+               ORDER BY num DESC LIMIT 2";
+    let result = engine
+        .query_user(sql, &[], 5_000, 100)
+        .await
+        .expect("union with trailing ORDER BY should execute");
+
+    let nums: Vec<i64> = result
+        .rows
+        .iter()
+        .map(|row| {
+            row[0]
+                .as_i64()
+                .or_else(|| row[0].as_str().and_then(|s| s.parse().ok()))
+                .expect("numeric num")
+        })
+        .collect();
+    assert_eq!(nums, [3, 2]);
+}
+
+/// Hoisting a bare set operation must normalize relation-qualified ordering
+/// references because the relations are inside the derived table.
+#[tokio::test]
+#[serial(clickhouse)]
+async fn test_query_user_union_with_qualified_trailing_order_by() {
+    let ch = TestClickHouse::new("tidx_repro_union_ch_qualified")
+        .expect("Failed to create ClickHouse client");
+
+    if ch.wait_for_ready().await.is_err() {
+        println!("ClickHouse not available, skipping test");
+        return;
+    }
+
+    ch.reset_database().await.expect("Failed to reset database");
+    ch.create_mock_blocks_table()
+        .await
+        .expect("Failed to create blocks table");
+    ch.query("INSERT INTO blocks (num, hash) VALUES (1, '0x01'), (2, '0x02'), (3, '0x03')")
+        .await
+        .expect("Failed to insert blocks");
+
+    let config = ClickHouseConfig {
+        enabled: true,
+        url: ch.url.clone(),
+        database: Some(ch.database.clone()),
+        ..Default::default()
+    };
+    let engine = ClickHouseEngine::new(&config, 4217).expect("Failed to create engine");
+
+    let sql = "SELECT b.num AS height FROM blocks AS b WHERE b.num <= 2 \
+               UNION ALL \
+               SELECT b.num AS height FROM blocks AS b WHERE b.num >= 2 \
+               ORDER BY b.num DESC LIMIT 3";
+    let result = engine
+        .query_user(sql, &[], 5_000, 100)
+        .await
+        .expect("qualified union ordering should execute");
+
+    let nums: Vec<i64> = result
+        .rows
+        .iter()
+        .map(|row| {
+            row[0]
+                .as_i64()
+                .or_else(|| row[0].as_str().and_then(|s| s.parse().ok()))
+                .expect("numeric num")
+        })
+        .collect();
+    assert_eq!(nums, [3, 2, 2]);
+}
+
+/// Same shape with the whole set expression parenthesized:
+/// `(a UNION b) ORDER BY ...`. ClickHouse rejects trailing clauses after a
+/// parenthesized set query too, so the hoist must unwrap it.
+#[tokio::test]
+#[serial(clickhouse)]
+async fn test_query_user_parenthesized_union_with_trailing_order_by() {
+    let ch = TestClickHouse::new("tidx_repro_union_ch_paren")
+        .expect("Failed to create ClickHouse client");
+
+    if ch.wait_for_ready().await.is_err() {
+        println!("ClickHouse not available, skipping test");
+        return;
+    }
+
+    ch.reset_database().await.expect("Failed to reset database");
+    ch.create_mock_blocks_table()
+        .await
+        .expect("Failed to create blocks table");
+    ch.query("INSERT INTO blocks (num, hash) VALUES (1, '0x01'), (2, '0x02'), (3, '0x03')")
+        .await
+        .expect("Failed to insert blocks");
+
+    let config = ClickHouseConfig {
+        enabled: true,
+        url: ch.url.clone(),
+        database: Some(ch.database.clone()),
+        ..Default::default()
+    };
+    let engine = ClickHouseEngine::new(&config, 4217).expect("Failed to create engine");
+
+    let sql = "(SELECT num FROM blocks UNION SELECT num FROM blocks) ORDER BY num DESC LIMIT 2";
+    let result = engine
+        .query_user(sql, &[], 5_000, 100)
+        .await
+        .expect("parenthesized union with trailing ORDER BY should execute");
+
+    let nums: Vec<i64> = result
+        .rows
+        .iter()
+        .map(|row| {
+            row[0]
+                .as_i64()
+                .or_else(|| row[0].as_str().and_then(|s| s.parse().ok()))
+                .expect("numeric num")
+        })
+        .collect();
+    assert_eq!(nums, [3, 2]);
+}
+
 // ============================================================================
 // Predicate Pushdown Tests
 // ============================================================================
@@ -678,9 +895,7 @@ async fn test_role_granted_cte() {
 #[tokio::test]
 #[serial(clickhouse)]
 async fn test_predicate_pushdown_indexed_param() {
-    let ch = TestClickHouse::new(TEST_DB)
-        .await
-        .expect("Failed to create ClickHouse client");
+    let ch = TestClickHouse::new(TEST_DB).expect("Failed to create ClickHouse client");
 
     if ch.wait_for_ready().await.is_err() {
         println!("ClickHouse not available, skipping test");
@@ -752,9 +967,7 @@ async fn test_predicate_pushdown_indexed_param() {
 #[tokio::test]
 #[serial(clickhouse)]
 async fn test_case_insensitive_table_reference() {
-    let ch = TestClickHouse::new(TEST_DB)
-        .await
-        .expect("Failed to create ClickHouse client");
+    let ch = TestClickHouse::new(TEST_DB).expect("Failed to create ClickHouse client");
 
     if ch.wait_for_ready().await.is_err() {
         println!("ClickHouse not available, skipping test");
@@ -795,12 +1008,107 @@ async fn test_case_insensitive_table_reference() {
 
 const SINK_DB: &str = "tidx_sink_test";
 const TEST_CHAIN_ID: u64 = 99999;
+const RETIRED_CLICKHOUSE_OBJECTS: &[&str] = &[
+    "address_transfers",
+    "address_transfers_mv",
+    "address_txs",
+    "address_txs_mv",
+    "contract_creations",
+    "contract_creations_mv",
+    "token_approvals",
+    "token_approvals_current",
+    "token_approvals_mv",
+    "balance_dirty_keys",
+    "balance_dirty_keys_mv",
+    "balance_reorg_keys",
+    "balance_state",
+    "balance_state_clean_mv",
+    "balance_state_refresh",
+];
+
+async fn seed_retired_clickhouse_objects(ch: &TestClickHouse) {
+    for table in [
+        "address_transfers",
+        "address_txs",
+        "contract_creations",
+        "token_approvals",
+    ] {
+        ch.query(&format!(
+            "CREATE TABLE {table} (marker UInt8) ENGINE = MergeTree ORDER BY marker"
+        ))
+        .await
+        .unwrap_or_else(|_| panic!("failed to seed {table}"));
+    }
+
+    for (view, target) in [
+        ("address_transfers_mv", "address_transfers"),
+        ("address_txs_mv", "address_txs"),
+        ("contract_creations_mv", "contract_creations"),
+        ("token_approvals_mv", "token_approvals"),
+    ] {
+        ch.query(&format!(
+            "CREATE MATERIALIZED VIEW {view} TO {target} AS SELECT toUInt8(1) AS marker"
+        ))
+        .await
+        .unwrap_or_else(|_| panic!("failed to seed {view}"));
+    }
+    ch.query("CREATE VIEW token_approvals_current AS SELECT marker FROM token_approvals")
+        .await
+        .expect("failed to seed token_approvals_current");
+
+    seed_retired_balance_state_objects(ch).await;
+}
+
+async fn seed_retired_balance_state_objects(ch: &TestClickHouse) {
+    ch.query(
+        "CREATE TABLE balance_dirty_keys (token String, holder String) \
+         ENGINE = MergeTree ORDER BY (token, holder)",
+    )
+    .await
+    .expect("failed to seed balance_dirty_keys");
+    ch.query(
+        "CREATE TABLE balance_reorg_keys (from_block Int64, token String, holder String) \
+         ENGINE = MergeTree ORDER BY (from_block, token, holder)",
+    )
+    .await
+    .expect("failed to seed balance_reorg_keys");
+    ch.query(
+        "CREATE TABLE balance_state (token String, holder String, balance UInt256) \
+         ENGINE = MergeTree ORDER BY (token, holder)",
+    )
+    .await
+    .expect("failed to seed balance_state");
+    ch.query("CREATE VIEW balance_dirty_keys_mv AS SELECT token, holder FROM balance_dirty_keys")
+        .await
+        .expect("failed to seed balance_dirty_keys_mv");
+    ch.query("CREATE VIEW balance_state_clean_mv AS SELECT token, holder FROM balance_dirty_keys")
+        .await
+        .expect("failed to seed balance_state_clean_mv");
+    ch.query(
+        "CREATE VIEW balance_state_refresh AS SELECT token, holder, balance FROM balance_state",
+    )
+    .await
+    .expect("failed to seed balance_state_refresh");
+}
+
+async fn assert_retired_clickhouse_objects_absent(ch: &TestClickHouse) {
+    let names = RETIRED_CLICKHOUSE_OBJECTS
+        .iter()
+        .map(|name| format!("'{name}'"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let retired = ch
+        .query_json(&format!(
+            "SELECT name FROM system.tables WHERE database = currentDatabase() AND name IN ({names})"
+        ))
+        .await
+        .expect("failed to inspect retired objects");
+    assert_eq!(retired["rows"], 0);
+}
 
 /// Helper: create a ClickHouseSink pointed at the test instance, with a clean DB.
 async fn setup_sink() -> Option<(ClickHouseSink, TestClickHouse)> {
-    let ch = TestClickHouse::new(SINK_DB)
-        .await
-        .expect("Failed to create CH client");
+    let ch = TestClickHouse::new(SINK_DB).expect("Failed to create CH client");
     if ch.wait_for_ready().await.is_err() {
         println!("ClickHouse not available, skipping test");
         return None;
@@ -827,6 +1135,7 @@ fn make_block(num: i64) -> BlockRow {
         gas_used: 21_000 * num,
         miner: vec![0xaa; 20],
         extra_data: Some(vec![0xbb, 0xcc]),
+        consensus_proposer: None,
     }
 }
 
@@ -840,7 +1149,7 @@ fn make_tx(block_num: i64, idx: i32) -> TxRow {
         idx,
         hash: {
             let mut h = vec![block_num as u8; 16];
-            h.extend_from_slice(&vec![idx as u8; 16]);
+            h.extend_from_slice(&[idx as u8; 16]);
             h
         },
         tx_type: 2,
@@ -881,7 +1190,42 @@ fn make_log(block_num: i64, log_idx: i32) -> LogRow {
         topic2: Some(vec![0x22; 32]),
         topic3: None,
         data: vec![0x00; 32],
+        is_virtual_forward: false,
     }
+}
+
+fn make_transfer_log(block_num: i64, log_idx: i32, from: &str, to: &str, value: u128) -> LogRow {
+    use chrono::TimeZone;
+    let ts = chrono::Utc.with_ymd_and_hms(2025, 1, 15, 12, 0, 0).unwrap()
+        + chrono::Duration::seconds(block_num);
+    let topic0 =
+        hex::decode("ddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef").unwrap();
+    let mut data = vec![0; 16];
+    data.extend_from_slice(&value.to_be_bytes());
+
+    LogRow {
+        block_num,
+        block_timestamp: ts,
+        log_idx,
+        tx_idx: 0,
+        tx_hash: vec![block_num as u8; 32],
+        address: vec![0xda; 20],
+        selector: Some(topic0.clone()),
+        topic0: Some(topic0),
+        topic1: Some(padded_topic_address(from)),
+        topic2: Some(padded_topic_address(to)),
+        topic3: None,
+        data,
+        is_virtual_forward: false,
+    }
+}
+
+fn padded_topic_address(address: &str) -> Vec<u8> {
+    let bytes = hex::decode(address.trim_start_matches("0x")).unwrap();
+    assert_eq!(bytes.len(), 20);
+    let mut topic = vec![0; 12];
+    topic.extend_from_slice(&bytes);
+    topic
 }
 
 fn make_receipt(block_num: i64, tx_idx: i32) -> ReceiptRow {
@@ -901,6 +1245,8 @@ fn make_receipt(block_num: i64, tx_idx: i32) -> ReceiptRow {
         effective_gas_price: Some("100000000000".to_string()),
         status: Some(1),
         fee_payer: None,
+        tx_type: None,
+        fee_token: None,
     }
 }
 
@@ -911,12 +1257,142 @@ async fn test_sink_ensure_schema_creates_tables() {
         return;
     };
 
-    for table in ["blocks", "txs", "logs", "receipts"] {
+    for table in [
+        "blocks",
+        "txs",
+        "logs",
+        "receipts",
+        "token_transfers",
+        "token_holder_deltas",
+        "token_balances_snapshot",
+    ] {
         let count = ch
             .table_count(table)
             .await
             .unwrap_or_else(|_| panic!("Table {table} should exist"));
         assert_eq!(count, 0, "{table} should be empty after schema creation");
+
+        let ddl = ch
+            .query(&format!("SHOW CREATE TABLE {table}"))
+            .await
+            .unwrap_or_else(|_| panic!("Table {table} should expose its DDL"));
+        assert!(ddl.contains("default_compression_codec"));
+        assert!(
+            ddl.contains("ZSTD(1)"),
+            "table {table} should use ZSTD(1) by default: {ddl}"
+        );
+    }
+
+    let tracked = ch
+        .table_count("tidx_schema_objects")
+        .await
+        .expect("schema object tracking should exist");
+    assert!(tracked > 0);
+
+    let count = ch
+        .table_count("token_balances")
+        .await
+        .expect("token_balances view should exist");
+    assert_eq!(count, 0);
+
+    let names = RETIRED_CLICKHOUSE_OBJECTS
+        .iter()
+        .map(|name| format!("'{name}'"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let retired = ch
+        .query_json(&format!(
+            "SELECT name FROM system.tables WHERE database = currentDatabase() AND name IN ({names})"
+        ))
+        .await
+        .expect("failed to inspect retired objects");
+    assert_eq!(retired["rows"], 0);
+}
+
+#[tokio::test]
+#[serial(clickhouse)]
+async fn test_sink_ensure_schema_drops_retired_objects() {
+    let ch = TestClickHouse::new(SINK_DB).expect("Failed to create CH client");
+    if ch.wait_for_ready().await.is_err() {
+        println!("ClickHouse not available, skipping test");
+        return;
+    }
+    ch.reset_database().await.expect("Failed to reset database");
+
+    seed_retired_clickhouse_objects(&ch).await;
+
+    let sink = ClickHouseSink::new(&ch.url, SINK_DB, None, None).expect("Failed to create sink");
+    sink.ensure_schema()
+        .await
+        .expect("first ensure_schema failed");
+    assert_retired_clickhouse_objects_absent(&ch).await;
+
+    seed_retired_clickhouse_objects(&ch).await;
+    sink.ensure_schema()
+        .await
+        .expect("second ensure_schema failed");
+    assert_retired_clickhouse_objects_absent(&ch).await;
+}
+
+#[tokio::test]
+#[serial(clickhouse)]
+async fn test_sink_replaces_snapshot_after_incremental_state_schema() {
+    let Some((sink, ch)) = setup_sink().await else {
+        return;
+    };
+
+    // Model the important parts of the PR #271 transition: the canonical
+    // snapshot needs replacement while a refresh-dependent child exists, and
+    // the retired reducer objects are still present.
+    ch.query("DROP VIEW IF EXISTS address_balances_snapshot SYNC")
+        .await
+        .expect("failed to remove address snapshot fixture");
+    seed_retired_balance_state_objects(&ch).await;
+    ch.query(
+        "ALTER TABLE tidx_schema_objects DELETE WHERE name IN (\
+            'balance_state_20260715_stop_refresh', \
+            'token_holder_counts_20260715_drop_before_snapshot_replace', \
+            'token_balances_snapshot'\
+         ) SETTINGS mutations_sync = 1",
+    )
+    .await
+    .expect("failed to reset transition tracking fixture");
+    ch.query(
+        "INSERT INTO tidx_schema_objects (name, checksum, kind) \
+         VALUES \
+            ('token_balances_snapshot', 'pre-rollback-definition', \
+             'refreshable_materialized_view'), \
+            ('balance_state_20260714_bootstrap', 'applied-by-pr-271', 'migration')",
+    )
+    .await
+    .expect("failed to seed stale snapshot checksum");
+
+    sink.ensure_schema_only()
+        .await
+        .expect("incremental state schema transition failed");
+
+    assert_retired_clickhouse_objects_absent(&ch).await;
+    let retired_bootstrap = ch
+        .query(
+            "SELECT count() FROM tidx_schema_objects FINAL \
+             WHERE name = 'balance_state_20260714_bootstrap'",
+        )
+        .await
+        .expect("failed to inspect retired bootstrap tracking");
+    assert_eq!(retired_bootstrap.trim(), "0");
+    for view in [
+        "token_balances_snapshot",
+        "address_balances_snapshot",
+        "token_holder_counts",
+    ] {
+        let count = ch
+            .query(&format!(
+                "SELECT count() FROM system.tables WHERE database = currentDatabase() \
+                 AND name = '{view}'"
+            ))
+            .await
+            .unwrap_or_else(|_| panic!("failed to inspect recreated {view}"));
+        assert_eq!(count.trim(), "1", "{view} should be recreated");
     }
 }
 
@@ -953,6 +1429,31 @@ async fn test_sink_write_blocks() {
     assert_eq!(num4, 5);
 }
 
+/// A retried insert re-sends an identical part; the insert dedup window must
+/// drop it instead of writing duplicate ReplacingMergeTree rows.
+#[tokio::test]
+#[serial(clickhouse)]
+async fn test_retried_identical_insert_is_deduplicated() {
+    let Some((sink, ch)) = setup_sink().await else {
+        return;
+    };
+
+    // Block merges so surviving duplicates stay visible as physical rows.
+    ch.query_raw(&format!("SYSTEM STOP MERGES {SINK_DB}.blocks"))
+        .await
+        .expect("stop merges failed");
+
+    let blocks: Vec<BlockRow> = (1..=5).map(make_block).collect();
+    sink.write_blocks(&blocks)
+        .await
+        .expect("write_blocks failed");
+    sink.write_blocks(&blocks)
+        .await
+        .expect("write_blocks retry failed");
+
+    assert_eq!(ch.table_count("blocks").await.unwrap(), 5);
+}
+
 #[tokio::test]
 #[serial(clickhouse)]
 async fn test_sink_write_txs() {
@@ -983,6 +1484,498 @@ async fn test_sink_write_logs() {
 
     let count = ch.table_count("logs").await.expect("count failed");
     assert_eq!(count, 12);
+}
+
+#[tokio::test]
+#[serial(clickhouse)]
+async fn test_sink_write_logs_roundtrips_virtual_forward_flag() {
+    let Some((sink, ch)) = setup_sink().await else {
+        return;
+    };
+
+    let mut logs: Vec<LogRow> = (1..=2).map(|b| make_log(b, 0)).collect();
+    logs[1].is_virtual_forward = true;
+    sink.write_logs(&logs).await.expect("write_logs failed");
+
+    let result = ch
+        .query_json("SELECT block_num, is_virtual_forward FROM logs ORDER BY block_num")
+        .await
+        .unwrap();
+    let rows = result["data"].as_array().unwrap();
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0]["is_virtual_forward"].as_u64(), Some(0));
+    assert_eq!(rows[1]["is_virtual_forward"].as_u64(), Some(1));
+}
+
+#[tokio::test]
+#[serial(clickhouse)]
+async fn test_sink_token_transfers_decodes_transfers_and_reorgs() {
+    let Some((sink, ch)) = setup_sink().await else {
+        return;
+    };
+
+    let zero = "0x0000000000000000000000000000000000000000";
+    let alice = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    let bob = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+
+    let mut logs = vec![
+        make_transfer_log(1, 0, zero, alice, 100),
+        make_transfer_log(2, 0, alice, bob, 40),
+        make_transfer_log(3, 0, bob, zero, 10),
+    ];
+    logs[2].is_virtual_forward = true;
+
+    sink.write_logs(&logs).await.expect("write_logs failed");
+
+    let rows = token_transfers(&ch).await;
+    assert_eq!(rows.len(), 3);
+    assert_eq!(rows[0].token, "0xdadadadadadadadadadadadadadadadadadadada");
+    assert_eq!(rows[0].from, zero);
+    assert_eq!(rows[0].to, alice);
+    assert_eq!(rows[0].amount, "100");
+    assert_eq!(rows[0].is_virtual_forward, 0);
+    assert_eq!(rows[2].from, bob);
+    assert_eq!(rows[2].to, zero);
+    assert_eq!(rows[2].amount, "10");
+    assert_eq!(rows[2].is_virtual_forward, 1);
+
+    sink.delete_from(3).await.expect("delete_from failed");
+
+    let rows = token_transfers(&ch).await;
+    assert_eq!(rows.len(), 2);
+    assert!(rows.iter().all(|row| row.block_num < 3));
+}
+
+#[tokio::test]
+#[serial(clickhouse)]
+async fn test_api_recipient_query_executes() {
+    let Some((sink, ch)) = setup_sink().await else {
+        return;
+    };
+
+    let alice = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    let bob = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    let logs = vec![
+        make_transfer_log(1, 0, alice, bob, 40),
+        make_transfer_log(2, 0, alice, bob, 60),
+    ];
+    sink.write_logs(&logs).await.expect("write_logs failed");
+
+    let config = ClickHouseConfig {
+        enabled: true,
+        url: ch.url.clone(),
+        database: Some(ch.database.clone()),
+        ..Default::default()
+    };
+    let engine = ClickHouseEngine::new(&config, 4217).expect("Failed to create engine");
+
+    // Keep this query in sync with the recipient path in tempo-api's transfer route.
+    let sql = format!(
+        r#"SELECT DISTINCT "from", "to", token AS address, amount AS value, tx_hash, block_num, log_idx, block_timestamp
+           FROM token_transfers
+           WHERE "to" = '{bob}'
+           ORDER BY block_num DESC, log_idx DESC
+           LIMIT 256"#
+    );
+    let result = engine
+        .query_user(&sql, &[], 5_000, 256)
+        .await
+        .expect("API recipient query should execute");
+
+    assert_eq!(
+        result.columns,
+        [
+            "from",
+            "to",
+            "address",
+            "value",
+            "tx_hash",
+            "block_num",
+            "log_idx",
+            "block_timestamp",
+        ]
+    );
+    assert_eq!(result.rows.len(), 2);
+    assert_eq!(result.rows[0][1].as_str(), Some(bob));
+    assert_eq!(result.rows[0][5].as_i64(), Some(2));
+    assert_eq!(result.rows[1][5].as_i64(), Some(1));
+}
+
+#[tokio::test]
+#[serial(clickhouse)]
+async fn test_sink_token_balances_view_tracks_balances_and_reorgs() {
+    let Some((sink, ch)) = setup_sink().await else {
+        return;
+    };
+
+    let zero = "0x0000000000000000000000000000000000000000";
+    let alice = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    let bob = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+
+    let logs = vec![
+        make_transfer_log(1, 0, zero, alice, 100),
+        make_transfer_log(2, 0, alice, bob, 40),
+        make_transfer_log(3, 0, bob, zero, 10),
+    ];
+    sink.write_logs(&logs).await.expect("write_logs failed");
+
+    let balances = token_holder_balances(&ch).await;
+    assert_eq!(balances.get(alice).map(String::as_str), Some("60"));
+    assert_eq!(balances.get(bob).map(String::as_str), Some("30"));
+    assert!(!balances.contains_key(zero));
+
+    // Replaying the source batch creates physical duplicates, but FINAL keeps
+    // the canonical snapshot idempotent. The address snapshot must be the same
+    // atomic balance generation with only its storage order changed.
+    sink.write_logs(&logs)
+        .await
+        .expect("replayed write_logs failed");
+    refresh_balance_snapshots(&ch).await;
+    assert_eq!(
+        balance_rows(&ch, "token_balances_snapshot").await,
+        balance_rows(&ch, "address_balances_snapshot").await
+    );
+    assert_eq!(balance_rows(&ch, "token_balances_snapshot").await.len(), 2);
+
+    sink.delete_from(3).await.expect("delete_from failed");
+
+    let balances = token_holder_balances(&ch).await;
+    assert_eq!(balances.get(alice).map(String::as_str), Some("60"));
+    assert_eq!(balances.get(bob).map(String::as_str), Some("40"));
+
+    refresh_balance_snapshots(&ch).await;
+    assert_eq!(
+        balance_rows(&ch, "token_balances_snapshot").await,
+        balance_rows(&ch, "address_balances_snapshot").await
+    );
+    let snapshot = balance_rows(&ch, "token_balances_snapshot").await;
+    assert!(
+        snapshot
+            .iter()
+            .any(|(_, holder, balance)| { holder == bob && balance == "40" })
+    );
+}
+
+#[tokio::test]
+#[serial(clickhouse)]
+async fn test_sink_ensure_schema_backfills_token_transfer_views() {
+    let ch = TestClickHouse::new(SINK_DB).expect("Failed to create CH client");
+    if ch.wait_for_ready().await.is_err() {
+        println!("ClickHouse not available, skipping test");
+        return;
+    }
+    ch.reset_database().await.expect("Failed to reset database");
+
+    for object in base_objects() {
+        let ddl = object.ddl();
+        ch.query(&ddl)
+            .await
+            .unwrap_or_else(|_| panic!("base object {} should be created", object.name));
+    }
+    for migration in migrations() {
+        let ddl = migration.ddl();
+        ch.query(&ddl)
+            .await
+            .unwrap_or_else(|_| panic!("migration {} should run", migration.name));
+    }
+
+    let sink = ClickHouseSink::new(&ch.url, SINK_DB, None, None).expect("Failed to create sink");
+    let zero = "0x0000000000000000000000000000000000000000";
+    let alice = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    let bob = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+
+    let logs = vec![
+        make_transfer_log(1, 0, zero, alice, 100),
+        make_transfer_log(2, 0, alice, bob, 40),
+        make_transfer_log(3, 0, bob, zero, 10),
+    ];
+    sink.write_logs(&logs).await.expect("write_logs failed");
+
+    sink.ensure_schema().await.expect("ensure_schema failed");
+
+    let transfers = token_transfers(&ch).await;
+    assert_eq!(transfers.len(), 3);
+
+    let balances = token_holder_balances(&ch).await;
+    assert_eq!(balances.get(alice).map(String::as_str), Some("60"));
+    assert_eq!(balances.get(bob).map(String::as_str), Some("30"));
+    assert!(!balances.contains_key(zero));
+}
+
+struct TokenTransferEvent {
+    block_num: i64,
+    token: String,
+    from: String,
+    to: String,
+    amount: String,
+    is_virtual_forward: u64,
+}
+
+async fn token_transfers(ch: &TestClickHouse) -> Vec<TokenTransferEvent> {
+    let result = ch
+        .query_json(
+            r#"
+            SELECT
+                block_num,
+                token,
+                `from`,
+                `to`,
+                toString(amount) AS amount,
+                is_virtual_forward
+            FROM token_transfers
+            ORDER BY block_num, log_idx
+            "#,
+        )
+        .await
+        .expect("token_transfers query failed");
+    result["data"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|row| TokenTransferEvent {
+            block_num: row["block_num"]
+                .as_i64()
+                .or_else(|| {
+                    row["block_num"]
+                        .as_str()
+                        .and_then(|value| value.parse().ok())
+                })
+                .unwrap(),
+            token: row["token"].as_str().unwrap().to_string(),
+            from: row["from"].as_str().unwrap().to_string(),
+            to: row["to"].as_str().unwrap().to_string(),
+            amount: row["amount"].as_str().unwrap().to_string(),
+            is_virtual_forward: row["is_virtual_forward"].as_u64().unwrap(),
+        })
+        .collect()
+}
+
+fn make_transfer_log_u256(
+    block_num: i64,
+    log_idx: i32,
+    from: &str,
+    to: &str,
+    value_hex: &str,
+) -> LogRow {
+    use chrono::TimeZone;
+    let ts = chrono::Utc.with_ymd_and_hms(2025, 1, 15, 12, 0, 0).unwrap()
+        + chrono::Duration::seconds(block_num);
+    let topic0 =
+        hex::decode("ddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef").unwrap();
+    let data = hex::decode(value_hex).expect("value_hex must be valid hex");
+    assert_eq!(data.len(), 32, "value_hex must encode 32 bytes");
+
+    LogRow {
+        block_num,
+        block_timestamp: ts,
+        log_idx,
+        tx_idx: 0,
+        tx_hash: vec![block_num as u8; 32],
+        address: vec![0xda; 20],
+        selector: Some(topic0.clone()),
+        topic0: Some(topic0),
+        topic1: Some(padded_topic_address(from)),
+        topic2: Some(padded_topic_address(to)),
+        topic3: None,
+        data,
+        is_virtual_forward: false,
+    }
+}
+
+#[tokio::test]
+#[serial(clickhouse)]
+async fn test_sink_token_balances_handles_amount_above_int256_max() {
+    let Some((sink, ch)) = setup_sink().await else {
+        return;
+    };
+
+    let zero = "0x0000000000000000000000000000000000000000";
+    let alice = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    let bob = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+
+    let a_hex = "8000000000000000000000000000000000000000000000000000000000000064";
+    let c_hex = "8000000000000000000000000000000000000000000000000000000000000028";
+
+    let logs = vec![
+        make_transfer_log_u256(1, 0, zero, alice, a_hex),
+        make_transfer_log_u256(2, 0, alice, bob, c_hex),
+    ];
+    sink.write_logs(&logs).await.expect("write_logs failed");
+
+    let delta_type = ch
+        .query(&format!(
+            "SELECT type FROM system.columns WHERE database = '{SINK_DB}' \
+             AND table = 'token_holder_deltas' AND name = 'balance_delta'"
+        ))
+        .await
+        .expect("column type query failed");
+    assert_eq!(delta_type.trim(), "UInt256");
+
+    let balances = token_holder_balances(&ch).await;
+    assert_eq!(balances.get(alice).map(String::as_str), Some("60"));
+    assert_eq!(
+        balances.get(bob).map(String::as_str),
+        Some("57896044618658097711785492504343953926634992332820282019728792003956564820008")
+    );
+    assert!(!balances.contains_key(zero));
+}
+
+#[tokio::test]
+#[serial(clickhouse)]
+async fn test_post_derived_migrations_repair_legacy_signed_holder_deltas() {
+    let ch = TestClickHouse::new(SINK_DB).expect("Failed to create CH client");
+    if ch.wait_for_ready().await.is_err() {
+        println!("ClickHouse not available, skipping test");
+        return;
+    }
+    ch.reset_database().await.expect("Failed to reset database");
+
+    let zero = "0x0000000000000000000000000000000000000000";
+    let alice = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    let bob = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    let token = "0xdadadadadadadadadadadadadadadadadadadada";
+    let a = "57896044618658097711785492504343953926634992332820282019728792003956564820068";
+    let c = "57896044618658097711785492504343953926634992332820282019728792003956564820008";
+
+    ch.query(include_str!("../db/clickhouse/token_transfers.sql"))
+        .await
+        .expect("create token_transfers");
+    ch.query(&format!(
+        "INSERT INTO token_transfers \
+         (block_num, block_timestamp, tx_idx, log_idx, tx_hash, token, `from`, `to`, amount, is_virtual_forward) VALUES \
+         (1, '2025-01-15 12:00:01', 0, 0, 'a1', '{token}', '{zero}',  '{alice}', {a}, 0), \
+         (2, '2025-01-15 12:00:02', 0, 0, 'a2', '{token}', '{alice}', '{bob}',   {c}, 0)"
+    ))
+    .await
+    .expect("seed token_transfers");
+
+    ch.query(
+        "CREATE TABLE token_holder_deltas (
+            block_num Int64, block_timestamp DateTime64(3, 'UTC'), tx_hash String, log_idx Int32,
+            token String, holder String, leg Int8, balance_delta Int256
+        ) ENGINE = ReplacingMergeTree()
+        PARTITION BY toYYYYMM(block_timestamp)
+        ORDER BY (token, holder, block_num, tx_hash, log_idx, leg)",
+    )
+    .await
+    .expect("create legacy token_holder_deltas");
+
+    ch.query(
+        "INSERT INTO token_holder_deltas
+         SELECT block_num, block_timestamp, tx_hash, log_idx, token,
+             tupleElement(leg_tuple, 1) AS holder,
+             tupleElement(leg_tuple, 2) AS leg,
+             tupleElement(leg_tuple, 3) AS balance_delta
+         FROM token_transfers
+         ARRAY JOIN [
+             (`to`,   CAST(1 AS Int8),  CAST(amount AS Int256)),
+             (`from`, CAST(-1 AS Int8), -CAST(amount AS Int256))
+         ] AS leg_tuple
+         WHERE tupleElement(leg_tuple, 1) != '0x0000000000000000000000000000000000000000'",
+    )
+    .await
+    .expect("seed legacy deltas");
+
+    let legacy_bob = ch
+        .query(&format!(
+            "SELECT toString(sum(balance_delta)) FROM token_holder_deltas FINAL WHERE holder = '{bob}'"
+        ))
+        .await
+        .expect("legacy balance query");
+    assert!(
+        legacy_bob.trim().starts_with('-'),
+        "legacy signed delta for bob should wrap negative, got {}",
+        legacy_bob.trim()
+    );
+
+    for name in [
+        "token_holder_deltas_20260704_fix_signed",
+        "token_holder_deltas_20260704_widen_uint256",
+        "token_holder_deltas_20260704_reinsert_overflow",
+    ] {
+        let migration = post_derived_migrations()
+            .iter()
+            .find(|object| object.name == name)
+            .unwrap_or_else(|| panic!("migration {name} should exist"));
+        ch.query(&migration.ddl())
+            .await
+            .unwrap_or_else(|e| panic!("migration {name} failed: {e}"));
+    }
+
+    let delta_type = ch
+        .query(&format!(
+            "SELECT type FROM system.columns WHERE database = '{SINK_DB}' \
+             AND table = 'token_holder_deltas' AND name = 'balance_delta'"
+        ))
+        .await
+        .expect("column type query failed");
+    assert_eq!(delta_type.trim(), "UInt256");
+
+    ch.query(include_str!("../db/clickhouse/token_balances.sql"))
+        .await
+        .expect("create token_balances view");
+
+    let balances = token_holder_balances(&ch).await;
+    assert_eq!(balances.get(alice).map(String::as_str), Some("60"));
+    assert_eq!(balances.get(bob).map(String::as_str), Some(c));
+    assert!(!balances.contains_key(zero));
+}
+
+async fn token_holder_balances(ch: &TestClickHouse) -> std::collections::HashMap<String, String> {
+    let result = ch
+        .query_json(
+            "SELECT holder, toString(balance) AS balance FROM token_balances ORDER BY holder",
+        )
+        .await
+        .expect("token_balances query failed");
+    result["data"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|row| {
+            (
+                row["holder"].as_str().unwrap().to_string(),
+                row["balance"].as_str().unwrap().to_string(),
+            )
+        })
+        .collect()
+}
+
+async fn refresh_balance_snapshots(ch: &TestClickHouse) {
+    for view in [
+        "token_balances_snapshot",
+        "address_balances_snapshot",
+        "token_holder_counts",
+    ] {
+        ch.query(&format!("SYSTEM REFRESH VIEW {view}"))
+            .await
+            .unwrap_or_else(|_| panic!("failed to refresh {view}"));
+        ch.query(&format!("SYSTEM WAIT VIEW {view}"))
+            .await
+            .unwrap_or_else(|_| panic!("failed to wait for {view}"));
+    }
+}
+
+async fn balance_rows(ch: &TestClickHouse, table: &str) -> Vec<(String, String, String)> {
+    let result = ch
+        .query_json(&format!(
+            "SELECT token, holder, toString(balance) AS balance \
+             FROM {table} ORDER BY token, holder"
+        ))
+        .await
+        .unwrap_or_else(|_| panic!("failed to query {table}"));
+    result["data"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|row| {
+            (
+                row["token"].as_str().unwrap().to_string(),
+                row["holder"].as_str().unwrap().to_string(),
+                row["balance"].as_str().unwrap().to_string(),
+            )
+        })
+        .collect()
 }
 
 #[tokio::test]
@@ -1150,6 +2143,59 @@ async fn test_sink_reorg_reinsert_correctness() {
     );
 }
 
+/// A reorg can replace a block while leaving its transactions, logs, and
+/// receipts byte-for-byte identical. Those child rows must survive replay.
+#[tokio::test]
+#[serial(clickhouse)]
+async fn test_sink_reorg_replays_identical_child_rows() {
+    let Some((_pool, sinks, _ch_sink, ch)) = setup_backfill().await else {
+        return;
+    };
+
+    let original_block = make_block(8);
+    let tx = make_tx(8, 0);
+    let log = make_log(8, 0);
+    let receipt = make_receipt(8, 0);
+    sinks
+        .write_all(
+            std::slice::from_ref(&original_block),
+            std::slice::from_ref(&tx),
+            std::slice::from_ref(&log),
+            std::slice::from_ref(&receipt),
+        )
+        .await
+        .expect("initial batch failed");
+
+    sinks.delete_from(8).await.expect("reorg delete failed");
+    for table in ["blocks", "txs", "logs", "receipts"] {
+        assert_eq!(
+            ch.table_count(table).await.unwrap(),
+            0,
+            "{table} should be empty after the reorg delete"
+        );
+    }
+
+    let mut canonical_block = original_block;
+    canonical_block.hash = vec![0xff; 32];
+    sinks
+        .write_all(
+            std::slice::from_ref(&canonical_block),
+            std::slice::from_ref(&tx),
+            std::slice::from_ref(&log),
+            std::slice::from_ref(&receipt),
+        )
+        .await
+        .expect("canonical replay failed");
+
+    for table in ["blocks", "txs", "logs", "receipts"] {
+        assert_eq!(
+            ch.table_count(table).await.unwrap(),
+            1,
+            "{table} should contain the canonical replay"
+        );
+    }
+}
+
 #[tokio::test]
 #[serial(clickhouse)]
 async fn test_sink_hex_encoding() {
@@ -1279,6 +2325,7 @@ async fn test_cte_query_against_sink_data() {
         topic2: Some(to_addr),
         topic3: None,
         data: value_data,
+        is_virtual_forward: false,
     };
 
     sink.write_logs(&[log]).await.expect("write_logs failed");
@@ -1340,6 +2387,7 @@ async fn test_predicate_pushdown_against_sink_data() {
             topic2: Some(to_addr.clone()),
             topic3: None,
             data: value_data.clone(),
+            is_virtual_forward: false,
         });
     }
     // 3 logs from addr_b
@@ -1357,6 +2405,7 @@ async fn test_predicate_pushdown_against_sink_data() {
             topic2: Some(to_addr.clone()),
             topic3: None,
             data: value_data.clone(),
+            is_virtual_forward: false,
         });
     }
 
@@ -1389,6 +2438,26 @@ async fn test_predicate_pushdown_against_sink_data() {
         .as_u64()
         .unwrap();
     assert_eq!(cnt, 5, "expected 5 transfers from addr_a");
+
+    let token_sql = apply_event_signature_ctes_clickhouse(
+        r#"SELECT "from", "to", address, value, tx_hash, block_num, log_idx, block_timestamp
+FROM Transfer
+WHERE address = '0xcccccccccccccccccccccccccccccccccccccccc'
+ORDER BY block_num DESC, log_idx DESC
+LIMIT 6"#,
+        &["Transfer(address indexed from, address indexed to, uint256 value)"],
+    )
+    .unwrap();
+    assert!(token_sql.contains("logs.address = '0xcccccccccccccccccccccccccccccccccccccccc'"));
+
+    let result = ch
+        .query_json(&token_sql)
+        .await
+        .expect("token-scoped transfer query failed");
+    let rows = result["data"].as_array().unwrap();
+    assert_eq!(rows.len(), 6);
+    assert_eq!(rows[0]["block_num"].as_i64(), Some(12));
+    assert_eq!(rows[5]["block_num"].as_i64(), Some(3));
 }
 
 /// Verify hex literal filter works with sink-written 0x data (no conversion needed).
@@ -1418,12 +2487,11 @@ async fn test_hex_filter_against_sink_data() {
 // ============================================================================
 
 /// Helper: set up both PG (TestDb) and CH (ClickHouseSink) for backfill tests.
-/// Returns (PG pool, SinkSet with CH, TestClickHouse) or None if infra unavailable.
-async fn setup_backfill() -> Option<(tidx::db::Pool, SinkSet, TestClickHouse)> {
+/// Returns (PG pool, SinkSet with CH, ClickHouseSink, TestClickHouse) or None
+/// if infrastructure is unavailable.
+async fn setup_backfill() -> Option<(tidx::db::Pool, SinkSet, ClickHouseSink, TestClickHouse)> {
     // Set up CH
-    let ch = TestClickHouse::new(SINK_DB)
-        .await
-        .expect("Failed to create CH client");
+    let ch = TestClickHouse::new(SINK_DB).expect("Failed to create CH client");
     if ch.wait_for_ready().await.is_err() {
         println!("ClickHouse not available, skipping test");
         return None;
@@ -1460,8 +2528,22 @@ async fn setup_backfill() -> Option<(tidx::db::Pool, SinkSet, TestClickHouse)> {
         .await
         .expect("Failed to truncate PG tables");
 
-    let sinks = SinkSet::new(pool.clone()).with_clickhouse(ch_sink);
-    Some((pool, sinks, ch))
+    // Tests below write via `writer::` directly (bypassing SinkSet partition
+    // provisioning); pre-create partitions covering the fixed test timestamps.
+    {
+        use chrono::TimeZone;
+        let ts0 = chrono::Utc.with_ymd_and_hms(2025, 1, 15, 0, 0, 0).unwrap();
+        tidx::db::partitions::ensure_partitions_covering(
+            &pool,
+            ts0,
+            ts0 + chrono::Duration::days(7),
+        )
+        .await
+        .expect("Failed to ensure partitions");
+    }
+
+    let sinks = SinkSet::new(pool.clone()).with_clickhouse(ch_sink.clone());
+    Some((pool, sinks, ch_sink, ch))
 }
 
 async fn set_ch_backfill_cursor(pool: &tidx::db::Pool, chain_id: u64, block: i64) {
@@ -1480,11 +2562,127 @@ async fn set_ch_backfill_cursor(pool: &tidx::db::Pool, chain_id: u64, block: i64
     .expect("Failed to set CH backfill cursor");
 }
 
+async fn assert_replayed_transfer_block(ch: &TestClickHouse, from: &str, to: &str) {
+    for (table, expected) in [
+        ("blocks", 1),
+        ("txs", 1),
+        ("logs", 1),
+        ("receipts", 1),
+        ("token_transfers", 1),
+        ("token_holder_deltas", 2),
+        ("address_holder_deltas", 2),
+    ] {
+        assert_eq!(
+            ch.table_count_final(table).await.unwrap(),
+            expected,
+            "unexpected canonical row count for {table}"
+        );
+    }
+
+    let transfers = token_transfers(ch).await;
+    assert_eq!(transfers.len(), 1);
+    assert_eq!(
+        transfers[0].token,
+        "0xdadadadadadadadadadadadadadadadadadadada"
+    );
+    assert_eq!(transfers[0].from, from);
+    assert_eq!(transfers[0].to, to);
+    assert_eq!(transfers[0].amount, "100");
+}
+
+/// PostgreSQL hot-tier hydration reads canonical base rows from ClickHouse,
+/// preserves encoded fields, and refuses a range that its archive cannot fill.
+#[tokio::test]
+#[serial(clickhouse)]
+async fn test_hydrate_postgres_from_clickhouse() {
+    let Some((pool, sinks, ch_sink, _ch)) = setup_backfill().await else {
+        return;
+    };
+
+    let blocks: Vec<BlockRow> = (1..=5).map(make_block).collect();
+    let mut txs: Vec<TxRow> = (1..=5)
+        .flat_map(|b| (0..2).map(move |i| make_tx(b, i)))
+        .collect();
+    txs.iter_mut()
+        .find(|tx| tx.block_num == 2 && tx.idx == 0)
+        .unwrap()
+        .calls = Some(serde_json::json!([{"to": "0x1234"}]));
+    let mut logs: Vec<LogRow> = (1..=5).map(|b| make_log(b, 0)).collect();
+    logs.iter_mut()
+        .find(|log| log.block_num == 3)
+        .unwrap()
+        .is_virtual_forward = true;
+    let receipts: Vec<ReceiptRow> = (1..=5).map(|b| make_receipt(b, 0)).collect();
+
+    tokio::try_join!(
+        ch_sink.write_blocks(&blocks),
+        ch_sink.write_txs(&txs),
+        ch_sink.write_logs(&logs),
+        ch_sink.write_receipts(&receipts),
+    )
+    .expect("failed to seed ClickHouse archive");
+    // Crash replay can leave identical ReplacingMergeTree rows. The archive
+    // reader must collapse them before checking completeness and hydrating PG.
+    ch_sink
+        .write_blocks(&blocks)
+        .await
+        .expect("failed to seed replayed ClickHouse blocks");
+
+    let err = sinks
+        .hydrate_postgres_from_clickhouse(1, 6)
+        .await
+        .expect_err("incomplete ClickHouse range must be rejected");
+    assert!(err.to_string().contains("returned 5 of 6 blocks"));
+
+    sinks
+        .hydrate_postgres_from_clickhouse(2, 4)
+        .await
+        .expect("ClickHouse to PostgreSQL hydration failed");
+
+    let conn = pool.get().await.unwrap();
+    let counts = conn
+        .query_one(
+            "SELECT (SELECT count(*) FROM blocks), (SELECT count(*) FROM txs), \
+             (SELECT count(*) FROM logs), (SELECT count(*) FROM receipts)",
+            &[],
+        )
+        .await
+        .unwrap();
+    assert_eq!(counts.get::<_, i64>(0), 3);
+    assert_eq!(counts.get::<_, i64>(1), 6);
+    assert_eq!(counts.get::<_, i64>(2), 3);
+    assert_eq!(counts.get::<_, i64>(3), 3);
+
+    let block = conn
+        .query_one("SELECT hash FROM blocks WHERE num = 2", &[])
+        .await
+        .unwrap();
+    assert_eq!(block.get::<_, Vec<u8>>(0), vec![2; 32]);
+
+    let tx = conn
+        .query_one("SELECT calls FROM txs WHERE block_num = 2 AND idx = 0", &[])
+        .await
+        .unwrap();
+    assert_eq!(
+        tx.get::<_, Option<serde_json::Value>>(0),
+        Some(serde_json::json!([{"to": "0x1234"}]))
+    );
+
+    let log = conn
+        .query_one(
+            "SELECT is_virtual_forward FROM logs WHERE block_num = 3",
+            &[],
+        )
+        .await
+        .unwrap();
+    assert!(log.get::<_, bool>(0));
+}
+
 /// Backfill should copy all blocks/txs/logs/receipts from PG to an empty CH.
 #[tokio::test]
 #[serial(clickhouse)]
 async fn test_backfill_pg_to_empty_clickhouse() {
-    let Some((pool, sinks, ch)) = setup_backfill().await else {
+    let Some((pool, sinks, _ch_sink, ch)) = setup_backfill().await else {
         return;
     };
 
@@ -1513,12 +2711,22 @@ async fn test_backfill_pg_to_empty_clickhouse() {
         .await
         .expect("PG write_receipts failed");
 
+    let plan = sinks
+        .clickhouse_backfill_plan(TEST_CHAIN_ID)
+        .await
+        .expect("backfill plan failed");
+    assert_eq!(plan.upper_bound, Some(10));
+    assert!(
+        plan.complete_before_realtime,
+        "legacy rows without sync state need an ordered startup catch-up"
+    );
+
     // Verify PG has data, CH is empty
     assert_eq!(ch.table_count("blocks").await.unwrap(), 0);
 
-    // Run backfill
+    // Run the ordered startup catch-up and establish the first durable tip.
     sinks
-        .backfill_clickhouse(TEST_CHAIN_ID)
+        .run_clickhouse_startup_backfill(TEST_CHAIN_ID, plan)
         .await
         .expect("backfill failed");
 
@@ -1527,13 +2735,313 @@ async fn test_backfill_pg_to_empty_clickhouse() {
     assert_eq!(ch.table_count("txs").await.unwrap(), 20);
     assert_eq!(ch.table_count("logs").await.unwrap(), 30);
     assert_eq!(ch.table_count("receipts").await.unwrap(), 20);
+    let state = writer::load_sync_state(&pool, TEST_CHAIN_ID)
+        .await
+        .unwrap()
+        .expect("startup catch-up should establish sync state");
+    assert_eq!(
+        state.tip_num, 10,
+        "realtime must resume after the copied PostgreSQL range"
+    );
+}
+
+/// A zero-valued sync row has no durable dual-write handoff either. Preserve
+/// the legacy PG catch-up, but require it to complete before realtime starts.
+#[tokio::test]
+#[serial(clickhouse)]
+async fn test_backfill_plan_serializes_zero_tip_legacy_rows() {
+    let Some((pool, sinks, _ch_sink, ch)) = setup_backfill().await else {
+        return;
+    };
+
+    let blocks: Vec<BlockRow> = (1..=3).map(make_block).collect();
+    writer::write_blocks(&pool, &blocks).await.unwrap();
+    writer::update_tip_num(&pool, TEST_CHAIN_ID, 0, 0)
+        .await
+        .unwrap();
+
+    let plan = sinks
+        .clickhouse_backfill_plan(TEST_CHAIN_ID)
+        .await
+        .expect("backfill plan failed");
+    assert_eq!(plan.upper_bound, Some(3));
+    assert!(plan.complete_before_realtime);
+
+    let pg_only = SinkSet::new(pool.clone());
+    pg_only
+        .run_clickhouse_startup_backfill(TEST_CHAIN_ID, plan)
+        .await
+        .unwrap();
+    let state = writer::load_sync_state(&pool, TEST_CHAIN_ID)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        state.tip_num, 0,
+        "startup handoff must not advance without an active ClickHouse sink"
+    );
+
+    sinks
+        .run_clickhouse_startup_backfill(TEST_CHAIN_ID, plan)
+        .await
+        .unwrap();
+    assert_eq!(ch.table_count("blocks").await.unwrap(), 3);
+    let state = writer::load_sync_state(&pool, TEST_CHAIN_ID)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(state.tip_num, 3);
+}
+
+#[tokio::test]
+#[serial(clickhouse)]
+async fn test_backfill_pg_to_clickhouse_preserves_virtual_forward_flag() {
+    let Some((pool, sinks, _ch_sink, ch)) = setup_backfill().await else {
+        return;
+    };
+
+    let blocks: Vec<BlockRow> = (1..=2).map(make_block).collect();
+    let txs: Vec<TxRow> = (1..=2).map(|b| make_tx(b, 0)).collect();
+    let mut logs: Vec<LogRow> = (1..=2).map(|b| make_log(b, 0)).collect();
+    logs[1].is_virtual_forward = true;
+    let receipts: Vec<ReceiptRow> = (1..=2).map(|b| make_receipt(b, 0)).collect();
+
+    writer::write_blocks(&pool, &blocks).await.unwrap();
+    writer::write_txs(&pool, &txs).await.unwrap();
+    writer::write_logs(&pool, &logs).await.unwrap();
+    writer::write_receipts(&pool, &receipts).await.unwrap();
+
+    sinks.backfill_clickhouse(TEST_CHAIN_ID).await.unwrap();
+
+    let result = ch
+        .query_json("SELECT block_num, is_virtual_forward FROM logs ORDER BY block_num")
+        .await
+        .unwrap();
+    let rows = result["data"].as_array().unwrap();
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0]["is_virtual_forward"].as_u64(), Some(0));
+    assert_eq!(rows[1]["is_virtual_forward"].as_u64(), Some(1));
+}
+
+/// A restarted backfill (stale cursor) must not duplicate blocks ClickHouse
+/// already holds: each table's rows are filtered by that table's own
+/// presence before each batch write.
+#[tokio::test]
+#[serial(clickhouse)]
+async fn test_backfill_restart_does_not_duplicate_present_blocks() {
+    let Some((pool, sinks, _ch_sink, ch)) = setup_backfill().await else {
+        return;
+    };
+
+    // Two backfill batches: BACKFILL_BLOCK_BATCH blocks plus one.
+    let blocks: Vec<BlockRow> = (1..=5001).map(make_block).collect();
+    writer::write_blocks(&pool, &blocks)
+        .await
+        .expect("PG write_blocks failed");
+
+    sinks
+        .backfill_clickhouse(TEST_CHAIN_ID)
+        .await
+        .expect("backfill failed");
+    assert_eq!(ch.table_count("blocks").await.unwrap(), 5001);
+
+    // Block merges so surviving duplicates stay visible, then rewind the
+    // cursor to simulate a restart with stale state.
+    ch.query_raw(&format!("SYSTEM STOP MERGES {SINK_DB}.blocks"))
+        .await
+        .expect("stop merges failed");
+    let conn = pool.get().await.unwrap();
+    conn.execute(
+        "UPDATE sync_state SET ch_backfill_block = 0 WHERE chain_id = $1",
+        &[&(TEST_CHAIN_ID as i64)],
+    )
+    .await
+    .expect("cursor rewind failed");
+    drop(conn);
+
+    sinks
+        .backfill_clickhouse(TEST_CHAIN_ID)
+        .await
+        .expect("backfill rerun failed");
+    assert_eq!(ch.table_count("blocks").await.unwrap(), 5001);
+}
+
+/// A failed chunk can leave only some rows for a block in a child table.
+/// Backfill must filter by the full natural key, not skip the whole block.
+#[tokio::test]
+#[serial(clickhouse)]
+async fn test_backfill_repairs_partial_child_table_blocks() {
+    let Some((pool, sinks, ch_sink, ch)) = setup_backfill().await else {
+        return;
+    };
+
+    let blocks = vec![make_block(1)];
+    let txs: Vec<_> = (0..2).map(|idx| make_tx(1, idx)).collect();
+    let logs: Vec<_> = (0..2).map(|idx| make_log(1, idx)).collect();
+    let receipts: Vec<_> = (0..2).map(|idx| make_receipt(1, idx)).collect();
+
+    writer::write_blocks(&pool, &blocks).await.unwrap();
+    writer::write_txs(&pool, &txs).await.unwrap();
+    writer::write_logs(&pool, &logs).await.unwrap();
+    writer::write_receipts(&pool, &receipts).await.unwrap();
+
+    ch_sink.write_txs(&txs[..1]).await.unwrap();
+    ch_sink.write_logs(&logs[..1]).await.unwrap();
+    ch_sink.write_receipts(&receipts[..1]).await.unwrap();
+
+    sinks.backfill_clickhouse(TEST_CHAIN_ID).await.unwrap();
+
+    assert_eq!(ch.table_count("blocks").await.unwrap(), 1);
+    assert_eq!(ch.table_count("txs").await.unwrap(), 2);
+    assert_eq!(ch.table_count("logs").await.unwrap(), 2);
+    assert_eq!(ch.table_count("receipts").await.unwrap(), 2);
+}
+
+/// A stale partial write can reuse canonical child positions and retain extra
+/// rows from the replaced block. Backfill must clear the exact block and replay
+/// every canonical row, including when ClickHouse remembers the original token.
+#[tokio::test]
+#[serial(clickhouse)]
+async fn test_backfill_replays_blocks_with_stale_child_rows() {
+    let Some((_pool, sinks, ch_sink, ch)) = setup_backfill().await else {
+        return;
+    };
+
+    let blocks = vec![make_block(1)];
+    let txs: Vec<_> = (0..2).map(|idx| make_tx(1, idx)).collect();
+    let logs: Vec<_> = (0..2).map(|idx| make_log(1, idx)).collect();
+    let receipts: Vec<_> = (0..2).map(|idx| make_receipt(1, idx)).collect();
+
+    // Record the ordinary deterministic tokens, then remove the rows without
+    // evicting those tokens from ClickHouse's deduplication window.
+    sinks
+        .write_all(&blocks, &txs, &logs, &receipts)
+        .await
+        .unwrap();
+    ch_sink.delete_from(1).await.unwrap();
+
+    let mut stale_txs = txs.clone();
+    stale_txs[1].hash = vec![0xee; 32];
+    let mut stale_logs = logs.clone();
+    stale_logs[1].address = vec![0xee; 20];
+    stale_logs[1].selector = Some(vec![0xee; 4]);
+    stale_logs.push(make_log(1, 2));
+    let mut stale_receipts = receipts.clone();
+    stale_receipts[1].gas_used += 1;
+
+    ch_sink.write_txs(&stale_txs).await.unwrap();
+    ch_sink.write_logs(&stale_logs).await.unwrap();
+    ch_sink.write_receipts(&stale_receipts).await.unwrap();
+    ch_sink.write_blocks(&blocks).await.unwrap();
+
+    sinks.backfill_clickhouse(TEST_CHAIN_ID).await.unwrap();
+
+    assert_eq!(ch.table_count_final("blocks").await.unwrap(), 1);
+    assert_eq!(ch.table_count_final("txs").await.unwrap(), 2);
+    assert_eq!(ch.table_count_final("logs").await.unwrap(), 2);
+    assert_eq!(ch.table_count_final("receipts").await.unwrap(), 2);
+
+    let tx_result = ch
+        .query_json("SELECT hash FROM txs FINAL WHERE block_num = 1 AND idx = 1")
+        .await
+        .unwrap();
+    assert_eq!(
+        tx_result["data"][0]["hash"].as_str(),
+        Some(format!("0x{}", hex::encode(&txs[1].hash)).as_str())
+    );
+    let log_result = ch
+        .query_json("SELECT address FROM logs FINAL WHERE block_num = 1 AND log_idx = 1")
+        .await
+        .unwrap();
+    assert_eq!(
+        log_result["data"][0]["address"].as_str(),
+        Some(format!("0x{}", hex::encode(&logs[1].address)).as_str())
+    );
+    let receipt_result = ch
+        .query_json("SELECT gas_used FROM receipts FINAL WHERE block_num = 1 AND tx_idx = 1")
+        .await
+        .unwrap();
+    assert_eq!(receipt_result["data"][0]["gas_used"].as_i64(), Some(21_000));
+}
+
+/// A canonical block can coexist with an older distinct version until a merge.
+/// Backfill must replace the entire block instead of treating the canonical row
+/// as sufficient.
+#[tokio::test]
+#[serial(clickhouse)]
+async fn test_backfill_replays_blocks_with_extra_block_versions() {
+    let Some((pool, sinks, ch_sink, ch)) = setup_backfill().await else {
+        return;
+    };
+
+    let blocks = vec![make_block(1)];
+    writer::write_blocks(&pool, &blocks).await.unwrap();
+
+    let mut stale_blocks = blocks.clone();
+    stale_blocks[0].hash = vec![0xee; 32];
+    stale_blocks.extend(blocks.clone());
+    ch_sink.write_blocks(&stale_blocks).await.unwrap();
+    assert_eq!(ch.table_count("blocks").await.unwrap(), 2);
+
+    sinks.backfill_clickhouse(TEST_CHAIN_ID).await.unwrap();
+
+    assert_eq!(ch.table_count("blocks").await.unwrap(), 1);
+    let result = ch
+        .query_json("SELECT hash FROM blocks WHERE num = 1")
+        .await
+        .unwrap();
+    assert_eq!(
+        result["data"][0]["hash"].as_str(),
+        Some(format!("0x{}", hex::encode(&blocks[0].hash)).as_str())
+    );
+}
+
+/// Replay must recover both completed deletion and cleanup interrupted after
+/// the block marker was removed, without reusing remembered insert tokens.
+#[tokio::test]
+#[serial(clickhouse)]
+async fn test_backfill_recovers_interrupted_exact_block_repair() {
+    let Some((pool, sinks, ch_sink, ch)) = setup_backfill().await else {
+        return;
+    };
+
+    let alice = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    let bob = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    let blocks = vec![make_block(1)];
+    let txs = vec![make_tx(1, 0)];
+    let logs = vec![make_transfer_log(1, 0, alice, bob, 100)];
+    let receipts = vec![make_receipt(1, 0)];
+
+    sinks
+        .write_all(&blocks, &txs, &logs, &receipts)
+        .await
+        .unwrap();
+
+    ch_sink.delete_from(1).await.unwrap();
+    set_ch_backfill_cursor(&pool, TEST_CHAIN_ID, 0).await;
+    sinks.backfill_clickhouse(TEST_CHAIN_ID).await.unwrap();
+    assert_replayed_transfer_block(&ch, alice, bob).await;
+
+    // Simulate a crash midway through marker-first exact cleanup.
+    for sql in [
+        "ALTER TABLE blocks DELETE WHERE num = 1 SETTINGS mutations_sync = 1",
+        "ALTER TABLE token_holder_deltas DELETE WHERE block_num = 1 SETTINGS mutations_sync = 1",
+        "ALTER TABLE token_transfers DELETE WHERE block_num = 1 SETTINGS mutations_sync = 1",
+        "ALTER TABLE txs DELETE WHERE block_num = 1 SETTINGS mutations_sync = 1",
+    ] {
+        ch.query(sql).await.unwrap();
+    }
+
+    set_ch_backfill_cursor(&pool, TEST_CHAIN_ID, 0).await;
+    sinks.backfill_clickhouse(TEST_CHAIN_ID).await.unwrap();
+    assert_replayed_transfer_block(&ch, alice, bob).await;
 }
 
 /// Backfill should resume from the persisted PG cursor.
 #[tokio::test]
 #[serial(clickhouse)]
 async fn test_backfill_resumes_from_highwater_mark() {
-    let Some((pool, sinks, ch)) = setup_backfill().await else {
+    let Some((pool, sinks, _ch_sink, ch)) = setup_backfill().await else {
         return;
     };
 
@@ -1568,15 +3076,15 @@ async fn test_backfill_resumes_from_highwater_mark() {
         .await
         .expect("backfill failed");
 
-    assert_eq!(ch.table_count("blocks").await.unwrap(), 20);
-    assert_eq!(ch.table_count("txs").await.unwrap(), 20);
+    assert_eq!(ch.table_count_final("blocks").await.unwrap(), 20);
+    assert_eq!(ch.table_count_final("txs").await.unwrap(), 20);
 }
 
 /// Backfill should be a no-op when the persisted cursor is already up to date.
 #[tokio::test]
 #[serial(clickhouse)]
 async fn test_backfill_noop_when_up_to_date() {
-    let Some((pool, sinks, ch)) = setup_backfill().await else {
+    let Some((pool, sinks, _ch_sink, ch)) = setup_backfill().await else {
         return;
     };
 
@@ -1606,7 +3114,7 @@ async fn test_backfill_noop_when_up_to_date() {
 #[tokio::test]
 #[serial(clickhouse)]
 async fn test_backfill_noop_when_pg_empty() {
-    let Some((_pool, sinks, ch)) = setup_backfill().await else {
+    let Some((_pool, sinks, _ch_sink, ch)) = setup_backfill().await else {
         return;
     };
 
@@ -1619,12 +3127,52 @@ async fn test_backfill_noop_when_pg_empty() {
     assert_eq!(ch.table_count("blocks").await.unwrap(), 0);
 }
 
+/// The startup snapshot must not copy a PostgreSQL-first realtime commit
+/// beyond the last block durably acknowledged by both sinks.
+#[tokio::test]
+#[serial(clickhouse)]
+async fn test_backfill_stops_at_durable_sync_tip() {
+    let Some((pool, sinks, _ch_sink, ch)) = setup_backfill().await else {
+        return;
+    };
+
+    let blocks: Vec<BlockRow> = (1..=3).map(make_block).collect();
+    writer::write_blocks(&pool, &blocks).await.unwrap();
+    writer::update_tip_num(&pool, TEST_CHAIN_ID, 2, 3)
+        .await
+        .unwrap();
+
+    let plan = sinks
+        .clickhouse_backfill_plan(TEST_CHAIN_ID)
+        .await
+        .expect("backfill plan failed");
+    assert_eq!(plan.upper_bound, Some(2));
+    assert!(
+        !plan.complete_before_realtime,
+        "a positive durable tip is a non-overlapping realtime handoff"
+    );
+
+    sinks.backfill_clickhouse(TEST_CHAIN_ID).await.unwrap();
+
+    let result = ch
+        .query_json("SELECT num FROM blocks ORDER BY num")
+        .await
+        .unwrap();
+    let nums: Vec<_> = result["data"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|row| row["num"].as_i64().unwrap())
+        .collect();
+    assert_eq!(nums, vec![1, 2]);
+}
+
 /// If CH is partially populated but the cursor was never advanced, backfill
 /// should safely replay the full range and converge after deduplication.
 #[tokio::test]
 #[serial(clickhouse)]
 async fn test_backfill_per_table_independent_highwater() {
-    let Some((pool, sinks, ch)) = setup_backfill().await else {
+    let Some((pool, sinks, _ch_sink, ch)) = setup_backfill().await else {
         return;
     };
 
@@ -1654,8 +3202,8 @@ async fn test_backfill_per_table_independent_highwater() {
     ch_sink.write_txs(&partial_txs).await.unwrap();
     // logs and receipts: nothing in CH
 
-    assert_eq!(ch.table_count("blocks").await.unwrap(), 10);
-    assert_eq!(ch.table_count("txs").await.unwrap(), 10); // only 5 blocks × 2 txs
+    assert_eq!(ch.table_count_final("blocks").await.unwrap(), 10);
+    assert_eq!(ch.table_count_final("txs").await.unwrap(), 10); // only 5 blocks × 2 txs
     assert_eq!(ch.table_count("logs").await.unwrap(), 0);
     assert_eq!(ch.table_count("receipts").await.unwrap(), 0);
 
@@ -1677,7 +3225,7 @@ async fn test_backfill_per_table_independent_highwater() {
 #[tokio::test]
 #[serial(clickhouse)]
 async fn test_backfill_multi_batch_pagination() {
-    let Some((pool, sinks, ch)) = setup_backfill().await else {
+    let Some((pool, sinks, _ch_sink, ch)) = setup_backfill().await else {
         return;
     };
 
@@ -1698,7 +3246,10 @@ async fn test_backfill_multi_batch_pagination() {
         .await
         .expect("backfill failed");
 
-    assert_eq!(ch.table_count("blocks").await.unwrap(), block_count as u64);
+    assert_eq!(
+        ch.table_count_final("blocks").await.unwrap(),
+        block_count as u64
+    );
 
     // Verify first and last blocks roundtripped
     let result = ch
@@ -1722,7 +3273,7 @@ async fn test_backfill_multi_batch_pagination() {
 #[tokio::test]
 #[serial(clickhouse)]
 async fn test_backfill_idempotent() {
-    let Some((pool, sinks, ch)) = setup_backfill().await else {
+    let Some((pool, sinks, _ch_sink, ch)) = setup_backfill().await else {
         return;
     };
 

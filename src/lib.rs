@@ -1,6 +1,7 @@
 pub mod api;
 pub mod broadcast;
 pub mod clickhouse;
+pub mod clickhouse_schema;
 pub mod config;
 pub mod db;
 pub mod metrics;
@@ -9,3 +10,4 @@ pub mod service;
 pub mod sync;
 pub mod tempo;
 pub mod types;
+pub mod virtual_address;

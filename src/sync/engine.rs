@@ -1,30 +1,38 @@
+use alloy::consensus::BlockHeader as _;
 use alloy::network::ReceiptResponse;
 use anyhow::Result;
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::sync::broadcast;
 use tracing::{debug, error, info};
 
 use crate::broadcast::{BlockUpdate, Broadcaster};
 use crate::db::{Pool, ThrottledPool};
 use crate::metrics::{self, SyncProgress};
-use crate::types::SyncState;
+use crate::types::{LogRow, ReceiptRow, SyncState};
 
 use super::decoder::{
-    decode_block, decode_log, decode_receipt, decode_transaction, enrich_txs_from_receipts,
-    timestamp_from_secs,
+    decode_block, decode_log, decode_receipt, decode_transaction, enrich_receipts_from_txs,
+    enrich_txs_from_receipts, timestamp_from_secs,
 };
 use super::fetcher::RpcClient;
-use super::sink::SinkSet;
+use super::sink::{SinkSet, WriteTarget};
 use super::writer::{
-    detect_all_gaps, detect_blocks_missing_receipts, find_fork_point, get_block_hash, has_gaps,
-    load_sync_state, save_sync_state, update_sync_rate, update_synced_num, update_tip_num,
+    detect_all_gaps, detect_blocks_missing_receipts, discover_legacy_receipt_repairs,
+    find_fork_point, finish_receipt_repair_attempt, get_block_hash, has_gaps, load_sync_state,
+    save_sync_state, update_sync_rate, update_synced_num, update_tip_num,
 };
+use crate::virtual_address::mark_virtual_forward_hops;
 
 /// RPC concurrency limits
 const REALTIME_RPC_CONCURRENCY: usize = 4;
 const BACKFILL_RPC_CONCURRENCY: usize = 8;
+const RECEIPT_BACKFILL_BLOCK_LIMIT: i64 = 100;
+const RECEIPT_BACKFILL_DISCOVERY_WINDOW: i64 = 1_000;
+const RECEIPT_BACKFILL_POLL_INTERVAL: Duration = Duration::from_secs(2);
+const RECEIPT_BACKFILL_MAX_WRITE_ROWS: usize = 50_000;
+const RECEIPT_BACKFILL_INFO_ROWS: usize = 10_000;
 
 pub struct SyncEngine {
     /// Throttled pool - shared by all, but backfill is rate-limited
@@ -40,6 +48,7 @@ pub struct SyncEngine {
     batch_size: u64,
     concurrency: usize,
     backfill_first: bool,
+    gapfill_enabled: bool,
     /// Skip parent hash validation (trust RPC for reorg handling)
     trust_rpc: bool,
 }
@@ -69,6 +78,7 @@ impl SyncEngine {
             batch_size: 100,
             concurrency: 4,
             backfill_first: false,
+            gapfill_enabled: true,
             trust_rpc: false,
         })
     }
@@ -90,6 +100,15 @@ impl SyncEngine {
 
     pub fn with_backfill_first(mut self, backfill_first: bool) -> Self {
         self.backfill_first = backfill_first;
+        self
+    }
+
+    /// Disable the PostgreSQL-driven historical gap-fill loop.
+    ///
+    /// Tiered deployments run independent ClickHouse archive and PostgreSQL
+    /// hot-window reconcilers instead.
+    pub fn with_gapfill_enabled(mut self, enabled: bool) -> Self {
+        self.gapfill_enabled = enabled;
         self
     }
 
@@ -148,8 +167,12 @@ impl SyncEngine {
             let remote_head = self.realtime_rpc.latest_block_number().await?;
             update_tip_num(self.pool(), self.chain_id, remote_head, remote_head).await?;
 
-            // Check for gaps
-            let gaps = detect_all_gaps(self.pool(), remote_head).await?;
+            // Check for gaps (reload state: pruner may advance the floor)
+            let floor = load_sync_state(self.pool(), self.chain_id)
+                .await?
+                .unwrap_or_default()
+                .prune_floor();
+            let gaps = detect_all_gaps(self.pool(), floor, remote_head).await?;
             if gaps.is_empty() {
                 info!(
                     chain_id = self.chain_id,
@@ -232,17 +255,19 @@ impl SyncEngine {
         let gapfill_chain_id = self.chain_id;
         let gapfill_batch_size = self.batch_size;
         let gapfill_concurrency = self.concurrency;
-        let gapfill_handle = tokio::spawn(async move {
-            run_gapfill_loop(
-                gapfill_sinks,
-                gapfill_semaphore,
-                gapfill_rpc,
-                gapfill_chain_id,
-                gapfill_batch_size,
-                gapfill_concurrency,
-                gapfill_shutdown,
-            )
-            .await
+        let gapfill_handle = self.gapfill_enabled.then(|| {
+            tokio::spawn(async move {
+                run_gapfill_loop(
+                    gapfill_sinks,
+                    gapfill_semaphore,
+                    gapfill_rpc,
+                    gapfill_chain_id,
+                    gapfill_batch_size,
+                    gapfill_concurrency,
+                    gapfill_shutdown,
+                )
+                .await
+            })
         });
 
         // Spawn receipt backfill as a separate background task
@@ -277,7 +302,9 @@ impl SyncEngine {
         }
 
         // Abort background tasks
-        gapfill_handle.abort();
+        if let Some(gapfill_handle) = gapfill_handle {
+            gapfill_handle.abort();
+        }
         receipt_handle.abort();
         Ok(())
     }
@@ -408,14 +435,14 @@ impl SyncEngine {
                 for block in &blocks {
                     broadcaster.send(BlockUpdate {
                         chain_id: self.chain_id,
-                        block_num: block.header.number,
+                        block_num: block.header.number(),
                         block_hash: format!("0x{}", hex::encode(block.header.hash)),
                         tx_count: block.transactions.len() as u64,
                         log_count: logs_per_block
-                            .get(&(block.header.number as i64))
+                            .get(&(block.header.number() as i64))
                             .copied()
                             .unwrap_or(0),
-                        timestamp: block.header.timestamp as i64,
+                        timestamp: block.header.timestamp() as i64,
                     });
                 }
             }
@@ -445,7 +472,7 @@ impl SyncEngine {
         }
 
         let first_block = &blocks[0];
-        let first_num = first_block.header.number;
+        let first_num = first_block.header.number();
 
         // Check parent hash against stored block (if not genesis)
         if first_num > 0
@@ -454,7 +481,7 @@ impl SyncEngine {
             let expected_parent: [u8; 32] = stored_hash
                 .try_into()
                 .map_err(|_| anyhow::anyhow!("Invalid stored hash length"))?;
-            if first_block.header.parent_hash.0 != expected_parent {
+            if first_block.header.parent_hash().0 != expected_parent {
                 // Reorg detected - handle it automatically
                 return self.handle_reorg(first_num).await;
             }
@@ -462,11 +489,11 @@ impl SyncEngine {
 
         // Validate internal chain continuity
         for window in blocks.windows(2) {
-            if window[1].header.parent_hash != window[0].header.hash {
+            if window[1].header.parent_hash() != window[0].header.hash {
                 return Err(anyhow::anyhow!(
                     "Internal chain break at block {}: parent_hash {:?} != prev hash {:?}",
-                    window[1].header.number,
-                    hex::encode(window[1].header.parent_hash.0),
+                    window[1].header.number(),
+                    hex::encode(window[1].header.parent_hash().0),
                     hex::encode(window[0].header.hash.0)
                 ));
             }
@@ -526,7 +553,7 @@ impl SyncEngine {
         let state = load_sync_state(self.pool(), self.chain_id)
             .await?
             .unwrap_or_default();
-        let gaps = detect_all_gaps(self.pool(), state.tip_num).await?;
+        let gaps = detect_all_gaps(self.pool(), state.prune_floor(), state.tip_num).await?;
         let mut filled = 0;
 
         for (start, end) in gaps {
@@ -551,7 +578,7 @@ impl SyncEngine {
         Vec<crate::types::ReceiptRow>,
     )> {
         let (blocks, receipts) = tokio::try_join!(
-            self.realtime_rpc.get_blocks_batch(from..=to),
+            self.realtime_rpc.get_blocks_batch_adaptive(from..=to),
             self.realtime_rpc.get_receipts_batch_adaptive(from..=to)
         )?;
 
@@ -560,7 +587,7 @@ impl SyncEngine {
 
         let block_timestamps: HashMap<u64, _> = blocks
             .iter()
-            .map(|b| (b.header.number, timestamp_from_secs(b.header.timestamp)))
+            .map(|b| (b.header.number(), timestamp_from_secs(b.header.timestamp())))
             .collect();
 
         let block_rows: Vec<_> = blocks.iter().map(decode_block).collect();
@@ -576,7 +603,7 @@ impl SyncEngine {
             })
             .collect();
 
-        let all_logs: Vec<_> = receipts
+        let mut all_logs: Vec<_> = receipts
             .iter()
             .flatten()
             .flat_map(|receipt| {
@@ -595,7 +622,7 @@ impl SyncEngine {
             })
             .collect();
 
-        let all_receipts: Vec<_> = receipts
+        let mut all_receipts: Vec<_> = receipts
             .iter()
             .flatten()
             .filter_map(|receipt| {
@@ -607,6 +634,13 @@ impl SyncEngine {
             .collect();
 
         enrich_txs_from_receipts(&mut all_txs, &all_receipts);
+        enrich_receipts_from_txs(&mut all_receipts, &all_txs);
+
+        // TIP-1022: mark virtual address forwarding hops
+        let forward_marks = mark_virtual_forward_hops(&all_logs);
+        for (log, is_forward) in all_logs.iter_mut().zip(forward_marks) {
+            log.is_virtual_forward = is_forward;
+        }
 
         Ok((blocks, block_rows, all_txs, all_logs, all_receipts))
     }
@@ -629,7 +663,7 @@ impl SyncEngine {
         )?;
 
         let block_row = decode_block(&block);
-        let block_ts = timestamp_from_secs(block.header.timestamp);
+        let block_ts = timestamp_from_secs(block.header.timestamp());
         let mut txs: Vec<_> = block
             .transactions
             .txns()
@@ -637,17 +671,24 @@ impl SyncEngine {
             .map(|(i, tx)| decode_transaction(tx, &block, i as u32))
             .collect();
 
-        let log_rows: Vec<_> = receipts
+        let mut log_rows: Vec<_> = receipts
             .iter()
             .flat_map(|r| r.inner.logs().iter().map(|log| decode_log(log, block_ts)))
             .collect();
 
-        let receipt_rows: Vec<_> = receipts
+        let mut receipt_rows: Vec<_> = receipts
             .iter()
             .map(|r| decode_receipt(r, block_ts))
             .collect();
 
         enrich_txs_from_receipts(&mut txs, &receipt_rows);
+        enrich_receipts_from_txs(&mut receipt_rows, &txs);
+
+        // TIP-1022: mark virtual address forwarding hops
+        let forward_marks = mark_virtual_forward_hops(&log_rows);
+        for (log, is_forward) in log_rows.iter_mut().zip(forward_marks) {
+            log.is_virtual_forward = is_forward;
+        }
 
         self.sinks
             .write_all(
@@ -670,6 +711,7 @@ impl SyncEngine {
             backfill_num: state.backfill_num,
             sync_rate: state.sync_rate,
             started_at: state.started_at,
+            pruned_below: state.pruned_below,
         };
         save_sync_state(self.pool(), &new_state).await?;
 
@@ -860,10 +902,9 @@ async fn tick_gapfill_parallel(
     // are any gaps at all. Only fall back to the expensive LAG() window
     // function when gaps actually exist and we need their exact ranges.
     // With 0.5s block time, tip_num races ahead of synced_num constantly,
-    // so we check the range [1, tip_num] cheaply via COUNT vs expected.
-    if state.tip_num > 0 && !has_gaps(pool, 1, state.tip_num).await? {
-        metrics::set_gap_blocks(chain_id, "postgres", 0);
-        metrics::set_gap_count(chain_id, "postgres", 0);
+    // so we check the range [floor, tip_num] cheaply via COUNT vs expected.
+    if state.tip_num > 0 && !has_gaps(pool, state.prune_floor(), state.tip_num).await? {
+        metrics::set_gap_ranges(chain_id, "postgres", &[]);
         metrics::set_synced(chain_id, realtime_lag == 0);
         if state.synced_num < state.tip_num {
             update_synced_num(pool, chain_id, state.tip_num).await?;
@@ -873,12 +914,11 @@ async fn tick_gapfill_parallel(
     }
 
     // Gaps exist — run the expensive window function to find exact ranges
-    let gaps = detect_all_gaps(pool, state.tip_num).await?;
+    let gaps = detect_all_gaps(pool, state.prune_floor(), state.tip_num).await?;
 
     if gaps.is_empty() {
         // No gaps - fully synced from genesis to tip
-        metrics::set_gap_blocks(chain_id, "postgres", 0);
-        metrics::set_gap_count(chain_id, "postgres", 0);
+        metrics::set_gap_ranges(chain_id, "postgres", &[]);
         metrics::set_synced(chain_id, realtime_lag == 0);
         if state.synced_num < state.tip_num {
             update_synced_num(pool, chain_id, state.tip_num).await?;
@@ -890,8 +930,7 @@ async fn tick_gapfill_parallel(
 
     let total_gap_blocks: u64 = gaps.iter().map(|(s, e)| e - s + 1).sum();
     let gap_count = gaps.len();
-    metrics::set_gap_blocks(chain_id, "postgres", total_gap_blocks);
-    metrics::set_gap_count(chain_id, "postgres", gap_count as u64);
+    metrics::set_gap_ranges(chain_id, "postgres", &gaps);
     metrics::set_synced(chain_id, false);
 
     // Collect all batch ranges to process (from most recent gaps first)
@@ -990,7 +1029,7 @@ async fn tick_gapfill_parallel(
                     "postgres",
                     total_gap_blocks.saturating_sub(completed),
                 );
-                progress.report_backfill(completed, total_gap_blocks, batch_count);
+                progress.report_gap_fill(completed, total_gap_blocks, batch_count);
 
                 debug!(
                     from = start,
@@ -1148,10 +1187,11 @@ async fn tick_gapfill_parallel_no_throttle(
     let pool = sinks.pool();
     let state = load_sync_state(pool, chain_id).await?.unwrap_or_default();
 
-    // Detect ALL gaps including from genesis, sorted by end DESC (most recent first)
-    let gaps = detect_all_gaps(pool, state.tip_num).await?;
+    // Detect ALL gaps above the prune floor, sorted by end DESC (most recent first)
+    let gaps = detect_all_gaps(pool, state.prune_floor(), state.tip_num).await?;
 
     if gaps.is_empty() {
+        metrics::set_gap_ranges(chain_id, "postgres", &[]);
         if state.synced_num < state.tip_num {
             update_synced_num(pool, chain_id, state.tip_num).await?;
             info!(synced_num = state.tip_num, "Backfill: fully synced");
@@ -1161,6 +1201,7 @@ async fn tick_gapfill_parallel_no_throttle(
 
     let total_gap_blocks: u64 = gaps.iter().map(|(s, e)| e - s + 1).sum();
     let gap_count = gaps.len();
+    metrics::set_gap_ranges(chain_id, "postgres", &gaps);
 
     // Collect all batch ranges to process (from most recent gaps first)
     let mut batch_ranges: Vec<(u64, u64)> = Vec::new();
@@ -1220,7 +1261,7 @@ async fn tick_gapfill_parallel_no_throttle(
                     "postgres",
                     total_gap_blocks.saturating_sub(completed),
                 );
-                progress.report_backfill(completed, total_gap_blocks, batch_count);
+                progress.report_gap_fill(completed, total_gap_blocks, batch_count);
 
                 debug!(
                     from = start,
@@ -1321,29 +1362,35 @@ async fn tick_gapfill_parallel_no_throttle(
     Ok(())
 }
 
-/// Check if fully synced (no gaps from genesis to tip)
+/// Check if fully synced (no gaps from `floor` to tip)
 #[allow(dead_code)]
-async fn is_fully_synced(pool: &Pool, tip_num: u64) -> Result<bool> {
-    let gaps = detect_all_gaps(pool, tip_num).await?;
+async fn is_fully_synced(pool: &Pool, floor: u64, tip_num: u64) -> Result<bool> {
+    let gaps = detect_all_gaps(pool, floor, tip_num).await?;
     Ok(gaps.is_empty())
 }
 
 /// Standalone sync_range for gap-fill (doesn't need SyncEngine self)
-async fn sync_range_standalone(sinks: &SinkSet, rpc: &RpcClient, from: u64, to: u64) -> Result<()> {
+pub(crate) async fn sync_range_standalone_to(
+    sinks: &SinkSet,
+    rpc: &RpcClient,
+    from: u64,
+    to: u64,
+    target: WriteTarget,
+) -> Result<()> {
     use super::decoder::{
-        decode_block, decode_log, decode_receipt, decode_transaction, enrich_txs_from_receipts,
-        timestamp_from_secs,
+        decode_block, decode_log, decode_receipt, decode_transaction, enrich_receipts_from_txs,
+        enrich_txs_from_receipts, timestamp_from_secs,
     };
     use alloy::network::ReceiptResponse;
 
     let (blocks, receipts) = tokio::try_join!(
-        rpc.get_blocks_batch(from..=to),
+        rpc.get_blocks_batch_adaptive(from..=to),
         rpc.get_receipts_batch_adaptive(from..=to)
     )?;
 
     let block_timestamps: HashMap<u64, _> = blocks
         .iter()
-        .map(|b| (b.header.number, timestamp_from_secs(b.header.timestamp)))
+        .map(|b| (b.header.number(), timestamp_from_secs(b.header.timestamp())))
         .collect();
 
     let block_rows: Vec<_> = blocks.iter().map(decode_block).collect();
@@ -1359,7 +1406,7 @@ async fn sync_range_standalone(sinks: &SinkSet, rpc: &RpcClient, from: u64, to: 
         })
         .collect();
 
-    let all_logs: Vec<_> = receipts
+    let mut all_logs: Vec<_> = receipts
         .iter()
         .flatten()
         .flat_map(|receipt| {
@@ -1378,7 +1425,7 @@ async fn sync_range_standalone(sinks: &SinkSet, rpc: &RpcClient, from: u64, to: 
         })
         .collect();
 
-    let all_receipts: Vec<_> = receipts
+    let mut all_receipts: Vec<_> = receipts
         .iter()
         .flatten()
         .filter_map(|receipt| {
@@ -1390,12 +1437,37 @@ async fn sync_range_standalone(sinks: &SinkSet, rpc: &RpcClient, from: u64, to: 
         .collect();
 
     enrich_txs_from_receipts(&mut all_txs, &all_receipts);
+    enrich_receipts_from_txs(&mut all_receipts, &all_txs);
 
-    sinks
-        .write_all(&block_rows, &all_txs, &all_logs, &all_receipts)
-        .await?;
+    // TIP-1022: mark virtual address forwarding hops
+    let forward_marks = mark_virtual_forward_hops(&all_logs);
+    for (log, is_forward) in all_logs.iter_mut().zip(forward_marks) {
+        log.is_virtual_forward = is_forward;
+    }
+
+    match target {
+        WriteTarget::All => {
+            sinks
+                .write_all(&block_rows, &all_txs, &all_logs, &all_receipts)
+                .await?;
+        }
+        WriteTarget::Postgres => {
+            sinks
+                .write_all_postgres(&block_rows, &all_txs, &all_logs, &all_receipts)
+                .await?;
+        }
+        WriteTarget::ClickHouse => {
+            sinks
+                .write_all_clickhouse(&block_rows, &all_txs, &all_logs, &all_receipts)
+                .await?;
+        }
+    }
 
     Ok(())
+}
+
+async fn sync_range_standalone(sinks: &SinkSet, rpc: &RpcClient, from: u64, to: u64) -> Result<()> {
+    sync_range_standalone_to(sinks, rpc, from, to, WriteTarget::All).await
 }
 
 /// Receipt backfill loop: repairs any blocks missing receipts/logs.
@@ -1422,6 +1494,8 @@ async fn run_receipt_backfill_loop(
                 if let Err(e) = result {
                     error!(chain_id, error = %e, "Receipt backfill tick failed");
                     tokio::time::sleep(Duration::from_secs(1)).await;
+                } else {
+                    tokio::time::sleep(RECEIPT_BACKFILL_POLL_INTERVAL).await;
                 }
             }
         }
@@ -1435,15 +1509,21 @@ async fn tick_receipt_backfill(sinks: &SinkSet, rpc: &RpcClient, chain_id: u64) 
     use super::decoder::{decode_log, decode_receipt};
     use alloy::network::ReceiptResponse;
 
-    const BATCH_LIMIT: i64 = 100;
     let pool = sinks.pool();
 
-    // Find blocks that have no receipts (most recent first)
-    let blocks_missing = detect_blocks_missing_receipts(pool, BATCH_LIMIT).await?;
+    let discovered =
+        discover_legacy_receipt_repairs(pool, chain_id, RECEIPT_BACKFILL_DISCOVERY_WINDOW).await?;
+    if discovered > 0 {
+        info!(
+            chain_id,
+            discovered, "Receipt backfill: discovered legacy work"
+        );
+    }
+
+    // Claim due work from the durable queue (most recent first).
+    let blocks_missing = detect_blocks_missing_receipts(pool, RECEIPT_BACKFILL_BLOCK_LIMIT).await?;
 
     if blocks_missing.is_empty() {
-        // All caught up, sleep before checking again
-        tokio::time::sleep(Duration::from_secs(2)).await;
         return Ok(());
     }
 
@@ -1489,58 +1569,102 @@ async fn tick_receipt_backfill(sinks: &SinkSet, rpc: &RpcClient, chain_id: u64) 
             })
             .collect();
 
-        // Decode logs and receipts
-        let all_logs: Vec<_> = receipts
-            .iter()
-            .flatten()
-            .flat_map(|receipt| {
-                let block_num = receipt.block_number().unwrap_or(0);
-                block_timestamps
-                    .get(&block_num)
-                    .map(|&ts| {
-                        receipt
-                            .inner
-                            .logs()
-                            .iter()
-                            .map(move |log| decode_log(log, ts))
-                    })
-                    .into_iter()
-                    .flatten()
-            })
-            .collect();
+        let mut chunk_logs: Vec<LogRow> = Vec::new();
+        let mut chunk_receipts: Vec<ReceiptRow> = Vec::new();
+        let mut chunk_min_block: Option<u64> = None;
+        let mut chunk_max_block: Option<u64> = None;
 
-        let all_receipts: Vec<_> = receipts
-            .iter()
-            .flatten()
-            .filter_map(|receipt| {
-                let block_num = receipt.block_number().unwrap_or(0);
-                block_timestamps
-                    .get(&block_num)
-                    .map(|&ts| decode_receipt(receipt, ts))
-            })
-            .collect();
+        for block_receipts in receipts {
+            let mut block_logs: Vec<_> = block_receipts
+                .iter()
+                .flat_map(|receipt| {
+                    let block_num = receipt.block_number().unwrap_or(0);
+                    block_timestamps
+                        .get(&block_num)
+                        .map(|&ts| {
+                            receipt
+                                .inner
+                                .logs()
+                                .iter()
+                                .map(move |log| decode_log(log, ts))
+                        })
+                        .into_iter()
+                        .flatten()
+                })
+                .collect();
 
-        let log_count = all_logs.len();
-        let receipt_count = all_receipts.len();
+            // TIP-1022: mark virtual address forwarding hops. Matching is scoped to a
+            // transaction, so doing this one block at a time keeps chunking safe.
+            let forward_marks = mark_virtual_forward_hops(&block_logs);
+            for (log, is_forward) in block_logs.iter_mut().zip(forward_marks) {
+                log.is_virtual_forward = is_forward;
+            }
 
-        // Write logs + receipts atomically in a single transaction
-        sinks.write_all(&[], &[], &all_logs, &all_receipts).await?;
+            let block_receipt_rows: Vec<_> = block_receipts
+                .iter()
+                .filter_map(|receipt| {
+                    let block_num = receipt.block_number().unwrap_or(0);
+                    block_timestamps
+                        .get(&block_num)
+                        .map(|&ts| decode_receipt(receipt, ts))
+                })
+                .collect();
 
-        if receipt_count > 0 {
-            min_block = Some(min_block.map_or(from, |m: u64| m.min(from)));
-            max_block = Some(max_block.map_or(to, |m: u64| m.max(to)));
+            let block_rows = receipt_backfill_rows(block_logs.len(), block_receipt_rows.len());
+            if should_flush_receipt_backfill_chunk(
+                receipt_backfill_rows(chunk_logs.len(), chunk_receipts.len()),
+                block_rows,
+            ) {
+                flush_receipt_backfill_chunk(
+                    sinks,
+                    chain_id,
+                    chunk_min_block,
+                    chunk_max_block,
+                    &mut chunk_logs,
+                    &mut chunk_receipts,
+                )
+                .await?;
+                chunk_min_block = None;
+                chunk_max_block = None;
+            }
+
+            for block_num in block_logs.iter().map(|log| log.block_num as u64).chain(
+                block_receipt_rows
+                    .iter()
+                    .map(|receipt| receipt.block_num as u64),
+            ) {
+                chunk_min_block = Some(chunk_min_block.map_or(block_num, |m| m.min(block_num)));
+                chunk_max_block = Some(chunk_max_block.map_or(block_num, |m| m.max(block_num)));
+            }
+
+            if let Some(block_num) = block_receipt_rows
+                .iter()
+                .map(|receipt| receipt.block_num as u64)
+                .min()
+            {
+                min_block = Some(min_block.map_or(block_num, |m: u64| m.min(block_num)));
+            }
+            if let Some(block_num) = block_receipt_rows
+                .iter()
+                .map(|receipt| receipt.block_num as u64)
+                .max()
+            {
+                max_block = Some(max_block.map_or(block_num, |m: u64| m.max(block_num)));
+            }
+
+            chunk_logs.extend(block_logs);
+            chunk_receipts.extend(block_receipt_rows);
         }
 
-        metrics::record_logs_indexed(chain_id, log_count as u64);
-
-        debug!(
+        flush_receipt_backfill_chunk(
+            sinks,
             chain_id,
-            from,
-            to,
-            receipts = receipt_count,
-            logs = log_count,
-            "Receipt backfill: wrote receipts+logs"
-        );
+            chunk_min_block,
+            chunk_max_block,
+            &mut chunk_logs,
+            &mut chunk_receipts,
+        )
+        .await?;
     }
 
     // Single UPDATE txs covering all processed ranges (instead of per-range)
@@ -1556,6 +1680,75 @@ async fn tick_receipt_backfill(sinks: &SinkSet, rpc: &RpcClient, chain_id: u64) 
         )
         .await?;
     }
+
+    let (completed, deferred) = finish_receipt_repair_attempt(pool, &blocks_missing).await?;
+    debug!(
+        chain_id,
+        completed, deferred, "Receipt backfill: repair attempt finalized"
+    );
+
+    Ok(())
+}
+
+fn receipt_backfill_rows(log_count: usize, receipt_count: usize) -> usize {
+    log_count + receipt_count
+}
+
+fn should_flush_receipt_backfill_chunk(current_rows: usize, next_rows: usize) -> bool {
+    current_rows > 0 && current_rows + next_rows > RECEIPT_BACKFILL_MAX_WRITE_ROWS
+}
+
+async fn flush_receipt_backfill_chunk(
+    sinks: &SinkSet,
+    chain_id: u64,
+    from: Option<u64>,
+    to: Option<u64>,
+    logs: &mut Vec<LogRow>,
+    receipts: &mut Vec<ReceiptRow>,
+) -> Result<()> {
+    if logs.is_empty() && receipts.is_empty() {
+        return Ok(());
+    }
+
+    let log_count = logs.len();
+    let receipt_count = receipts.len();
+    let row_count = receipt_backfill_rows(log_count, receipt_count);
+    let start = Instant::now();
+    let application_name = format!("tidx receipt_backfill {chain_id}");
+
+    sinks
+        .write_all_with_application_name(&[], &[], logs, receipts, &application_name)
+        .await?;
+
+    let elapsed = start.elapsed();
+    metrics::record_logs_indexed(chain_id, log_count as u64);
+
+    if elapsed >= Duration::from_secs(10) || row_count >= RECEIPT_BACKFILL_INFO_ROWS {
+        info!(
+            chain_id,
+            from,
+            to,
+            receipts = receipt_count,
+            logs = log_count,
+            rows = row_count,
+            elapsed_ms = elapsed.as_millis() as u64,
+            "Receipt backfill: wrote receipts+logs chunk"
+        );
+    } else {
+        debug!(
+            chain_id,
+            from,
+            to,
+            receipts = receipt_count,
+            logs = log_count,
+            rows = row_count,
+            elapsed_ms = elapsed.as_millis() as u64,
+            "Receipt backfill: wrote receipts+logs chunk"
+        );
+    }
+
+    logs.clear();
+    receipts.clear();
 
     Ok(())
 }
@@ -1641,5 +1834,25 @@ mod tests {
         let blocks: Vec<u64> = (1..=25).collect();
         let ranges = group_consecutive_blocks(&blocks);
         assert_eq!(ranges, vec![(1, 10), (11, 20), (21, 25)]);
+    }
+
+    #[test]
+    fn test_receipt_backfill_chunk_does_not_flush_empty_chunk() {
+        assert!(!should_flush_receipt_backfill_chunk(
+            0,
+            RECEIPT_BACKFILL_MAX_WRITE_ROWS + 1
+        ));
+    }
+
+    #[test]
+    fn test_receipt_backfill_chunk_flushes_before_row_limit() {
+        assert!(!should_flush_receipt_backfill_chunk(
+            RECEIPT_BACKFILL_MAX_WRITE_ROWS - 10,
+            10
+        ));
+        assert!(should_flush_receipt_backfill_chunk(
+            RECEIPT_BACKFILL_MAX_WRITE_ROWS - 10,
+            11
+        ));
     }
 }

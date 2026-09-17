@@ -12,6 +12,8 @@ pub struct BlockRow {
     pub gas_used: i64,
     pub miner: Vec<u8>,
     pub extra_data: Option<Vec<u8>>,
+    /// T5+: Ed25519 public key of the consensus proposer for this block. Previously `None`.
+    pub consensus_proposer: Option<Vec<u8>>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -54,6 +56,9 @@ pub struct LogRow {
     pub topic2: Option<Vec<u8>>,
     pub topic3: Option<Vec<u8>>,
     pub data: Vec<u8>,
+    /// TIP-1022: true if this log is the forwarding hop of a virtual address
+    /// Transfer pair (the second Transfer from virtualAddr → master).
+    pub is_virtual_forward: bool,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -70,6 +75,11 @@ pub struct ReceiptRow {
     pub effective_gas_price: Option<String>,
     pub status: Option<i16>,
     pub fee_payer: Option<Vec<u8>>,
+    /// Tx-level transaction type, denormalized from the matching `TxRow` so
+    /// receipt queries don't have to join `txs`. None until enriched/backfilled.
+    pub tx_type: Option<i16>,
+    /// Tx-level fee token, denormalized from the matching `TxRow`.
+    pub fee_token: Option<Vec<u8>>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -89,12 +99,26 @@ pub struct SyncState {
     /// When sync started (for ETA calculations)
     #[serde(default)]
     pub started_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// Current PostgreSQL hot-tier boundary (0 = hot-only).
+    /// Gap detection ignores blocks routed to ClickHouse at or below this.
+    #[serde(default)]
+    pub pruned_below: u64,
 }
 
 impl SyncState {
-    /// Returns true if backfill is complete (reached genesis)
+    /// Lowest block expected to exist in Postgres.
+    /// Block 0 (genesis) is never indexed, so the floor is at least 1.
+    pub fn prune_floor(&self) -> u64 {
+        self.pruned_below + 1
+    }
+
+    /// Returns true if backfill is complete (reached genesis, or the prune
+    /// floor when history below it was intentionally pruned).
     pub fn backfill_complete(&self) -> bool {
-        self.backfill_num == Some(0)
+        match self.backfill_num {
+            Some(n) => n <= self.pruned_below,
+            None => false,
+        }
     }
 
     /// Returns true if backfill has started
@@ -102,12 +126,12 @@ impl SyncState {
         self.backfill_num.is_some()
     }
 
-    /// Returns the number of blocks remaining to backfill
+    /// Returns the number of blocks remaining to backfill.
+    /// Blocks at or below the prune floor were intentionally dropped and don't count.
     pub fn backfill_remaining(&self) -> u64 {
         match self.backfill_num {
-            None => self.tip_num,     // Haven't started, need to fill 0..tip_num
-            Some(0) => 0,             // Complete
-            Some(n) => n,             // Blocks 0..n remain
+            None => self.tip_num.saturating_sub(self.pruned_below),
+            Some(n) => n.saturating_sub(self.pruned_below),
         }
     }
 
@@ -116,19 +140,15 @@ impl SyncState {
     /// After backfill completes (backfill_num=0), range is 0 to tip_num.
     pub fn indexed_range(&self) -> (u64, u64) {
         match self.backfill_num {
-            Some(n) => (n, self.tip_num),             // Backfill in progress: n..tip_num
-            None => (self.tip_num, self.tip_num),     // Not started: just the tip
+            Some(n) => (n, self.tip_num), // Backfill in progress: n..tip_num
+            None => (self.tip_num, self.tip_num), // Not started: just the tip
         }
     }
 
     /// Returns total number of indexed blocks
     pub fn total_indexed(&self) -> u64 {
         let (low, high) = self.indexed_range();
-        if high >= low {
-            high - low + 1
-        } else {
-            0
-        }
+        if high >= low { high - low + 1 } else { 0 }
     }
 
     /// Get the current sync rate (blocks per second)
