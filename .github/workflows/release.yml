@@ -28,7 +28,7 @@ jobs:
         with:
           policy: release
       - id: changelogs
-        uses: tempoxyz/changelogs@83e69646d7ef76c5f35364d3a06fce3a6fe62bf9
+        uses: tempoxyz/changelogs@34f165d2e2af92c12ad459357445e7ca86768720
         with:
           conventional-commit: true
           github-token: ${{ steps.app-token.outputs.token }}
