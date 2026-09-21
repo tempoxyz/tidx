@@ -706,15 +706,21 @@ pub fn inject_block_filter(sql: &str, block_num: u64) -> Result<String, ApiError
         }
     };
 
-    let table_name: String = select
+    // When the table is aliased (`FROM txs AS t`, `FROM txs t`) only the alias
+    // is a valid qualifier in the WHERE clause, so qualify the injected column
+    // with it; otherwise fall back to the table name itself.
+    let (table_name, qualifier): (String, Ident) = select
         .from
         .first()
         .and_then(|twj| match &twj.relation {
-            sqlparser::ast::TableFactor::Table { name, .. } => name
-                .0
-                .last()
-                .and_then(|part| part.as_ident())
-                .map(|ident| ident.value.to_lowercase()),
+            sqlparser::ast::TableFactor::Table { name, alias, .. } => {
+                let table = name.0.last().and_then(|part| part.as_ident())?;
+                let qualifier = alias
+                    .as_ref()
+                    .map(|alias| alias.name.clone())
+                    .unwrap_or_else(|| table.clone());
+                Some((table.value.to_lowercase(), qualifier))
+            }
             _ => None,
         })
         .ok_or_else(|| {
@@ -727,7 +733,7 @@ pub fn inject_block_filter(sql: &str, block_num: u64) -> Result<String, ApiError
         "block_num"
     };
 
-    let col_expr = Expr::CompoundIdentifier(vec![Ident::new(&table_name), Ident::new(col_name)]);
+    let col_expr = Expr::CompoundIdentifier(vec![qualifier, Ident::new(col_name)]);
 
     let block_filter = Expr::BinaryOp {
         left: Box::new(col_expr),

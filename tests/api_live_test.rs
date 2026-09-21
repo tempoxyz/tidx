@@ -465,6 +465,35 @@ fn test_inject_block_filter_with_user_cte() {
 }
 
 #[test]
+fn test_inject_block_filter_uses_table_alias() {
+    let sql = "SELECT t.hash FROM txs AS t WHERE t.gas_used > 21000 ORDER BY t.block_num DESC";
+    let filtered = inject_block_filter(sql, 460).unwrap();
+    assert!(filtered.contains("t.block_num = 460"), "got: {filtered}");
+    assert!(
+        !filtered.contains("txs.block_num"),
+        "must not qualify with the hidden table name: {filtered}"
+    );
+}
+
+#[test]
+fn test_inject_block_filter_uses_implicit_table_alias() {
+    let sql = "SELECT b.num, b.hash FROM blocks b ORDER BY b.num DESC LIMIT 1";
+    let filtered = inject_block_filter(sql, 470).unwrap();
+    assert!(filtered.contains("b.num = 470"), "got: {filtered}");
+    assert!(!filtered.contains("blocks.num"), "got: {filtered}");
+}
+
+#[test]
+fn test_inject_block_filter_preserves_quoted_alias() {
+    let sql = r#"SELECT "Tx".hash FROM txs AS "Tx""#;
+    let filtered = inject_block_filter(sql, 480).unwrap();
+    assert!(
+        filtered.contains(r#""Tx".block_num = 480"#),
+        "got: {filtered}"
+    );
+}
+
+#[test]
 fn test_inject_block_filter_no_order_by() {
     let sql = "SELECT COUNT(*) FROM blocks LIMIT 1";
     let filtered = inject_block_filter(sql, 500).unwrap();
