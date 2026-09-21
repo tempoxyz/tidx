@@ -36,7 +36,7 @@ jobs:
 
     steps:
       - name: Secure runner
-        uses: tempoxyz/gh-actions/actions/secure-runner@0a60d757d0f4725a34f22f7b9ebf7b91b4b00bcf # main
+        uses: tempoxyz/gh-actions/actions/secure-runner@baf48ebcfcb26812085b8351125493b2ef8009ab # 2026-09-21T19-33-30Z-baf48ebc
 
       - name: Checkout tidx
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
@@ -60,20 +60,20 @@ jobs:
           echo "tags=${image}:${PG_VERSION}-minimal-trixie-${short_sha},${image}:${PG_VERSION}-minimal-trixie" >> "$GITHUB_OUTPUT"
 
       - name: Set up QEMU
-        uses: tempoxyz/gh-actions/vendor/docker/setup-qemu-action@0a60d757d0f4725a34f22f7b9ebf7b91b4b00bcf
+        uses: tempoxyz/gh-actions/vendor/docker/setup-qemu-action@baf48ebcfcb26812085b8351125493b2ef8009ab # 2026-09-21T19-33-30Z-baf48ebc
 
       - name: Set up Docker Buildx
-        uses: tempoxyz/gh-actions/vendor/docker/setup-buildx-action@0a60d757d0f4725a34f22f7b9ebf7b91b4b00bcf
+        uses: tempoxyz/gh-actions/vendor/docker/setup-buildx-action@baf48ebcfcb26812085b8351125493b2ef8009ab # 2026-09-21T19-33-30Z-baf48ebc
 
       - name: Log in to GHCR
-        uses: tempoxyz/gh-actions/vendor/docker/login-action@0a60d757d0f4725a34f22f7b9ebf7b91b4b00bcf
+        uses: tempoxyz/gh-actions/vendor/docker/login-action@baf48ebcfcb26812085b8351125493b2ef8009ab # 2026-09-21T19-33-30Z-baf48ebc
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Build and push
-        uses: tempoxyz/gh-actions/vendor/docker/build-push-action@0a60d757d0f4725a34f22f7b9ebf7b91b4b00bcf
+        uses: tempoxyz/gh-actions/vendor/docker/build-push-action@baf48ebcfcb26812085b8351125493b2ef8009ab # 2026-09-21T19-33-30Z-baf48ebc
         with:
           context: docker/pg-clickhouse
           file: docker/pg-clickhouse/Dockerfile
