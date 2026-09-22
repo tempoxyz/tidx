@@ -23,6 +23,7 @@ use tidx::sync::tiered_sync::TieredSync;
 
 const CLICKHOUSE_BACKFILL_RETRY_MAX_SECS: u64 = 10;
 const CLICKHOUSE_DERIVED_REPAIR_RETRY_MAX_SECS: u64 = 300;
+const CLICKHOUSE_SCHEMA_RETRY_MAX_SECS: u64 = 30;
 
 #[derive(ClapArgs)]
 pub struct Args {
@@ -271,7 +272,7 @@ fn spawn_sync_engine(
     throttled_pool: ThrottledPool,
     broadcaster: Arc<Broadcaster>,
     clickhouse_engines: SharedClickHouseEngines,
-    shutdown_rx: tokio::sync::broadcast::Receiver<()>,
+    mut shutdown_rx: tokio::sync::broadcast::Receiver<()>,
 ) {
     let rpc_url = match chain.resolved_rpc_url() {
         Ok(url) => url,
@@ -331,8 +332,14 @@ fn spawn_sync_engine(
                     )
                     .map(|sink| sink.with_replicated_database(ch_config.replicated_database))
                     {
-                        Ok(ch_sink) => match ch_sink.ensure_schema_only().await {
-                            Ok(()) => {
+                        Ok(ch_sink) => match initialize_clickhouse_schema(
+                            &ch_sink,
+                            &chain.name,
+                            &mut shutdown_rx,
+                        )
+                        .await
+                        {
+                            Some(()) => {
                                 match ClickHouseEngine::new(ch_config, chain.chain_id) {
                                     Ok(engine) => {
                                         clickhouse_engines
@@ -409,13 +416,7 @@ fn spawn_sync_engine(
                                     }
                                 }
                             }
-                            Err(e) => {
-                                error!(
-                                    error = %e,
-                                    chain = %chain.name,
-                                    "Failed to initialize ClickHouse schema (continuing without CH sink)"
-                                );
-                            }
+                            None => return,
                         },
                         Err(e) => {
                             error!(
@@ -576,6 +577,41 @@ fn retry_delay_secs(attempt: u32, max_secs: u64) -> u64 {
     2u64.saturating_pow(attempt).min(max_secs)
 }
 
+// A transient DDL failure must not permanently disable the query engine and
+// archive sink. Keep initialization pending until ClickHouse recovers or shutdown.
+async fn initialize_clickhouse_schema(
+    sink: &ClickHouseSink,
+    chain_name: &str,
+    shutdown_rx: &mut tokio::sync::broadcast::Receiver<()>,
+) -> Option<()> {
+    let mut attempt: u32 = 0;
+    loop {
+        let result = tokio::select! {
+            biased;
+            _ = shutdown_rx.recv() => return None,
+            result = sink.ensure_schema_only() => result,
+        };
+        match result {
+            Ok(()) => return Some(()),
+            Err(e) => {
+                attempt = attempt.saturating_add(1);
+                let delay_secs = retry_delay_secs(attempt, CLICKHOUSE_SCHEMA_RETRY_MAX_SECS);
+                error!(
+                    error = %e,
+                    chain = %chain_name,
+                    attempt,
+                    retry_in_secs = delay_secs,
+                    "Failed to initialize ClickHouse schema, retrying"
+                );
+                tokio::select! {
+                    _ = shutdown_rx.recv() => return None,
+                    () = tokio::time::sleep(std::time::Duration::from_secs(delay_secs)) => {}
+                }
+            }
+        }
+    }
+}
+
 async fn run_legacy_clickhouse_backfill(
     sinks: &SinkSet,
     chain_name: &str,
@@ -695,5 +731,61 @@ mod tests {
         assert_eq!(retry_delay_secs(8, 300), 256);
         assert_eq!(retry_delay_secs(9, 300), 300);
         assert_eq!(retry_delay_secs(127, 300), 300);
+    }
+
+    #[tokio::test]
+    async fn clickhouse_schema_retries_connection_failures_until_shutdown() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let sink = ClickHouseSink::new(&url, "startup_retry", None, None).unwrap();
+        let (shutdown_tx, mut shutdown_rx) = tokio::sync::broadcast::channel(1);
+        let started = std::time::Instant::now();
+        let task = tokio::spawn(async move {
+            initialize_clickhouse_schema(&sink, "test", &mut shutdown_rx).await
+        });
+
+        // Real connection resets exercise the ClickHouse transport and retry delay.
+        for _ in 0..2 {
+            let (connection, _) =
+                tokio::time::timeout(std::time::Duration::from_secs(10), listener.accept())
+                    .await
+                    .unwrap()
+                    .unwrap();
+            drop(connection);
+        }
+        assert!(started.elapsed() >= std::time::Duration::from_secs(2));
+        shutdown_tx.send(()).unwrap();
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_secs(1), task)
+                .await
+                .unwrap()
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn clickhouse_schema_shutdown_cancels_pending_request() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let sink = ClickHouseSink::new(&url, "startup_shutdown", None, None).unwrap();
+        let (shutdown_tx, mut shutdown_rx) = tokio::sync::broadcast::channel(1);
+        let task = tokio::spawn(async move {
+            initialize_clickhouse_schema(&sink, "test", &mut shutdown_rx).await
+        });
+        let (_connection, _) =
+            tokio::time::timeout(std::time::Duration::from_secs(10), listener.accept())
+                .await
+                .unwrap()
+                .unwrap();
+
+        shutdown_tx.send(()).unwrap();
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_secs(1), task)
+                .await
+                .unwrap()
+                .unwrap()
+                .is_none()
+        );
     }
 }
