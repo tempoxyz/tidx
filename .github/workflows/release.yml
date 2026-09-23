@@ -28,7 +28,7 @@ jobs:
         with:
           policy: release
       - id: changelogs
-        uses: tempoxyz/changelogs@83e69646d7ef76c5f35364d3a06fce3a6fe62bf9 # 2026-09-07T12-57-31Z-83e69646
+        uses: tempoxyz/changelogs@83e69646d7ef76c5f35364d3a06fce3a6fe62bf9 # 2026-09-07T12-57-31Z-83e69646 zizmor: ignore[ref-version-mismatch]
         with:
           conventional-commit: true
           github-token: ${{ steps.app-token.outputs.token }}
