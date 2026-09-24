@@ -13,6 +13,9 @@ jobs:
     if: github.event_name == 'pull_request'
     permissions:
       contents: read
+      id-token: write
+      pull-requests: read
+      statuses: write
     uses: tempoxyz/gh-actions/.github/workflows/pr-audit.yml@d39baa2b43f5eba5d261c047521a4fbd56101129 # 2026-09-23T04-31-11Z-d39baa2b
     with:
       required-labels: |
