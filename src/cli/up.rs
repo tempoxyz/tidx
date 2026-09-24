@@ -98,11 +98,12 @@ pub async fn run(args: Args) -> Result<()> {
             }
             None => throttled_pool.pool.clone(),
         };
-        pools.write().await.insert(chain.chain_id, api_pool);
+        pools.write().await.insert(chain.chain_id, api_pool.clone());
 
         spawn_sync_engine(
             chain.clone(),
             throttled_pool,
+            api_pool,
             broadcaster.clone(),
             Arc::clone(&clickhouse_engines),
             shutdown_tx.subscribe(),
@@ -168,11 +169,12 @@ pub async fn run(args: Args) -> Result<()> {
                         pools_for_watcher
                             .write()
                             .await
-                            .insert(event.chain.chain_id, api_pool);
+                            .insert(event.chain.chain_id, api_pool.clone());
 
                         spawn_sync_engine(
                             event.chain,
                             throttled_pool,
+                            api_pool,
                             broadcaster_for_watcher.clone(),
                             Arc::clone(&clickhouse_engines_for_watcher),
                             shutdown_tx_for_watcher.subscribe(),
@@ -270,6 +272,7 @@ async fn initialize_chain(
 fn spawn_sync_engine(
     chain: ChainConfig,
     throttled_pool: ThrottledPool,
+    api_pool: db::Pool,
     broadcaster: Arc<Broadcaster>,
     clickhouse_engines: SharedClickHouseEngines,
     mut shutdown_rx: tokio::sync::broadcast::Receiver<()>,
@@ -397,10 +400,11 @@ fn spawn_sync_engine(
                                     );
                                     let result = match target {
                                         Ok(target) => {
-                                            db::tiered::bootstrap(
+                                            db::tiered::bootstrap_with_api_pool(
                                                 throttled_pool.inner(),
                                                 &target,
                                                 chain.chain_id,
+                                                &api_pool,
                                             )
                                             .await
                                         }
