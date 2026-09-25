@@ -19,6 +19,84 @@ use crate::query::{
 
 const MAX_QUERY_RESULT_BYTES: usize = 10 * 1024 * 1024;
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum QueryFailureKind {
+    Timeout,
+    Unavailable,
+    BadGateway,
+    InvalidQuery,
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("{message}")]
+pub(crate) struct QueryFailure {
+    pub(crate) kind: QueryFailureKind,
+    pub(crate) upstream_status: Option<reqwest::StatusCode>,
+    message: String,
+}
+
+impl QueryFailure {
+    pub(crate) fn new(kind: QueryFailureKind, message: impl Into<String>) -> Self {
+        Self {
+            kind,
+            upstream_status: None,
+            message: message.into(),
+        }
+    }
+
+    fn with_status(mut self, status: reqwest::StatusCode) -> Self {
+        self.upstream_status = Some(status);
+        self
+    }
+}
+
+fn query_failure(kind: QueryFailureKind, message: impl Into<String>) -> anyhow::Error {
+    anyhow::Error::new(QueryFailure::new(kind, message))
+}
+
+/// ClickHouse reports SQL errors as HTTP 500, so its exception code takes
+/// precedence over the HTTP status when deciding whether a retry can help.
+fn classify_upstream_failure(status: reqwest::StatusCode, body: &str) -> QueryFailureKind {
+    let code = body.trim_start().strip_prefix("Code: ").and_then(|rest| {
+        let digits = rest.bytes().take_while(u8::is_ascii_digit).count();
+        rest.get(..digits)?.parse::<u32>().ok()
+    });
+
+    match code {
+        // Execution, socket, query-slot, and memory-reservation timeouts.
+        Some(159 | 209 | 1019 | 1020) => return QueryFailureKind::Timeout,
+        // DNS errors, overloaded connections, and unavailable shards.
+        Some(198 | 202 | 203 | 279 | 297 | 904) => return QueryFailureKind::Unavailable,
+        // NETWORK_ERROR.
+        Some(210) => return QueryFailureKind::BadGateway,
+        _ => {}
+    }
+
+    if status == reqwest::StatusCode::REQUEST_TIMEOUT
+        || status == reqwest::StatusCode::GATEWAY_TIMEOUT
+    {
+        return QueryFailureKind::Timeout;
+    }
+    if status == reqwest::StatusCode::SERVICE_UNAVAILABLE
+        || status == reqwest::StatusCode::TOO_MANY_REQUESTS
+    {
+        return QueryFailureKind::Unavailable;
+    }
+    if status == reqwest::StatusCode::BAD_GATEWAY {
+        return QueryFailureKind::BadGateway;
+    }
+    if code.is_some() || body.contains("DB::Exception") || body.contains("DB::NetException") {
+        return QueryFailureKind::InvalidQuery;
+    }
+    if status.is_server_error()
+        || status == reqwest::StatusCode::UNAUTHORIZED
+        || status == reqwest::StatusCode::FORBIDDEN
+    {
+        return QueryFailureKind::BadGateway;
+    }
+    QueryFailureKind::InvalidQuery
+}
+
 /// A single ClickHouse instance (connection + URL).
 struct Instance {
     http_client: reqwest::Client,
@@ -90,10 +168,8 @@ impl ClickHouseEngine {
     }
 
     /// Execute a query and return results as JSON values.
-    /// On connection failure the engine automatically retries with the next
-    /// instance (failover). Only connection-level errors trigger failover;
-    /// ClickHouse query errors (syntax, missing table, etc.) are returned
-    /// immediately.
+    /// On instance-specific transport or availability failure, the engine
+    /// tries the next instance. Query errors are returned immediately.
     pub async fn query(&self, sql: &str, signatures: &[&str]) -> Result<QueryResult> {
         let sql = Self::prepare_query(sql, signatures)?;
         self.execute_prepared_query(&sql, None).await
@@ -193,7 +269,7 @@ impl ClickHouseEngine {
                         url = %inst.url,
                         error = %e,
                         database = %self.database,
-                        "ClickHouse instance unreachable, trying next"
+                        "ClickHouse instance failed, trying next"
                     );
                 }
                 Err(e) => return Err(e),
@@ -258,9 +334,16 @@ impl ClickHouseEngine {
             send.await.map_err(|e| send_error(e, None))?
         };
 
-        if !resp.status().is_success() {
-            let error_text = read_limited_response(resp).await.unwrap_or_default();
-            return Err(anyhow!("ClickHouse query failed: {error_text}"));
+        let resp_status = resp.status();
+        if !resp_status.is_success() {
+            let error_text = read_limited_response(resp).await?;
+            return Err(anyhow::Error::new(
+                QueryFailure::new(
+                    classify_upstream_failure(resp_status, &error_text),
+                    format!("ClickHouse query failed: {error_text}"),
+                )
+                .with_status(resp_status),
+            ));
         }
 
         let json_response = read_limited_response(resp).await?;
@@ -276,45 +359,52 @@ impl ClickHouseEngine {
             });
         }
 
-        let parsed: serde_json::Value = serde_json::from_str(&json_response)
-            .map_err(|e| anyhow!("Failed to parse ClickHouse JSON response: {e}"))?;
-
-        let meta = parsed.get("meta").and_then(|m| m.as_array());
-        let data = parsed.get("data").and_then(|d| d.as_array());
-
+        let malformed = || {
+            anyhow::Error::new(
+                QueryFailure::new(
+                    QueryFailureKind::BadGateway,
+                    "Malformed ClickHouse JSON response",
+                )
+                .with_status(resp_status),
+            )
+        };
+        let parsed: serde_json::Value =
+            serde_json::from_str(&json_response).map_err(|_| malformed())?;
+        let meta = parsed
+            .get("meta")
+            .and_then(|value| value.as_array())
+            .ok_or_else(malformed)?;
+        let data = parsed
+            .get("data")
+            .and_then(|value| value.as_array())
+            .ok_or_else(malformed)?;
         let columns: Vec<String> = meta
-            .map(|m| {
-                m.iter()
-                    .filter_map(|col| col.get("name").and_then(|n| n.as_str()).map(String::from))
-                    .collect()
+            .iter()
+            .map(|col| {
+                col.get("name")
+                    .and_then(|value| value.as_str())
+                    .map(String::from)
+                    .ok_or_else(malformed)
             })
-            .unwrap_or_default();
-
+            .collect::<Result<_>>()?;
         let column_types: Vec<String> = meta
-            .map(|m| {
-                m.iter()
-                    .map(|col| {
-                        col.get("type")
-                            .and_then(|t| t.as_str())
-                            .unwrap_or_default()
-                            .to_string()
-                    })
-                    .collect()
+            .iter()
+            .map(|col| {
+                col.get("type")
+                    .and_then(|value| value.as_str())
+                    .map(String::from)
+                    .ok_or_else(malformed)
             })
-            .unwrap_or_default();
-
+            .collect::<Result<_>>()?;
         let rows: Vec<Vec<serde_json::Value>> = data
-            .map(|d| {
-                d.iter()
-                    .map(|row| {
-                        columns
-                            .iter()
-                            .map(|col| row.get(col).cloned().unwrap_or(serde_json::Value::Null))
-                            .collect()
-                    })
-                    .collect()
+            .iter()
+            .map(|row| {
+                columns
+                    .iter()
+                    .map(|col| row.get(col).cloned().ok_or_else(malformed))
+                    .collect::<Result<_>>()
             })
-            .unwrap_or_default();
+            .collect::<Result<_>>()?;
 
         let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
         let row_count = rows.len();
@@ -356,49 +446,89 @@ fn clickhouse_request_timeout(timeout_ms: u64) -> std::time::Duration {
 /// Error for a client-side deadline expiry: a slow query, not an
 /// unreachable instance.
 fn timeout_error(timeout: std::time::Duration) -> anyhow::Error {
-    anyhow!(
-        "ClickHouse request timed out after {}ms",
-        timeout.as_millis()
+    query_failure(
+        QueryFailureKind::Timeout,
+        format!(
+            "ClickHouse request timed out after {}ms",
+            timeout.as_millis()
+        ),
     )
 }
 
 /// Wrap a reqwest send failure, keeping the typed source so
 /// [`is_connection_error`] can classify it precisely.
 fn send_error(e: reqwest::Error, timeout: Option<std::time::Duration>) -> anyhow::Error {
-    let msg = if e.is_timeout() {
-        match timeout {
-            Some(t) => format!("ClickHouse request timed out after {}ms", t.as_millis()),
-            None => "ClickHouse request timed out".to_string(),
-        }
+    let (kind, msg) = if e.is_timeout() {
+        (
+            QueryFailureKind::Timeout,
+            match timeout {
+                Some(t) => format!("ClickHouse request timed out after {}ms", t.as_millis()),
+                None => "ClickHouse request timed out".to_string(),
+            },
+        )
+    } else if e.is_connect() {
+        (
+            QueryFailureKind::Unavailable,
+            format!("ClickHouse HTTP request failed: {e}"),
+        )
     } else {
-        format!("ClickHouse HTTP request failed: {e}")
+        (
+            QueryFailureKind::BadGateway,
+            format!("ClickHouse HTTP request failed: {e}"),
+        )
     };
-    anyhow::Error::new(e).context(msg)
+    anyhow::Error::new(e).context(QueryFailure::new(kind, msg))
 }
 
 async fn read_limited_response(mut resp: reqwest::Response) -> Result<String> {
+    let status = resp.status();
     let mut body = Vec::new();
 
-    while let Some(chunk) = resp
-        .chunk()
-        .await
-        .map_err(|e| anyhow::Error::new(e).context("Failed to read response"))?
-    {
+    while let Some(chunk) = resp.chunk().await.map_err(|e| {
+        let kind = if e.is_timeout() {
+            QueryFailureKind::Timeout
+        } else {
+            QueryFailureKind::BadGateway
+        };
+        anyhow::Error::new(e).context(
+            QueryFailure::new(kind, "Failed to read ClickHouse response").with_status(status),
+        )
+    })? {
         if body.len().saturating_add(chunk.len()) > MAX_QUERY_RESULT_BYTES {
-            return Err(anyhow!(
-                "ClickHouse response exceeded {} bytes",
-                MAX_QUERY_RESULT_BYTES
+            return Err(anyhow::Error::new(
+                QueryFailure::new(
+                    QueryFailureKind::InvalidQuery,
+                    format!(
+                        "ClickHouse response exceeded {} bytes",
+                        MAX_QUERY_RESULT_BYTES
+                    ),
+                )
+                .with_status(status),
             ));
         }
         body.extend_from_slice(&chunk);
     }
 
-    String::from_utf8(body).map_err(|e| anyhow!("ClickHouse response was not valid UTF-8: {e}"))
+    String::from_utf8(body).map_err(|e| {
+        anyhow::Error::new(
+            QueryFailure::new(
+                QueryFailureKind::BadGateway,
+                format!("ClickHouse response was not valid UTF-8: {e}"),
+            )
+            .with_status(status),
+        )
+    })
 }
 
-/// Returns true for instance-specific transport failures, but not client
-/// timeouts or query-level errors that would recur on another instance.
+/// Returns true for instance-specific transport or availability failures, but
+/// not client timeouts or query errors that would recur on another instance.
 pub(crate) fn is_connection_error(err: &anyhow::Error) -> bool {
+    if let Some(failure) = err.downcast_ref::<QueryFailure>() {
+        return matches!(
+            failure.kind,
+            QueryFailureKind::Unavailable | QueryFailureKind::BadGateway
+        );
+    }
     if let Some(e) = err.downcast_ref::<reqwest::Error>() {
         return e.is_connect() || !e.is_timeout();
     }
@@ -425,6 +555,98 @@ pub struct QueryResult {
 mod tests {
     use super::*;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    fn failure_kind(error: &anyhow::Error) -> Option<QueryFailureKind> {
+        error
+            .downcast_ref::<QueryFailure>()
+            .map(|failure| failure.kind)
+    }
+
+    #[test]
+    fn test_classify_upstream_failure() {
+        use reqwest::StatusCode;
+
+        let cases = [
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Code: 159. DB::Exception: Timeout exceeded (TIMEOUT_EXCEEDED)",
+                QueryFailureKind::Timeout,
+            ),
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Code: 209. DB::Exception: Socket timeout (SOCKET_TIMEOUT)",
+                QueryFailureKind::Timeout,
+            ),
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Code: 202. DB::Exception: Too many simultaneous queries",
+                QueryFailureKind::Unavailable,
+            ),
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Code: 279. DB::Exception: All connection tries failed",
+                QueryFailureKind::Unavailable,
+            ),
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Code: 1019. DB::Exception: Query slot acquisition timeout",
+                QueryFailureKind::Timeout,
+            ),
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Code: 210. DB::NetException: Network error",
+                QueryFailureKind::BadGateway,
+            ),
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Code: 62. DB::Exception: Syntax error",
+                QueryFailureKind::InvalidQuery,
+            ),
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Code: 60. DB::Exception: Unknown table",
+                QueryFailureKind::InvalidQuery,
+            ),
+            (
+                StatusCode::BAD_GATEWAY,
+                "upstream closed connection",
+                QueryFailureKind::BadGateway,
+            ),
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "service unavailable",
+                QueryFailureKind::Unavailable,
+            ),
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Code: 62. DB::Exception: Syntax error",
+                QueryFailureKind::Unavailable,
+            ),
+            (
+                StatusCode::GATEWAY_TIMEOUT,
+                "gateway timeout",
+                QueryFailureKind::Timeout,
+            ),
+            (
+                StatusCode::REQUEST_TIMEOUT,
+                "request timeout",
+                QueryFailureKind::Timeout,
+            ),
+            (
+                StatusCode::BAD_REQUEST,
+                "Code: 62. DB::Exception: Syntax error",
+                QueryFailureKind::InvalidQuery,
+            ),
+        ];
+
+        for (status, body, kind) in cases {
+            assert_eq!(
+                classify_upstream_failure(status, body),
+                kind,
+                "{status}: {body}"
+            );
+        }
+    }
 
     async fn read_request(stream: &mut tokio::net::TcpStream) {
         let mut request = Vec::new();
@@ -462,6 +684,131 @@ mod tests {
         stream.shutdown().await.unwrap();
     }
 
+    async fn query_user_error_response(status: u16, body: &str) -> anyhow::Error {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let response = format!(
+            "HTTP/1.1 {status} Error\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        let task = tokio::spawn(serve_once(listener, response.into_bytes()));
+        let engine = ClickHouseEngine::new(
+            &ClickHouseConfig {
+                enabled: true,
+                url,
+                database: Some("default".to_string()),
+                ..Default::default()
+            },
+            4217,
+        )
+        .unwrap();
+        let error = engine
+            .query_user("SELECT 1", &[], 1_000, 10)
+            .await
+            .expect_err("upstream error must fail the query");
+        task.await.unwrap();
+        error
+    }
+
+    #[tokio::test]
+    async fn test_user_query_preserves_upstream_failure_kind() {
+        let cases = [
+            (502, "bad gateway", QueryFailureKind::BadGateway),
+            (503, "unavailable", QueryFailureKind::Unavailable),
+            (
+                500,
+                "Code: 159. DB::Exception: Timeout exceeded",
+                QueryFailureKind::Timeout,
+            ),
+            (
+                500,
+                "Code: 62. DB::Exception: Syntax error",
+                QueryFailureKind::InvalidQuery,
+            ),
+        ];
+
+        for (status, body, kind) in cases {
+            let error = query_user_error_response(status, body).await;
+            assert_eq!(failure_kind(&error), Some(kind), "{status}: {body}");
+            assert_eq!(
+                error
+                    .downcast_ref::<QueryFailure>()
+                    .unwrap()
+                    .upstream_status,
+                Some(reqwest::StatusCode::from_u16(status).unwrap()),
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_user_query_rejects_malformed_upstream_json() {
+        for body in ["not json", "{}", r#"{"meta":"bad","data":[]}"#] {
+            let error = query_user_error_response(200, body).await;
+            assert_eq!(failure_kind(&error), Some(QueryFailureKind::BadGateway));
+            assert_eq!(
+                error
+                    .downcast_ref::<QueryFailure>()
+                    .unwrap()
+                    .upstream_status,
+                Some(reqwest::StatusCode::OK),
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_user_query_preserves_status_on_truncated_response() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let task = tokio::spawn(serve_once(
+            listener,
+            b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 1024\r\nConnection: close\r\n\r\nshort"
+                .to_vec(),
+        ));
+        let engine = ClickHouseEngine::new(
+            &ClickHouseConfig {
+                enabled: true,
+                url,
+                database: Some("default".to_string()),
+                ..Default::default()
+            },
+            4217,
+        )
+        .unwrap();
+
+        let error = engine
+            .query_user("SELECT 1", &[], 1_000, 10)
+            .await
+            .expect_err("truncated upstream body must fail the query");
+        assert_eq!(failure_kind(&error), Some(QueryFailureKind::BadGateway));
+        assert_eq!(
+            error
+                .downcast_ref::<QueryFailure>()
+                .unwrap()
+                .upstream_status,
+            Some(reqwest::StatusCode::BAD_GATEWAY),
+        );
+        task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_user_query_rejects_invalid_sql_without_dependency_failure() {
+        let engine = ClickHouseEngine::new(
+            &ClickHouseConfig {
+                enabled: true,
+                url: "http://127.0.0.1:1".to_string(),
+                ..Default::default()
+            },
+            4217,
+        )
+        .unwrap();
+        let error = engine
+            .query_user("DELETE FROM blocks", &[], 1_000, 10)
+            .await
+            .expect_err("invalid SQL must be rejected locally");
+
+        assert!(failure_kind(&error).is_none());
+    }
+
     #[test]
     fn test_is_connection_error() {
         let conn_err = anyhow!("ClickHouse HTTP request failed: connection refused");
@@ -473,6 +820,10 @@ mod tests {
 
         let timeout_err = timeout_error(std::time::Duration::from_secs(2));
         assert!(!is_connection_error(&timeout_err));
+        assert_eq!(failure_kind(&timeout_err), Some(QueryFailureKind::Timeout));
+
+        let query_err = query_failure(QueryFailureKind::InvalidQuery, "connection refused in SQL");
+        assert!(!is_connection_error(&query_err));
     }
 
     #[tokio::test]
@@ -489,6 +840,7 @@ mod tests {
             .expect_err("connect must fail");
         let err = send_error(e, None);
         assert!(is_connection_error(&err), "got: {err:#}");
+        assert_eq!(failure_kind(&err), Some(QueryFailureKind::Unavailable));
     }
 
     #[tokio::test]
@@ -508,6 +860,7 @@ mod tests {
             .expect_err("send must fail");
         let err = send_error(e, None);
         assert!(is_connection_error(&err), "got: {err:#}");
+        assert_eq!(failure_kind(&err), Some(QueryFailureKind::BadGateway));
     }
 
     #[tokio::test]
@@ -535,6 +888,46 @@ mod tests {
         let engine = ClickHouseEngine::new(&config, 4217).unwrap();
         let result = engine.query("SELECT 1 AS n", &[]).await.unwrap();
 
+        assert_eq!(result.rows, vec![vec![serde_json::json!(1)]]);
+        assert_eq!(engine.active_url(), secondary_url);
+        primary_task.await.unwrap();
+        secondary_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_service_unavailable_fails_over() {
+        let primary = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let primary_url = format!("http://{}", primary.local_addr().unwrap());
+        let primary_task = tokio::spawn(serve_once(
+            primary,
+            b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                .to_vec(),
+        ));
+
+        let secondary = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let secondary_url = format!("http://{}", secondary.local_addr().unwrap());
+        let body = r#"{"meta":[{"name":"n","type":"UInt8"}],"data":[{"n":1}],"rows":1}"#;
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        let secondary_task = tokio::spawn(serve_once(secondary, response.into_bytes()));
+        let engine = ClickHouseEngine::new(
+            &ClickHouseConfig {
+                enabled: true,
+                url: primary_url,
+                failover_urls: vec![secondary_url.clone()],
+                database: Some("default".to_string()),
+                ..Default::default()
+            },
+            4217,
+        )
+        .unwrap();
+
+        let result = engine
+            .query_user("SELECT 1 AS n", &[], 1_000, 10)
+            .await
+            .unwrap();
         assert_eq!(result.rows, vec![vec![serde_json::json!(1)]]);
         assert_eq!(engine.active_url(), secondary_url);
         primary_task.await.unwrap();
@@ -756,6 +1149,7 @@ mod tests {
             !is_connection_error(&err),
             "client timeout misclassified as connection error: {err}"
         );
+        assert_eq!(failure_kind(&err), Some(QueryFailureKind::Timeout));
     }
 
     #[test]

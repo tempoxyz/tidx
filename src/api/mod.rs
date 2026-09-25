@@ -26,7 +26,7 @@ use tower_http::cors::CorsLayer;
 use tower_http::trace::TraceLayer;
 
 use crate::broadcast::Broadcaster;
-use crate::clickhouse::ClickHouseEngine;
+use crate::clickhouse::{ClickHouseEngine, QueryFailure, QueryFailureKind};
 use crate::config::HttpConfig;
 use crate::db::Pool;
 use crate::service::{QueryOptions, QueryResult, SyncStatus};
@@ -481,7 +481,7 @@ async fn handle_query_once(
                     engine: r.engine,
                     query_time_ms: r.query_time_ms,
                 })
-                .map_err(|e| ApiError::QueryError(e.to_string()))?
+                .map_err(clickhouse_api_error)?
         }
         crate::query::QueryRoute::Tiered => {
             // Split hot/cold at the prune boundary when possible; otherwise
@@ -518,6 +518,24 @@ async fn handle_query_once(
     };
 
     Ok(Json(QueryResponse { result, ok: true }))
+}
+
+fn clickhouse_api_error(error: anyhow::Error) -> ApiError {
+    let failure = error.downcast_ref::<QueryFailure>();
+    if let Some(failure) = failure.filter(|failure| failure.kind != QueryFailureKind::InvalidQuery)
+    {
+        tracing::warn!(
+            kind = ?failure.kind,
+            upstream_status = ?failure.upstream_status,
+            "ClickHouse query dependency failed"
+        );
+    }
+    match failure.map(|failure| failure.kind) {
+        Some(QueryFailureKind::Timeout) => ApiError::Timeout,
+        Some(QueryFailureKind::Unavailable) => ApiError::ServiceUnavailable,
+        Some(QueryFailureKind::BadGateway) => ApiError::BadGateway,
+        Some(QueryFailureKind::InvalidQuery) | None => ApiError::QueryError(error.to_string()),
+    }
 }
 
 type SseStream = std::pin::Pin<Box<dyn Stream<Item = Result<SseEvent, Infallible>> + Send>>;
@@ -752,8 +770,10 @@ pub fn inject_block_filter(sql: &str, block_num: u64) -> Result<String, ApiError
 #[derive(Debug)]
 pub enum ApiError {
     BadRequest(String),
+    BadGateway,
     Timeout,
     QueryError(String),
+    ServiceUnavailable,
     #[allow(dead_code)]
     Internal(String),
     Forbidden(String),
@@ -764,8 +784,10 @@ impl std::fmt::Display for ApiError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             ApiError::BadRequest(msg) => write!(f, "{msg}"),
+            ApiError::BadGateway => write!(f, "ClickHouse upstream failed"),
             ApiError::Timeout => write!(f, "Query timeout"),
             ApiError::QueryError(msg) => write!(f, "{msg}"),
+            ApiError::ServiceUnavailable => write!(f, "ClickHouse unavailable"),
             ApiError::Internal(msg) => write!(f, "{msg}"),
             ApiError::Forbidden(msg) => write!(f, "{msg}"),
             ApiError::NotFound(msg) => write!(f, "{msg}"),
@@ -777,8 +799,16 @@ impl IntoResponse for ApiError {
     fn into_response(self) -> axum::response::Response {
         let (status, message) = match self {
             ApiError::BadRequest(msg) => (StatusCode::BAD_REQUEST, msg),
+            ApiError::BadGateway => (
+                StatusCode::BAD_GATEWAY,
+                "ClickHouse upstream failed".to_string(),
+            ),
             ApiError::Timeout => (StatusCode::REQUEST_TIMEOUT, "Query timeout".to_string()),
             ApiError::QueryError(msg) => (StatusCode::UNPROCESSABLE_ENTITY, msg),
+            ApiError::ServiceUnavailable => (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "ClickHouse unavailable".to_string(),
+            ),
             ApiError::Internal(msg) => (StatusCode::INTERNAL_SERVER_ERROR, msg),
             ApiError::Forbidden(msg) => (StatusCode::FORBIDDEN, msg),
             ApiError::NotFound(msg) => (StatusCode::NOT_FOUND, msg),
@@ -796,6 +826,48 @@ impl IntoResponse for ApiError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn test_clickhouse_error_responses() {
+        let cases = [
+            (
+                QueryFailureKind::Timeout,
+                StatusCode::REQUEST_TIMEOUT,
+                "Query timeout",
+            ),
+            (
+                QueryFailureKind::Unavailable,
+                StatusCode::SERVICE_UNAVAILABLE,
+                "ClickHouse unavailable",
+            ),
+            (
+                QueryFailureKind::BadGateway,
+                StatusCode::BAD_GATEWAY,
+                "ClickHouse upstream failed",
+            ),
+            (
+                QueryFailureKind::InvalidQuery,
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "query rejected",
+            ),
+        ];
+
+        for (kind, status, message) in cases {
+            let error = anyhow::Error::new(QueryFailure::new(kind, "query rejected"));
+            let response = clickhouse_api_error(error).into_response();
+            assert_eq!(response.status(), status);
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            assert_eq!(
+                serde_json::from_slice::<serde_json::Value>(&body).unwrap(),
+                serde_json::json!({ "ok": false, "error": message }),
+            );
+        }
+
+        let response = clickhouse_api_error(anyhow!("invalid SQL")).into_response();
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    }
 
     #[test]
     fn test_parse_cidrs() {
