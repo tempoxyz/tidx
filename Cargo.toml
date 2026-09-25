@@ -58,7 +58,7 @@ metrics = "0.24"
 metrics-exporter-prometheus = { version = "0.16", default-features = false, features = ["http-listener"] }
 
 # Crypto
-sha3 = "0.10"
+sha3 = "0.11"
 
 # Error handling
 thiserror = "2"
