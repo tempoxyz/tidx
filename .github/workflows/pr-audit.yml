@@ -13,7 +13,10 @@ jobs:
     if: github.event_name == 'pull_request'
     permissions:
       contents: read
-    uses: tempoxyz/gh-actions/.github/workflows/pr-audit.yml@183a02178c660ce295e9a262edc5857cb7135f06 # main
+      id-token: write
+      pull-requests: read
+      statuses: write
+    uses: tempoxyz/gh-actions/.github/workflows/pr-audit.yml@d39baa2b43f5eba5d261c047521a4fbd56101129 # 2026-09-23T04-31-11Z-d39baa2b
     with:
       required-labels: |
         cyclops
@@ -40,10 +43,10 @@ jobs:
       pull-requests: read
     steps:
       - name: Secure runner
-        uses: tempoxyz/gh-actions/actions/secure-runner@077919669f220320ec1cd44cc18ceff33440c8f0 # main
+        uses: tempoxyz/gh-actions/actions/secure-runner@d39baa2b43f5eba5d261c047521a4fbd56101129 # 2026-09-23T04-31-11Z-d39baa2b
 
       - name: Handle audit command
-        uses: tempoxyz/gh-actions/actions/pr-audit-comment@183a02178c660ce295e9a262edc5857cb7135f06 # main
+        uses: tempoxyz/gh-actions/actions/pr-audit-comment@d39baa2b43f5eba5d261c047521a4fbd56101129 # 2026-09-23T04-31-11Z-d39baa2b
         env:
           # The pinned action checks the commenter's repository permission before using these.
           EVENTS_ARGS: ${{ secrets.EVENTS_ARGS }} # zizmor: ignore[secrets-outside-env]
