@@ -3,12 +3,6 @@ yanked = "warn"
 ignore = [
     # https://rustsec.org/advisories/RUSTSEC-2024-0436 paste! is unmaintained
     "RUSTSEC-2024-0436",
-    # https://rustsec.org/advisories/RUSTSEC-2025-0141 bincode is unmaintained
-    "RUSTSEC-2025-0141",
-    # https://rustsec.org/advisories/RUSTSEC-2026-0097 rand is unsound with a custom logger
-    "RUSTSEC-2026-0097",
-    # https://rustsec.org/advisories/RUSTSEC-2024-0320 yaml-rust is unmaintained, transitive dep
-    "RUSTSEC-2024-0320",
     # https://rustsec.org/advisories/RUSTSEC-2024-0388 derivative is unmaintained, transitive dep
     "RUSTSEC-2024-0388",
 ]
