@@ -5,9 +5,10 @@ on:
     types: [opened, reopened]
 
 permissions:
+  id-token: write
   issues: write
   pull-requests: write
 
 jobs:
   assign:
-    uses: tempoxyz/ci/.github/workflows/auto-assign-pr.yml@b73270c9ac67ef4b74ad6ae8ec2ad409b78623ff # 2026-09-07T02-26-37Z-b73270c9 zizmor: ignore[ref-version-mismatch]
+    uses: tempoxyz/gh-actions/.github/workflows/auto-assign-pr.yml@5840979a7c849cbe541c67431ec7315cd6396e3b
