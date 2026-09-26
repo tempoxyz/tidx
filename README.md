@@ -419,7 +419,7 @@ GET  /metrics                                            Prometheus metrics
 
 Manage ClickHouse materialized views for pre-computed analytics. Views are stored in `analytics_{chainId}` database and auto-update on new data.
 
-**Note:** POST and DELETE require connection from a trusted IP (configured via `trusted_cidrs`).
+**Note:** POST and DELETE require connection from a trusted IP (configured via `trusted_cidrs`). When the connection comes from a trusted proxy, the client is resolved from `X-Forwarded-For` by skipping trusted hops from the right; add every proxy hop to `trusted_cidrs`.
 
 #### List Views
 
