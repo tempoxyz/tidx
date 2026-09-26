@@ -16,9 +16,10 @@ pub fn timestamp_from_secs(secs: u64) -> DateTime<Utc> {
 
 pub fn decode_block(block: &Block) -> BlockRow {
     let header = &block.header;
-    let timestamp_secs = header.timestamp();
-    let timestamp = timestamp_from_secs(timestamp_secs);
-    let timestamp_ms = (timestamp_secs * 1000) as i64;
+    let timestamp = timestamp_from_secs(header.timestamp());
+    // Tempo headers carry a sub-second `timestampMillis`; the second-precision
+    // `timestamp` alone cannot distinguish blocks produced within the same second.
+    let timestamp_ms = i64::try_from(header.timestamp_millis).unwrap_or(i64::MAX);
 
     BlockRow {
         num: header.number() as i64,
@@ -191,6 +192,23 @@ mod tests {
             fee_payer,
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn decode_block_keeps_sub_second_timestamp_millis() {
+        let mut inner =
+            alloy::rpc::types::Header::<tempo_alloy::primitives::TempoHeader>::default();
+        inner.inner.inner.timestamp = 1_750_000_000;
+        inner.inner.timestamp_millis_part = 345;
+        let header = tempo_alloy::rpc::TempoHeaderResponse {
+            inner,
+            timestamp_millis: 1_750_000_000_345,
+        };
+
+        let row = decode_block(&Block::empty(header));
+
+        assert_eq!(row.timestamp, timestamp_from_secs(1_750_000_000));
+        assert_eq!(row.timestamp_ms, 1_750_000_000_345);
     }
 
     #[test]
