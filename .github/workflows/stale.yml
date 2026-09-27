@@ -1,0 +1,33 @@
+name: Close Stale PRs
+
+on:
+  schedule:
+    - cron: "0 0 * * *" # daily at midnight UTC
+
+permissions:
+  issues: write
+  pull-requests: write
+
+jobs:
+  stale:
+    permissions:
+      issues: write
+      pull-requests: write
+      id-token: write
+    if: ${{ github.event_name != 'schedule' || github.repository == 'tempoxyz/tidx' }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Secure runner
+        uses: tempoxyz/gh-actions/actions/secure-runner@ee2960a6cc25d99bda45614135bfe1197d879bac # 2026-09-26T06-46-03Z-ee2960a6
+
+      - uses: actions/stale@b5d41d4e1d5dceea10e7104786b73624c18a190f # v10.2.0
+        with:
+          days-before-pr-stale: 7
+          days-before-pr-close: 3
+          stale-pr-message: "This PR has been marked stale due to 7 days of inactivity."
+          close-pr-message: "Closed due to inactivity. Reopen if still needed."
+          stale-pr-label: stale
+          exempt-draft-pr: false
+          operations-per-run: 120
+          days-before-issue-stale: -1
+          days-before-issue-close: -1
