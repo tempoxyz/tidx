@@ -1391,6 +1391,53 @@ async fn test_query_bytes32_indexed_param() {
 
 #[tokio::test]
 #[serial(db)]
+async fn test_query_fixed_bytes_returns_declared_width() {
+    let db = TestDb::empty().await;
+    let opts = default_options();
+    let signature = "Fixed(bytes4 indexed tag, bytes4 value, bytes32 word)";
+    let selector = EventSignature::parse(signature).unwrap().topic0.to_vec();
+
+    let pad = |head: [u8; 4]| [head.as_slice(), &[0u8; 28]].concat();
+    let log = tidx::types::LogRow {
+        block_num: 1,
+        block_timestamp: chrono::Utc::now(),
+        tx_hash: vec![0xfb; 32],
+        address: vec![0x11; 20],
+        selector: Some(selector.clone()),
+        topic0: Some(selector.clone()),
+        topic1: Some(pad([0xca, 0xfe, 0xba, 0xbe])),
+        data: [pad([0xde, 0xad, 0xbe, 0xef]), vec![0x11; 32]].concat(),
+        ..Default::default()
+    };
+    let conn = db.pool.get().await.unwrap();
+    let cleanup = "DELETE FROM logs WHERE selector = $1";
+    conn.execute(cleanup, &[&selector]).await.unwrap();
+    tidx::sync::writer::write_logs(&db.pool, std::slice::from_ref(&log))
+        .await
+        .unwrap();
+
+    let result = execute_query_postgres(
+        &db.pool,
+        r#"SELECT tag, "value", word FROM Fixed"#,
+        &[signature],
+        &opts,
+    )
+    .await;
+    conn.execute(cleanup, &[&selector]).await.unwrap();
+
+    let result = result.expect("Query with fixed bytes params failed");
+    assert_eq!(
+        result.rows,
+        [vec![
+            serde_json::json!("0xcafebabe"),
+            serde_json::json!("0xdeadbeef"),
+            serde_json::json!(format!("0x{}", "11".repeat(32))),
+        ]]
+    );
+}
+
+#[tokio::test]
+#[serial(db)]
 async fn test_query_bool_param() {
     let db = TestDb::new().await;
     let opts = default_options();

@@ -736,6 +736,73 @@ async fn test_role_granted_cte() {
     assert_eq!(data.unwrap().len(), 1);
 }
 
+#[tokio::test]
+#[serial(clickhouse)]
+async fn test_fixed_bytes_cte_returns_declared_width() {
+    let ch =
+        TestClickHouse::new("tidx_test_fixed_bytes").expect("Failed to create ClickHouse client");
+
+    if ch.wait_for_ready().await.is_err() {
+        println!("ClickHouse not available, skipping test");
+        return;
+    }
+
+    ch.reset_database().await.expect("Failed to reset database");
+    ch.create_mock_logs_table()
+        .await
+        .expect("Failed to create logs table");
+
+    let signature = "Fixed(bytes4 indexed tag, bytes4 value, bytes32 word)";
+    let selector = format!(
+        "0x{}",
+        EventSignature::parse(signature).unwrap().topic0_hex()
+    );
+    let tag = format!("0xcafebabe{}", "00".repeat(28));
+    let word = "11".repeat(32);
+    let data = format!("0xdeadbeef{}{word}", "00".repeat(28));
+    let zero = format!("0x{}", "00".repeat(32));
+    ch.insert_mock_log(
+        1,
+        0,
+        0,
+        &zero,
+        "0x1111111111111111111111111111111111111111",
+        &selector,
+        &tag,
+        &zero,
+        &zero,
+        &data,
+    )
+    .await
+    .expect("Failed to insert log");
+
+    let config = ClickHouseConfig {
+        enabled: true,
+        url: ch.url.clone(),
+        database: Some(ch.database.clone()),
+        ..Default::default()
+    };
+    let engine = ClickHouseEngine::new(&config, 4217).expect("Failed to create engine");
+    let result = engine
+        .query_user(
+            "SELECT tag, value, word FROM Fixed",
+            &[signature],
+            5_000,
+            100,
+        )
+        .await
+        .expect("Query failed");
+
+    assert_eq!(
+        result.rows,
+        [vec![
+            serde_json::json!("0xcafebabe"),
+            serde_json::json!("0xdeadbeef"),
+            serde_json::json!(format!("0x{word}")),
+        ]]
+    );
+}
+
 /// `query_user` (the public /query path) must execute parenthesized UNION arms
 /// with a trailing ORDER BY/LIMIT, a shape valid in PostgreSQL. ClickHouse
 /// grammar rejects the trailing clauses (Code 62) unless they are hoisted
