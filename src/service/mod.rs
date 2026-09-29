@@ -235,11 +235,60 @@ const TIERED_COLD_CH_SETTINGS: &[(&str, &str)] = &[
     // split cold arm only reads long-merged history below the prune boundary).
 ];
 
+/// ClickHouse settings for native `engine=clickhouse` queries: ISO
+/// timestamps for [`normalize_datetime_columns`].
+const NATIVE_CH_SETTINGS: &[(&str, &str)] = &[("date_time_output_format", "iso")];
+
+/// Execute a public query directly on ClickHouse.
+pub async fn execute_query_clickhouse(
+    clickhouse: &crate::clickhouse::ClickHouseEngine,
+    sql: &str,
+    signatures: &[&str],
+    options: &QueryOptions,
+) -> Result<QueryResult> {
+    let mut result = clickhouse
+        .query_user_with_settings(
+            sql,
+            signatures,
+            options.timeout_ms,
+            options.limit,
+            NATIVE_CH_SETTINGS,
+        )
+        .await?;
+    normalize_datetime_columns(&mut result);
+    Ok(result.into())
+}
+
+/// Strip `Nullable(...)` from a ClickHouse column type.
+fn ch_base_type(ty: &str) -> &str {
+    ty.strip_prefix("Nullable(")
+        .and_then(|t| t.strip_suffix(')'))
+        .unwrap_or(ty)
+}
+
+/// Rewrite `DateTime*` columns (fetched with `date_time_output_format=iso`)
+/// from ClickHouse ISO strings to chrono RFC 3339, the formatting
+/// [`try_format_column_json`] gives PostgreSQL `timestamptz`.
+fn normalize_datetime_columns(result: &mut crate::clickhouse::QueryResult) {
+    for (i, ty) in result.column_types.iter().enumerate() {
+        if !ch_base_type(ty).starts_with("DateTime") {
+            continue;
+        }
+        for row in &mut result.rows {
+            if let Some(serde_json::Value::String(s)) = row.get_mut(i)
+                && let Ok(v) = DateTime::parse_from_rfc3339(s)
+            {
+                *s = v.with_timezone(&Utc).to_rfc3339();
+            }
+        }
+    }
+}
+
 /// Rewrite ClickHouse JSON values to the hot (PostgreSQL) arm's
 /// representations, per column type:
 ///
 /// - `Int64`/`UInt64`: quoted string → JSON number (PG int8 is a number);
-/// - `DateTime*`: ISO string → chrono RFC 3339 (PG timestamptz formatting);
+/// - `DateTime*`: see [`normalize_datetime_columns`];
 /// - `(U)Int128`/`(U)Int256`: PG NUMERIC parity — decimal string when the
 ///   value fits [`rust_decimal::Decimal`], else NULL (PG's formatter nulls
 ///   values past Decimal's 96-bit mantissa, see [`try_format_column_json`]);
@@ -258,22 +307,17 @@ fn normalize_cold_result(
             }
         }
     }
+    normalize_datetime_columns(result);
     for (i, ty) in result.column_types.iter().enumerate() {
-        let base = ty
-            .strip_prefix("Nullable(")
-            .and_then(|t| t.strip_suffix(')'))
-            .unwrap_or(ty);
         enum Kind {
             Int64,
             UInt64,
             BigNum,
-            DateTime,
         }
-        let kind = match base {
+        let kind = match ch_base_type(ty) {
             "Int64" => Kind::Int64,
             "UInt64" => Kind::UInt64,
             "Int128" | "UInt128" | "Int256" | "UInt256" => Kind::BigNum,
-            t if t.starts_with("DateTime") => Kind::DateTime,
             _ => continue,
         };
         for row in &mut result.rows {
@@ -297,11 +341,6 @@ fn normalize_cold_result(
                         Ok(v) => serde_json::Value::String(v.to_string()),
                         Err(_) => serde_json::Value::Null,
                     };
-                }
-                Kind::DateTime => {
-                    if let Ok(v) = DateTime::parse_from_rfc3339(s) {
-                        *cell = serde_json::Value::String(v.with_timezone(&Utc).to_rfc3339());
-                    }
                 }
             }
         }

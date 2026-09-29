@@ -471,16 +471,8 @@ async fn handle_query_once(
                     ))
                 })?;
 
-            clickhouse
-                .query_user(&params.sql, &sigs, options.timeout_ms, options.limit)
+            crate::service::execute_query_clickhouse(&clickhouse, &params.sql, &sigs, &options)
                 .await
-                .map(|r| QueryResult {
-                    columns: r.columns,
-                    rows: r.rows,
-                    row_count: r.row_count,
-                    engine: r.engine,
-                    query_time_ms: r.query_time_ms,
-                })
                 .map_err(|e| ApiError::QueryError(e.to_string()))?
         }
         crate::query::QueryRoute::Tiered => {
