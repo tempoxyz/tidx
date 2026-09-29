@@ -757,24 +757,25 @@ async fn run_pg_query(
     let timeout = std::time::Duration::from_millis(options.timeout_ms + 100);
     let limit = options.limit as usize;
     let result = tokio::time::timeout(timeout, async {
+        // query_raw prepares a &str anyway; preparing here under the
+        // session setup yields column names even for an empty result.
+        let stmt = tx.prepare(sql).await?;
+        let columns: Vec<String> = stmt
+            .columns()
+            .iter()
+            .map(|c| c.name().to_string())
+            .collect();
         let params = std::iter::empty::<&(dyn ToSql + Sync)>();
-        let stream = tx.query_raw(sql, params).await?;
+        let stream = tx.query_raw(&stmt, params).await?;
         futures::pin_mut!(stream);
-        let mut columns: Option<Vec<String>> = None;
         let mut rows = Vec::new();
         let mut result_bytes = 0usize;
 
         while let Some(row) = stream.try_next().await? {
-            if columns.is_none() {
-                columns = Some(row.columns().iter().map(|c| c.name().to_string()).collect());
-            }
             if rows.len() >= limit {
                 return Err(anyhow!("Query returned more than {limit} rows"));
             }
-            let cols = columns
-                .as_ref()
-                .expect("columns initialized from first row");
-            let row_values = (0..cols.len())
+            let row_values = (0..columns.len())
                 .map(|i| try_format_column_json(&row, i))
                 .collect::<Result<Vec<_>>>()?;
             result_bytes = result_bytes.saturating_add(
@@ -792,11 +793,11 @@ async fn run_pg_query(
             rows.push(row_values);
         }
 
-        Ok::<_, anyhow::Error>((columns.unwrap_or_default(), rows))
+        Ok::<_, anyhow::Error>((columns, rows))
     })
     .await;
 
-    let (mut columns, result_rows) = match result {
+    let (columns, result_rows) = match result {
         Ok(Ok(result)) => {
             metrics::record_query_duration(start.elapsed());
             result
@@ -808,15 +809,6 @@ async fn run_pg_query(
     };
 
     tx.commit().await.map_err(classify_postgres_error)?;
-
-    if columns.is_empty() {
-        columns = conn
-            .prepare(sql)
-            .await
-            .ok()
-            .map(|s| s.columns().iter().map(|c| c.name().to_string()).collect())
-            .unwrap_or_default();
-    }
 
     let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
     let row_count = result_rows.len();

@@ -56,6 +56,27 @@ async fn teardown(db: &TestDb) {
 
 #[tokio::test]
 #[serial(db)]
+async fn test_fdw_empty_event_result_keeps_columns() {
+    let Some((db, _ch)) = setup().await else {
+        return;
+    };
+
+    let result = execute_query_postgres_via_clickhouse(
+        &db.pool,
+        r#"SELECT block_num, "from", "to", "value" FROM Transfer WHERE block_num < 0"#,
+        &["Transfer(address indexed from, address indexed to, uint256 value)"],
+        &QueryOptions::default(),
+    )
+    .await;
+    teardown(&db).await;
+
+    let result = result.expect("FDW query failed");
+    assert_eq!(result.row_count, 0);
+    assert_eq!(result.columns, ["block_num", "from", "to", "value"]);
+}
+
+#[tokio::test]
+#[serial(db)]
 async fn test_fdw_fixed_bytes_returns_declared_width() {
     let Some((db, ch)) = setup().await else {
         return;
