@@ -607,7 +607,7 @@ async fn test_create_materialized_view_daily_stats() {
 
     assert!(data.is_some());
     let rows = data.unwrap();
-    assert!(!rows.is_empty());
+    assert!(!rows.is_empty(), "query returned no rows");
 
     // Check aggregations exist
     let first = &rows[0];
