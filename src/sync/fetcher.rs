@@ -155,6 +155,16 @@ impl RpcClient {
             anyhow!("Failed to decode blocks response: {}", e)
         })?;
 
+        if responses.len() != batch.len() {
+            anyhow::bail!(
+                "Expected {} block responses for blocks {}..={}, got {}",
+                batch.len(),
+                range.start(),
+                range.end(),
+                responses.len()
+            );
+        }
+
         responses
             .into_iter()
             .enumerate()
@@ -208,6 +218,12 @@ impl RpcClient {
                 serde_json::json!([format!("0x{:x}", block_num)]),
             )
             .await?;
+        if let Some(err) = resp.error {
+            anyhow::bail!(
+                "eth_getBlockReceipts failed for block {block_num}: {}",
+                err.message
+            );
+        }
         Ok(resp.result.unwrap_or_default())
     }
 
@@ -274,9 +290,31 @@ impl RpcClient {
                 anyhow!("Failed to decode receipts response: {}", e)
             })?;
 
+        if responses.len() != batch.len() {
+            anyhow::bail!(
+                "Expected {} receipt responses for blocks {}..={}, got {}",
+                batch.len(),
+                range.start(),
+                range.end(),
+                responses.len()
+            );
+        }
+
         responses
             .into_iter()
-            .map(|r| Ok(r.result.unwrap_or_default()))
+            .enumerate()
+            .map(|(i, r)| {
+                if let Some(err) = r.error {
+                    anyhow::bail!(
+                        "RPC error for receipts of block {}: {}",
+                        range.start() + i as u64,
+                        err.message
+                    );
+                }
+                // A node answers `null` for a block it does not know. Completeness is checked
+                // by the caller against the block's transactions.
+                Ok(r.result.unwrap_or_default())
+            })
             .collect()
     }
 
@@ -585,6 +623,138 @@ mod tests {
 
         let sizes = request_sizes.lock().await.clone();
         assert_eq!(sizes, vec![5, 3, 2, 1, 2]);
+
+        server.abort();
+    }
+
+    /// Starts an RPC server that answers every request body with `respond`.
+    async fn serve(
+        respond: impl Fn(&Value) -> Value + Clone + Send + Sync + 'static,
+    ) -> (RpcClient, tokio::task::JoinHandle<()>) {
+        let app = Router::new().route(
+            "/",
+            post(move |Json(body): Json<Value>| async move { Json(respond(&body)) }),
+        );
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("Failed to bind test RPC server");
+        let addr = listener.local_addr().unwrap();
+
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("RPC server failed");
+        });
+
+        let client = RpcClient::new(&format!("http://127.0.0.1:{}", addr.port()));
+        (client, server)
+    }
+
+    fn rpc_result(id: &Value, result: Value) -> Value {
+        json!({ "jsonrpc": "2.0", "id": id, "result": result })
+    }
+
+    fn rpc_error(id: &Value, message: &str) -> Value {
+        json!({ "jsonrpc": "2.0", "id": id, "error": { "code": -32000, "message": message } })
+    }
+
+    #[tokio::test]
+    async fn test_get_receipts_batch_fails_on_item_error() {
+        let (client, server) = serve(|body| {
+            let requests = body.as_array().expect("expected batch request");
+            requests
+                .iter()
+                .map(|req| {
+                    if req["id"] == 1 {
+                        rpc_error(&req["id"], "header not found")
+                    } else {
+                        rpc_result(&req["id"], json!([]))
+                    }
+                })
+                .collect()
+        })
+        .await;
+
+        let err = client.get_receipts_batch(10..=12).await.unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "RPC error for receipts of block 11: header not found"
+        );
+
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn test_get_receipts_batch_adaptive_splits_on_item_size_error() {
+        let request_sizes = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sizes = request_sizes.clone();
+        let (client, server) = serve(move |body| {
+            let requests = body.as_array().expect("expected batch request");
+            sizes.lock().unwrap().push(requests.len());
+            requests
+                .iter()
+                .enumerate()
+                .map(|(i, req)| {
+                    if requests.len() > 2 && i == 0 {
+                        rpc_error(&req["id"], "response size exceeded")
+                    } else {
+                        rpc_result(&req["id"], json!([]))
+                    }
+                })
+                .collect()
+        })
+        .await;
+
+        let receipts = client
+            .get_receipts_batch_adaptive(1..=5)
+            .await
+            .expect("adaptive receipt fetch should succeed");
+        assert_eq!(receipts.len(), 5);
+        assert_eq!(*request_sizes.lock().unwrap(), vec![5, 3, 2, 1, 2]);
+
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn test_get_blocks_batch_fails_on_truncated_response() {
+        let header = tempo_alloy::rpc::TempoHeaderResponse {
+            inner: alloy::rpc::types::Header::default(),
+            timestamp_millis: 0,
+        };
+        let block = serde_json::to_value(Block::empty(header)).unwrap();
+        let (client, server) =
+            serve(move |body| json!([rpc_result(&body[0]["id"], block.clone())])).await;
+
+        let err = client.get_blocks_batch(1..=3).await.unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "Expected 3 block responses for blocks 1..=3, got 1"
+        );
+
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn test_get_receipts_batch_fails_on_truncated_response() {
+        let (client, server) = serve(|body| json!([rpc_result(&body[0]["id"], json!([]))])).await;
+
+        let err = client.get_receipts_batch(1..=3).await.unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "Expected 3 receipt responses for blocks 1..=3, got 1"
+        );
+
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn test_get_block_receipts_fails_on_rpc_error() {
+        let (client, server) = serve(|body| rpc_error(&body["id"], "header not found")).await;
+
+        let err = client.get_block_receipts(7).await.unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "eth_getBlockReceipts failed for block 7: header not found"
+        );
 
         server.abort();
     }

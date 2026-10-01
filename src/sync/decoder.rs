@@ -166,9 +166,58 @@ pub fn decode_receipt(receipt: &Receipt, block_timestamp: DateTime<Utc>) -> Rece
     }
 }
 
+/// Check that `receipts[i]` holds the receipts of `blocks[i]`: one receipt per
+/// transaction, in transaction order, each carrying the block's hash.
+///
+/// Blocks and receipts are fetched by block number in separate requests, so they can
+/// disagree: the node may switch forks between the two requests, answer them from
+/// backends with different views, or not have the receipts. Rows are joined by
+/// `(block_num, tx_idx)` only, which would pair a block with another block's receipts.
+pub fn validate_receipts(blocks: &[Block], receipts: &[Vec<Receipt>]) -> anyhow::Result<()> {
+    if blocks.len() != receipts.len() {
+        anyhow::bail!(
+            "Fetched {} blocks but {} receipt lists",
+            blocks.len(),
+            receipts.len()
+        );
+    }
+
+    for (block, block_receipts) in blocks.iter().zip(receipts) {
+        let block_num = block.header.number();
+        let block_hash = block.header.hash;
+
+        if block_receipts.len() != block.transactions.len() {
+            anyhow::bail!(
+                "Block {block_num} has {} transactions but {} receipts",
+                block.transactions.len(),
+                block_receipts.len()
+            );
+        }
+
+        for (i, (tx_hash, receipt)) in block.transactions.hashes().zip(block_receipts).enumerate() {
+            if receipt.block_hash() != Some(block_hash) {
+                anyhow::bail!(
+                    "Receipt {i} of block {block_num} has block hash {:?}, expected {block_hash}",
+                    receipt.block_hash()
+                );
+            }
+            if receipt.transaction_hash() != tx_hash {
+                anyhow::bail!(
+                    "Receipt {i} of block {block_num} has transaction hash {}, expected {tx_hash}",
+                    receipt.transaction_hash()
+                );
+            }
+        }
+    }
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use alloy::primitives::{Address, Bloom};
+    use serde_json::json;
 
     fn make_tx(block_num: i64, idx: i32) -> TxRow {
         TxRow {
@@ -305,5 +354,108 @@ mod tests {
         enrich_receipts_from_txs(&mut receipts, &[]);
         assert_eq!(receipts[0].tx_type, None);
         assert_eq!(receipts[0].fee_token, None);
+    }
+
+    const BLOCK_A: B256 = B256::repeat_byte(0xaa);
+    const BLOCK_B: B256 = B256::repeat_byte(0xbb);
+    const TX_1: B256 = B256::repeat_byte(0x11);
+    const TX_2: B256 = B256::repeat_byte(0x22);
+
+    /// Block as returned by `eth_getBlockByNumber` with full transactions.
+    fn rpc_block(number: u64, hash: B256, tx_hashes: &[B256]) -> Block {
+        let header = tempo_alloy::rpc::TempoHeaderResponse {
+            inner: alloy::rpc::types::Header::default(),
+            timestamp_millis: 0,
+        };
+        let mut block = serde_json::to_value(Block::empty(header)).unwrap();
+        block["number"] = json!(format!("0x{number:x}"));
+        block["hash"] = json!(hash);
+        block["transactions"] = tx_hashes
+            .iter()
+            .map(|tx_hash| {
+                json!({
+                    "type": "0x0",
+                    "hash": tx_hash,
+                    "nonce": "0x0",
+                    "gasPrice": "0x0",
+                    "gas": "0x0",
+                    "value": "0x0",
+                    "input": "0x",
+                    "r": "0x0",
+                    "s": "0x0",
+                    "v": "0x1b",
+                    "from": Address::ZERO,
+                })
+            })
+            .collect();
+        serde_json::from_value(block).unwrap()
+    }
+
+    /// Receipt as returned by `eth_getBlockReceipts`.
+    fn rpc_receipt(block_hash: B256, tx_hash: B256) -> Receipt {
+        serde_json::from_value(json!({
+            "type": "0x0",
+            "status": "0x1",
+            "cumulativeGasUsed": "0x0",
+            "logs": [],
+            "logsBloom": Bloom::ZERO,
+            "transactionHash": tx_hash,
+            "blockHash": block_hash,
+            "gasUsed": "0x0",
+            "from": Address::ZERO,
+            "to": null,
+            "contractAddress": null,
+            "feePayer": Address::ZERO,
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn validate_receipts_accepts_matching_receipts() {
+        let block = rpc_block(1, BLOCK_A, &[TX_1, TX_2]);
+        let receipts = vec![rpc_receipt(BLOCK_A, TX_1), rpc_receipt(BLOCK_A, TX_2)];
+        let empty_block = rpc_block(2, BLOCK_B, &[]);
+
+        validate_receipts(&[block, empty_block], &[receipts, vec![]]).unwrap();
+    }
+
+    #[test]
+    fn validate_receipts_rejects_missing_receipts() {
+        let block = rpc_block(1, BLOCK_A, &[TX_1, TX_2]);
+
+        let err = validate_receipts(&[block], &[vec![]]).unwrap_err();
+        assert_eq!(err.to_string(), "Block 1 has 2 transactions but 0 receipts");
+    }
+
+    #[test]
+    fn validate_receipts_rejects_receipts_of_another_block() {
+        let block = rpc_block(1, BLOCK_A, &[TX_1]);
+        let receipts = vec![rpc_receipt(BLOCK_B, TX_1)];
+
+        let err = validate_receipts(&[block], &[receipts]).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            format!("Receipt 0 of block 1 has block hash Some({BLOCK_B}), expected {BLOCK_A}")
+        );
+    }
+
+    #[test]
+    fn validate_receipts_rejects_reordered_receipts() {
+        let block = rpc_block(1, BLOCK_A, &[TX_1, TX_2]);
+        let receipts = vec![rpc_receipt(BLOCK_A, TX_2), rpc_receipt(BLOCK_A, TX_1)];
+
+        let err = validate_receipts(&[block], &[receipts]).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            format!("Receipt 0 of block 1 has transaction hash {TX_2}, expected {TX_1}")
+        );
+    }
+
+    #[test]
+    fn validate_receipts_rejects_length_mismatch() {
+        let block = rpc_block(1, BLOCK_A, &[]);
+
+        let err = validate_receipts(&[block], &[]).unwrap_err();
+        assert_eq!(err.to_string(), "Fetched 1 blocks but 0 receipt lists");
     }
 }
