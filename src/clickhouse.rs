@@ -19,6 +19,17 @@ use crate::query::{
 
 const MAX_QUERY_RESULT_BYTES: usize = 10 * 1024 * 1024;
 
+/// Working memory ClickHouse may use for one public API query; internal
+/// queries keep the server profile's limit.
+///
+/// The row and result-size caps only bound what a query returns, so functions
+/// that build large arrays (`range`, `arrayWithConstant`) could otherwise
+/// allocate up to the profile's limit while executing. API queries are
+/// interactive (10 MB results, 30 second deadline), so 1 GiB still leaves room
+/// for aggregations. `max_threads` is deliberately not set: it would slow
+/// legitimate queries without bounding memory any further.
+const MAX_USER_QUERY_MEMORY_BYTES: u64 = 1 << 30;
+
 /// A single ClickHouse instance (connection + URL).
 struct Instance {
     http_client: reqwest::Client,
@@ -100,7 +111,8 @@ impl ClickHouseEngine {
     }
 
     /// Execute a public user query after applying signature rewrites, SQL
-    /// validation, and caller-provided timeout limits.
+    /// validation, caller-provided timeout limits, and the per-query memory
+    /// cap.
     pub async fn query_user(
         &self,
         sql: &str,
@@ -127,7 +139,11 @@ impl ClickHouseEngine {
         validate_clickhouse_query(&sql)?;
         let sql = hoist_set_operation_order_by_clickhouse(&sql);
         let sql = Self::wrap_user_query_with_limit(&sql, limit.clamp(1, HARD_LIMIT_MAX));
-        self.execute_prepared_query_with_settings(&sql, Some(timeout_ms), settings)
+        // The memory cap goes last so no caller setting can override it.
+        let max_memory_usage = MAX_USER_QUERY_MEMORY_BYTES.to_string();
+        let mut settings = settings.to_vec();
+        settings.push(("max_memory_usage", &max_memory_usage));
+        self.execute_prepared_query_with_settings(&sql, Some(timeout_ms), &settings)
             .await
     }
 
@@ -426,13 +442,13 @@ mod tests {
     use super::*;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-    async fn read_request(stream: &mut tokio::net::TcpStream) {
+    async fn read_request(stream: &mut tokio::net::TcpStream) -> String {
         let mut request = Vec::new();
         let mut buf = [0; 1024];
         loop {
             let read = stream.read(&mut buf).await.unwrap();
             if read == 0 {
-                return;
+                break;
             }
             request.extend_from_slice(&buf[..read]);
 
@@ -450,9 +466,10 @@ mod tests {
                 })
                 .unwrap_or(0);
             if request.len() >= header_end + 4 + content_length {
-                return;
+                break;
             }
         }
+        String::from_utf8_lossy(&request).into_owned()
     }
 
     async fn serve_once(listener: tokio::net::TcpListener, response: Vec<u8>) {
@@ -714,6 +731,57 @@ mod tests {
         assert_eq!(
             url,
             "http://clickhouse-1:8123/?database=tidx_4217&default_format=JSON&max_result_bytes=10485760&result_overflow_mode=throw&union_default_mode=DISTINCT&max_execution_time=2"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_memory_cap_applies_to_user_queries_only() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let body = r#"{"meta":[{"name":"n","type":"UInt8"}],"data":[{"n":1}],"rows":1}"#;
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        // Answers three requests and returns the request target of each.
+        let server = tokio::spawn(async move {
+            let mut targets = Vec::new();
+            for _ in 0..3 {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let request = read_request(&mut stream).await;
+                stream.write_all(response.as_bytes()).await.unwrap();
+                stream.shutdown().await.unwrap();
+                targets.push(request.split_whitespace().nth(1).unwrap().to_string());
+            }
+            targets
+        });
+
+        let config = ClickHouseConfig {
+            enabled: true,
+            url,
+            failover_urls: vec![],
+            database: None,
+            ..Default::default()
+        };
+        let engine = ClickHouseEngine::new(&config, 4217).unwrap();
+        let sql = "SELECT 1 AS n";
+        // A public API query, a tiered cold-arm query, and an internal query.
+        engine.query_user(sql, &[], 1_001, 10).await.unwrap();
+        engine
+            .query_user_with_settings(sql, &[], 1_001, 10, &[("date_time_output_format", "iso")])
+            .await
+            .unwrap();
+        engine.query(sql, &[]).await.unwrap();
+
+        let base = "/?database=tidx_4217&default_format=JSON&max_result_bytes=10485760&result_overflow_mode=throw&union_default_mode=DISTINCT";
+        let cap = format!("max_memory_usage={MAX_USER_QUERY_MEMORY_BYTES}");
+        assert_eq!(
+            server.await.unwrap(),
+            [
+                format!("{base}&max_execution_time=2&{cap}"),
+                format!("{base}&max_execution_time=2&date_time_output_format=iso&{cap}"),
+                base.to_string(),
+            ]
         );
     }
 
