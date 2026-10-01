@@ -1,4 +1,5 @@
-# TIDX Indexer Configuration
+# TIDX Indexer Configuration (Production)
+# Sensitive credentials are decoupled from repository files and loaded via environment variables.
 
 [http]
 enabled = true
@@ -18,7 +19,9 @@ backfill = true
 batch_size = 100
 
 [chains.postgres]
-url = "postgres://tidx:tidx@postgres:5432/tidx_moderato"
+# Credentials omitted from URL; retrieved at runtime via password_env
+url = "postgres://tidx@postgres:5432/tidx_moderato"
+password_env = "POSTGRES_PASSWORD"
 
 # ClickHouse OLAP engine (optional)
 [chains.clickhouse]
@@ -34,7 +37,9 @@ backfill = true
 batch_size = 100
 
 [chains.postgres]
-url = "postgres://tidx:tidx@postgres:5432/tidx_mainnet"
+# Credentials omitted from URL; retrieved at runtime via password_env
+url = "postgres://tidx@postgres:5432/tidx_mainnet"
+password_env = "POSTGRES_PASSWORD"
 
 # ClickHouse OLAP engine (optional)
 [chains.clickhouse]
