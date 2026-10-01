@@ -1294,6 +1294,8 @@ pub async fn finish_receipt_repair_attempt(pool: &Pool, block_nums: &[u64]) -> R
 
 /// Detect ALL gaps between `floor` and `tip_num`, including the leading gap
 /// from `floor` to the first stored block.
+/// The range above the highest stored block is not a gap here, see
+/// [`detect_all_gaps_with_trailing`].
 /// `floor` is the lowest block expected in PG (`SyncState::prune_floor()`);
 /// pass 1 when no pruning is configured (block 0 is genesis/empty).
 /// Returns gaps sorted by end block descending (most recent first).
@@ -1329,6 +1331,42 @@ pub async fn detect_all_gaps(pool: &Pool, floor: u64, tip_num: u64) -> Result<Ve
 
     // Sort by end block descending (most recent gaps first)
     gaps.sort_by_key(|b| std::cmp::Reverse(b.1));
+
+    Ok(gaps)
+}
+
+/// Like [`detect_all_gaps`], but also reports the trailing range above the
+/// highest stored block (at or below `tip_num`) up to `tip_num`.
+///
+/// `detect_all_gaps` leaves that range to realtime sync, which stores a block
+/// before it advances `tip_num`; reporting it there would make gap-fill race
+/// realtime for the newest blocks. Use this function only where `tip_num` is
+/// set ahead of the stored blocks and nothing else fetches the range in
+/// between, as in backfill-first mode.
+/// Returns gaps sorted by end block descending (most recent first).
+pub async fn detect_all_gaps_with_trailing(
+    pool: &Pool,
+    floor: u64,
+    tip_num: u64,
+) -> Result<Vec<(u64, u64)>> {
+    let mut gaps = detect_all_gaps(pool, floor, tip_num).await?;
+
+    let conn = pool.get().await?;
+    let tip = tip_num.min(i64::MAX as u64) as i64;
+    let highest: Option<i64> = conn
+        .query_one("SELECT MAX(num) FROM blocks WHERE num <= $1", &[&tip])
+        .await?
+        .get(0);
+
+    // Without a stored block at or below the tip there is no trailing range:
+    // detect_all_gaps already reports an empty table as a single gap.
+    if let Some(highest) = highest {
+        let start = (highest as u64 + 1).max(floor);
+        if start <= tip_num {
+            // Ends at the tip, so it sorts before every other gap.
+            gaps.insert(0, (start, tip_num));
+        }
+    }
 
     Ok(gaps)
 }
