@@ -106,6 +106,10 @@ name = "query_bench"
 harness = false
 
 [[bench]]
+name = "log_index_bench"
+harness = false
+
+[[bench]]
 name = "sync_bench"
 harness = false
 
