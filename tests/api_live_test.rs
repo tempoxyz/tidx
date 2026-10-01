@@ -92,9 +92,9 @@ async fn test_status_endpoint() {
 
     assert_eq!(json["ok"], true);
     assert!(json["version"].is_string());
-    assert!(!json["version"].as_str().unwrap().is_empty());
+    assert_ne!(json["version"].as_str().unwrap(), "");
     assert!(json["rev"].is_string());
-    assert!(!json["rev"].as_str().unwrap().is_empty());
+    assert_ne!(json["rev"].as_str().unwrap(), "");
     assert!(json["chains"].is_array());
 }
 
