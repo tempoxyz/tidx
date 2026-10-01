@@ -581,6 +581,6 @@ mod tests {
     fn postgres_hydration_is_clamped_to_archived_ranges() {
         let gaps = vec![(91, 110), (1, 50)];
         assert_eq!(intersect_gaps(&gaps, 40, 100), vec![(91, 100), (40, 50)]);
-        assert!(intersect_gaps(&gaps, 111, 120).is_empty());
+        assert_eq!(intersect_gaps(&gaps, 111, 120), vec![]);
     }
 }
