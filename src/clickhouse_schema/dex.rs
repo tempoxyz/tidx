@@ -188,6 +188,16 @@ mod tests {
     }
 
     #[test]
+    fn ohlc_join_builds_only_on_orders_filled_in_the_window() {
+        let ddl = object("dex_ohlc_1m").ddl();
+        // Joining the whole `dex_orders` table would load every order ever
+        // placed into memory on each refresh.
+        assert!(!ddl.contains("INNER JOIN dex_orders"));
+        assert!(ddl.contains("FROM dex_orders\n        WHERE orderId IN"));
+        assert!(ddl.contains("max_memory_usage = 8589934592"));
+    }
+
+    #[test]
     fn pair_liquidity_joins_pairs_to_dex_escrow_balances() {
         let view = object("dex_pair_liquidity");
         assert!(view.is_view());
