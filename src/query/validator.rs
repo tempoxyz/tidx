@@ -210,7 +210,7 @@ fn validate_limit_expr(expr: &Expr, context: &str) -> Result<()> {
 
 const CLICKHOUSE_BLOCKED_SCHEMAS: &[&str] = &["system", "information_schema"];
 /// Functions a ClickHouse user query must not call. Entries are lowercase because
-/// `validate_clickhouse_function` lowercases the called name before the lookup.
+/// the called name is lowercased before the lookup.
 const CLICKHOUSE_DANGEROUS_FUNCTIONS: &[&str] = &[
     "url",
     "urlcluster",
