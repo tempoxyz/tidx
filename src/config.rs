@@ -612,7 +612,7 @@ mod tests {
         let config: ChainConfig = toml::from_str(toml_str).unwrap();
         let ch = config.clickhouse.unwrap();
 
-        assert!(ch.failover_urls.is_empty());
+        assert_eq!(ch.failover_urls, Vec::<String>::new());
         assert_eq!(ch.all_urls(), vec!["http://clickhouse:8123"]);
         assert!(ch.repair_derived_on_startup);
     }
