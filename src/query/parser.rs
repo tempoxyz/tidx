@@ -1582,7 +1582,7 @@ mod tests {
     fn test_parse_empty_params() {
         let sig = EventSignature::parse("Paused()").unwrap();
         assert_eq!(sig.name, "Paused");
-        assert!(sig.params.is_empty());
+        assert_eq!(sig.params, vec![]);
     }
 
     #[test]
@@ -2249,7 +2249,7 @@ mod tests {
         let preds = extract_raw_column_predicates(
             r#"SELECT * FROM Transfer WHERE "to" = '0xABC' AND "value" > 1000"#,
         );
-        assert!(preds.is_empty());
+        assert_eq!(preds, Vec::<String>::new());
     }
 
     #[test]
