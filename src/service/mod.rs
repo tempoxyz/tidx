@@ -259,11 +259,17 @@ pub async fn execute_query_clickhouse(
     Ok(result.into())
 }
 
-/// Strip `Nullable(...)` from a ClickHouse column type.
-fn ch_base_type(ty: &str) -> &str {
-    ty.strip_prefix("Nullable(")
+/// Strip `LowCardinality(...)` and `Nullable(...)` from a ClickHouse column
+/// type, e.g. `LowCardinality(Nullable(DateTime('UTC')))` → `DateTime('UTC')`.
+fn ch_base_type(mut ty: &str) -> &str {
+    while let Some(inner) = ty
+        .strip_prefix("Nullable(")
+        .or_else(|| ty.strip_prefix("LowCardinality("))
         .and_then(|t| t.strip_suffix(')'))
-        .unwrap_or(ty)
+    {
+        ty = inner;
+    }
+    ty
 }
 
 /// Rewrite `DateTime*` columns (fetched with `date_time_output_format=iso`)
@@ -1111,6 +1117,19 @@ mod tests {
         assert_eq!(r.rows[0][4], json!("1000000000000000000"));
         // Exceeds Decimal's 96-bit mantissa: NULL, matching PG's formatter.
         assert_eq!(r.rows[0][5], J::Null);
+    }
+
+    #[test]
+    fn normalize_datetime_unwraps_low_cardinality() {
+        let mut r = ch_result(
+            &[
+                "LowCardinality(DateTime('UTC'))",
+                "LowCardinality(Nullable(DateTime('UTC')))",
+            ],
+            vec![vec![json!("2026-09-11T22:38:08Z"), J::Null]],
+        );
+        normalize_datetime_columns(&mut r);
+        assert_eq!(r.rows[0], [json!("2026-09-11T22:38:08+00:00"), J::Null]);
     }
 
     #[test]
