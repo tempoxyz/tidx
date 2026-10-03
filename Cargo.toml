@@ -109,6 +109,10 @@ harness = false
 name = "sync_bench"
 harness = false
 
+[[bench]]
+name = "clickhouse_bench"
+harness = false
+
 [profile.bench]
 debug = true
 
