@@ -853,6 +853,7 @@ async fn run_gapfill_loop(
         .await?
         .unwrap_or_default();
     let mut progress = SyncProgress::new(chain_id, state.synced_num);
+    let mut gap_check = GapCheck::default();
 
     info!(
         chain_id = chain_id,
@@ -870,7 +871,7 @@ async fn run_gapfill_loop(
                 info!("Gap-fill: shutting down");
                 break;
             }
-            result = tick_gapfill_parallel(&sinks, &backfill_semaphore, &rpc, chain_id, batch_size, concurrency, &mut progress) => {
+            result = tick_gapfill_parallel(&sinks, &backfill_semaphore, &rpc, chain_id, batch_size, concurrency, &mut progress, &mut gap_check) => {
                 if let Err(e) = result {
                     error!(error = %e, "Gap-fill sync tick failed");
                     tokio::time::sleep(Duration::from_secs(1)).await;
@@ -880,6 +881,43 @@ async fn run_gapfill_loop(
     }
 
     Ok(())
+}
+
+/// How often gap-fill verifies the whole range from the prune floor, although
+/// only blocks above `synced_num` can be missing.
+const FULL_GAP_CHECK_INTERVAL: Duration = Duration::from_secs(10 * 60);
+
+/// Chooses the range that gap-fill checks for missing blocks.
+///
+/// `synced_num` is only raised after the blocks up to it were verified to be
+/// contiguous, and a reorg rewinds it together with the blocks it deletes. The
+/// check that runs every tick therefore only counts the blocks above
+/// `synced_num` instead of every block since the prune floor. The full range is
+/// still verified on start, so state written by older versions is not trusted,
+/// and then every [`FULL_GAP_CHECK_INTERVAL`].
+#[derive(Debug, Default)]
+struct GapCheck {
+    last_full_check: Option<Instant>,
+}
+
+impl GapCheck {
+    /// First block of the range to check at `now`.
+    fn check_from(&self, state: &SyncState, now: Instant) -> u64 {
+        let floor = state.prune_floor();
+        match self.last_full_check {
+            Some(at) if now.saturating_duration_since(at) < FULL_GAP_CHECK_INTERVAL => {
+                floor.max(state.synced_num.saturating_add(1))
+            }
+            _ => floor,
+        }
+    }
+
+    /// Records that no block is missing from `from` through the tip.
+    fn passed(&mut self, from: u64, state: &SyncState, now: Instant) {
+        if from <= state.prune_floor() {
+            self.last_full_check = Some(now);
+        }
+    }
 }
 
 /// Parallel gap-fill: spawns N concurrent workers to fetch and write block ranges
@@ -893,6 +931,7 @@ async fn tick_gapfill_parallel(
     batch_size: u64,
     concurrency: usize,
     progress: &mut SyncProgress,
+    gap_check: &mut GapCheck,
 ) -> Result<()> {
     let pool = sinks.pool();
     let state = load_sync_state(pool, chain_id).await?.unwrap_or_default();
@@ -918,8 +957,11 @@ async fn tick_gapfill_parallel(
     // are any gaps at all. Only fall back to the expensive LAG() window
     // function when gaps actually exist and we need their exact ranges.
     // With 0.5s block time, tip_num races ahead of synced_num constantly,
-    // so we check the range [floor, tip_num] cheaply via COUNT vs expected.
-    if state.tip_num > 0 && !has_gaps(pool, state.prune_floor(), state.tip_num).await? {
+    // so we usually only count the blocks above synced_num.
+    let now = Instant::now();
+    let check_from = gap_check.check_from(&state, now);
+    if state.tip_num > 0 && !has_gaps(pool, check_from, state.tip_num).await? {
+        gap_check.passed(check_from, &state, now);
         metrics::set_gap_ranges(chain_id, "postgres", &[]);
         metrics::set_synced(chain_id, realtime_lag == 0);
         if state.synced_num < state.tip_num {
@@ -1804,6 +1846,57 @@ fn group_consecutive_blocks(blocks: &[u64]) -> Vec<(u64, u64)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn synced_state(synced_num: u64, pruned_below: u64) -> SyncState {
+        SyncState {
+            synced_num,
+            tip_num: synced_num + 10,
+            pruned_below,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn test_gap_check_verifies_full_range_first() {
+        let check = GapCheck::default();
+        assert_eq!(check.check_from(&synced_state(500, 0), Instant::now()), 1);
+        assert_eq!(
+            check.check_from(&synced_state(500, 99), Instant::now()),
+            100
+        );
+    }
+
+    #[test]
+    fn test_gap_check_starts_above_synced_after_full_check() {
+        let now = Instant::now();
+        let state = synced_state(500, 0);
+        let mut check = GapCheck::default();
+        check.passed(check.check_from(&state, now), &state, now);
+
+        assert_eq!(check.check_from(&state, now), 501);
+        // The prune floor still bounds the range when it is above synced_num.
+        assert_eq!(check.check_from(&synced_state(500, 700), now), 701);
+    }
+
+    #[test]
+    fn test_gap_check_repeats_full_check_after_interval() {
+        let now = Instant::now();
+        let state = synced_state(500, 0);
+        let mut check = GapCheck::default();
+        check.passed(1, &state, now);
+
+        assert_eq!(check.check_from(&state, now + FULL_GAP_CHECK_INTERVAL), 1);
+    }
+
+    #[test]
+    fn test_gap_check_partial_check_does_not_count_as_full() {
+        let now = Instant::now();
+        let state = synced_state(500, 0);
+        let mut check = GapCheck::default();
+        check.passed(501, &state, now);
+
+        assert_eq!(check.check_from(&state, now), 1);
+    }
 
     #[test]
     fn test_group_consecutive_blocks_empty() {
