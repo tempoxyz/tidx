@@ -225,19 +225,17 @@ pub async fn execute_query_postgres(
     run_pg_query(pool, &sql, options, &[], "postgres").await
 }
 
-/// ClickHouse settings for the tiered cold arm. 64-bit+ integers keep
-/// ClickHouse's default quoting (exact strings; unquoted UInt256 would parse
-/// lossily as f64) — [`normalize_cold_result`] then converts per column type.
-const TIERED_COLD_CH_SETTINGS: &[(&str, &str)] = &[
+/// ClickHouse settings for public queries (native `engine=clickhouse` and the
+/// tiered cold arm): ISO timestamps for [`normalize_datetime_columns`].
+/// 64-bit+ integers keep ClickHouse's default quoting (exact strings;
+/// unquoted UInt256 would parse lossily as f64) — [`normalize_cold_result`]
+/// then converts per column type for the tiered cold arm.
+const CH_QUERY_SETTINGS: &[(&str, &str)] = &[
     ("date_time_output_format", "iso"),
     // No `final = 1`: reads match the native ClickHouse engine's semantics
     // (unmerged ReplacingMergeTree duplicates are possible but rare, and the
     // split cold arm only reads long-merged history below the prune boundary).
 ];
-
-/// ClickHouse settings for native `engine=clickhouse` queries: ISO
-/// timestamps for [`normalize_datetime_columns`].
-const NATIVE_CH_SETTINGS: &[(&str, &str)] = &[("date_time_output_format", "iso")];
 
 /// Execute a public query directly on ClickHouse.
 pub async fn execute_query_clickhouse(
@@ -252,7 +250,7 @@ pub async fn execute_query_clickhouse(
             signatures,
             options.timeout_ms,
             options.limit,
-            NATIVE_CH_SETTINGS,
+            CH_QUERY_SETTINGS,
         )
         .await?;
     normalize_datetime_columns(&mut result);
@@ -434,7 +432,7 @@ pub async fn execute_query_tiered(
                         signatures,
                         options.timeout_ms,
                         options.limit,
-                        TIERED_COLD_CH_SETTINGS,
+                        CH_QUERY_SETTINGS,
                     )
                     .await,
                 ),
@@ -554,7 +552,7 @@ async fn try_execute_tiered_split(
                 signatures,
                 timeout_ms,
                 eff_limit.max(1),
-                TIERED_COLD_CH_SETTINGS,
+                CH_QUERY_SETTINGS,
             ),
             execute_query_postgres(pool, &hot_sql, signatures, &hot_options),
         );
@@ -616,7 +614,7 @@ async fn try_execute_tiered_split(
                 signatures,
                 budget(&start),
                 remaining,
-                TIERED_COLD_CH_SETTINGS,
+                CH_QUERY_SETTINGS,
             )
             .await?;
         normalize_cold_result(&mut cold_raw, &plan.selector_null_cols);
@@ -670,7 +668,7 @@ async fn degrade_split_to_clickhouse(
             signatures,
             timeout_ms,
             options.limit,
-            TIERED_COLD_CH_SETTINGS,
+            CH_QUERY_SETTINGS,
         )
         .await
         .map_err(|ch_err| {
