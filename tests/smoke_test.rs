@@ -1205,7 +1205,7 @@ async fn test_query_empty_result_keeps_columns() {
     .expect("Query failed");
 
     assert_eq!(result.columns, vec!["num", "block_hash"]);
-    assert!(result.rows.is_empty());
+    assert_eq!(result.rows, Vec::<Vec<serde_json::Value>>::new());
 }
 
 #[tokio::test]
