@@ -883,7 +883,15 @@ fn try_format_column_json(row: &tokio_postgres::Row, idx: usize) -> Result<serde
                 _ => serde_json::Value::Null,
             }
         }
-        "float4" | "float8" => row
+        // Widen via the shortest decimal so 1.1::float4 is 1.1, as PostgreSQL
+        // prints it, rather than 1.100000023841858.
+        "float4" => row
+            .try_get::<_, f32>(idx)
+            .ok()
+            .and_then(|v| v.to_string().parse::<f64>().ok())
+            .and_then(serde_json::Number::from_f64)
+            .map_or(serde_json::Value::Null, serde_json::Value::Number),
+        "float8" => row
             .try_get::<_, f64>(idx)
             .ok()
             .and_then(serde_json::Number::from_f64)
@@ -898,7 +906,7 @@ fn try_format_column_json(row: &tokio_postgres::Row, idx: usize) -> Result<serde
             Ok(v) => serde_json::Value::String(format!("0x{}", hex::encode(v))),
             Err(_) => serde_json::Value::Null,
         },
-        "text" | "varchar" | "name" => match row.try_get::<_, &str>(idx) {
+        "text" | "varchar" | "bpchar" | "name" => match row.try_get::<_, &str>(idx) {
             Ok(v) if v.len() > MAX_CELL_BYTES => {
                 return Err(anyhow!(
                     "Query result cell exceeded {} bytes",
@@ -908,11 +916,19 @@ fn try_format_column_json(row: &tokio_postgres::Row, idx: usize) -> Result<serde
             Ok(v) => serde_json::Value::String(v.to_string()),
             Err(_) => serde_json::Value::Null,
         },
-        "timestamptz" | "timestamp" => row
+        "timestamptz" => row
             .try_get::<_, DateTime<Utc>>(idx)
             .ok()
             .map_or(serde_json::Value::Null, |v| {
                 serde_json::Value::String(v.to_rfc3339())
+            }),
+        // Zoneless; read as UTC so it formats like timestamptz and ClickHouse
+        // DateTime columns (e.g. `block_timestamp AT TIME ZONE 'UTC'`).
+        "timestamp" => row
+            .try_get::<_, chrono::NaiveDateTime>(idx)
+            .ok()
+            .map_or(serde_json::Value::Null, |v| {
+                serde_json::Value::String(v.and_utc().to_rfc3339())
             }),
         "bool" => row
             .try_get::<_, bool>(idx)
