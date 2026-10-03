@@ -1113,6 +1113,73 @@ async fn test_query_receipts() {
 
 #[tokio::test]
 #[serial(db)]
+async fn test_query_postgres_cell_json_formats() {
+    let db = TestDb::empty().await;
+    let opts = default_options();
+
+    // NUMERIC past rust_decimal's 96-bit mantissa and non-finite floats are NULL.
+    let result = execute_query_postgres(
+        &db.pool,
+        r#"SELECT 7::int2 AS i2, -42::int4 AS i4, 9007199254740993::int8 AS i8,
+            123.4500::numeric AS num, -0.5::numeric AS neg_num,
+            1234567890123456789012345678901234567890::numeric AS big_num,
+            1.5::float8 AS f8, 'NaN'::float8 AS nan,
+            '\xDEADbeef'::bytea AS bytes, ''::bytea AS empty_bytes,
+            'héllo "q"'::text AS txt, 'v'::varchar AS vc, 'n'::name AS nm,
+            '2024-01-02 03:04:05.678+05:30'::timestamptz AS ts, true AS flag,
+            NULL::int8 AS null_i8, NULL::numeric AS null_num, NULL::float8 AS null_f8,
+            NULL::bytea AS null_bytes, NULL::text AS null_txt,
+            NULL::timestamptz AS null_ts, NULL::bool AS null_flag"#,
+        &[],
+        &opts,
+    )
+    .await
+    .expect("Query failed");
+
+    assert_eq!(
+        serde_json::to_string(&result.rows).unwrap(),
+        r#"[[7,-42,9007199254740993,"123.4500","-0.5",null,1.5,null,"0xdeadbeef","0x","héllo \"q\"","v","n","2024-01-01T21:34:05.678+00:00",true,null,null,null,null,null,null,null]]"#
+    );
+
+    // Cells over 1 MiB fail the query. They are stored directly so the
+    // query itself does not need functions that build large values.
+    let block_num = 74_000_000_i64;
+    let conn = db.pool.get().await.unwrap();
+    conn.execute("DELETE FROM logs WHERE block_num = $1", &[&block_num])
+        .await
+        .unwrap();
+    conn.execute(
+        "INSERT INTO logs (block_num, block_timestamp, log_idx, tx_idx, tx_hash, address, data)
+         VALUES ($1, NOW(), 0, 0, $2, $2, $3), ($1, NOW(), 1, 0, $2, $2, $4)",
+        &[
+            &block_num,
+            &vec![0_u8; 20],
+            &vec![0xab_u8; 1024 * 1024 + 1],
+            &vec![b'a'; 1024 * 1024 + 1],
+        ],
+    )
+    .await
+    .unwrap();
+    for sql in [
+        "SELECT data FROM logs WHERE block_num = 74000000 AND log_idx = 0",
+        "SELECT encode(data, 'escape') FROM logs WHERE block_num = 74000000 AND log_idx = 1",
+    ] {
+        let err = execute_query_postgres(&db.pool, sql, &[], &opts)
+            .await
+            .expect_err("cell over 1 MiB should fail");
+        assert!(
+            err.to_string()
+                .contains("Query result cell exceeded 1048576 bytes"),
+            "got: {err}"
+        );
+    }
+    conn.execute("DELETE FROM logs WHERE block_num = $1", &[&block_num])
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+#[serial(db)]
 async fn test_query_rejects_non_select() {
     let db = TestDb::new().await;
     let opts = default_options();

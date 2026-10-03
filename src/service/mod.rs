@@ -4,7 +4,7 @@ use futures::TryStreamExt;
 use serde::Serialize;
 use std::time::Instant;
 use tokio_postgres::error::SqlState;
-use tokio_postgres::types::ToSql;
+use tokio_postgres::types::{ToSql, Type};
 
 use crate::db::Pool;
 use crate::metrics;
@@ -850,73 +850,81 @@ pub fn format_column_json(row: &tokio_postgres::Row, idx: usize) -> serde_json::
     try_format_column_json(row, idx).unwrap_or(serde_json::Value::Null)
 }
 
+/// Cells decode as `Option<T>` so NULLs don't allocate a `WasNull` error.
+/// Dispatching on the built-in [`Type`] rather than the type name is
+/// equivalent: none of these decoders accept a custom type that merely shares
+/// a built-in's name, so such columns were already NULL.
 fn try_format_column_json(row: &tokio_postgres::Row, idx: usize) -> Result<serde_json::Value> {
-    let col = &row.columns()[idx];
-
-    let value = match col.type_().name() {
-        "int2" => row
-            .try_get::<_, i16>(idx)
+    let value = match *row.columns()[idx].type_() {
+        Type::INT2 => row
+            .try_get::<_, Option<i16>>(idx)
             .ok()
+            .flatten()
             .map_or(serde_json::Value::Null, |v| {
                 serde_json::Value::Number(v.into())
             }),
-        "int4" => row
-            .try_get::<_, i32>(idx)
+        Type::INT4 => row
+            .try_get::<_, Option<i32>>(idx)
             .ok()
+            .flatten()
             .map_or(serde_json::Value::Null, |v| {
                 serde_json::Value::Number(v.into())
             }),
-        "int8" => row
-            .try_get::<_, i64>(idx)
+        Type::INT8 => row
+            .try_get::<_, Option<i64>>(idx)
             .ok()
+            .flatten()
             .map_or(serde_json::Value::Null, |v| {
                 serde_json::Value::Number(v.into())
             }),
-        "numeric" => {
+        Type::NUMERIC => {
             // rust_decimal::Decimal panics (not errors) for values exceeding its
             // 96-bit mantissa (~28 digits). Postgres NUMERIC is arbitrary precision
             // (e.g. abi_uint() on uint256 = 78 digits), so catch the panic.
             match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                row.try_get::<_, rust_decimal::Decimal>(idx)
+                row.try_get::<_, Option<rust_decimal::Decimal>>(idx)
             })) {
-                Ok(Ok(v)) => serde_json::Value::String(v.to_string()),
+                Ok(Ok(Some(v))) => serde_json::Value::String(v.to_string()),
                 _ => serde_json::Value::Null,
             }
         }
-        "float4" | "float8" => row
-            .try_get::<_, f64>(idx)
+        Type::FLOAT4 | Type::FLOAT8 => row
+            .try_get::<_, Option<f64>>(idx)
             .ok()
+            .flatten()
             .and_then(serde_json::Number::from_f64)
             .map_or(serde_json::Value::Null, serde_json::Value::Number),
-        "bytea" => match row.try_get::<_, &[u8]>(idx) {
-            Ok(v) if v.len() > MAX_CELL_BYTES => {
+        Type::BYTEA => match row.try_get::<_, Option<&[u8]>>(idx) {
+            Ok(Some(v)) if v.len() > MAX_CELL_BYTES => {
                 return Err(anyhow!(
                     "Query result cell exceeded {} bytes",
                     MAX_CELL_BYTES
                 ));
             }
-            Ok(v) => serde_json::Value::String(format!("0x{}", hex::encode(v))),
-            Err(_) => serde_json::Value::Null,
+            Ok(Some(v)) => serde_json::Value::String(alloy::hex::encode_prefixed(v)),
+            _ => serde_json::Value::Null,
         },
-        "text" | "varchar" | "name" => match row.try_get::<_, &str>(idx) {
-            Ok(v) if v.len() > MAX_CELL_BYTES => {
+        Type::TEXT | Type::VARCHAR | Type::NAME => match row.try_get::<_, Option<&str>>(idx) {
+            Ok(Some(v)) if v.len() > MAX_CELL_BYTES => {
                 return Err(anyhow!(
                     "Query result cell exceeded {} bytes",
                     MAX_CELL_BYTES
                 ));
             }
-            Ok(v) => serde_json::Value::String(v.to_string()),
-            Err(_) => serde_json::Value::Null,
+            Ok(Some(v)) => serde_json::Value::String(v.to_string()),
+            _ => serde_json::Value::Null,
         },
-        "timestamptz" | "timestamp" => row
-            .try_get::<_, DateTime<Utc>>(idx)
+        Type::TIMESTAMPTZ | Type::TIMESTAMP => row
+            .try_get::<_, Option<DateTime<Utc>>>(idx)
             .ok()
+            .flatten()
             .map_or(serde_json::Value::Null, |v| {
                 serde_json::Value::String(v.to_rfc3339())
             }),
-        "bool" => row
-            .try_get::<_, bool>(idx)
+        Type::BOOL => row
+            .try_get::<_, Option<bool>>(idx)
             .ok()
+            .flatten()
             .map_or(serde_json::Value::Null, serde_json::Value::Bool),
         _ => serde_json::Value::Null,
     };
@@ -928,7 +936,20 @@ fn estimated_json_value_bytes(value: &serde_json::Value) -> usize {
     match value {
         serde_json::Value::Null => 4,
         serde_json::Value::Bool(_) => 5,
-        serde_json::Value::Number(n) => n.to_string().len(),
+        serde_json::Value::Number(n) => {
+            use std::fmt::Write;
+
+            struct ByteCount(usize);
+            impl Write for ByteCount {
+                fn write_str(&mut self, s: &str) -> std::fmt::Result {
+                    self.0 += s.len();
+                    Ok(())
+                }
+            }
+            let mut count = ByteCount(0);
+            let _ = write!(count, "{n}");
+            count.0
+        }
         serde_json::Value::String(s) => s.len(),
         serde_json::Value::Array(values) => values.iter().map(estimated_json_value_bytes).sum(),
         serde_json::Value::Object(values) => values
@@ -1339,6 +1360,20 @@ mod tests {
         });
 
         assert!(estimated_json_value_bytes(&value) >= 10);
+    }
+
+    #[test]
+    fn test_estimated_json_value_bytes_numbers_match_json_text() {
+        for n in [
+            json!(0),
+            json!(-42),
+            json!(u64::MAX),
+            json!(i64::MIN),
+            json!(1.5),
+            json!(1e-7),
+        ] {
+            assert_eq!(estimated_json_value_bytes(&n), n.to_string().len(), "{n}");
+        }
     }
 
     // ========================================================================
