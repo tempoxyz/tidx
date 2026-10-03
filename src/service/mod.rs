@@ -225,21 +225,74 @@ pub async fn execute_query_postgres(
     run_pg_query(pool, &sql, options, &[], "postgres").await
 }
 
-/// ClickHouse settings for the tiered cold arm. 64-bit+ integers keep
-/// ClickHouse's default quoting (exact strings; unquoted UInt256 would parse
-/// lossily as f64) — [`normalize_cold_result`] then converts per column type.
-const TIERED_COLD_CH_SETTINGS: &[(&str, &str)] = &[
+/// ClickHouse settings for public queries (native `engine=clickhouse` and the
+/// tiered cold arm): ISO timestamps for [`normalize_datetime_columns`].
+/// 64-bit+ integers keep ClickHouse's default quoting (exact strings;
+/// unquoted UInt256 would parse lossily as f64) — [`normalize_cold_result`]
+/// then converts per column type for the tiered cold arm.
+const CH_QUERY_SETTINGS: &[(&str, &str)] = &[
     ("date_time_output_format", "iso"),
     // No `final = 1`: reads match the native ClickHouse engine's semantics
     // (unmerged ReplacingMergeTree duplicates are possible but rare, and the
     // split cold arm only reads long-merged history below the prune boundary).
 ];
 
+/// Execute a public query directly on ClickHouse.
+pub async fn execute_query_clickhouse(
+    clickhouse: &crate::clickhouse::ClickHouseEngine,
+    sql: &str,
+    signatures: &[&str],
+    options: &QueryOptions,
+) -> Result<QueryResult> {
+    let mut result = clickhouse
+        .query_user_with_settings(
+            sql,
+            signatures,
+            options.timeout_ms,
+            options.limit,
+            CH_QUERY_SETTINGS,
+        )
+        .await?;
+    normalize_datetime_columns(&mut result);
+    Ok(result.into())
+}
+
+/// Strip `LowCardinality(...)` and `Nullable(...)` from a ClickHouse column
+/// type, e.g. `LowCardinality(Nullable(DateTime('UTC')))` → `DateTime('UTC')`.
+fn ch_base_type(mut ty: &str) -> &str {
+    while let Some(inner) = ty
+        .strip_prefix("Nullable(")
+        .or_else(|| ty.strip_prefix("LowCardinality("))
+        .and_then(|t| t.strip_suffix(')'))
+    {
+        ty = inner;
+    }
+    ty
+}
+
+/// Rewrite `DateTime*` columns (fetched with `date_time_output_format=iso`)
+/// from ClickHouse ISO strings to chrono RFC 3339, the formatting
+/// [`try_format_column_json`] gives PostgreSQL `timestamptz`.
+fn normalize_datetime_columns(result: &mut crate::clickhouse::QueryResult) {
+    for (i, ty) in result.column_types.iter().enumerate() {
+        if !ch_base_type(ty).starts_with("DateTime") {
+            continue;
+        }
+        for row in &mut result.rows {
+            if let Some(serde_json::Value::String(s)) = row.get_mut(i)
+                && let Ok(v) = DateTime::parse_from_rfc3339(s)
+            {
+                *s = v.with_timezone(&Utc).to_rfc3339();
+            }
+        }
+    }
+}
+
 /// Rewrite ClickHouse JSON values to the hot (PostgreSQL) arm's
 /// representations, per column type:
 ///
 /// - `Int64`/`UInt64`: quoted string → JSON number (PG int8 is a number);
-/// - `DateTime*`: ISO string → chrono RFC 3339 (PG timestamptz formatting);
+/// - `DateTime*`: see [`normalize_datetime_columns`];
 /// - `(U)Int128`/`(U)Int256`: PG NUMERIC parity — decimal string when the
 ///   value fits [`rust_decimal::Decimal`], else NULL (PG's formatter nulls
 ///   values past Decimal's 96-bit mantissa, see [`try_format_column_json`]);
@@ -258,22 +311,17 @@ fn normalize_cold_result(
             }
         }
     }
+    normalize_datetime_columns(result);
     for (i, ty) in result.column_types.iter().enumerate() {
-        let base = ty
-            .strip_prefix("Nullable(")
-            .and_then(|t| t.strip_suffix(')'))
-            .unwrap_or(ty);
         enum Kind {
             Int64,
             UInt64,
             BigNum,
-            DateTime,
         }
-        let kind = match base {
+        let kind = match ch_base_type(ty) {
             "Int64" => Kind::Int64,
             "UInt64" => Kind::UInt64,
             "Int128" | "UInt128" | "Int256" | "UInt256" => Kind::BigNum,
-            t if t.starts_with("DateTime") => Kind::DateTime,
             _ => continue,
         };
         for row in &mut result.rows {
@@ -297,11 +345,6 @@ fn normalize_cold_result(
                         Ok(v) => serde_json::Value::String(v.to_string()),
                         Err(_) => serde_json::Value::Null,
                     };
-                }
-                Kind::DateTime => {
-                    if let Ok(v) = DateTime::parse_from_rfc3339(s) {
-                        *cell = serde_json::Value::String(v.with_timezone(&Utc).to_rfc3339());
-                    }
                 }
             }
         }
@@ -389,7 +432,7 @@ pub async fn execute_query_tiered(
                         signatures,
                         options.timeout_ms,
                         options.limit,
-                        TIERED_COLD_CH_SETTINGS,
+                        CH_QUERY_SETTINGS,
                     )
                     .await,
                 ),
@@ -509,7 +552,7 @@ async fn try_execute_tiered_split(
                 signatures,
                 timeout_ms,
                 eff_limit.max(1),
-                TIERED_COLD_CH_SETTINGS,
+                CH_QUERY_SETTINGS,
             ),
             execute_query_postgres(pool, &hot_sql, signatures, &hot_options),
         );
@@ -571,7 +614,7 @@ async fn try_execute_tiered_split(
                 signatures,
                 budget(&start),
                 remaining,
-                TIERED_COLD_CH_SETTINGS,
+                CH_QUERY_SETTINGS,
             )
             .await?;
         normalize_cold_result(&mut cold_raw, &plan.selector_null_cols);
@@ -625,7 +668,7 @@ async fn degrade_split_to_clickhouse(
             signatures,
             timeout_ms,
             options.limit,
-            TIERED_COLD_CH_SETTINGS,
+            CH_QUERY_SETTINGS,
         )
         .await
         .map_err(|ch_err| {
@@ -757,24 +800,25 @@ async fn run_pg_query(
     let timeout = std::time::Duration::from_millis(options.timeout_ms + 100);
     let limit = options.limit as usize;
     let result = tokio::time::timeout(timeout, async {
+        // query_raw prepares a &str anyway; preparing here under the
+        // session setup yields column names even for an empty result.
+        let stmt = tx.prepare(sql).await?;
+        let columns: Vec<String> = stmt
+            .columns()
+            .iter()
+            .map(|c| c.name().to_string())
+            .collect();
         let params = std::iter::empty::<&(dyn ToSql + Sync)>();
-        let stream = tx.query_raw(sql, params).await?;
+        let stream = tx.query_raw(&stmt, params).await?;
         futures::pin_mut!(stream);
-        let mut columns: Option<Vec<String>> = None;
         let mut rows = Vec::new();
         let mut result_bytes = 0usize;
 
         while let Some(row) = stream.try_next().await? {
-            if columns.is_none() {
-                columns = Some(row.columns().iter().map(|c| c.name().to_string()).collect());
-            }
             if rows.len() >= limit {
                 return Err(anyhow!("Query returned more than {limit} rows"));
             }
-            let cols = columns
-                .as_ref()
-                .expect("columns initialized from first row");
-            let row_values = (0..cols.len())
+            let row_values = (0..columns.len())
                 .map(|i| try_format_column_json(&row, i))
                 .collect::<Result<Vec<_>>>()?;
             result_bytes = result_bytes.saturating_add(
@@ -792,11 +836,11 @@ async fn run_pg_query(
             rows.push(row_values);
         }
 
-        Ok::<_, anyhow::Error>((columns.unwrap_or_default(), rows))
+        Ok::<_, anyhow::Error>((columns, rows))
     })
     .await;
 
-    let (mut columns, result_rows) = match result {
+    let (columns, result_rows) = match result {
         Ok(Ok(result)) => {
             metrics::record_query_duration(start.elapsed());
             result
@@ -808,15 +852,6 @@ async fn run_pg_query(
     };
 
     tx.commit().await.map_err(classify_postgres_error)?;
-
-    if columns.is_empty() {
-        columns = conn
-            .prepare(sql)
-            .await
-            .ok()
-            .map(|s| s.columns().iter().map(|c| c.name().to_string()).collect())
-            .unwrap_or_default();
-    }
 
     let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
     let row_count = result_rows.len();
@@ -1080,6 +1115,19 @@ mod tests {
         assert_eq!(r.rows[0][4], json!("1000000000000000000"));
         // Exceeds Decimal's 96-bit mantissa: NULL, matching PG's formatter.
         assert_eq!(r.rows[0][5], J::Null);
+    }
+
+    #[test]
+    fn normalize_datetime_unwraps_low_cardinality() {
+        let mut r = ch_result(
+            &[
+                "LowCardinality(DateTime('UTC'))",
+                "LowCardinality(Nullable(DateTime('UTC')))",
+            ],
+            vec![vec![json!("2026-09-11T22:38:08Z"), J::Null]],
+        );
+        normalize_datetime_columns(&mut r);
+        assert_eq!(r.rows[0], [json!("2026-09-11T22:38:08+00:00"), J::Null]);
     }
 
     #[test]

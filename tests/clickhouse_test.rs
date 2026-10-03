@@ -736,6 +736,136 @@ async fn test_role_granted_cte() {
     assert_eq!(data.unwrap().len(), 1);
 }
 
+#[tokio::test]
+#[serial(clickhouse)]
+async fn test_fixed_bytes_cte_returns_declared_width() {
+    let ch =
+        TestClickHouse::new("tidx_test_fixed_bytes").expect("Failed to create ClickHouse client");
+
+    if ch.wait_for_ready().await.is_err() {
+        println!("ClickHouse not available, skipping test");
+        return;
+    }
+
+    ch.reset_database().await.expect("Failed to reset database");
+    ch.create_mock_logs_table()
+        .await
+        .expect("Failed to create logs table");
+
+    let signature = "Fixed(bytes4 indexed tag, bytes4 value, bytes32 word)";
+    let selector = format!(
+        "0x{}",
+        EventSignature::parse(signature).unwrap().topic0_hex()
+    );
+    let tag = format!("0xcafebabe{}", "00".repeat(28));
+    let word = "11".repeat(32);
+    let data = format!("0xdeadbeef{}{word}", "00".repeat(28));
+    let zero = format!("0x{}", "00".repeat(32));
+    ch.insert_mock_log(
+        1,
+        0,
+        0,
+        &zero,
+        "0x1111111111111111111111111111111111111111",
+        &selector,
+        &tag,
+        &zero,
+        &zero,
+        &data,
+    )
+    .await
+    .expect("Failed to insert log");
+
+    let config = ClickHouseConfig {
+        enabled: true,
+        url: ch.url.clone(),
+        database: Some(ch.database.clone()),
+        ..Default::default()
+    };
+    let engine = ClickHouseEngine::new(&config, 4217).expect("Failed to create engine");
+    let result = engine
+        .query_user(
+            "SELECT tag, value, word FROM Fixed",
+            &[signature],
+            5_000,
+            100,
+        )
+        .await
+        .expect("Query failed");
+
+    assert_eq!(
+        result.rows,
+        [vec![
+            serde_json::json!("0xcafebabe"),
+            serde_json::json!("0xdeadbeef"),
+            serde_json::json!(format!("0x{word}")),
+        ]]
+    );
+}
+
+/// Native ClickHouse timestamps must match PostgreSQL's RFC 3339
+/// `timestamptz` formatting, not ClickHouse's zone-less default
+/// (`2026-09-11 22:38:08.000`, which JavaScript parses as local time).
+#[tokio::test]
+#[serial(clickhouse)]
+async fn test_execute_query_clickhouse_formats_timestamps_like_postgres() {
+    let ch = TestClickHouse::new("tidx_test_native_timestamps")
+        .expect("Failed to create ClickHouse client");
+
+    if ch.wait_for_ready().await.is_err() {
+        println!("ClickHouse not available, skipping test");
+        return;
+    }
+
+    ch.reset_database().await.expect("Failed to reset database");
+    ch.create_mock_logs_table()
+        .await
+        .expect("Failed to create logs table");
+    ch.query(
+        "INSERT INTO logs (block_num, block_timestamp, log_idx, tx_idx, tx_hash, address, data) VALUES \
+         (1, '2026-09-11 22:38:08.000', 0, 0, '0x01', '0x02', '0x'), \
+         (2, '2026-09-11 22:38:08.123', 0, 0, '0x01', '0x02', '0x')",
+    )
+    .await
+    .expect("Failed to insert logs");
+
+    let config = ClickHouseConfig {
+        enabled: true,
+        url: ch.url.clone(),
+        database: Some(ch.database.clone()),
+        ..Default::default()
+    };
+    let engine = ClickHouseEngine::new(&config, 4217).expect("Failed to create engine");
+    let result = tidx::service::execute_query_clickhouse(
+        &engine,
+        "SELECT block_timestamp FROM logs ORDER BY block_num",
+        &[],
+        &tidx::service::QueryOptions::default(),
+    )
+    .await
+    .expect("ClickHouse query failed");
+
+    let db = common::testdb::TestDb::empty().await;
+    let pg = tidx::service::execute_query_postgres(
+        &db.pool,
+        "SELECT ts FROM (VALUES (TIMESTAMPTZ '2026-09-11 22:38:08+00'), \
+         (TIMESTAMPTZ '2026-09-11 22:38:08.123+00')) AS t(ts)",
+        &[],
+        &tidx::service::QueryOptions::default(),
+    )
+    .await
+    .expect("PostgreSQL query failed");
+
+    assert_eq!(
+        result.rows,
+        [
+            [serde_json::json!("2026-09-11T22:38:08+00:00")],
+            [serde_json::json!("2026-09-11T22:38:08.123+00:00")],
+        ]
+    );
+    assert_eq!(result.rows, pg.rows);
+}
+
 /// `query_user` (the public /query path) must execute parenthesized UNION arms
 /// with a trailing ORDER BY/LIMIT, a shape valid in PostgreSQL. ClickHouse
 /// grammar rejects the trailing clauses (Code 62) unless they are hoisted
