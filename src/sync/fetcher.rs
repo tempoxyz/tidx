@@ -33,8 +33,25 @@ struct RpcRequest<'a> {
 
 #[derive(Deserialize)]
 struct RpcResponse<T> {
+    id: Option<u64>,
     result: Option<T>,
     error: Option<RpcError>,
+}
+
+/// Batch request IDs are their zero-based positions. Responses may arrive in
+/// any order, but every requested ID must occur exactly once before callers
+/// can pair blocks with their receipt lists.
+fn order_batch_responses<T>(responses: &mut [RpcResponse<T>]) -> Result<()> {
+    responses.sort_unstable_by_key(|response| response.id);
+    for (index, response) in responses.iter().enumerate() {
+        if response.id != Some(index as u64) {
+            anyhow::bail!(
+                "Expected RPC batch response ID {index}, got {:?}",
+                response.id
+            );
+        }
+    }
+    Ok(())
 }
 
 #[derive(Deserialize, Debug)]
@@ -144,7 +161,7 @@ impl RpcClient {
             }
         }
 
-        let responses: Vec<RpcResponse<Block>> = serde_json::from_str(&body).map_err(|e| {
+        let mut responses: Vec<RpcResponse<Block>> = serde_json::from_str(&body).map_err(|e| {
             tracing::error!(
                 error = %e,
                 body_preview = %body.chars().take(500).collect::<String>(),
@@ -164,6 +181,7 @@ impl RpcClient {
                 responses.len()
             );
         }
+        order_batch_responses(&mut responses)?;
 
         responses
             .into_iter()
@@ -278,7 +296,7 @@ impl RpcClient {
             }
         }
 
-        let responses: Vec<RpcResponse<Vec<Receipt>>> =
+        let mut responses: Vec<RpcResponse<Vec<Receipt>>> =
             serde_json::from_str(&body).map_err(|e| {
                 tracing::error!(
                     error = %e,
@@ -299,6 +317,7 @@ impl RpcClient {
                 responses.len()
             );
         }
+        order_batch_responses(&mut responses)?;
 
         responses
             .into_iter()
@@ -495,6 +514,47 @@ mod tests {
     use serde_json::{Value, json};
     use std::sync::Arc;
     use tokio::sync::Mutex;
+
+    #[test]
+    fn test_batch_responses_restore_request_order() {
+        let mut responses: Vec<RpcResponse<Vec<u64>>> = serde_json::from_value(json!([
+            { "id": 2, "result": [20, 21] },
+            { "id": 0, "result": [] },
+            { "id": 1, "error": { "code": -32000, "message": "header not found" } }
+        ]))
+        .unwrap();
+
+        order_batch_responses(&mut responses).unwrap();
+
+        assert_eq!(responses[0].result.as_deref(), Some([].as_slice()));
+        assert_eq!(
+            responses[1].error.as_ref().unwrap().message,
+            "header not found"
+        );
+        assert_eq!(responses[2].result.as_deref(), Some([20, 21].as_slice()));
+        assert_eq!(
+            responses
+                .iter()
+                .map(|response| response.id)
+                .collect::<Vec<_>>(),
+            vec![Some(0), Some(1), Some(2)]
+        );
+    }
+
+    #[test]
+    fn test_batch_responses_reject_invalid_ids() {
+        for batch in [
+            json!([{ "id": 0 }, { "id": 0 }]), // Duplicate, missing ID 1.
+            json!([{ "id": 1 }, { "id": 2 }]), // Missing ID 0.
+            json!([{ "id": 0 }, { "id": 2 }]), // Unexpected ID 2.
+            json!([{ "id": null }, { "id": 1 }]),
+            json!([{}, { "id": 1 }]),
+        ] {
+            let mut responses: Vec<RpcResponse<Value>> =
+                serde_json::from_value(batch.clone()).unwrap();
+            assert!(order_batch_responses(&mut responses).is_err(), "{batch}");
+        }
+    }
 
     #[derive(Clone)]
     struct TestState {

@@ -173,6 +173,7 @@ pub fn decode_receipt(receipt: &Receipt, block_timestamp: DateTime<Utc>) -> Rece
 /// disagree: the node may switch forks between the two requests, answer them from
 /// backends with different views, or not have the receipts. Rows are joined by
 /// `(block_num, tx_idx)` only, which would pair a block with another block's receipts.
+/// The fetcher restores batch request order using response IDs before this check.
 pub fn validate_receipts(blocks: &[Block], receipts: &[Vec<Receipt>]) -> anyhow::Result<()> {
     if blocks.len() != receipts.len() {
         anyhow::bail!(
