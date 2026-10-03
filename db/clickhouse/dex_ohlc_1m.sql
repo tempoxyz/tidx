@@ -19,10 +19,11 @@
 -- recomputes and atomically swaps, so it is reorg-correct by construction —
 -- the same reasoning as `token_balances_snapshot`.
 --
--- Recompute cost and table size are bounded by the rolling retention window
--- below; long historical OHLC ranges fall back to scanning `dex_fills`
--- directly. Tune `REFRESH EVERY`, the retention window, and the spill setting
--- to the deployment's fill volume.
+-- Table size and refresh memory are bounded by the rolling retention window
+-- below: the join only builds on orders that were filled inside it, not on
+-- every order ever placed. Long historical OHLC ranges fall back to scanning
+-- `dex_fills` directly. Tune `REFRESH EVERY`, the retention window, and the
+-- memory and spill settings to the deployment's fill volume.
 --
 -- Price math mirrors the API exactly: the DEX prices `1 base =
 -- (priceScale + tick) / priceScale quote` with `priceScale = 100000`. The
@@ -64,8 +65,26 @@ FROM
             toFloat64(100000) / (toFloat64(100000) + o.tick)
         ) AS rate
     FROM dex_fills AS f
-    INNER JOIN dex_orders AS o ON o.orderId = f.orderId
+    INNER JOIN
+    (
+        -- `dex_orders` keeps every order ever placed and the join loads its
+        -- right side into memory, so restrict it to orders with a fill in the
+        -- window. The lookback is a day wider than the fill window so that
+        -- every windowed fill still finds its order if the two `now()` calls
+        -- differ.
+        SELECT orderId, token, isBid, tick
+        FROM dex_orders
+        WHERE orderId IN
+        (
+            SELECT orderId
+            FROM dex_fills
+            WHERE block_timestamp >= now() - INTERVAL 31 DAY
+        )
+    ) AS o ON o.orderId = f.orderId
     WHERE f.block_timestamp >= now() - INTERVAL 30 DAY
 )
 GROUP BY token, bucket
-SETTINGS max_bytes_before_external_group_by = 2000000000
+SETTINGS
+    max_threads = 4,
+    max_memory_usage = 8589934592,
+    max_bytes_before_external_group_by = 2000000000
