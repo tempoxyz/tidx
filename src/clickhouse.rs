@@ -228,7 +228,7 @@ impl ClickHouseEngine {
         // union_default_mode: bare UNION behaves as UNION DISTINCT
         // (PostgreSQL semantics); ClickHouse otherwise rejects it.
         let mut url = format!(
-            "{}/?database={}&default_format=JSON&max_result_bytes={}&result_overflow_mode=throw&union_default_mode=DISTINCT",
+            "{}/?database={}&default_format=JSONCompact&max_result_bytes={}&result_overflow_mode=throw&union_default_mode=DISTINCT",
             inst.url.trim_end_matches('/'),
             self.database,
             MAX_QUERY_RESULT_BYTES
@@ -292,57 +292,9 @@ impl ClickHouseEngine {
             });
         }
 
-        let parsed: serde_json::Value = serde_json::from_str(&json_response)
-            .map_err(|e| anyhow!("Failed to parse ClickHouse JSON response: {e}"))?;
-
-        let meta = parsed.get("meta").and_then(|m| m.as_array());
-        let data = parsed.get("data").and_then(|d| d.as_array());
-
-        let columns: Vec<String> = meta
-            .map(|m| {
-                m.iter()
-                    .filter_map(|col| col.get("name").and_then(|n| n.as_str()).map(String::from))
-                    .collect()
-            })
-            .unwrap_or_default();
-
-        let column_types: Vec<String> = meta
-            .map(|m| {
-                m.iter()
-                    .map(|col| {
-                        col.get("type")
-                            .and_then(|t| t.as_str())
-                            .unwrap_or_default()
-                            .to_string()
-                    })
-                    .collect()
-            })
-            .unwrap_or_default();
-
-        let rows: Vec<Vec<serde_json::Value>> = data
-            .map(|d| {
-                d.iter()
-                    .map(|row| {
-                        columns
-                            .iter()
-                            .map(|col| row.get(col).cloned().unwrap_or(serde_json::Value::Null))
-                            .collect()
-                    })
-                    .collect()
-            })
-            .unwrap_or_default();
-
-        let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
-        let row_count = rows.len();
-
-        Ok(QueryResult {
-            columns,
-            column_types,
-            rows,
-            row_count,
-            engine: Some("clickhouse".to_string()),
-            query_time_ms: Some(elapsed_ms),
-        })
+        let mut result = parse_query_response(&json_response)?;
+        result.query_time_ms = Some(start.elapsed().as_secs_f64() * 1000.0);
+        Ok(result)
     }
 
     /// Return the URL of the currently active instance (for observability).
@@ -390,6 +342,43 @@ fn send_error(e: reqwest::Error, timeout: Option<std::time::Duration>) -> anyhow
         format!("ClickHouse HTTP request failed: {e}")
     };
     anyhow::Error::new(e).context(msg)
+}
+
+/// Body of a ClickHouse `JSONCompact` response. Statistics are ignored.
+#[derive(serde::Deserialize)]
+struct CompactResponse {
+    #[serde(default)]
+    meta: Vec<ColumnMeta>,
+    #[serde(default)]
+    data: Vec<Vec<serde_json::Value>>,
+}
+
+#[derive(serde::Deserialize)]
+struct ColumnMeta {
+    name: String,
+    #[serde(rename = "type", default)]
+    ty: String,
+}
+
+/// Parses a non-empty `JSONCompact` response body. Rows are arrays in column
+/// order, so cells are kept as parsed instead of being looked up by name.
+#[doc(hidden)]
+pub fn parse_query_response(body: &str) -> Result<QueryResult> {
+    let response: CompactResponse = serde_json::from_str(body)
+        .map_err(|e| anyhow!("Failed to parse ClickHouse JSON response: {e}"))?;
+    let (columns, column_types) = response
+        .meta
+        .into_iter()
+        .map(|column| (column.name, column.ty))
+        .unzip();
+    Ok(QueryResult {
+        columns,
+        column_types,
+        row_count: response.data.len(),
+        rows: response.data,
+        engine: Some("clickhouse".to_string()),
+        query_time_ms: None,
+    })
 }
 
 async fn read_limited_response(mut resp: reqwest::Response) -> Result<String> {
@@ -535,7 +524,7 @@ mod tests {
 
         let secondary = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let secondary_url = format!("http://{}", secondary.local_addr().unwrap());
-        let body = r#"{"meta":[{"name":"n","type":"UInt8"}],"data":[{"n":1}],"rows":1}"#;
+        let body = r#"{"meta":[{"name":"n","type":"UInt8"}],"data":[[1]],"rows":1}"#;
         let response = format!(
             "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
             body.len()
@@ -577,7 +566,7 @@ mod tests {
 
         let secondary = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let secondary_url = format!("http://{}", secondary.local_addr().unwrap());
-        let body = r#"{"meta":[{"name":"n","type":"UInt8"}],"data":[{"n":1}],"rows":1}"#;
+        let body = r#"{"meta":[{"name":"n","type":"UInt8"}],"data":[[1]],"rows":1}"#;
         let response = format!(
             "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
             body.len()
@@ -710,7 +699,7 @@ mod tests {
 
         assert_eq!(
             url,
-            "http://clickhouse-1:8123/?database=tidx_4217&default_format=JSON&max_result_bytes=10485760&result_overflow_mode=throw&union_default_mode=DISTINCT"
+            "http://clickhouse-1:8123/?database=tidx_4217&default_format=JSONCompact&max_result_bytes=10485760&result_overflow_mode=throw&union_default_mode=DISTINCT"
         );
         assert!(!url.contains("max_execution_time"));
     }
@@ -730,7 +719,7 @@ mod tests {
 
         assert_eq!(
             url,
-            "http://clickhouse-1:8123/?database=tidx_4217&default_format=JSON&max_result_bytes=10485760&result_overflow_mode=throw&union_default_mode=DISTINCT&max_execution_time=2"
+            "http://clickhouse-1:8123/?database=tidx_4217&default_format=JSONCompact&max_result_bytes=10485760&result_overflow_mode=throw&union_default_mode=DISTINCT&max_execution_time=2"
         );
     }
 
@@ -738,7 +727,7 @@ mod tests {
     async fn test_memory_cap_applies_to_user_queries_only() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("http://{}", listener.local_addr().unwrap());
-        let body = r#"{"meta":[{"name":"n","type":"UInt8"}],"data":[{"n":1}],"rows":1}"#;
+        let body = r#"{"meta":[{"name":"n","type":"UInt8"}],"data":[[1]],"rows":1}"#;
         let response = format!(
             "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
             body.len()
@@ -773,7 +762,7 @@ mod tests {
             .unwrap();
         engine.query(sql, &[]).await.unwrap();
 
-        let base = "/?database=tidx_4217&default_format=JSON&max_result_bytes=10485760&result_overflow_mode=throw&union_default_mode=DISTINCT";
+        let base = "/?database=tidx_4217&default_format=JSONCompact&max_result_bytes=10485760&result_overflow_mode=throw&union_default_mode=DISTINCT";
         let cap = format!("max_memory_usage={MAX_USER_QUERY_MEMORY_BYTES}");
         assert_eq!(
             server.await.unwrap(),
