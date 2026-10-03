@@ -4,7 +4,7 @@ use std::collections::{HashMap, HashSet};
 use std::ops::ControlFlow;
 
 use sqlparser::ast::{
-    BinaryOperator, Expr, Ident, OrderBy, Query, Select, SelectItem,
+    BinaryOperator, Expr, GroupByExpr, Ident, OrderBy, Query, Select, SelectItem,
     SelectItemQualifiedWildcardKind, SetExpr, Spanned, Statement, TableAlias, TableFactor, Value,
     Visit, Visitor,
 };
@@ -112,8 +112,22 @@ impl Rewrite<'_> {
                     aliases,
                     ctes,
                     nested: 0,
+                    pushdown: true,
                 };
-                let _ = select.visit(&mut visitor);
+                if matches!(&select.group_by, GroupByExpr::Expressions(exprs, _) if exprs.is_empty())
+                {
+                    let _ = select.visit(&mut visitor);
+                } else {
+                    // Only row-level clauses can use raw topics in a grouped query.
+                    // Keep the remaining clauses on decoded grouping keys, including
+                    // SELECT/HAVING/ORDER BY expressions and GROUP BY expressions.
+                    let mut grouped = select.as_ref().clone();
+                    let _ = std::mem::take(&mut grouped.from).visit(&mut visitor);
+                    let _ = grouped.prewhere.take().visit(&mut visitor);
+                    let _ = grouped.selection.take().visit(&mut visitor);
+                    visitor.pushdown = false;
+                    let _ = grouped.visit(&mut visitor);
+                }
                 if let Some(order_by) = order_by {
                     let _ = order_by.visit(&mut visitor);
                 }
@@ -259,7 +273,13 @@ impl Rewrite<'_> {
         Some(columns)
     }
 
-    fn comparison(&mut self, column: &Expr, literal: &Expr, relations: &[Relation]) {
+    fn comparison(
+        &mut self,
+        column: &Expr,
+        literal: &Expr,
+        relations: &[Relation],
+        pushdown: bool,
+    ) {
         let column = unnested(column);
         let literal = unnested(literal);
         let Some((relation, source)) = resolve(column, relations) else {
@@ -275,7 +295,8 @@ impl Rewrite<'_> {
             Value::SingleQuotedString(s) | Value::Number(s, _) => s,
             _ => return,
         };
-        if let Some(topic) = &source.topic
+        if pushdown
+            && let Some(topic) = &source.topic
             && let Some(encoded) = EventSignature::encode_value_for_pushdown(ty, value)
         {
             // Preserve explicit qualifiers and qualify new topic references in joins.
@@ -331,6 +352,7 @@ struct Comparisons<'a, 'b> {
     aliases: HashSet<String>,
     ctes: &'a Ctes,
     nested: usize,
+    pushdown: bool,
 }
 
 impl Visitor for Comparisons<'_, '_> {
@@ -360,7 +382,8 @@ impl Visitor for Comparisons<'_, '_> {
             for (column, literal) in [(left, right), (right, left)] {
                 if !matches!(unnested(column), Expr::Identifier(ident) if self.aliases.contains(&key(ident)))
                 {
-                    self.rewrite.comparison(column, literal, &self.relations);
+                    self.rewrite
+                        .comparison(column, literal, &self.relations, self.pushdown);
                 }
             }
         }
@@ -640,6 +663,47 @@ mod tests {
             fixed(sql, true),
             format!(
                 "SELECT tag FROM Fixed f WHERE (f.topic1) = ('0xcafebabe{}')",
+                "0".repeat(56)
+            )
+        );
+    }
+
+    #[test]
+    fn grouped_comparisons_keep_decoded_columns() {
+        let signatures = [EventSignature::parse("A(uint256 indexed amount)").unwrap()];
+        for sql in [
+            "SELECT amount, count(*) FROM A GROUP BY amount HAVING amount = 1",
+            "SELECT amount, count(*) FROM A GROUP BY amount ORDER BY amount = 1",
+            "SELECT amount = 1, count(*) FROM A GROUP BY amount",
+            "SELECT amount = 1, count(*) FROM A GROUP BY amount = 1",
+        ] {
+            assert_eq!(rewrite(sql, &signatures, &GenericDialect {}, true), sql);
+            assert_eq!(rewrite(sql, &signatures, &ClickHouseDialect {}, false), sql);
+        }
+    }
+
+    #[test]
+    fn grouped_fixed_bytes_convert_literals_and_keep_row_filter_pushdown() {
+        let sql = "SELECT tag = '0xcafebabe', count(*) FROM Fixed WHERE tag = '0xcafebabe' GROUP BY tag HAVING tag = '0xcafebabe' ORDER BY tag = '0xcafebabe'";
+        let expected = sql.replace("'0xcafebabe'", "'\\xcafebabe'").replace(
+            "WHERE tag = '\\xcafebabe'",
+            &format!("WHERE topic1 = '0xcafebabe{}'", "0".repeat(56)),
+        );
+        assert_eq!(fixed(sql, true), expected);
+        let expected = sql.replace(
+            "WHERE tag = '0xcafebabe'",
+            &format!("WHERE topic1 = '0xcafebabe{}'", "0".repeat(56)),
+        );
+        assert_eq!(fixed(sql, false), expected);
+    }
+
+    #[test]
+    fn grouped_queries_rewrite_nested_filters_in_their_own_scope() {
+        let sql = "SELECT tag FROM Fixed GROUP BY tag HAVING tag = '0xcafebabe' AND EXISTS (SELECT 1 FROM Fixed WHERE tag = '0xdeadbeef')";
+        assert_eq!(
+            fixed(sql, true),
+            format!(
+                "SELECT tag FROM Fixed GROUP BY tag HAVING tag = '\\xcafebabe' AND EXISTS (SELECT 1 FROM Fixed WHERE topic1 = '0xdeadbeef{}')",
                 "0".repeat(56)
             )
         );
