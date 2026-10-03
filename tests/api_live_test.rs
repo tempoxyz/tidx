@@ -14,7 +14,7 @@ use tower::Service;
 use common::testdb::TestDb;
 use serial_test::serial;
 use tidx::api::{self, inject_block_filter};
-use tidx::broadcast::Broadcaster;
+use tidx::broadcast::{BlockUpdate, Broadcaster};
 
 fn make_pools(pool: tidx::db::Pool) -> (HashMap<u64, tidx::db::Pool>, u64) {
     let mut pools = HashMap::new();
@@ -409,6 +409,92 @@ async fn test_query_live_rejects_when_stream_capacity_reached() {
     let body = std::str::from_utf8(&body).unwrap();
     assert!(body.contains("event: error"), "got: {body}");
     assert!(body.contains("Live stream capacity reached"), "got: {body}");
+}
+
+#[tokio::test]
+#[serial(db)]
+async fn test_query_live_streams_each_new_block() {
+    let db = TestDb::empty().await;
+    db.truncate_all().await;
+    let now = chrono::Utc::now();
+    let blocks: Vec<tidx::types::BlockRow> = (1..=4)
+        .map(|num| tidx::types::BlockRow {
+            num,
+            hash: vec![num as u8; 32],
+            parent_hash: vec![0; 32],
+            timestamp: now,
+            timestamp_ms: now.timestamp_millis(),
+            gas_limit: 1,
+            gas_used: 1,
+            miner: vec![0; 20],
+            extra_data: None,
+            consensus_proposer: None,
+        })
+        .collect();
+    tidx::sync::writer::write_blocks(&db.pool, &blocks)
+        .await
+        .unwrap();
+    tidx::sync::writer::save_sync_state(
+        &db.pool,
+        &tidx::types::SyncState {
+            chain_id: 1,
+            synced_num: 2,
+            tip_num: 2,
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+
+    let broadcaster = Arc::new(Broadcaster::new());
+    let (pools, chain_id) = make_pools(db.pool.clone());
+    let mut app = make_test_service(pools, chain_id, broadcaster.clone()).await;
+    let response = app
+        .call(
+            Request::builder()
+                .method("GET")
+                .uri("/query?sql=SELECT%20num%20FROM%20blocks%20ORDER%20BY%20num&chainId=1&live=true")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    // Blocks 3 and 4 arrive after the stream caught up to block 2.
+    broadcaster.send(BlockUpdate {
+        chain_id: 1,
+        block_num: 4,
+        block_hash: String::new(),
+        tx_count: 0,
+        log_count: 0,
+        timestamp: now.timestamp(),
+    });
+
+    let mut body = response.into_body().into_data_stream();
+    let mut events = String::new();
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while events.matches("event: result").count() < 3 {
+            let chunk = futures::StreamExt::next(&mut body).await.unwrap().unwrap();
+            events.push_str(std::str::from_utf8(&chunk).unwrap());
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("expected three results, got: {events}"));
+
+    let rows: Vec<serde_json::Value> = events
+        .lines()
+        .filter_map(|line| line.strip_prefix("data: "))
+        .map(|data| serde_json::from_str::<serde_json::Value>(data).unwrap()["rows"].clone())
+        .collect();
+    assert_eq!(
+        rows,
+        vec![
+            serde_json::json!([[1], [2], [3], [4]]),
+            serde_json::json!([[3]]),
+            serde_json::json!([[4]]),
+        ]
+    );
 }
 
 // Unit tests for inject_block_filter (no DB required)
