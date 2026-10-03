@@ -6,10 +6,11 @@ services:
     image: ghcr.io/tempoxyz/pg_clickhouse:16-02505c4
     environment:
       POSTGRES_USER: tidx
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-tidx}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD before starting this stack}
       POSTGRES_DB: tidx
     ports:
-      - "5432:5432"
+      # Loopback only: never expose the database on every host interface.
+      - "127.0.0.1:5432:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
     command:
@@ -38,8 +39,9 @@ services:
   clickhouse:
     image: clickhouse/clickhouse-server:latest
     ports:
-      - "8123:8123"   # HTTP interface
-      - "9000:9000"   # Native interface
+      # Loopback only: never expose the database on every host interface.
+      - "127.0.0.1:8123:8123"   # HTTP interface
+      - "127.0.0.1:9000:9000"   # Native interface
     volumes:
       - clickhouse_data:/var/lib/clickhouse
       - ./clickhouse-config.xml:/etc/clickhouse-server/config.d/custom.xml:ro
@@ -63,8 +65,8 @@ services:
       - --config
       - /config.toml
     ports:
-      - "8080:8080"   # HTTP API
-      - "9090:9090"   # Prometheus metrics
+      - "8080:8080"             # Public HTTP API
+      - "127.0.0.1:9090:9090"   # Prometheus metrics restricted to localhost
     volumes:
       - ./config.toml:/config.toml:ro
     depends_on:
@@ -75,13 +77,15 @@ services:
     environment:
       RUST_LOG: ${RUST_LOG:-tidx=info}
       RUST_LOG_FORMAT: ${RUST_LOG_FORMAT:-pretty}
+      # Read by chains.postgres.password_env in config.toml.
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD before starting this stack}
     restart: unless-stopped
 
   # Optional: Prometheus for metrics collection
   prometheus:
     image: prom/prometheus:latest
     ports:
-      - "9091:9090"
+      - "127.0.0.1:9091:9090"
     volumes:
       - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
       - ./alerts.yml:/etc/prometheus/alerts.yml:ro
@@ -99,11 +103,11 @@ services:
   grafana:
     image: grafana/grafana:latest
     ports:
-      - "3000:3000"
+      - "127.0.0.1:3000:3000"
     volumes:
       - grafana_data:/var/lib/grafana
     environment:
-      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_PASSWORD:-admin}
+      GF_SECURITY_ADMIN_PASSWORD: ${GF_SECURITY_ADMIN_PASSWORD:-${GRAFANA_PASSWORD:?set GF_SECURITY_ADMIN_PASSWORD or GRAFANA_PASSWORD before starting the monitoring profile}}
     restart: unless-stopped
     profiles:
       - monitoring
