@@ -5,7 +5,7 @@ use std::convert::Infallible;
 use std::net::IpAddr;
 use std::sync::{Arc, RwLock as StdRwLock};
 
-use tokio::sync::RwLock;
+use tokio::sync::{RwLock, Semaphore};
 
 use anyhow::{Result as AnyhowResult, anyhow};
 use axum::{
@@ -21,7 +21,7 @@ use axum::{
 use chrono::Utc;
 use futures::Stream;
 use serde::{Deserialize, Serialize};
-use tower::limit::ConcurrencyLimitLayer;
+use tower::limit::GlobalConcurrencyLimitLayer;
 use tower_http::cors::CorsLayer;
 use tower_http::trace::TraceLayer;
 
@@ -59,6 +59,9 @@ pub struct AppState {
     pub clickhouse_engines: SharedClickHouseEngines,
     /// Parsed trusted CIDRs for admin operations
     pub trusted_cidrs: SharedTrustedCidrs,
+    /// Permits for the API statements that may run at once. One-shot queries
+    /// and every statement of a live stream draw from the same permits.
+    pub query_permits: Arc<Semaphore>,
 }
 
 impl AppState {
@@ -173,6 +176,7 @@ pub fn router_with_options(
         clickhouse_configs: Arc::new(RwLock::new(clickhouse_configs)),
         clickhouse_engines: Arc::new(RwLock::new(HashMap::new())),
         trusted_cidrs,
+        query_permits: Arc::new(Semaphore::new(MAX_CONCURRENT_API_QUERIES)),
     };
 
     Ok(build_router(state))
@@ -193,6 +197,7 @@ pub fn router_shared(
         clickhouse_configs,
         clickhouse_engines,
         trusted_cidrs,
+        query_permits: Arc::new(Semaphore::new(MAX_CONCURRENT_API_QUERIES)),
     };
 
     build_router(state)
@@ -209,7 +214,9 @@ fn build_router(state: AppState) -> Router<()> {
         .route("/status", get(handle_status))
         .route(
             "/query",
-            get(handle_query).layer(ConcurrencyLimitLayer::new(MAX_CONCURRENT_API_QUERIES)),
+            get(handle_query).layer(GlobalConcurrencyLimitLayer::with_semaphore(
+                state.query_permits.clone(),
+            )),
         )
         .route("/views", get(views::list_views).post(views::create_view))
         .route(
@@ -552,13 +559,14 @@ async fn handle_query_live(
         timeout_ms: params.timeout_ms.clamp(100, 30000),
         limit: params.limit.clamp(1, crate::query::HARD_LIMIT_MAX),
     };
+    let permits = state.query_permits.clone();
 
     let stream = async_stream::stream! {
         let mut last_block_num: u64 = 0;
         let sigs: Vec<&str> = signatures.iter().map(String::as_str).collect();
 
         // Execute initial query (live streaming uses Postgres for realtime data)
-        match crate::service::execute_query_postgres(&pool, &sql, &sigs, &options).await {
+        match execute_live_query(&permits, &pool, &sql, &sigs, &options).await {
             Ok(result) => {
                 yield Ok(SseEvent::default()
                     .event("result")
@@ -622,7 +630,7 @@ async fn handle_query_live(
                                 return;
                             }
                         };
-                        match crate::service::execute_query_postgres(&pool, &filtered_sql, &sigs, &options).await {
+                        match execute_live_query(&permits, &pool, &filtered_sql, &sigs, &options).await {
                             Ok(result) => {
                                 yield Ok(SseEvent::default()
                                     .event("result")
@@ -654,6 +662,22 @@ async fn handle_query_live(
 
     let stream: SseStream = Box::pin(stream);
     Sse::new(stream).keep_alive(KeepAlive::default())
+}
+
+/// Runs one statement of a live stream under an API query permit.
+///
+/// The route's concurrency limit is released as soon as the SSE response
+/// starts, so each statement the stream runs afterwards takes a permit from
+/// the same budget for as long as it executes.
+async fn execute_live_query(
+    permits: &Semaphore,
+    pool: &Pool,
+    sql: &str,
+    signatures: &[&str],
+    options: &QueryOptions,
+) -> AnyhowResult<QueryResult> {
+    let _permit = permits.acquire().await?;
+    crate::service::execute_query_postgres(pool, sql, signatures, options).await
 }
 
 /// Inject a block number filter into SQL query for live streaming.
@@ -788,6 +812,8 @@ impl IntoResponse for ApiError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use futures::StreamExt;
+    use std::time::Duration;
 
     #[test]
     fn test_parse_cidrs() {
@@ -842,6 +868,7 @@ mod tests {
             clickhouse_configs: Arc::new(RwLock::new(HashMap::new())),
             clickhouse_engines: Arc::new(RwLock::new(HashMap::new())),
             trusted_cidrs: Arc::new(std::sync::RwLock::new(Vec::new())),
+            query_permits: Arc::new(Semaphore::new(MAX_CONCURRENT_API_QUERIES)),
         };
         assert!(!state.is_trusted_ip(&"127.0.0.1".parse().unwrap()));
     }
@@ -895,5 +922,57 @@ mod tests {
             48
         ));
         assert!(!ip_in_cidr(&"2001:db8::1".parse().unwrap(), &network, 48));
+    }
+
+    #[tokio::test]
+    async fn test_live_stream_statements_wait_for_a_query_permit() {
+        // Nothing listens on port 1, so a statement that starts fails at once.
+        let mut config = deadpool_postgres::Config::new();
+        config.url = Some("postgres://tidx@127.0.0.1:1/tidx".to_string());
+        let pool = config
+            .create_pool(
+                Some(deadpool_postgres::Runtime::Tokio1),
+                tokio_postgres::NoTls,
+            )
+            .unwrap();
+        let state = AppState {
+            pools: Arc::new(RwLock::new(HashMap::from([(1, pool)]))),
+            default_chain_id: 1,
+            broadcaster: Arc::new(Broadcaster::new()),
+            clickhouse_configs: Arc::new(RwLock::new(HashMap::new())),
+            clickhouse_engines: Arc::new(RwLock::new(HashMap::new())),
+            trusted_cidrs: Arc::new(std::sync::RwLock::new(Vec::new())),
+            query_permits: Arc::new(Semaphore::new(0)),
+        };
+        let permits = state.query_permits.clone();
+        let params = QueryParams {
+            sql: "SELECT num FROM blocks".to_string(),
+            chain_id: 1,
+            live: true,
+            timeout_ms: 1_000,
+            limit: 1,
+            engine: None,
+            source: None,
+        };
+        let mut events = handle_query_live(state, params, vec![])
+            .await
+            .into_response()
+            .into_body()
+            .into_data_stream();
+
+        // Every permit is taken, so the stream must not run its first statement.
+        assert!(
+            tokio::time::timeout(Duration::from_millis(200), events.next())
+                .await
+                .is_err()
+        );
+
+        permits.add_permits(1);
+        let event = tokio::time::timeout(Duration::from_secs(5), events.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert!(String::from_utf8_lossy(&event).starts_with("event: error"));
     }
 }

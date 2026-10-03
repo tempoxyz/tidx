@@ -514,7 +514,7 @@ mod tests {
     use std::collections::HashMap;
     use std::net::IpAddr;
     use std::sync::{Arc, RwLock as StdRwLock};
-    use tokio::sync::RwLock;
+    use tokio::sync::{RwLock, Semaphore};
 
     #[test]
     fn test_valid_view_name() {
@@ -540,6 +540,7 @@ mod tests {
             clickhouse_configs: Arc::new(RwLock::new(HashMap::new())),
             clickhouse_engines: Arc::new(RwLock::new(HashMap::new())),
             trusted_cidrs: Arc::new(StdRwLock::new(trusted_cidrs)),
+            query_permits: Arc::new(Semaphore::new(1)),
         }
     }
 
