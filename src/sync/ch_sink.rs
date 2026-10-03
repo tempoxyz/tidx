@@ -716,16 +716,22 @@ impl ClickHouseSink {
         // Fetch blocks first so their canonical timestamps can constrain the
         // monthly partitions used by the denormalized child tables. This also
         // avoids launching three archive reads when the checkpoint is corrupt
-        // and the requested block range is absent.
+        // and the requested block range is absent. Child rows carry the
+        // second-precision block `timestamp`, not `timestamp_ms`, so the bounds
+        // must come from the same column or sub-second blocks fall outside them.
         let blocks = self
             .fetch_archive_rows::<ChBlockWire>(&blocks_sql, "blocks")
             .await?;
-        let Some(from_timestamp_ms) = blocks.iter().map(|block| block.timestamp_ms).min() else {
+        let Some(from_timestamp_ms) = blocks
+            .iter()
+            .map(|block| block.timestamp.timestamp_millis())
+            .min()
+        else {
             return Ok(ArchiveBatch::default());
         };
         let to_timestamp_ms = blocks
             .iter()
-            .map(|block| block.timestamp_ms)
+            .map(|block| block.timestamp.timestamp_millis())
             .max()
             .expect("non-empty blocks have a maximum timestamp");
         let range_predicate = archive_range_predicate(from, to, from_timestamp_ms, to_timestamp_ms);
