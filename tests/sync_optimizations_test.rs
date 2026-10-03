@@ -568,6 +568,272 @@ async fn test_rewrite_replaces_rows_of_block_with_other_timestamp() {
 
 #[tokio::test]
 #[serial(db)]
+async fn test_write_batch_roundtrips_every_column() {
+    let db = TestDb::empty().await;
+    db.truncate_all().await;
+
+    let base = chrono::Utc::now().timestamp() - 3600;
+    let ts = |secs: i64| chrono::DateTime::from_timestamp(base + secs, 0).unwrap();
+    let blocks = vec![
+        BlockRow {
+            num: 73_000_000,
+            hash: vec![1; 32],
+            parent_hash: vec![2; 32],
+            timestamp: ts(0),
+            timestamp_ms: 1_780_000_000_250,
+            gas_limit: 30_000_000,
+            gas_used: 21_000,
+            miner: vec![3; 20],
+            extra_data: Some(vec![4, 5]),
+            consensus_proposer: Some(vec![6; 32]),
+        },
+        BlockRow {
+            num: 73_000_001,
+            hash: vec![7; 32],
+            parent_hash: vec![1; 32],
+            timestamp: ts(1),
+            timestamp_ms: 1_780_000_001_000,
+            gas_limit: 30_000_000,
+            gas_used: 0,
+            miner: vec![8; 20],
+            extra_data: None,
+            consensus_proposer: None,
+        },
+    ];
+    let txs = vec![
+        TxRow {
+            block_num: 73_000_000,
+            block_timestamp: ts(0),
+            idx: 0,
+            hash: vec![9; 32],
+            tx_type: 118,
+            from: vec![10; 20],
+            to: Some(vec![11; 20]),
+            value: "1000000000000000000000".to_string(),
+            input: vec![0xa9, 0x05, 0x9c, 0xbb],
+            gas_limit: 100_000,
+            max_fee_per_gas: "20000000000".to_string(),
+            max_priority_fee_per_gas: "1".to_string(),
+            gas_used: Some(50_000),
+            nonce_key: vec![12; 32],
+            nonce: 7,
+            fee_token: Some(vec![13; 20]),
+            fee_payer: Some(vec![14; 20]),
+            calls: Some(serde_json::json!([{ "to": "0x01", "input": "0x", "value": "0x0" }])),
+            call_count: 1,
+            valid_before: Some(1_780_000_100),
+            valid_after: Some(1_779_999_900),
+            signature_type: Some(2),
+        },
+        TxRow {
+            block_num: 73_000_001,
+            block_timestamp: ts(1),
+            idx: 0,
+            hash: vec![15; 32],
+            tx_type: 0,
+            from: vec![16; 20],
+            to: None,
+            value: "0".to_string(),
+            input: vec![],
+            gas_limit: 21_000,
+            max_fee_per_gas: "1".to_string(),
+            max_priority_fee_per_gas: "0".to_string(),
+            gas_used: None,
+            nonce_key: vec![0; 32],
+            nonce: 0,
+            fee_token: None,
+            fee_payer: None,
+            calls: None,
+            call_count: 1,
+            valid_before: None,
+            valid_after: None,
+            signature_type: None,
+        },
+    ];
+    let logs = vec![
+        LogRow {
+            block_num: 73_000_000,
+            block_timestamp: ts(0),
+            log_idx: 0,
+            tx_idx: 0,
+            tx_hash: vec![9; 32],
+            address: vec![17; 20],
+            selector: Some(vec![18; 32]),
+            topic0: Some(vec![18; 32]),
+            topic1: Some(vec![19; 32]),
+            topic2: Some(vec![20; 32]),
+            topic3: Some(vec![21; 32]),
+            data: vec![22; 64],
+            is_virtual_forward: true,
+        },
+        LogRow {
+            block_num: 73_000_000,
+            block_timestamp: ts(0),
+            log_idx: 1,
+            tx_idx: 0,
+            tx_hash: vec![9; 32],
+            address: vec![23; 20],
+            selector: None,
+            topic0: None,
+            topic1: None,
+            topic2: None,
+            topic3: None,
+            data: vec![],
+            is_virtual_forward: false,
+        },
+    ];
+    let receipts = vec![
+        ReceiptRow {
+            block_num: 73_000_000,
+            block_timestamp: ts(0),
+            tx_idx: 0,
+            tx_hash: vec![9; 32],
+            from: vec![10; 20],
+            to: Some(vec![11; 20]),
+            contract_address: None,
+            gas_used: 50_000,
+            cumulative_gas_used: 50_000,
+            effective_gas_price: Some("20000000000".to_string()),
+            status: Some(1),
+            fee_payer: Some(vec![14; 20]),
+            ..Default::default()
+        },
+        ReceiptRow {
+            block_num: 73_000_001,
+            block_timestamp: ts(1),
+            tx_idx: 0,
+            tx_hash: vec![15; 32],
+            from: vec![16; 20],
+            to: None,
+            contract_address: Some(vec![24; 20]),
+            gas_used: 21_000,
+            cumulative_gas_used: 21_000,
+            effective_gas_price: None,
+            status: None,
+            fee_payer: None,
+            ..Default::default()
+        },
+    ];
+
+    write_batch(&db.pool, &blocks, &txs, &logs, &receipts)
+        .await
+        .unwrap();
+
+    let conn = db.pool.get().await.unwrap();
+    let stored_blocks: Vec<BlockRow> = conn
+        .query("SELECT * FROM blocks ORDER BY num", &[])
+        .await
+        .unwrap()
+        .iter()
+        .map(|r| BlockRow {
+            num: r.get("num"),
+            hash: r.get("hash"),
+            parent_hash: r.get("parent_hash"),
+            timestamp: r.get("timestamp"),
+            timestamp_ms: r.get("timestamp_ms"),
+            gas_limit: r.get("gas_limit"),
+            gas_used: r.get("gas_used"),
+            miner: r.get("miner"),
+            extra_data: r.get("extra_data"),
+            consensus_proposer: r.get("consensus_proposer"),
+        })
+        .collect();
+    assert_eq!(format!("{stored_blocks:?}"), format!("{blocks:?}"));
+
+    let stored_txs: Vec<TxRow> = conn
+        .query("SELECT * FROM txs ORDER BY block_num, idx", &[])
+        .await
+        .unwrap()
+        .iter()
+        .map(|r| TxRow {
+            block_num: r.get("block_num"),
+            block_timestamp: r.get("block_timestamp"),
+            idx: r.get("idx"),
+            hash: r.get("hash"),
+            tx_type: r.get("type"),
+            from: r.get("from"),
+            to: r.get("to"),
+            value: r.get("value"),
+            input: r.get("input"),
+            gas_limit: r.get("gas_limit"),
+            max_fee_per_gas: r.get("max_fee_per_gas"),
+            max_priority_fee_per_gas: r.get("max_priority_fee_per_gas"),
+            gas_used: r.get("gas_used"),
+            nonce_key: r.get("nonce_key"),
+            nonce: r.get("nonce"),
+            fee_token: r.get("fee_token"),
+            fee_payer: r.get("fee_payer"),
+            calls: r.get("calls"),
+            call_count: r.get("call_count"),
+            valid_before: r.get("valid_before"),
+            valid_after: r.get("valid_after"),
+            signature_type: r.get("signature_type"),
+        })
+        .collect();
+    assert_eq!(format!("{stored_txs:?}"), format!("{txs:?}"));
+
+    let stored_logs: Vec<LogRow> = conn
+        .query("SELECT * FROM logs ORDER BY block_num, log_idx", &[])
+        .await
+        .unwrap()
+        .iter()
+        .map(|r| LogRow {
+            block_num: r.get("block_num"),
+            block_timestamp: r.get("block_timestamp"),
+            log_idx: r.get("log_idx"),
+            tx_idx: r.get("tx_idx"),
+            tx_hash: r.get("tx_hash"),
+            address: r.get("address"),
+            selector: r.get("selector"),
+            topic0: r.get("topic0"),
+            topic1: r.get("topic1"),
+            topic2: r.get("topic2"),
+            topic3: r.get("topic3"),
+            data: r.get("data"),
+            is_virtual_forward: r.get("is_virtual_forward"),
+        })
+        .collect();
+    assert_eq!(format!("{stored_logs:?}"), format!("{logs:?}"));
+
+    let stored_receipts: Vec<ReceiptRow> = conn
+        .query("SELECT * FROM receipts ORDER BY block_num, tx_idx", &[])
+        .await
+        .unwrap()
+        .iter()
+        .map(|r| ReceiptRow {
+            block_num: r.get("block_num"),
+            block_timestamp: r.get("block_timestamp"),
+            tx_idx: r.get("tx_idx"),
+            tx_hash: r.get("tx_hash"),
+            from: r.get("from"),
+            to: r.get("to"),
+            contract_address: r.get("contract_address"),
+            gas_used: r.get("gas_used"),
+            cumulative_gas_used: r.get("cumulative_gas_used"),
+            effective_gas_price: r.get("effective_gas_price"),
+            status: r.get("status"),
+            fee_payer: r.get("fee_payer"),
+            ..Default::default()
+        })
+        .collect();
+    assert_eq!(format!("{stored_receipts:?}"), format!("{receipts:?}"));
+
+    // Only the block whose transaction lacks receipt data is queued for repair.
+    let queued: Vec<(i64, chrono::DateTime<chrono::Utc>)> = conn
+        .query(
+            "SELECT block_num, block_timestamp FROM receipt_repair_queue ORDER BY block_num",
+            &[],
+        )
+        .await
+        .unwrap()
+        .iter()
+        .map(|r| (r.get(0), r.get(1)))
+        .collect();
+    assert_eq!(queued, vec![(73_000_001, ts(1))]);
+}
+
+#[tokio::test]
+#[serial(db)]
 async fn test_delete_copy_handles_block_range() {
     let db = TestDb::empty().await;
     db.truncate_all().await;
