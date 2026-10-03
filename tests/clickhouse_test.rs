@@ -1152,6 +1152,29 @@ async fn test_predicate_pushdown_indexed_param() {
     assert!(data.is_some());
     let cnt = data.unwrap()[0].get("cnt").and_then(|v| v.as_u64());
     assert_eq!(cnt, Some(5), "Expected 5 transfers from address a975...");
+
+    // Identity aliases must retain normalization of mixed-case address literals.
+    for projection in [
+        r#""from" AS "from""#,
+        r#"(t."from") AS "from""#,
+        r#"t."from" AS "from", t.topic1 AS topic1"#,
+    ] {
+        let sql = format!(
+            r#"SELECT {projection} FROM Transfer t WHERE t."from" = '0xA975BA910C2eE169956F3Df99Ee2EcE79d3887CF'"#
+        );
+        let sql = apply_event_signature_ctes_clickhouse(
+            &sql,
+            &["Transfer(address indexed from, address indexed to, uint256 value)"],
+        )
+        .unwrap();
+        let result = ch.query_json(&sql).await.unwrap();
+        let rows = result["data"].as_array().unwrap();
+        assert_eq!(rows.len(), 5, "{sql}");
+        assert!(
+            rows.iter()
+                .all(|row| row["from"] == "0xa975ba910c2ee169956f3df99ee2ece79d3887cf")
+        );
+    }
 }
 
 // ============================================================================

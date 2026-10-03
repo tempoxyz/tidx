@@ -175,17 +175,23 @@ impl Filter<'_> {
         }
     }
 
-    fn comparison(&mut self, column: &Expr, literal: &Expr) {
-        let column = unnested(column);
-        let literal = unnested(literal);
-        let (ident, qualified) = match column {
-            Expr::Identifier(ident) => (ident, false),
+    fn column<'a>(&self, expr: &'a Expr) -> Option<(&'a Ident, bool)> {
+        match unnested(expr) {
+            Expr::Identifier(ident) => Some((ident, false)),
             Expr::CompoundIdentifier(parts)
                 if parts.len() == 2 && self.key(&parts[0]) == self.key(self.qualifier) =>
             {
-                (&parts[1], true)
+                Some((&parts[1], true))
             }
-            _ => return,
+            _ => None,
+        }
+    }
+
+    fn comparison(&mut self, column: &Expr, literal: &Expr) {
+        let column = unnested(column);
+        let literal = unnested(literal);
+        let Some((ident, qualified)) = self.column(column) else {
+            return;
         };
         let Expr::Value(value) = literal else { return };
         let value = match &value.value {
@@ -203,9 +209,19 @@ impl Filter<'_> {
                 continue;
             }
             let topic = format!("topic{topic_index}");
-            // ClickHouse SELECT aliases can shadow both the decoded and raw name in WHERE.
-            if self.clickhouse && self.projection.iter().any(|item| matches!(item,
-                SelectItem::ExprWithAlias { alias, .. } if self.key(alias) == name || self.key(alias) == topic)) {
+            // Identity aliases retain column meaning; other aliases can shadow either name.
+            if self.clickhouse
+                && self.projection.iter().any(|item| {
+                    let SelectItem::ExprWithAlias { expr, alias } = item else {
+                        return false;
+                    };
+                    let alias = self.key(alias);
+                    (alias == name || alias == topic)
+                        && self
+                            .column(expr)
+                            .is_none_or(|(column, _)| self.key(column) != alias)
+                })
+            {
                 return;
             }
             if let Some(encoded) = EventSignature::encode_value_for_pushdown(&param.ty, value) {
@@ -236,9 +252,9 @@ mod tests {
     #[test]
     fn rewrites_each_predicate_without_touching_other_tokens() {
         let sig = EventSignature::parse("Fixed(bytes4 indexed tag)").unwrap();
-        let sql = "SELECT 'tag = ''0xcafebabe''' FROM Fixed f WHERE (f.tag)='0xcafebabe' OR '0xdeadbeef' = tag /* keep */";
+        let sql = "SELECT f.tag AS tag, f.topic1 AS topic1, 'tag = ''0xcafebabe''' FROM Fixed f WHERE (f.tag)='0xcafebabe' OR '0xdeadbeef' = tag /* keep */";
         let expected = format!(
-            "SELECT 'tag = ''0xcafebabe''' FROM Fixed f WHERE (f.topic1)='0xcafebabe{}' OR '0xdeadbeef{}' = topic1 /* keep */",
+            "SELECT f.tag AS tag, f.topic1 AS topic1, 'tag = ''0xcafebabe''' FROM Fixed f WHERE (f.topic1)='0xcafebabe{}' OR '0xdeadbeef{}' = topic1 /* keep */",
             "0".repeat(56),
             "0".repeat(56)
         );
