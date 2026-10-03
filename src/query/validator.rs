@@ -1,9 +1,10 @@
 use std::collections::HashSet;
+use std::ops::ControlFlow;
 
 use anyhow::{Result, anyhow};
 use sqlparser::ast::{
     Expr, Function, FunctionArg, FunctionArgExpr, FunctionArguments, LimitClause, ObjectName,
-    Query, SetExpr, Statement, TableFactor, TableWithJoins,
+    Query, SetExpr, Statement, TableFactor, TableWithJoins, Visit, Visitor,
 };
 use sqlparser::dialect::GenericDialect;
 use sqlparser::parser::Parser;
@@ -90,7 +91,8 @@ pub fn validate_clickhouse_query(sql: &str) -> Result<()> {
     match &statements[0] {
         Statement::Query(query) => {
             let cte_names = HashSet::new();
-            validate_clickhouse_query_ast(query, &cte_names, 0)
+            validate_clickhouse_query_ast(query, &cte_names, 0)?;
+            validate_clickhouse_query_nodes(query)
         }
         _ => Err(anyhow!("Only SELECT queries are allowed")),
     }
@@ -228,6 +230,15 @@ const CLICKHOUSE_DANGEROUS_FUNCTIONS: &[&str] = &[
     "repeat",
     "sleep",
     "sleepeachrow",
+    // IN as a function: its second argument can name a table.
+    "in",
+    "notin",
+    "globalin",
+    "globalnotin",
+    "nullin",
+    "notnullin",
+    "globalnullin",
+    "globalnotnullin",
 ];
 
 fn validate_clickhouse_query_ast(
@@ -242,7 +253,7 @@ fn validate_clickhouse_query_ast(
         ));
     }
 
-    if query.fetch.is_some() || !query.locks.is_empty() {
+    if query.fetch.is_some() || !query.locks.is_empty() || !query.pipe_operators.is_empty() {
         return Err(anyhow!("Unsupported query clause"));
     }
 
@@ -252,6 +263,10 @@ fn validate_clickhouse_query_ast(
             return Err(anyhow!("Recursive CTEs are not allowed"));
         }
         for cte in &with.cte_tables {
+            // `WITH x AS (...) FROM t SELECT ...` keeps `t` here, outside the FROM clause.
+            if cte.from.is_some() {
+                return Err(anyhow!("FROM before SELECT is not allowed after WITH"));
+            }
             validate_clickhouse_query_ast(&cte.query, &all_cte_names, depth + 1)?;
             all_cte_names.insert(cte.alias.name.value.to_lowercase());
         }
@@ -262,7 +277,14 @@ fn validate_clickhouse_query_ast(
     if let Some(order_by) = &query.order_by {
         if let sqlparser::ast::OrderByKind::Expressions(exprs) = &order_by.kind {
             for order_expr in exprs {
-                validate_clickhouse_expr(&order_expr.expr, &all_cte_names, depth)?;
+                validate_clickhouse_order_by_expr(order_expr, &all_cte_names, depth)?;
+            }
+        }
+        if let Some(sqlparser::ast::Interpolate { exprs: Some(exprs) }) = &order_by.interpolate {
+            for interpolate in exprs {
+                if let Some(expr) = &interpolate.expr {
+                    validate_clickhouse_expr(expr, &all_cte_names, depth)?;
+                }
             }
         }
     }
@@ -286,6 +308,24 @@ fn validate_clickhouse_set_expr(
         SetExpr::Select(select) => {
             if select.into.is_some() {
                 return Err(anyhow!("SELECT INTO is not allowed"));
+            }
+            if select.top.is_some() {
+                return Err(anyhow!("TOP clause is not allowed, use LIMIT instead"));
+            }
+            // ClickHouse has none of these clauses, but the parser accepts the Hive ones
+            // for every dialect.
+            if !select.lateral_views.is_empty()
+                || !select.cluster_by.is_empty()
+                || !select.distribute_by.is_empty()
+                || !select.sort_by.is_empty()
+                || select.connect_by.is_some()
+            {
+                return Err(anyhow!("Unsupported SELECT clause"));
+            }
+            if let Some(sqlparser::ast::Distinct::On(exprs)) = &select.distinct {
+                for expr in exprs {
+                    validate_clickhouse_expr(expr, cte_names, depth)?;
+                }
             }
             for table in &select.from {
                 validate_clickhouse_table_with_joins(table, cte_names, depth)?;
@@ -316,6 +356,18 @@ fn validate_clickhouse_set_expr(
             if let sqlparser::ast::GroupByExpr::Expressions(exprs, _) = &select.group_by {
                 for expr in exprs {
                     validate_clickhouse_expr(expr, cte_names, depth)?;
+                }
+            }
+            let (sqlparser::ast::GroupByExpr::All(modifiers)
+            | sqlparser::ast::GroupByExpr::Expressions(_, modifiers)) = &select.group_by;
+            for modifier in modifiers {
+                match modifier {
+                    sqlparser::ast::GroupByWithModifier::Rollup
+                    | sqlparser::ast::GroupByWithModifier::Cube
+                    | sqlparser::ast::GroupByWithModifier::Totals => {}
+                    sqlparser::ast::GroupByWithModifier::GroupingSets(expr) => {
+                        validate_clickhouse_expr(expr, cte_names, depth)?;
+                    }
                 }
             }
             if let Some(having) = &select.having {
@@ -368,18 +420,41 @@ fn validate_clickhouse_table_with_joins(
     validate_clickhouse_table_factor(&table.relation, cte_names, depth)?;
     for join in &table.joins {
         validate_clickhouse_table_factor(&join.relation, cte_names, depth)?;
-        match &join.join_operator {
-            sqlparser::ast::JoinOperator::Join(sqlparser::ast::JoinConstraint::On(expr))
-            | sqlparser::ast::JoinOperator::Inner(sqlparser::ast::JoinConstraint::On(expr))
-            | sqlparser::ast::JoinOperator::Left(sqlparser::ast::JoinConstraint::On(expr))
-            | sqlparser::ast::JoinOperator::LeftOuter(sqlparser::ast::JoinConstraint::On(expr))
-            | sqlparser::ast::JoinOperator::Right(sqlparser::ast::JoinConstraint::On(expr))
-            | sqlparser::ast::JoinOperator::RightOuter(sqlparser::ast::JoinConstraint::On(expr))
-            | sqlparser::ast::JoinOperator::FullOuter(sqlparser::ast::JoinConstraint::On(expr))
-            | sqlparser::ast::JoinOperator::CrossJoin(sqlparser::ast::JoinConstraint::On(expr)) => {
+        let constraint = match &join.join_operator {
+            sqlparser::ast::JoinOperator::Join(constraint)
+            | sqlparser::ast::JoinOperator::Inner(constraint)
+            | sqlparser::ast::JoinOperator::Left(constraint)
+            | sqlparser::ast::JoinOperator::LeftOuter(constraint)
+            | sqlparser::ast::JoinOperator::Right(constraint)
+            | sqlparser::ast::JoinOperator::RightOuter(constraint)
+            | sqlparser::ast::JoinOperator::FullOuter(constraint)
+            | sqlparser::ast::JoinOperator::CrossJoin(constraint)
+            | sqlparser::ast::JoinOperator::Semi(constraint)
+            | sqlparser::ast::JoinOperator::LeftSemi(constraint)
+            | sqlparser::ast::JoinOperator::RightSemi(constraint)
+            | sqlparser::ast::JoinOperator::Anti(constraint)
+            | sqlparser::ast::JoinOperator::LeftAnti(constraint)
+            | sqlparser::ast::JoinOperator::RightAnti(constraint) => constraint,
+            sqlparser::ast::JoinOperator::AsOf {
+                match_condition,
+                constraint,
+            } => {
+                validate_clickhouse_expr(match_condition, cte_names, depth)?;
+                constraint
+            }
+            sqlparser::ast::JoinOperator::CrossApply
+            | sqlparser::ast::JoinOperator::OuterApply
+            | sqlparser::ast::JoinOperator::StraightJoin(_) => {
+                return Err(anyhow!("Unsupported join type"));
+            }
+        };
+        match constraint {
+            sqlparser::ast::JoinConstraint::On(expr) => {
                 validate_clickhouse_expr(expr, cte_names, depth)?;
             }
-            _ => {}
+            sqlparser::ast::JoinConstraint::Using(_)
+            | sqlparser::ast::JoinConstraint::Natural
+            | sqlparser::ast::JoinConstraint::None => {}
         }
     }
     Ok(())
@@ -396,10 +471,23 @@ fn validate_clickhouse_table_factor(
             args,
             sample,
             with_ordinality,
-            ..
+            with_hints,
+            version,
+            partitions,
+            json_path,
+            index_hints,
+            alias: _,
         } => {
             if args.is_some() || sample.is_some() || *with_ordinality {
                 return Err(anyhow!("Table functions are not allowed"));
+            }
+            if !with_hints.is_empty()
+                || version.is_some()
+                || !partitions.is_empty()
+                || json_path.is_some()
+                || !index_hints.is_empty()
+            {
+                return Err(anyhow!("Unsupported table modifier"));
             }
             validate_clickhouse_table_name(name, cte_names)
         }
@@ -478,6 +566,18 @@ fn validate_clickhouse_expr(expr: &Expr, cte_names: &HashSet<String>, depth: usi
         }
         Expr::InList { expr, list, .. } => {
             validate_clickhouse_expr(expr, cte_names, depth)?;
+            // ClickHouse reads a lone identifier on the right side of IN as a table name.
+            if let [item] = list.as_slice() {
+                let mut item = item;
+                while let Expr::Nested(inner) = item {
+                    item = inner;
+                }
+                if matches!(item, Expr::Identifier(_) | Expr::CompoundIdentifier(_)) {
+                    return Err(anyhow!(
+                        "IN with a single identifier is not allowed, use = or a subquery"
+                    ));
+                }
+            }
             for item in list {
                 validate_clickhouse_expr(item, cte_names, depth)?;
             }
@@ -521,11 +621,17 @@ fn validate_clickhouse_expr(expr: &Expr, cte_names: &HashSet<String>, depth: usi
             Ok(())
         }
         Expr::Trim {
-            expr, trim_what, ..
+            expr,
+            trim_what,
+            trim_characters,
+            ..
         } => {
             validate_clickhouse_expr(expr, cte_names, depth)?;
             if let Some(trim_what) = trim_what {
                 validate_clickhouse_expr(trim_what, cte_names, depth)?;
+            }
+            for expr in trim_characters.iter().flatten() {
+                validate_clickhouse_expr(expr, cte_names, depth)?;
             }
             Ok(())
         }
@@ -562,37 +668,36 @@ fn validate_clickhouse_function(
     cte_names: &HashSet<String>,
     depth: usize,
 ) -> Result<()> {
-    let parts: Vec<String> = func
-        .name
-        .0
-        .iter()
-        .map(|part| {
-            part.as_ident()
-                .map(|ident| ident.value.to_lowercase())
-                .ok_or_else(|| anyhow!("Unsupported function identifier"))
-        })
-        .collect::<Result<_>>()?;
-    let bare_name = parts.last().map(String::as_str).unwrap_or_default();
-    if CLICKHOUSE_DANGEROUS_FUNCTIONS.contains(&bare_name) {
-        return Err(anyhow!("Function '{}' is not allowed", func.name));
-    }
+    validate_clickhouse_function_name(func)?;
 
-    if let FunctionArguments::List(arg_list) = &func.args {
+    // Parametric functions, e.g. `quantile(0.5)(x)`, carry a second argument list.
+    for arguments in [&func.parameters, &func.args] {
+        let arg_list = match arguments {
+            FunctionArguments::None => continue,
+            FunctionArguments::Subquery(query) => {
+                validate_clickhouse_query_ast(query, cte_names, depth + 1)?;
+                continue;
+            }
+            FunctionArguments::List(arg_list) => arg_list,
+        };
         for arg in &arg_list.args {
-            if let FunctionArg::Unnamed(FunctionArgExpr::Expr(expr))
-            | FunctionArg::Named {
-                arg: FunctionArgExpr::Expr(expr),
-                ..
-            } = arg
-            {
-                validate_clickhouse_expr(expr, cte_names, depth)?;
+            let arg = match arg {
+                FunctionArg::Unnamed(arg) | FunctionArg::Named { arg, .. } => arg,
+                FunctionArg::ExprNamed { name, arg, .. } => {
+                    validate_clickhouse_expr(name, cte_names, depth)?;
+                    arg
+                }
+            };
+            match arg {
+                FunctionArgExpr::Expr(expr) => validate_clickhouse_expr(expr, cte_names, depth)?,
+                FunctionArgExpr::Wildcard | FunctionArgExpr::QualifiedWildcard(_) => {}
             }
         }
         for clause in &arg_list.clauses {
             match clause {
                 sqlparser::ast::FunctionArgumentClause::OrderBy(order_by) => {
                     for order_expr in order_by {
-                        validate_clickhouse_expr(&order_expr.expr, cte_names, depth)?;
+                        validate_clickhouse_order_by_expr(order_expr, cte_names, depth)?;
                     }
                 }
                 sqlparser::ast::FunctionArgumentClause::Limit(expr) => {
@@ -611,12 +716,30 @@ fn validate_clickhouse_function(
         validate_clickhouse_expr(filter, cte_names, depth)?;
     }
     for order_expr in &func.within_group {
-        validate_clickhouse_expr(&order_expr.expr, cte_names, depth)?;
+        validate_clickhouse_order_by_expr(order_expr, cte_names, depth)?;
     }
     if let Some(sqlparser::ast::WindowType::WindowSpec(spec)) = &func.over {
         validate_clickhouse_window_spec(spec, cte_names, depth)?;
     }
 
+    Ok(())
+}
+
+fn validate_clickhouse_function_name(func: &Function) -> Result<()> {
+    let parts: Vec<String> = func
+        .name
+        .0
+        .iter()
+        .map(|part| {
+            part.as_ident()
+                .map(|ident| ident.value.to_lowercase())
+                .ok_or_else(|| anyhow!("Unsupported function identifier"))
+        })
+        .collect::<Result<_>>()?;
+    let bare_name = parts.last().map(String::as_str).unwrap_or_default();
+    if CLICKHOUSE_DANGEROUS_FUNCTIONS.contains(&bare_name) {
+        return Err(anyhow!("Function '{}' is not allowed", func.name));
+    }
     Ok(())
 }
 
@@ -642,7 +765,7 @@ fn validate_clickhouse_window_spec(
         validate_clickhouse_expr(expr, cte_names, depth)?;
     }
     for order_expr in &spec.order_by {
-        validate_clickhouse_expr(&order_expr.expr, cte_names, depth)?;
+        validate_clickhouse_order_by_expr(order_expr, cte_names, depth)?;
     }
     if let Some(frame) = &spec.window_frame {
         validate_clickhouse_window_frame_bound(&frame.start_bound, cte_names, depth)?;
@@ -666,6 +789,93 @@ fn validate_clickhouse_window_frame_bound(
         | sqlparser::ast::WindowFrameBound::Following(Some(expr)) => {
             validate_clickhouse_expr(expr, cte_names, depth)
         }
+    }
+}
+
+fn validate_clickhouse_order_by_expr(
+    order_expr: &sqlparser::ast::OrderByExpr,
+    cte_names: &HashSet<String>,
+    depth: usize,
+) -> Result<()> {
+    validate_clickhouse_expr(&order_expr.expr, cte_names, depth)?;
+    if let Some(sqlparser::ast::WithFill { from, to, step }) = &order_expr.with_fill {
+        for expr in [from, to, step].into_iter().flatten() {
+            validate_clickhouse_expr(expr, cte_names, depth)?;
+        }
+    }
+    Ok(())
+}
+
+/// Second pass over every node of the statement. The walk above enforces the
+/// detailed rules; this pass guarantees that a field the walk does not know
+/// about cannot hide a denied function or a table outside the allowlist.
+fn validate_clickhouse_query_nodes(query: &Query) -> Result<()> {
+    let mut visitor = ClickHouseNodeValidator {
+        cte_names: HashSet::new(),
+    };
+    match query.visit(&mut visitor) {
+        ControlFlow::Continue(()) => Ok(()),
+        ControlFlow::Break(error) => Err(error),
+    }
+}
+
+struct ClickHouseNodeValidator {
+    /// CTE names of the whole statement. The scoped check stays in the walk.
+    cte_names: HashSet<String>,
+}
+
+impl Visitor for ClickHouseNodeValidator {
+    type Break = anyhow::Error;
+
+    fn pre_visit_query(&mut self, query: &Query) -> ControlFlow<Self::Break> {
+        if let Some(with) = &query.with {
+            for cte in &with.cte_tables {
+                // A table named this way never shows up as a table factor.
+                if cte.from.is_some() {
+                    return ControlFlow::Break(anyhow!(
+                        "FROM before SELECT is not allowed after WITH"
+                    ));
+                }
+                self.cte_names.insert(cte.alias.name.value.to_lowercase());
+            }
+        }
+        ControlFlow::Continue(())
+    }
+
+    fn pre_visit_table_factor(&mut self, factor: &TableFactor) -> ControlFlow<Self::Break> {
+        let result = match factor {
+            TableFactor::Table {
+                name,
+                args,
+                sample,
+                with_ordinality,
+                ..
+            } => {
+                if args.is_some() || sample.is_some() || *with_ordinality {
+                    Err(anyhow!("Table functions are not allowed"))
+                } else {
+                    validate_clickhouse_table_name(name, &self.cte_names)
+                }
+            }
+            TableFactor::Derived { .. } | TableFactor::NestedJoin { .. } => Ok(()),
+            TableFactor::TableFunction { .. } | TableFactor::Function { .. } => {
+                Err(anyhow!("Table functions are not allowed"))
+            }
+            _ => Err(anyhow!("Unsupported FROM clause type")),
+        };
+        match result {
+            Ok(()) => ControlFlow::Continue(()),
+            Err(error) => ControlFlow::Break(error),
+        }
+    }
+
+    fn pre_visit_expr(&mut self, expr: &Expr) -> ControlFlow<Self::Break> {
+        if let Expr::Function(func) = expr
+            && let Err(error) = validate_clickhouse_function_name(func)
+        {
+            return ControlFlow::Break(error);
+        }
+        ControlFlow::Continue(())
     }
 }
 
@@ -1806,6 +2016,304 @@ mod tests {
             .is_err()
         );
         assert!(validate_clickhouse_query("SELECT * EXCEPT tx_hash FROM logs LIMIT 1").is_err());
+    }
+
+    /// Less common clauses that hold an expression; `{}` marks the expression.
+    const CLICKHOUSE_EXPR_POSITIONS: &[&str] = &[
+        "SELECT DISTINCT ON ({}) block_num FROM logs",
+        "SELECT block_num FROM logs ORDER BY block_num WITH FILL FROM {}",
+        "SELECT block_num FROM logs ORDER BY block_num WITH FILL TO {}",
+        "SELECT block_num FROM logs ORDER BY block_num WITH FILL STEP {}",
+        "SELECT block_num FROM logs ORDER BY block_num WITH FILL INTERPOLATE (block_num AS {})",
+        "SELECT quantile({})(block_num) FROM logs",
+        "SELECT quantile(0.5 ORDER BY {})(block_num) FROM logs",
+        "SELECT groupArray(block_num ORDER BY block_num WITH FILL FROM {}) FROM logs",
+        "SELECT quantile(0.5)(block_num) WITHIN GROUP (ORDER BY block_num WITH FILL TO {}) FROM logs",
+        "SELECT count() OVER (ORDER BY block_num WITH FILL STEP {}) FROM logs",
+        "SELECT count() OVER w FROM logs WINDOW w AS (ORDER BY block_num WITH FILL FROM {})",
+        "SELECT l.block_num FROM logs AS l SEMI JOIN txs AS t ON {}",
+        "SELECT l.block_num FROM logs AS l LEFT SEMI JOIN txs AS t ON {}",
+        "SELECT l.block_num FROM logs AS l RIGHT SEMI JOIN txs AS t ON {}",
+        "SELECT l.block_num FROM logs AS l ANTI JOIN txs AS t ON {}",
+        "SELECT l.block_num FROM logs AS l LEFT ANTI JOIN txs AS t ON {}",
+        "SELECT l.block_num FROM logs AS l RIGHT ANTI JOIN txs AS t ON {}",
+        "SELECT l.block_num FROM logs AS l ASOF JOIN txs AS t MATCH_CONDITION ({}) \
+         ON l.block_num = t.block_num",
+        "SELECT l.block_num FROM logs AS l ASOF JOIN txs AS t \
+         MATCH_CONDITION (l.block_num >= t.block_num) ON {}",
+    ];
+
+    fn parse_query(dialect: &dyn sqlparser::dialect::Dialect, sql: &str) -> Box<Query> {
+        match Parser::parse_sql(dialect, sql).expect(sql).pop() {
+            Some(Statement::Query(query)) => query,
+            other => panic!("expected a query for {sql}, got {other:?}"),
+        }
+    }
+
+    /// Asserts the error of the whole validation and of each pass on its own,
+    /// so that neither pass can hide a gap in the other.
+    fn assert_clickhouse_rejects(sql: &str, walk_error: &str, visitor_error: &str) {
+        let query = parse_query(&sqlparser::dialect::ClickHouseDialect {}, sql);
+        let walk = validate_clickhouse_query_ast(&query, &HashSet::new(), 0).expect_err(sql);
+        assert_eq!(walk.to_string(), walk_error, "walk: {sql}");
+        let visitor = validate_clickhouse_query_nodes(&query).expect_err(sql);
+        assert_eq!(visitor.to_string(), visitor_error, "visitor: {sql}");
+        let error = validate_clickhouse_query(sql).expect_err(sql);
+        assert_eq!(error.to_string(), walk_error, "{sql}");
+    }
+
+    #[test]
+    fn test_clickhouse_rejects_denied_function_in_every_clause() {
+        let denied = "Function 'sleep' is not allowed";
+        for position in CLICKHOUSE_EXPR_POSITIONS {
+            let sql = position.replace("{}", "sleep(1)");
+            assert_clickhouse_rejects(&sql, denied, denied);
+        }
+        assert_clickhouse_rejects(
+            "SELECT TOP (sleep(1)) block_num FROM logs",
+            "TOP clause is not allowed, use LIMIT instead",
+            denied,
+        );
+    }
+
+    #[test]
+    fn test_clickhouse_rejects_unlisted_table_in_every_clause() {
+        let denied = "Access to ClickHouse system schema 'system' is not allowed";
+        for position in CLICKHOUSE_EXPR_POSITIONS {
+            let sql = position.replace("{}", "(SELECT count() FROM system.one)");
+            assert_clickhouse_rejects(&sql, denied, denied);
+        }
+        assert_clickhouse_rejects(
+            "SELECT TOP ((SELECT count() FROM system.one)) block_num FROM logs",
+            "TOP clause is not allowed, use LIMIT instead",
+            denied,
+        );
+    }
+
+    #[test]
+    fn test_clickhouse_rejects_unsupported_clauses() {
+        let denied = "Function 'sleep' is not allowed";
+        for (sql, walk_error) in [
+            (
+                "SELECT block_num FROM logs LATERAL VIEW sleep(1) t AS x",
+                "Unsupported SELECT clause",
+            ),
+            (
+                "SELECT block_num FROM logs CLUSTER BY sleep(1)",
+                "Unsupported SELECT clause",
+            ),
+            (
+                "SELECT block_num FROM logs DISTRIBUTE BY sleep(1)",
+                "Unsupported SELECT clause",
+            ),
+            (
+                "SELECT block_num FROM logs SORT BY sleep(1)",
+                "Unsupported SELECT clause",
+            ),
+            (
+                "SELECT count() FROM logs GROUP BY block_num GROUPING SETS ((sleep(1)))",
+                "Unsupported expression type",
+            ),
+            (
+                "SELECT count() FROM logs GROUP BY ALL GROUPING SETS ((sleep(1)))",
+                "Unsupported expression type",
+            ),
+            (
+                "SELECT block_num FROM logs WITH (sleep(1))",
+                "Unsupported table modifier",
+            ),
+            (
+                "SELECT l.block_num FROM logs AS l STRAIGHT_JOIN txs AS t ON sleep(1)",
+                "Unsupported join type",
+            ),
+        ] {
+            assert_clickhouse_rejects(sql, walk_error, denied);
+        }
+
+        for (sql, error) in [
+            (
+                "SELECT l.block_num FROM logs AS l CROSS APPLY txs AS t",
+                "Unsupported join type",
+            ),
+            (
+                "SELECT l.block_num FROM logs AS l OUTER APPLY txs AS t",
+                "Unsupported join type",
+            ),
+            (
+                "SELECT TOP 5 block_num FROM logs",
+                "TOP clause is not allowed, use LIMIT instead",
+            ),
+        ] {
+            let result = validate_clickhouse_query(sql);
+            assert_eq!(result.expect_err(sql).to_string(), error, "{sql}");
+        }
+
+        // The table named after the CTE is not part of the parsed FROM clause.
+        let from_after_with = "FROM before SELECT is not allowed after WITH";
+        assert_clickhouse_rejects(
+            "WITH x AS (SELECT block_num FROM logs) FROM other_table SELECT *",
+            from_after_with,
+            from_after_with,
+        );
+    }
+
+    #[test]
+    fn test_clickhouse_walk_rejects_shapes_of_other_dialects() {
+        // The ClickHouse dialect does not produce these shapes. The walk must not skip them
+        // if that ever changes.
+        let walk_error = |dialect: &dyn sqlparser::dialect::Dialect, sql: &str| {
+            let query = parse_query(dialect, sql);
+            let walk = validate_clickhouse_query_ast(&query, &HashSet::new(), 0);
+            walk.expect_err(sql).to_string()
+        };
+
+        assert_eq!(
+            walk_error(
+                &sqlparser::dialect::SnowflakeDialect {},
+                "SELECT f(SELECT count() FROM system.one) FROM logs"
+            ),
+            "Access to ClickHouse system schema 'system' is not allowed"
+        );
+        assert_eq!(
+            walk_error(
+                &sqlparser::dialect::PostgreSqlDialect {},
+                "SELECT f(sleep(1) => 1) FROM logs"
+            ),
+            "Function 'sleep' is not allowed"
+        );
+        for (sql, error) in [
+            (
+                "SELECT trim(tx_hash, sleep(1)) FROM logs",
+                "Function 'sleep' is not allowed",
+            ),
+            (
+                "SELECT block_num FROM logs START WITH sleep(1) CONNECT BY sleep(1)",
+                "Unsupported SELECT clause",
+            ),
+            (
+                "SELECT block_num FROM logs |> WHERE sleep(1)",
+                "Unsupported query clause",
+            ),
+            (
+                "SELECT block_num FROM logs PARTITION (p0)",
+                "Unsupported table modifier",
+            ),
+        ] {
+            assert_eq!(walk_error(&GenericDialect {}, sql), error, "{sql}");
+        }
+        assert_eq!(
+            walk_error(
+                &sqlparser::dialect::BigQueryDialect {},
+                "SELECT block_num FROM logs FOR SYSTEM_TIME AS OF sleep(1)"
+            ),
+            "Unsupported table modifier"
+        );
+        assert_eq!(
+            walk_error(
+                &sqlparser::dialect::MySqlDialect {},
+                "SELECT block_num FROM logs USE INDEX (i)"
+            ),
+            "Unsupported table modifier"
+        );
+        assert_eq!(
+            walk_error(
+                &sqlparser::dialect::RedshiftSqlDialect {},
+                "SELECT block_num FROM logs[0].a"
+            ),
+            "Unsupported table modifier"
+        );
+    }
+
+    #[test]
+    fn test_clickhouse_allows_ordinary_clause_uses() {
+        for sql in [
+            "SELECT DISTINCT ON (address) block_num FROM logs",
+            "SELECT block_num FROM logs ORDER BY block_num WITH FILL FROM 1 TO 10 STEP 1",
+            "SELECT block_num FROM logs ORDER BY block_num WITH FILL \
+             INTERPOLATE (block_num AS block_num + 1)",
+            "SELECT quantile(0.5)(block_num) FROM logs",
+            "SELECT count(*), count(l.*) FROM logs AS l",
+            "SELECT l.block_num FROM logs AS l LEFT SEMI JOIN txs AS t \
+             ON l.block_num = t.block_num",
+            "SELECT l.block_num FROM logs AS l JOIN txs AS t USING (block_num)",
+            "SELECT l.block_num FROM logs AS l CROSS JOIN txs AS t",
+            "SELECT block_num, count() FROM logs GROUP BY block_num WITH TOTALS",
+            "SELECT block_num, count() FROM logs GROUP BY ALL",
+            "SELECT block_num FROM logs WHERE block_num IN (1)",
+            "SELECT block_num FROM logs WHERE block_num IN (1, 2)",
+            "SELECT block_num FROM logs WHERE block_num IN (log_idx, tx_idx)",
+            "SELECT block_num FROM logs WHERE block_num IN (SELECT block_num FROM txs)",
+            "SELECT block_num FROM logs WHERE block_num NOT IN (SELECT block_num FROM txs)",
+            "SELECT block_num FROM logs WHERE (block_num, log_idx) IN ((1, 2))",
+            "WITH recent AS (SELECT block_num FROM logs), counted AS (SELECT count() FROM recent) \
+             SELECT * FROM counted",
+            "SELECT * FROM (WITH inner_cte AS (SELECT block_num FROM logs) SELECT * FROM inner_cte) \
+             AS derived",
+            "SELECT block_num FROM logs SETTINGS max_threads = 1",
+        ] {
+            let result = validate_clickhouse_query(sql);
+            assert!(result.is_ok(), "{sql}: {result:?}");
+        }
+    }
+
+    #[test]
+    fn test_clickhouse_rejects_identifier_as_in_set() {
+        let single_identifier = "IN with a single identifier is not allowed, use = or a subquery";
+        for sql in [
+            "SELECT 1 IN (system.one) FROM logs",
+            "SELECT 1 IN (other_db.secrets) FROM logs",
+            "SELECT 1 NOT IN (system.one) FROM logs",
+            "SELECT 1 IN ((system.one)) FROM logs",
+            "SELECT count() FROM logs WHERE block_num IN (txs)",
+        ] {
+            let error = validate_clickhouse_query(sql).expect_err(sql);
+            assert_eq!(error.to_string(), single_identifier, "{sql}");
+        }
+
+        for name in [
+            "in",
+            "notIn",
+            "globalIn",
+            "globalNotIn",
+            "nullIn",
+            "notNullIn",
+            "globalNullIn",
+            "globalNotNullIn",
+        ] {
+            let sql = format!("SELECT {name}(1, system.one) FROM logs");
+            let error = validate_clickhouse_query(&sql).expect_err(&sql);
+            let denied = format!("Function '{name}' is not allowed");
+            assert_eq!(error.to_string(), denied, "{sql}");
+        }
+    }
+
+    #[test]
+    fn test_clickhouse_visitor_pass_covers_positions_outside_the_walk() {
+        for (sql, error) in [
+            (
+                "SELECT block_num FROM logs SETTINGS max_threads = sleep(1)",
+                "Function 'sleep' is not allowed",
+            ),
+            (
+                "SELECT block_num FROM logs SETTINGS max_threads = (SELECT count() FROM system.one)",
+                "Access to ClickHouse system schema 'system' is not allowed",
+            ),
+            (
+                "SELECT block_num FROM logs SETTINGS max_threads = (SELECT count() FROM numbers(1))",
+                "Table functions are not allowed",
+            ),
+            (
+                "SELECT CAST(block_num AS Nested(a UInt8 DEFAULT sleep(1))) FROM logs",
+                "Function 'sleep' is not allowed",
+            ),
+        ] {
+            // The walk does not look at these positions, only the visitor pass does.
+            let query = parse_query(&sqlparser::dialect::ClickHouseDialect {}, sql);
+            let walk = validate_clickhouse_query_ast(&query, &HashSet::new(), 0);
+            assert!(walk.is_ok(), "{sql}: {walk:?}");
+            let result = validate_clickhouse_query(sql);
+            assert_eq!(result.expect_err(sql).to_string(), error, "{sql}");
+        }
     }
 
     #[test]
