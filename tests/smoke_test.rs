@@ -9,8 +9,8 @@ use tidx::query::EventSignature;
 use tidx::sync::engine::SyncEngine;
 use tidx::sync::sink::SinkSet;
 use tidx::sync::writer::{
-    detect_gaps, get_block_hash, load_sync_state, save_sync_state, update_synced_num,
-    update_tip_num,
+    detect_all_gaps, detect_all_gaps_with_trailing, detect_gaps, get_block_hash, load_sync_state,
+    save_sync_state, update_synced_num, update_tip_num,
 };
 use tidx::types::SyncState;
 
@@ -838,6 +838,145 @@ async fn test_gap_detection_contiguous_blocks() {
         .expect("Failed to detect gaps");
 
     assert!(gaps.is_empty(), "Contiguous blocks should have no gaps");
+}
+
+#[tokio::test]
+#[serial(db)]
+async fn test_gap_detection_trailing_range() {
+    let db = TestDb::empty().await;
+    db.truncate_all().await;
+
+    // Insert contiguous blocks 1-5, tip is at 9 (missing 6-9 above the highest block)
+    insert_blocks(&db, &[1, 2, 3, 4, 5]).await;
+
+    // detect_all_gaps leaves the range above the highest stored block to realtime sync
+    let gaps = detect_all_gaps(&db.pool, 1, 9)
+        .await
+        .expect("Failed to detect gaps");
+    assert!(
+        gaps.is_empty(),
+        "detect_all_gaps should not report the trailing range"
+    );
+
+    let gaps = detect_all_gaps_with_trailing(&db.pool, 1, 9)
+        .await
+        .expect("Failed to detect gaps");
+    assert_eq!(gaps, vec![(6, 9)], "Trailing range should be blocks 6-9");
+
+    // Tip at the highest stored block: nothing is missing
+    let gaps = detect_all_gaps_with_trailing(&db.pool, 1, 5)
+        .await
+        .expect("Failed to detect gaps");
+    assert!(gaps.is_empty(), "No trailing range when the tip is stored");
+}
+
+async fn insert_blocks(db: &TestDb, nums: &[i64]) {
+    let conn = db.pool.get().await.expect("Failed to get connection");
+
+    for num in nums {
+        conn.execute(
+            r#"INSERT INTO blocks (num, hash, parent_hash, timestamp, timestamp_ms, gas_limit, gas_used, miner)
+               VALUES ($1, $2, $3, NOW(), $4, 1000000, 100000, $5)"#,
+            &[
+                num,
+                &vec![*num as u8; 32],
+                &vec![(num - 1) as u8; 32],
+                &(num * 1000),
+                &vec![0u8; 20],
+            ],
+        )
+        .await
+        .expect("Failed to insert block");
+    }
+}
+
+#[tokio::test]
+#[serial(db)]
+async fn test_gap_detection_trailing_range_with_other_gaps() {
+    let db = TestDb::empty().await;
+    db.truncate_all().await;
+
+    // Insert blocks 2, 3, 5, tip is at 9 (missing 1, 4 and 6-9)
+    insert_blocks(&db, &[2, 3, 5]).await;
+
+    let gaps = detect_all_gaps(&db.pool, 1, 9)
+        .await
+        .expect("Failed to detect gaps");
+    assert_eq!(
+        gaps,
+        vec![(4, 4), (1, 1)],
+        "detect_all_gaps should not report the trailing range"
+    );
+
+    // Same gaps plus the trailing range, most recent first
+    let gaps = detect_all_gaps_with_trailing(&db.pool, 1, 9)
+        .await
+        .expect("Failed to detect gaps");
+    assert_eq!(gaps, vec![(6, 9), (4, 4), (1, 1)]);
+}
+
+#[tokio::test]
+#[serial(db)]
+async fn test_gap_detection_trailing_range_empty_table() {
+    let db = TestDb::empty().await;
+    db.truncate_all().await;
+
+    // detect_all_gaps already reports the whole range, it must not show up twice
+    let gaps = detect_all_gaps_with_trailing(&db.pool, 1, 9)
+        .await
+        .expect("Failed to detect gaps");
+    assert_eq!(gaps, vec![(1, 9)], "Whole range should be reported once");
+
+    let gaps = detect_all_gaps_with_trailing(&db.pool, 1, 0)
+        .await
+        .expect("Failed to detect gaps");
+    assert!(gaps.is_empty(), "No gaps when tip_num is 0");
+}
+
+#[tokio::test]
+#[serial(db)]
+async fn test_gap_detection_trailing_range_respects_floor() {
+    let db = TestDb::empty().await;
+    db.truncate_all().await;
+
+    insert_blocks(&db, &[1, 2, 3, 4, 5]).await;
+
+    // Floor inside the trailing range: blocks 6-7 are below it
+    let gaps = detect_all_gaps_with_trailing(&db.pool, 8, 9)
+        .await
+        .expect("Failed to detect gaps");
+    assert_eq!(
+        gaps,
+        vec![(8, 9)],
+        "Trailing range should start at the floor"
+    );
+
+    // Floor above the tip: nothing is expected in PG
+    let gaps = detect_all_gaps_with_trailing(&db.pool, 10, 9)
+        .await
+        .expect("Failed to detect gaps");
+    assert!(gaps.is_empty(), "No trailing range below the floor");
+}
+
+#[tokio::test]
+#[serial(db)]
+async fn test_gap_detection_trailing_range_ignores_blocks_above_tip() {
+    let db = TestDb::empty().await;
+    db.truncate_all().await;
+
+    // Insert blocks 1-5 and 20, tip is at 9 (missing 6-9 at or below the tip)
+    insert_blocks(&db, &[1, 2, 3, 4, 5, 20]).await;
+
+    let gaps = detect_all_gaps_with_trailing(&db.pool, 1, 9)
+        .await
+        .expect("Failed to detect gaps");
+    assert_eq!(gaps, vec![(6, 9)], "Block 20 should not hide blocks 6-9");
+
+    // With the tip at block 20 the same blocks are an ordinary gap, reported once
+    let gaps = detect_all_gaps_with_trailing(&db.pool, 1, 20)
+        .await
+        .expect("Failed to detect gaps");
+    assert_eq!(gaps, vec![(6, 19)]);
 }
 
 // ============================================================================

@@ -19,9 +19,10 @@ use super::decoder::{
 use super::fetcher::RpcClient;
 use super::sink::{SinkSet, WriteTarget};
 use super::writer::{
-    detect_all_gaps, detect_blocks_missing_receipts, discover_legacy_receipt_repairs,
-    find_fork_point, finish_receipt_repair_attempt, get_block_hash, has_gaps, load_sync_state,
-    save_sync_state, update_sync_rate, update_synced_num, update_tip_num,
+    detect_all_gaps, detect_all_gaps_with_trailing, detect_blocks_missing_receipts,
+    discover_legacy_receipt_repairs, find_fork_point, finish_receipt_repair_attempt,
+    get_block_hash, has_gaps, load_sync_state, save_sync_state, update_sync_rate,
+    update_synced_num, update_tip_num,
 };
 use crate::virtual_address::mark_virtual_forward_hops;
 
@@ -156,6 +157,12 @@ impl SyncEngine {
         );
 
         // Phase 1: Complete all backfill
+        // The target is read once: a chain that grows during every round would
+        // otherwise keep this phase running forever. Realtime sync catches up
+        // from the target without skipping blocks.
+        let remote_head = self.realtime_rpc.latest_block_number().await?;
+        update_tip_num(self.pool(), self.chain_id, remote_head, remote_head).await?;
+
         loop {
             // Check for shutdown
             if shutdown_rx.try_recv().is_ok() {
@@ -163,16 +170,12 @@ impl SyncEngine {
                 return Ok(());
             }
 
-            // Get current head to know our target
-            let remote_head = self.realtime_rpc.latest_block_number().await?;
-            update_tip_num(self.pool(), self.chain_id, remote_head, remote_head).await?;
-
             // Check for gaps (reload state: pruner may advance the floor)
             let floor = load_sync_state(self.pool(), self.chain_id)
                 .await?
                 .unwrap_or_default()
                 .prune_floor();
-            let gaps = detect_all_gaps(self.pool(), floor, remote_head).await?;
+            let gaps = detect_all_gaps_with_trailing(self.pool(), floor, remote_head).await?;
             if gaps.is_empty() {
                 info!(
                     chain_id = self.chain_id,
@@ -324,7 +327,9 @@ impl SyncEngine {
         const TAIL_WINDOW: u64 = 10;
 
         // Jump to near head immediately, don't catch up sequentially
-        let start_from = if state.tip_num >= remote_head.saturating_sub(TAIL_WINDOW) {
+        // Backfill-first mode never jumps: no gap-fill loop would fill the skipped range.
+        let near_head = state.tip_num >= remote_head.saturating_sub(TAIL_WINDOW);
+        let start_from = if self.backfill_first || near_head {
             state.tip_num + 1
         } else {
             let jump_to = remote_head.saturating_sub(TAIL_WINDOW);
@@ -1175,7 +1180,8 @@ async fn tick_gapfill_parallel(
     Ok(())
 }
 
-/// Same as tick_gapfill_parallel but without lag throttling (for backfill-first mode)
+/// Same as tick_gapfill_parallel but without lag throttling, and it also fills the
+/// range above the highest stored block (for backfill-first mode)
 async fn tick_gapfill_parallel_no_throttle(
     sinks: &SinkSet,
     rpc: &RpcClient,
@@ -1188,7 +1194,7 @@ async fn tick_gapfill_parallel_no_throttle(
     let state = load_sync_state(pool, chain_id).await?.unwrap_or_default();
 
     // Detect ALL gaps above the prune floor, sorted by end DESC (most recent first)
-    let gaps = detect_all_gaps(pool, state.prune_floor(), state.tip_num).await?;
+    let gaps = detect_all_gaps_with_trailing(pool, state.prune_floor(), state.tip_num).await?;
 
     if gaps.is_empty() {
         metrics::set_gap_ranges(chain_id, "postgres", &[]);
