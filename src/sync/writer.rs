@@ -1,10 +1,10 @@
 use anyhow::Result;
 use chrono::{DateTime, Utc};
-use std::collections::BTreeSet;
-use std::pin::Pin;
+use futures::future::BoxFuture;
+use std::collections::{BTreeMap, BTreeSet};
+use std::task::Poll;
 use std::time::Instant;
-use tokio_postgres::binary_copy::BinaryCopyInWriter;
-use tokio_postgres::types::Type;
+use tokio_postgres::types::{ToSql, Type};
 
 use crate::db::Pool;
 use crate::metrics;
@@ -39,444 +39,378 @@ impl BlockSpan {
         let (min_timestamp, max_timestamp) = span?;
         Some(Self {
             block_nums: block_nums.into_iter().collect(),
-            min_timestamp,
-            max_timestamp,
+            min_timestamp: min_timestamp - DELETE_TIMESTAMP_MARGIN,
+            max_timestamp: max_timestamp + DELETE_TIMESTAMP_MARGIN,
         })
     }
 }
 
-/// Delete the rows of `table` stored for the blocks in `span`.
-async fn delete_blocks_exact(
-    tx: &tokio_postgres::Transaction<'_>,
-    table: &str,
-    span: &BlockSpan,
-) -> Result<()> {
-    tx.execute(
-        &format!(
-            "DELETE FROM {table} WHERE block_num = ANY($1) \
-             AND block_timestamp >= $2 AND block_timestamp <= $3"
-        ),
-        &[
-            &span.block_nums,
-            &(span.min_timestamp - DELETE_TIMESTAMP_MARGIN),
-            &(span.max_timestamp + DELETE_TIMESTAMP_MARGIN),
-        ],
-    )
-    .await?;
+type Statement<'a> = BoxFuture<'a, Result<u64, tokio_postgres::Error>>;
+
+fn execute<'a>(
+    tx: &'a tokio_postgres::Transaction<'_>,
+    sql: &'a str,
+    params: Vec<(&'a (dyn ToSql + Sync), Type)>,
+) -> Statement<'a> {
+    Box::pin(async move { tx.execute_typed(sql, &params).await })
+}
+
+/// Sends `statements` in order without waiting for each other's results, then
+/// waits for all of them. A statement is sent on its first poll, and
+/// PostgreSQL executes and answers statements in the order they were sent.
+async fn pipeline(statements: Vec<Statement<'_>>) -> Result<()> {
+    let mut sent = Vec::with_capacity(statements.len());
+    for mut statement in statements {
+        if let Poll::Ready(result) = futures::poll!(statement.as_mut()) {
+            result?;
+        } else {
+            sent.push(statement);
+        }
+    }
+    for statement in sent {
+        statement.await?;
+    }
     Ok(())
 }
 
-/// Replace repair-queue state for the complete set of blocks currently held
-/// in `_staging_txs`. This runs in the same transaction as the transaction
-/// replacement, so a crash cannot leave new incomplete transactions unqueued.
-async fn refresh_receipt_repair_queue_from_staging(
-    tx: &tokio_postgres::Transaction<'_>,
-    block_nums: &[i64],
-) -> Result<()> {
-    if block_nums.is_empty() {
-        return Ok(());
+/// Delete the rows of `table` stored for the blocks in `span`.
+fn delete_blocks_exact<'a>(
+    tx: &'a tokio_postgres::Transaction<'_>,
+    sql: &'a str,
+    span: &'a BlockSpan,
+) -> Statement<'a> {
+    execute(
+        tx,
+        sql,
+        vec![
+            (&span.block_nums, Type::INT8_ARRAY),
+            (&span.min_timestamp, Type::TIMESTAMPTZ),
+            (&span.max_timestamp, Type::TIMESTAMPTZ),
+        ],
+    )
+}
+
+const DELETE_TXS: &str = "DELETE FROM txs WHERE block_num = ANY($1) \
+     AND block_timestamp >= $2 AND block_timestamp <= $3";
+const DELETE_LOGS: &str = "DELETE FROM logs WHERE block_num = ANY($1) \
+     AND block_timestamp >= $2 AND block_timestamp <= $3";
+const DELETE_RECEIPTS: &str = "DELETE FROM receipts WHERE block_num = ANY($1) \
+     AND block_timestamp >= $2 AND block_timestamp <= $3";
+
+const INSERT_BLOCKS: &str = "INSERT INTO blocks (num, hash, parent_hash, timestamp, timestamp_ms, \
+     gas_limit, gas_used, miner, extra_data, consensus_proposer) \
+     SELECT * FROM unnest($1, $2, $3, $4, $5, $6, $7, $8, $9, $10) \
+     ON CONFLICT (timestamp, num) DO NOTHING";
+
+const INSERT_TXS: &str = r#"INSERT INTO txs (block_num, block_timestamp, idx, hash, type, "from",
+     "to", value, input, gas_limit, max_fee_per_gas, max_priority_fee_per_gas, gas_used,
+     nonce_key, nonce, fee_token, fee_payer, calls, call_count, valid_before, valid_after,
+     signature_type)
+     SELECT * FROM unnest($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15,
+     $16, $17, $18, $19, $20, $21, $22)
+     ON CONFLICT DO NOTHING"#;
+
+const INSERT_LOGS: &str = "INSERT INTO logs (block_num, block_timestamp, log_idx, tx_idx, \
+     tx_hash, address, selector, topic0, topic1, topic2, topic3, data, is_virtual_forward) \
+     SELECT * FROM unnest($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13) \
+     ON CONFLICT DO NOTHING";
+
+const INSERT_RECEIPTS: &str = r#"INSERT INTO receipts (block_num, block_timestamp, tx_idx,
+     tx_hash, "from", "to", contract_address, gas_used, cumulative_gas_used,
+     effective_gas_price, status, fee_payer)
+     SELECT * FROM unnest($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+     ON CONFLICT DO NOTHING"#;
+
+/// Replace the repair-queue state of the batch's blocks in the same
+/// transaction as their transactions, so a crash cannot leave new incomplete
+/// transactions unqueued.
+const DELETE_REPAIR_QUEUE: &str = "DELETE FROM receipt_repair_queue WHERE block_num = ANY($1)";
+const INSERT_REPAIR_QUEUE: &str = "INSERT INTO receipt_repair_queue (block_num, block_timestamp) \
+     SELECT * FROM unnest($1, $2)";
+
+struct BlockColumns<'a> {
+    num: Vec<i64>,
+    hash: Vec<&'a [u8]>,
+    parent_hash: Vec<&'a [u8]>,
+    timestamp: Vec<DateTime<Utc>>,
+    timestamp_ms: Vec<i64>,
+    gas_limit: Vec<i64>,
+    gas_used: Vec<i64>,
+    miner: Vec<&'a [u8]>,
+    extra_data: Vec<Option<&'a [u8]>>,
+    consensus_proposer: Vec<Option<&'a [u8]>>,
+}
+
+impl<'a> BlockColumns<'a> {
+    fn new(rows: &'a [BlockRow]) -> Self {
+        Self {
+            num: rows.iter().map(|r| r.num).collect(),
+            hash: rows.iter().map(|r| r.hash.as_slice()).collect(),
+            parent_hash: rows.iter().map(|r| r.parent_hash.as_slice()).collect(),
+            timestamp: rows.iter().map(|r| r.timestamp).collect(),
+            timestamp_ms: rows.iter().map(|r| r.timestamp_ms).collect(),
+            gas_limit: rows.iter().map(|r| r.gas_limit).collect(),
+            gas_used: rows.iter().map(|r| r.gas_used).collect(),
+            miner: rows.iter().map(|r| r.miner.as_slice()).collect(),
+            extra_data: rows.iter().map(|r| r.extra_data.as_deref()).collect(),
+            consensus_proposer: rows
+                .iter()
+                .map(|r| r.consensus_proposer.as_deref())
+                .collect(),
+        }
     }
 
-    tx.execute(
-        "DELETE FROM receipt_repair_queue WHERE block_num = ANY($1)",
-        &[&block_nums],
-    )
-    .await?;
-    tx.execute(
-        r#"
-        INSERT INTO receipt_repair_queue (block_num, block_timestamp)
-        SELECT block_num, MIN(block_timestamp)
-        FROM _staging_txs
-        WHERE gas_used IS NULL
-        GROUP BY block_num
-        "#,
-        &[],
-    )
-    .await?;
+    fn params(&self) -> Vec<(&(dyn ToSql + Sync), Type)> {
+        vec![
+            (&self.num, Type::INT8_ARRAY),
+            (&self.hash, Type::BYTEA_ARRAY),
+            (&self.parent_hash, Type::BYTEA_ARRAY),
+            (&self.timestamp, Type::TIMESTAMPTZ_ARRAY),
+            (&self.timestamp_ms, Type::INT8_ARRAY),
+            (&self.gas_limit, Type::INT8_ARRAY),
+            (&self.gas_used, Type::INT8_ARRAY),
+            (&self.miner, Type::BYTEA_ARRAY),
+            (&self.extra_data, Type::BYTEA_ARRAY),
+            (&self.consensus_proposer, Type::BYTEA_ARRAY),
+        ]
+    }
+}
 
-    Ok(())
+struct TxColumns<'a> {
+    block_num: Vec<i64>,
+    block_timestamp: Vec<DateTime<Utc>>,
+    idx: Vec<i32>,
+    hash: Vec<&'a [u8]>,
+    tx_type: Vec<i16>,
+    from: Vec<&'a [u8]>,
+    to: Vec<Option<&'a [u8]>>,
+    value: Vec<&'a str>,
+    input: Vec<&'a [u8]>,
+    gas_limit: Vec<i64>,
+    max_fee_per_gas: Vec<&'a str>,
+    max_priority_fee_per_gas: Vec<&'a str>,
+    gas_used: Vec<Option<i64>>,
+    nonce_key: Vec<&'a [u8]>,
+    nonce: Vec<i64>,
+    fee_token: Vec<Option<&'a [u8]>>,
+    fee_payer: Vec<Option<&'a [u8]>>,
+    calls: Vec<Option<&'a serde_json::Value>>,
+    call_count: Vec<i16>,
+    valid_before: Vec<Option<i64>>,
+    valid_after: Vec<Option<i64>>,
+    signature_type: Vec<Option<i16>>,
+}
+
+impl<'a> TxColumns<'a> {
+    fn new(rows: &'a [TxRow]) -> Self {
+        Self {
+            block_num: rows.iter().map(|r| r.block_num).collect(),
+            block_timestamp: rows.iter().map(|r| r.block_timestamp).collect(),
+            idx: rows.iter().map(|r| r.idx).collect(),
+            hash: rows.iter().map(|r| r.hash.as_slice()).collect(),
+            tx_type: rows.iter().map(|r| r.tx_type).collect(),
+            from: rows.iter().map(|r| r.from.as_slice()).collect(),
+            to: rows.iter().map(|r| r.to.as_deref()).collect(),
+            value: rows.iter().map(|r| r.value.as_str()).collect(),
+            input: rows.iter().map(|r| r.input.as_slice()).collect(),
+            gas_limit: rows.iter().map(|r| r.gas_limit).collect(),
+            max_fee_per_gas: rows.iter().map(|r| r.max_fee_per_gas.as_str()).collect(),
+            max_priority_fee_per_gas: rows
+                .iter()
+                .map(|r| r.max_priority_fee_per_gas.as_str())
+                .collect(),
+            gas_used: rows.iter().map(|r| r.gas_used).collect(),
+            nonce_key: rows.iter().map(|r| r.nonce_key.as_slice()).collect(),
+            nonce: rows.iter().map(|r| r.nonce).collect(),
+            fee_token: rows.iter().map(|r| r.fee_token.as_deref()).collect(),
+            fee_payer: rows.iter().map(|r| r.fee_payer.as_deref()).collect(),
+            calls: rows.iter().map(|r| r.calls.as_ref()).collect(),
+            call_count: rows.iter().map(|r| r.call_count).collect(),
+            valid_before: rows.iter().map(|r| r.valid_before).collect(),
+            valid_after: rows.iter().map(|r| r.valid_after).collect(),
+            signature_type: rows.iter().map(|r| r.signature_type).collect(),
+        }
+    }
+
+    fn params(&self) -> Vec<(&(dyn ToSql + Sync), Type)> {
+        vec![
+            (&self.block_num, Type::INT8_ARRAY),
+            (&self.block_timestamp, Type::TIMESTAMPTZ_ARRAY),
+            (&self.idx, Type::INT4_ARRAY),
+            (&self.hash, Type::BYTEA_ARRAY),
+            (&self.tx_type, Type::INT2_ARRAY),
+            (&self.from, Type::BYTEA_ARRAY),
+            (&self.to, Type::BYTEA_ARRAY),
+            (&self.value, Type::TEXT_ARRAY),
+            (&self.input, Type::BYTEA_ARRAY),
+            (&self.gas_limit, Type::INT8_ARRAY),
+            (&self.max_fee_per_gas, Type::TEXT_ARRAY),
+            (&self.max_priority_fee_per_gas, Type::TEXT_ARRAY),
+            (&self.gas_used, Type::INT8_ARRAY),
+            (&self.nonce_key, Type::BYTEA_ARRAY),
+            (&self.nonce, Type::INT8_ARRAY),
+            (&self.fee_token, Type::BYTEA_ARRAY),
+            (&self.fee_payer, Type::BYTEA_ARRAY),
+            (&self.calls, Type::JSONB_ARRAY),
+            (&self.call_count, Type::INT2_ARRAY),
+            (&self.valid_before, Type::INT8_ARRAY),
+            (&self.valid_after, Type::INT8_ARRAY),
+            (&self.signature_type, Type::INT2_ARRAY),
+        ]
+    }
+}
+
+struct LogColumns<'a> {
+    block_num: Vec<i64>,
+    block_timestamp: Vec<DateTime<Utc>>,
+    log_idx: Vec<i32>,
+    tx_idx: Vec<i32>,
+    tx_hash: Vec<&'a [u8]>,
+    address: Vec<&'a [u8]>,
+    selector: Vec<Option<&'a [u8]>>,
+    topic0: Vec<Option<&'a [u8]>>,
+    topic1: Vec<Option<&'a [u8]>>,
+    topic2: Vec<Option<&'a [u8]>>,
+    topic3: Vec<Option<&'a [u8]>>,
+    data: Vec<&'a [u8]>,
+    is_virtual_forward: Vec<bool>,
+}
+
+impl<'a> LogColumns<'a> {
+    fn new(rows: &'a [LogRow]) -> Self {
+        Self {
+            block_num: rows.iter().map(|r| r.block_num).collect(),
+            block_timestamp: rows.iter().map(|r| r.block_timestamp).collect(),
+            log_idx: rows.iter().map(|r| r.log_idx).collect(),
+            tx_idx: rows.iter().map(|r| r.tx_idx).collect(),
+            tx_hash: rows.iter().map(|r| r.tx_hash.as_slice()).collect(),
+            address: rows.iter().map(|r| r.address.as_slice()).collect(),
+            selector: rows.iter().map(|r| r.selector.as_deref()).collect(),
+            topic0: rows.iter().map(|r| r.topic0.as_deref()).collect(),
+            topic1: rows.iter().map(|r| r.topic1.as_deref()).collect(),
+            topic2: rows.iter().map(|r| r.topic2.as_deref()).collect(),
+            topic3: rows.iter().map(|r| r.topic3.as_deref()).collect(),
+            data: rows.iter().map(|r| r.data.as_slice()).collect(),
+            is_virtual_forward: rows.iter().map(|r| r.is_virtual_forward).collect(),
+        }
+    }
+
+    fn params(&self) -> Vec<(&(dyn ToSql + Sync), Type)> {
+        vec![
+            (&self.block_num, Type::INT8_ARRAY),
+            (&self.block_timestamp, Type::TIMESTAMPTZ_ARRAY),
+            (&self.log_idx, Type::INT4_ARRAY),
+            (&self.tx_idx, Type::INT4_ARRAY),
+            (&self.tx_hash, Type::BYTEA_ARRAY),
+            (&self.address, Type::BYTEA_ARRAY),
+            (&self.selector, Type::BYTEA_ARRAY),
+            (&self.topic0, Type::BYTEA_ARRAY),
+            (&self.topic1, Type::BYTEA_ARRAY),
+            (&self.topic2, Type::BYTEA_ARRAY),
+            (&self.topic3, Type::BYTEA_ARRAY),
+            (&self.data, Type::BYTEA_ARRAY),
+            (&self.is_virtual_forward, Type::BOOL_ARRAY),
+        ]
+    }
+}
+
+struct ReceiptColumns<'a> {
+    block_num: Vec<i64>,
+    block_timestamp: Vec<DateTime<Utc>>,
+    tx_idx: Vec<i32>,
+    tx_hash: Vec<&'a [u8]>,
+    from: Vec<&'a [u8]>,
+    to: Vec<Option<&'a [u8]>>,
+    contract_address: Vec<Option<&'a [u8]>>,
+    gas_used: Vec<i64>,
+    cumulative_gas_used: Vec<i64>,
+    effective_gas_price: Vec<Option<&'a str>>,
+    status: Vec<Option<i16>>,
+    fee_payer: Vec<Option<&'a [u8]>>,
+}
+
+impl<'a> ReceiptColumns<'a> {
+    fn new(rows: &'a [ReceiptRow]) -> Self {
+        Self {
+            block_num: rows.iter().map(|r| r.block_num).collect(),
+            block_timestamp: rows.iter().map(|r| r.block_timestamp).collect(),
+            tx_idx: rows.iter().map(|r| r.tx_idx).collect(),
+            tx_hash: rows.iter().map(|r| r.tx_hash.as_slice()).collect(),
+            from: rows.iter().map(|r| r.from.as_slice()).collect(),
+            to: rows.iter().map(|r| r.to.as_deref()).collect(),
+            contract_address: rows.iter().map(|r| r.contract_address.as_deref()).collect(),
+            gas_used: rows.iter().map(|r| r.gas_used).collect(),
+            cumulative_gas_used: rows.iter().map(|r| r.cumulative_gas_used).collect(),
+            effective_gas_price: rows
+                .iter()
+                .map(|r| r.effective_gas_price.as_deref())
+                .collect(),
+            status: rows.iter().map(|r| r.status).collect(),
+            fee_payer: rows.iter().map(|r| r.fee_payer.as_deref()).collect(),
+        }
+    }
+
+    fn params(&self) -> Vec<(&(dyn ToSql + Sync), Type)> {
+        vec![
+            (&self.block_num, Type::INT8_ARRAY),
+            (&self.block_timestamp, Type::TIMESTAMPTZ_ARRAY),
+            (&self.tx_idx, Type::INT4_ARRAY),
+            (&self.tx_hash, Type::BYTEA_ARRAY),
+            (&self.from, Type::BYTEA_ARRAY),
+            (&self.to, Type::BYTEA_ARRAY),
+            (&self.contract_address, Type::BYTEA_ARRAY),
+            (&self.gas_used, Type::INT8_ARRAY),
+            (&self.cumulative_gas_used, Type::INT8_ARRAY),
+            (&self.effective_gas_price, Type::TEXT_ARRAY),
+            (&self.status, Type::INT2_ARRAY),
+            (&self.fee_payer, Type::BYTEA_ARRAY),
+        ]
+    }
+}
+
+/// Blocks of a batch that hold transactions without receipt data, with the
+/// earliest timestamp of each, for the receipt repair queue.
+fn incomplete_blocks(txs: &[TxRow]) -> (Vec<i64>, Vec<DateTime<Utc>>) {
+    let mut blocks: BTreeMap<i64, DateTime<Utc>> = BTreeMap::new();
+    for tx in txs.iter().filter(|tx| tx.gas_used.is_none()) {
+        blocks
+            .entry(tx.block_num)
+            .and_modify(|ts| *ts = (*ts).min(tx.block_timestamp))
+            .or_insert(tx.block_timestamp);
+    }
+    blocks.into_iter().unzip()
 }
 
 pub async fn write_block(pool: &Pool, block: &BlockRow) -> Result<()> {
     write_blocks(pool, std::slice::from_ref(block)).await
 }
 
-/// Batch insert blocks using COPY BINARY via a staging temp table
 pub async fn write_blocks(pool: &Pool, blocks: &[BlockRow]) -> Result<()> {
     if blocks.is_empty() {
         return Ok(());
     }
-
-    let start = Instant::now();
-    let mut conn = pool.get().await?;
-    let tx = conn.transaction().await?;
-
-    tx.execute(
-        "CREATE TEMP TABLE _staging_blocks (
-            num INT8, hash BYTEA, parent_hash BYTEA, timestamp TIMESTAMPTZ,
-            timestamp_ms INT8, gas_limit INT8, gas_used INT8, miner BYTEA, extra_data BYTEA,
-            consensus_proposer BYTEA
-        ) ON COMMIT DROP",
-        &[],
-    )
-    .await?;
-
-    let types = &[
-        Type::INT8,        // num
-        Type::BYTEA,       // hash
-        Type::BYTEA,       // parent_hash
-        Type::TIMESTAMPTZ, // timestamp
-        Type::INT8,        // timestamp_ms
-        Type::INT8,        // gas_limit
-        Type::INT8,        // gas_used
-        Type::BYTEA,       // miner
-        Type::BYTEA,       // extra_data
-        Type::BYTEA,       // consensus_proposer
-    ];
-
-    let sink = tx
-        .copy_in(
-            "COPY _staging_blocks (num, hash, parent_hash, timestamp, timestamp_ms, gas_limit, gas_used, miner, extra_data, consensus_proposer) FROM STDIN BINARY",
-        )
-        .await?;
-
-    let writer = BinaryCopyInWriter::new(sink, types);
-    let mut pinned_writer: Pin<Box<BinaryCopyInWriter>> = Box::pin(writer);
-
-    for block in blocks {
-        pinned_writer
-            .as_mut()
-            .write(&[
-                &block.num,
-                &block.hash,
-                &block.parent_hash,
-                &block.timestamp,
-                &block.timestamp_ms,
-                &block.gas_limit,
-                &block.gas_used,
-                &block.miner,
-                &block.extra_data as &(dyn tokio_postgres::types::ToSql + Sync),
-                &block.consensus_proposer as &(dyn tokio_postgres::types::ToSql + Sync),
-            ])
-            .await?;
-    }
-
-    pinned_writer.as_mut().finish().await?;
-
-    tx.execute(
-        "INSERT INTO blocks SELECT * FROM _staging_blocks ON CONFLICT (timestamp, num) DO NOTHING",
-        &[],
-    )
-    .await?;
-    tx.commit().await?;
-
-    metrics::record_sink_write_duration("postgres", "blocks", start.elapsed());
-    metrics::record_sink_write_rows("postgres", "blocks", blocks.len() as u64);
-    metrics::update_sink_block_rate("postgres", blocks.len() as u64);
-    metrics::increment_sink_row_count("postgres", "blocks", blocks.len() as u64);
-    if let Some(max) = blocks.iter().map(|b| b.num).max() {
-        metrics::update_sink_watermark("postgres", "blocks", max);
-    }
-
-    Ok(())
+    write_batch(pool, blocks, &[], &[], &[]).await
 }
 
-/// Batch insert transactions using staging table + ON CONFLICT DO NOTHING
 pub async fn write_txs(pool: &Pool, txs: &[TxRow]) -> Result<()> {
     if txs.is_empty() {
         return Ok(());
     }
-
-    let start = Instant::now();
-    let mut conn = pool.get().await?;
-    let tx = conn.transaction().await?;
-
-    let span = BlockSpan::new(txs.iter().map(|tx| (tx.block_num, tx.block_timestamp)))
-        .expect("txs is not empty");
-    delete_blocks_exact(&tx, "txs", &span).await?;
-
-    tx.execute(
-        "CREATE TEMP TABLE _staging_txs (
-            block_num INT8, block_timestamp TIMESTAMPTZ, idx INT4, hash BYTEA,
-            type INT2, \"from\" BYTEA, \"to\" BYTEA, value TEXT, input BYTEA,
-            gas_limit INT8, max_fee_per_gas TEXT, max_priority_fee_per_gas TEXT,
-            gas_used INT8, nonce_key BYTEA, nonce INT8, fee_token BYTEA,
-            fee_payer BYTEA, calls JSONB, call_count INT2, valid_before INT8,
-            valid_after INT8, signature_type INT2
-        ) ON COMMIT DROP",
-        &[],
-    )
-    .await?;
-
-    let types = &[
-        Type::INT8,        // block_num
-        Type::TIMESTAMPTZ, // block_timestamp
-        Type::INT4,        // idx
-        Type::BYTEA,       // hash
-        Type::INT2,        // type
-        Type::BYTEA,       // from
-        Type::BYTEA,       // to
-        Type::TEXT,        // value
-        Type::BYTEA,       // input
-        Type::INT8,        // gas_limit
-        Type::TEXT,        // max_fee_per_gas
-        Type::TEXT,        // max_priority_fee_per_gas
-        Type::INT8,        // gas_used
-        Type::BYTEA,       // nonce_key
-        Type::INT8,        // nonce
-        Type::BYTEA,       // fee_token
-        Type::BYTEA,       // fee_payer
-        Type::JSONB,       // calls
-        Type::INT2,        // call_count
-        Type::INT8,        // valid_before
-        Type::INT8,        // valid_after
-        Type::INT2,        // signature_type
-    ];
-
-    let sink = tx
-        .copy_in(
-            r#"COPY _staging_txs (block_num, block_timestamp, idx, hash, type, "from", "to", value, input,
-                gas_limit, max_fee_per_gas, max_priority_fee_per_gas, gas_used,
-                nonce_key, nonce, fee_token, fee_payer, calls, call_count,
-                valid_before, valid_after, signature_type) FROM STDIN BINARY"#,
-        )
-        .await?;
-
-    let writer = BinaryCopyInWriter::new(sink, types);
-    let mut pinned_writer: Pin<Box<BinaryCopyInWriter>> = Box::pin(writer);
-
-    for tx in txs {
-        pinned_writer
-            .as_mut()
-            .write(&[
-                &tx.block_num,
-                &tx.block_timestamp,
-                &tx.idx,
-                &tx.hash,
-                &tx.tx_type,
-                &tx.from,
-                &tx.to,
-                &tx.value,
-                &tx.input,
-                &tx.gas_limit,
-                &tx.max_fee_per_gas,
-                &tx.max_priority_fee_per_gas,
-                &tx.gas_used,
-                &tx.nonce_key,
-                &tx.nonce,
-                &tx.fee_token,
-                &tx.fee_payer,
-                &tx.calls,
-                &tx.call_count,
-                &tx.valid_before,
-                &tx.valid_after,
-                &tx.signature_type,
-            ])
-            .await?;
-    }
-
-    pinned_writer.as_mut().finish().await?;
-
-    tx.execute(
-        "INSERT INTO txs SELECT * FROM _staging_txs ON CONFLICT DO NOTHING",
-        &[],
-    )
-    .await?;
-    refresh_receipt_repair_queue_from_staging(&tx, &span.block_nums).await?;
-    tx.commit().await?;
-
-    metrics::record_sink_write_duration("postgres", "txs", start.elapsed());
-    metrics::record_sink_write_rows("postgres", "txs", txs.len() as u64);
-    metrics::increment_sink_row_count("postgres", "txs", txs.len() as u64);
-    if let Some(max) = txs.iter().map(|t| t.block_num).max() {
-        metrics::update_sink_watermark("postgres", "txs", max);
-    }
-
-    Ok(())
+    write_batch(pool, &[], txs, &[], &[]).await
 }
 
-/// Batch insert logs using staging table + ON CONFLICT DO NOTHING
 pub async fn write_logs(pool: &Pool, logs: &[LogRow]) -> Result<()> {
     if logs.is_empty() {
         return Ok(());
     }
-
-    let start = Instant::now();
-    let mut conn = pool.get().await?;
-    let tx = conn.transaction().await?;
-
-    let span = BlockSpan::new(logs.iter().map(|log| (log.block_num, log.block_timestamp)))
-        .expect("logs is not empty");
-    delete_blocks_exact(&tx, "logs", &span).await?;
-
-    tx.execute(
-        "CREATE TEMP TABLE _staging_logs (
-            block_num INT8, block_timestamp TIMESTAMPTZ, log_idx INT4, tx_idx INT4,
-            tx_hash BYTEA, address BYTEA, selector BYTEA, topic0 BYTEA,
-            topic1 BYTEA, topic2 BYTEA, topic3 BYTEA, data BYTEA,
-            is_virtual_forward BOOLEAN
-        ) ON COMMIT DROP",
-        &[],
-    )
-    .await?;
-
-    let types = &[
-        Type::INT8,        // block_num
-        Type::TIMESTAMPTZ, // block_timestamp
-        Type::INT4,        // log_idx
-        Type::INT4,        // tx_idx
-        Type::BYTEA,       // tx_hash
-        Type::BYTEA,       // address
-        Type::BYTEA,       // selector
-        Type::BYTEA,       // topic0
-        Type::BYTEA,       // topic1
-        Type::BYTEA,       // topic2
-        Type::BYTEA,       // topic3
-        Type::BYTEA,       // data
-        Type::BOOL,        // is_virtual_forward
-    ];
-
-    let sink = tx
-        .copy_in(
-            "COPY _staging_logs (block_num, block_timestamp, log_idx, tx_idx, tx_hash, address, selector, topic0, topic1, topic2, topic3, data, is_virtual_forward) FROM STDIN BINARY",
-        )
-        .await?;
-
-    let writer = BinaryCopyInWriter::new(sink, types);
-    let mut pinned_writer: Pin<Box<BinaryCopyInWriter>> = Box::pin(writer);
-
-    for log in logs {
-        pinned_writer
-            .as_mut()
-            .write(&[
-                &log.block_num,
-                &log.block_timestamp,
-                &log.log_idx,
-                &log.tx_idx,
-                &log.tx_hash,
-                &log.address,
-                &log.selector,
-                &log.topic0,
-                &log.topic1,
-                &log.topic2,
-                &log.topic3,
-                &log.data,
-                &log.is_virtual_forward,
-            ])
-            .await?;
-    }
-
-    pinned_writer.as_mut().finish().await?;
-
-    tx.execute(
-        "INSERT INTO logs SELECT * FROM _staging_logs ON CONFLICT DO NOTHING",
-        &[],
-    )
-    .await?;
-    tx.commit().await?;
-
-    metrics::record_sink_write_duration("postgres", "logs", start.elapsed());
-    metrics::record_sink_write_rows("postgres", "logs", logs.len() as u64);
-    metrics::increment_sink_row_count("postgres", "logs", logs.len() as u64);
-    if let Some(max) = logs.iter().map(|l| l.block_num).max() {
-        metrics::update_sink_watermark("postgres", "logs", max);
-    }
-
-    Ok(())
+    write_batch(pool, &[], &[], logs, &[]).await
 }
 
-/// Batch insert receipts using staging table + ON CONFLICT DO NOTHING
 pub async fn write_receipts(pool: &Pool, receipts: &[ReceiptRow]) -> Result<()> {
     if receipts.is_empty() {
         return Ok(());
     }
-
-    let start = Instant::now();
-    let mut conn = pool.get().await?;
-    let tx = conn.transaction().await?;
-
-    let span = BlockSpan::new(
-        receipts
-            .iter()
-            .map(|receipt| (receipt.block_num, receipt.block_timestamp)),
-    )
-    .expect("receipts is not empty");
-    delete_blocks_exact(&tx, "receipts", &span).await?;
-
-    tx.execute(
-        "CREATE TEMP TABLE _staging_receipts (
-            block_num INT8, block_timestamp TIMESTAMPTZ, tx_idx INT4, tx_hash BYTEA,
-            \"from\" BYTEA, \"to\" BYTEA, contract_address BYTEA, gas_used INT8,
-            cumulative_gas_used INT8, effective_gas_price TEXT, status INT2,
-            fee_payer BYTEA
-        ) ON COMMIT DROP",
-        &[],
-    )
-    .await?;
-
-    let types = &[
-        Type::INT8,        // block_num
-        Type::TIMESTAMPTZ, // block_timestamp
-        Type::INT4,        // tx_idx
-        Type::BYTEA,       // tx_hash
-        Type::BYTEA,       // from
-        Type::BYTEA,       // to
-        Type::BYTEA,       // contract_address
-        Type::INT8,        // gas_used
-        Type::INT8,        // cumulative_gas_used
-        Type::TEXT,        // effective_gas_price
-        Type::INT2,        // status
-        Type::BYTEA,       // fee_payer
-    ];
-
-    let sink = tx
-        .copy_in(
-            r#"COPY _staging_receipts (block_num, block_timestamp, tx_idx, tx_hash, "from", "to",
-                contract_address, gas_used, cumulative_gas_used, effective_gas_price,
-                status, fee_payer) FROM STDIN BINARY"#,
-        )
-        .await?;
-
-    let writer = BinaryCopyInWriter::new(sink, types);
-    let mut pinned_writer: Pin<Box<BinaryCopyInWriter>> = Box::pin(writer);
-
-    for receipt in receipts {
-        pinned_writer
-            .as_mut()
-            .write(&[
-                &receipt.block_num,
-                &receipt.block_timestamp,
-                &receipt.tx_idx,
-                &receipt.tx_hash,
-                &receipt.from,
-                &receipt.to,
-                &receipt.contract_address,
-                &receipt.gas_used,
-                &receipt.cumulative_gas_used,
-                &receipt.effective_gas_price,
-                &receipt.status,
-                &receipt.fee_payer,
-            ])
-            .await?;
-    }
-
-    pinned_writer.as_mut().finish().await?;
-
-    tx.execute(
-        "INSERT INTO receipts SELECT * FROM _staging_receipts ON CONFLICT DO NOTHING",
-        &[],
-    )
-    .await?;
-    tx.commit().await?;
-
-    metrics::record_sink_write_duration("postgres", "receipts", start.elapsed());
-    metrics::record_sink_write_rows("postgres", "receipts", receipts.len() as u64);
-    metrics::increment_sink_row_count("postgres", "receipts", receipts.len() as u64);
-    if let Some(max) = receipts.iter().map(|r| r.block_num).max() {
-        metrics::update_sink_watermark("postgres", "receipts", max);
-    }
-
-    Ok(())
+    write_batch(pool, &[], &[], &[], receipts).await
 }
 
 /// Batch insert blocks, txs, logs, and receipts in a single PG transaction.
@@ -504,6 +438,11 @@ pub async fn write_batch_with_application_name(
     write_batch_inner(pool, blocks, txs, logs, receipts, Some(application_name)).await
 }
 
+/// Rows are passed as one array per column and expanded with `unnest`, so a
+/// table needs one statement instead of a staging table, a COPY and an
+/// `INSERT ... SELECT`. Statements are sent back to back without waiting for
+/// each other's results; PostgreSQL runs them in order, so the whole batch
+/// costs one round trip between `BEGIN` and `COMMIT`.
 async fn write_batch_inner(
     pool: &Pool,
     blocks: &[BlockRow],
@@ -513,323 +452,58 @@ async fn write_batch_inner(
     application_name: Option<&str>,
 ) -> Result<()> {
     let start = Instant::now();
+
+    let block_columns = BlockColumns::new(blocks);
+    let tx_columns = TxColumns::new(txs);
+    let log_columns = LogColumns::new(logs);
+    let receipt_columns = ReceiptColumns::new(receipts);
+    let tx_span = BlockSpan::new(txs.iter().map(|r| (r.block_num, r.block_timestamp)));
+    let log_span = BlockSpan::new(logs.iter().map(|r| (r.block_num, r.block_timestamp)));
+    let receipt_span = BlockSpan::new(receipts.iter().map(|r| (r.block_num, r.block_timestamp)));
+    let (repair_blocks, repair_timestamps) = incomplete_blocks(txs);
+
     let mut conn = pool.get().await?;
     let tx = conn.transaction().await?;
 
-    if let Some(application_name) = application_name {
-        tx.query(
+    let mut statements: Vec<Statement<'_>> = Vec::new();
+    if let Some(application_name) = &application_name {
+        statements.push(execute(
+            &tx,
             "SELECT set_config('application_name', $1, true)",
-            &[&application_name],
-        )
-        .await?;
+            vec![(application_name, Type::TEXT)],
+        ));
     }
-
-    // ── blocks ────────────────────────────────────────────────────────────
     if !blocks.is_empty() {
-        tx.execute(
-            "CREATE TEMP TABLE _staging_blocks (
-                num INT8, hash BYTEA, parent_hash BYTEA, timestamp TIMESTAMPTZ,
-                timestamp_ms INT8, gas_limit INT8, gas_used INT8, miner BYTEA, extra_data BYTEA,
-                consensus_proposer BYTEA
-            ) ON COMMIT DROP",
-            &[],
-        )
-        .await?;
-
-        let types = &[
-            Type::INT8,        // num
-            Type::BYTEA,       // hash
-            Type::BYTEA,       // parent_hash
-            Type::TIMESTAMPTZ, // timestamp
-            Type::INT8,        // timestamp_ms
-            Type::INT8,        // gas_limit
-            Type::INT8,        // gas_used
-            Type::BYTEA,       // miner
-            Type::BYTEA,       // extra_data
-            Type::BYTEA,       // consensus_proposer
-        ];
-
-        let sink = tx
-            .copy_in(
-                "COPY _staging_blocks (num, hash, parent_hash, timestamp, timestamp_ms, gas_limit, gas_used, miner, extra_data, consensus_proposer) FROM STDIN BINARY",
-            )
-            .await?;
-
-        let writer = BinaryCopyInWriter::new(sink, types);
-        let mut pinned_writer: Pin<Box<BinaryCopyInWriter>> = Box::pin(writer);
-
-        for block in blocks {
-            pinned_writer
-                .as_mut()
-                .write(&[
-                    &block.num,
-                    &block.hash,
-                    &block.parent_hash,
-                    &block.timestamp,
-                    &block.timestamp_ms,
-                    &block.gas_limit,
-                    &block.gas_used,
-                    &block.miner,
-                    &block.extra_data as &(dyn tokio_postgres::types::ToSql + Sync),
-                    &block.consensus_proposer as &(dyn tokio_postgres::types::ToSql + Sync),
-                ])
-                .await?;
-        }
-
-        pinned_writer.as_mut().finish().await?;
-
-        tx.execute(
-            "INSERT INTO blocks SELECT * FROM _staging_blocks ON CONFLICT (timestamp, num) DO NOTHING",
-            &[],
-        )
-        .await?;
+        statements.push(execute(&tx, INSERT_BLOCKS, block_columns.params()));
     }
-
-    // ── txs ───────────────────────────────────────────────────────────────
-    if !txs.is_empty() {
-        let span = BlockSpan::new(txs.iter().map(|tx| (tx.block_num, tx.block_timestamp)))
-            .expect("txs is not empty");
-        delete_blocks_exact(&tx, "txs", &span).await?;
-
-        tx.execute(
-            "CREATE TEMP TABLE _staging_txs (
-                block_num INT8, block_timestamp TIMESTAMPTZ, idx INT4, hash BYTEA,
-                type INT2, \"from\" BYTEA, \"to\" BYTEA, value TEXT, input BYTEA,
-                gas_limit INT8, max_fee_per_gas TEXT, max_priority_fee_per_gas TEXT,
-                gas_used INT8, nonce_key BYTEA, nonce INT8, fee_token BYTEA,
-                fee_payer BYTEA, calls JSONB, call_count INT2, valid_before INT8,
-                valid_after INT8, signature_type INT2
-            ) ON COMMIT DROP",
-            &[],
-        )
-        .await?;
-
-        let types = &[
-            Type::INT8,        // block_num
-            Type::TIMESTAMPTZ, // block_timestamp
-            Type::INT4,        // idx
-            Type::BYTEA,       // hash
-            Type::INT2,        // type
-            Type::BYTEA,       // from
-            Type::BYTEA,       // to
-            Type::TEXT,        // value
-            Type::BYTEA,       // input
-            Type::INT8,        // gas_limit
-            Type::TEXT,        // max_fee_per_gas
-            Type::TEXT,        // max_priority_fee_per_gas
-            Type::INT8,        // gas_used
-            Type::BYTEA,       // nonce_key
-            Type::INT8,        // nonce
-            Type::BYTEA,       // fee_token
-            Type::BYTEA,       // fee_payer
-            Type::JSONB,       // calls
-            Type::INT2,        // call_count
-            Type::INT8,        // valid_before
-            Type::INT8,        // valid_after
-            Type::INT2,        // signature_type
-        ];
-
-        let sink = tx
-            .copy_in(
-                r#"COPY _staging_txs (block_num, block_timestamp, idx, hash, type, "from", "to", value, input,
-                gas_limit, max_fee_per_gas, max_priority_fee_per_gas, gas_used,
-                nonce_key, nonce, fee_token, fee_payer, calls, call_count,
-                valid_before, valid_after, signature_type) FROM STDIN BINARY"#,
-            )
-            .await?;
-
-        let writer = BinaryCopyInWriter::new(sink, types);
-        let mut pinned_writer: Pin<Box<BinaryCopyInWriter>> = Box::pin(writer);
-
-        for tx_row in txs {
-            pinned_writer
-                .as_mut()
-                .write(&[
-                    &tx_row.block_num,
-                    &tx_row.block_timestamp,
-                    &tx_row.idx,
-                    &tx_row.hash,
-                    &tx_row.tx_type,
-                    &tx_row.from,
-                    &tx_row.to,
-                    &tx_row.value,
-                    &tx_row.input,
-                    &tx_row.gas_limit,
-                    &tx_row.max_fee_per_gas,
-                    &tx_row.max_priority_fee_per_gas,
-                    &tx_row.gas_used,
-                    &tx_row.nonce_key,
-                    &tx_row.nonce,
-                    &tx_row.fee_token,
-                    &tx_row.fee_payer,
-                    &tx_row.calls,
-                    &tx_row.call_count,
-                    &tx_row.valid_before,
-                    &tx_row.valid_after,
-                    &tx_row.signature_type,
-                ])
-                .await?;
+    if let Some(span) = &tx_span {
+        statements.push(delete_blocks_exact(&tx, DELETE_TXS, span));
+        statements.push(execute(&tx, INSERT_TXS, tx_columns.params()));
+        statements.push(execute(
+            &tx,
+            DELETE_REPAIR_QUEUE,
+            vec![(&span.block_nums, Type::INT8_ARRAY)],
+        ));
+        if !repair_blocks.is_empty() {
+            statements.push(execute(
+                &tx,
+                INSERT_REPAIR_QUEUE,
+                vec![
+                    (&repair_blocks, Type::INT8_ARRAY),
+                    (&repair_timestamps, Type::TIMESTAMPTZ_ARRAY),
+                ],
+            ));
         }
-
-        pinned_writer.as_mut().finish().await?;
-
-        tx.execute(
-            "INSERT INTO txs SELECT * FROM _staging_txs ON CONFLICT DO NOTHING",
-            &[],
-        )
-        .await?;
-        refresh_receipt_repair_queue_from_staging(&tx, &span.block_nums).await?;
     }
-
-    // ── logs ──────────────────────────────────────────────────────────────
-    if !logs.is_empty() {
-        let span = BlockSpan::new(logs.iter().map(|log| (log.block_num, log.block_timestamp)))
-            .expect("logs is not empty");
-        delete_blocks_exact(&tx, "logs", &span).await?;
-
-        tx.execute(
-            "CREATE TEMP TABLE _staging_logs (
-                block_num INT8, block_timestamp TIMESTAMPTZ, log_idx INT4, tx_idx INT4,
-                tx_hash BYTEA, address BYTEA, selector BYTEA, topic0 BYTEA,
-                topic1 BYTEA, topic2 BYTEA, topic3 BYTEA, data BYTEA,
-                is_virtual_forward BOOLEAN
-            ) ON COMMIT DROP",
-            &[],
-        )
-        .await?;
-
-        let types = &[
-            Type::INT8,        // block_num
-            Type::TIMESTAMPTZ, // block_timestamp
-            Type::INT4,        // log_idx
-            Type::INT4,        // tx_idx
-            Type::BYTEA,       // tx_hash
-            Type::BYTEA,       // address
-            Type::BYTEA,       // selector
-            Type::BYTEA,       // topic0
-            Type::BYTEA,       // topic1
-            Type::BYTEA,       // topic2
-            Type::BYTEA,       // topic3
-            Type::BYTEA,       // data
-            Type::BOOL,        // is_virtual_forward
-        ];
-
-        let sink = tx
-            .copy_in(
-                "COPY _staging_logs (block_num, block_timestamp, log_idx, tx_idx, tx_hash, address, selector, topic0, topic1, topic2, topic3, data, is_virtual_forward) FROM STDIN BINARY",
-            )
-            .await?;
-
-        let writer = BinaryCopyInWriter::new(sink, types);
-        let mut pinned_writer: Pin<Box<BinaryCopyInWriter>> = Box::pin(writer);
-
-        for log in logs {
-            pinned_writer
-                .as_mut()
-                .write(&[
-                    &log.block_num,
-                    &log.block_timestamp,
-                    &log.log_idx,
-                    &log.tx_idx,
-                    &log.tx_hash,
-                    &log.address,
-                    &log.selector,
-                    &log.topic0,
-                    &log.topic1,
-                    &log.topic2,
-                    &log.topic3,
-                    &log.data,
-                    &log.is_virtual_forward,
-                ])
-                .await?;
-        }
-
-        pinned_writer.as_mut().finish().await?;
-
-        tx.execute(
-            "INSERT INTO logs SELECT * FROM _staging_logs ON CONFLICT DO NOTHING",
-            &[],
-        )
-        .await?;
+    if let Some(span) = &log_span {
+        statements.push(delete_blocks_exact(&tx, DELETE_LOGS, span));
+        statements.push(execute(&tx, INSERT_LOGS, log_columns.params()));
     }
-
-    // ── receipts ──────────────────────────────────────────────────────────
-    if !receipts.is_empty() {
-        let span = BlockSpan::new(
-            receipts
-                .iter()
-                .map(|receipt| (receipt.block_num, receipt.block_timestamp)),
-        )
-        .expect("receipts is not empty");
-        delete_blocks_exact(&tx, "receipts", &span).await?;
-
-        tx.execute(
-            "CREATE TEMP TABLE _staging_receipts (
-                block_num INT8, block_timestamp TIMESTAMPTZ, tx_idx INT4, tx_hash BYTEA,
-                \"from\" BYTEA, \"to\" BYTEA, contract_address BYTEA, gas_used INT8,
-                cumulative_gas_used INT8, effective_gas_price TEXT, status INT2,
-                fee_payer BYTEA
-            ) ON COMMIT DROP",
-            &[],
-        )
-        .await?;
-
-        let types = &[
-            Type::INT8,        // block_num
-            Type::TIMESTAMPTZ, // block_timestamp
-            Type::INT4,        // tx_idx
-            Type::BYTEA,       // tx_hash
-            Type::BYTEA,       // from
-            Type::BYTEA,       // to
-            Type::BYTEA,       // contract_address
-            Type::INT8,        // gas_used
-            Type::INT8,        // cumulative_gas_used
-            Type::TEXT,        // effective_gas_price
-            Type::INT2,        // status
-            Type::BYTEA,       // fee_payer
-        ];
-
-        let sink = tx
-            .copy_in(
-                r#"COPY _staging_receipts (block_num, block_timestamp, tx_idx, tx_hash, "from", "to",
-                contract_address, gas_used, cumulative_gas_used, effective_gas_price,
-                status, fee_payer) FROM STDIN BINARY"#,
-            )
-            .await?;
-
-        let writer = BinaryCopyInWriter::new(sink, types);
-        let mut pinned_writer: Pin<Box<BinaryCopyInWriter>> = Box::pin(writer);
-
-        for receipt in receipts {
-            pinned_writer
-                .as_mut()
-                .write(&[
-                    &receipt.block_num,
-                    &receipt.block_timestamp,
-                    &receipt.tx_idx,
-                    &receipt.tx_hash,
-                    &receipt.from,
-                    &receipt.to,
-                    &receipt.contract_address,
-                    &receipt.gas_used,
-                    &receipt.cumulative_gas_used,
-                    &receipt.effective_gas_price,
-                    &receipt.status,
-                    &receipt.fee_payer,
-                ])
-                .await?;
-        }
-
-        pinned_writer.as_mut().finish().await?;
-
-        tx.execute(
-            "INSERT INTO receipts SELECT * FROM _staging_receipts ON CONFLICT DO NOTHING",
-            &[],
-        )
-        .await?;
+    if let Some(span) = &receipt_span {
+        statements.push(delete_blocks_exact(&tx, DELETE_RECEIPTS, span));
+        statements.push(execute(&tx, INSERT_RECEIPTS, receipt_columns.params()));
     }
-
-    // ── single COMMIT ─────────────────────────────────────────────────────
+    pipeline(statements).await?;
     tx.commit().await?;
 
     // ── metrics ───────────────────────────────────────────────────────────
