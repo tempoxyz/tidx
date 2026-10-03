@@ -1447,6 +1447,68 @@ async fn test_query_fixed_bytes_returns_declared_width() {
 
 #[tokio::test]
 #[serial(db)]
+async fn test_query_fixed_bytes_filter_scopes() {
+    let db = TestDb::empty().await;
+    let signature = "FilterRegression(bytes4 indexed tag, bytes4 value)";
+    let selector = EventSignature::parse(signature).unwrap().topic0.to_vec();
+    let opts = default_options();
+    let pad = |head: [u8; 4]| [head.as_slice(), &[0u8; 28]].concat();
+    let timestamp = chrono::Utc::now();
+    let logs = [[0xca, 0xfe, 0xba, 0xbe], [0xde, 0xad, 0xbe, 0xef]]
+        .into_iter()
+        .enumerate()
+        .map(|(i, tag)| tidx::types::LogRow {
+            block_num: 9_342_001,
+            block_timestamp: timestamp,
+            log_idx: i as i32,
+            tx_hash: vec![0x34; 32],
+            address: vec![0x34; 20],
+            selector: Some(selector.clone()),
+            topic0: Some(selector.clone()),
+            topic1: Some(pad(tag)),
+            data: pad(tag),
+            ..Default::default()
+        })
+        .collect::<Vec<_>>();
+    let conn = db.pool.get().await.unwrap();
+    conn.execute("DELETE FROM logs WHERE selector = $1", &[&selector])
+        .await
+        .unwrap();
+    let result = async {
+        tidx::sync::writer::write_logs(&db.pool, &logs).await?;
+        let mut results = Vec::new();
+        for sql in [
+            "SELECT tag FROM FilterRegression WHERE tag = '0xcafebabe'",
+            "SELECT tag FROM FilterRegression WHERE '0xcafebabe' = tag",
+            r#"SELECT tag FROM FilterRegression WHERE "tag" = '0xcafebabe' OR "tag" = '0xdeadbeef' ORDER BY tag"#,
+            r#"SELECT * FROM (SELECT "tag" FROM FilterRegression) q WHERE "tag" = '0xcafebabe'"#,
+            "WITH q AS (SELECT tag AS renamed FROM FilterRegression) SELECT renamed FROM q WHERE renamed = '0xcafebabe'",
+            r#"WITH q AS (SELECT '0xcafebabe' AS tag) SELECT q.tag FROM q CROSS JOIN FilterRegression WHERE q."tag" = '0xcafebabe'"#,
+            r#"SELECT "value" FROM FilterRegression WHERE "value" = '0xcafebabe'"#,
+        ] {
+            results.push(execute_query_postgres(&db.pool, sql, &[signature], &opts).await?);
+        }
+        Ok::<_, anyhow::Error>(results)
+    }.await;
+    conn.execute("DELETE FROM logs WHERE selector = $1", &[&selector])
+        .await
+        .unwrap();
+    let results = result.expect("fixed bytes filter regression query failed");
+    for (i, result) in results.iter().enumerate() {
+        let expected = match i {
+            2 => vec![
+                vec![serde_json::json!("0xcafebabe")],
+                vec![serde_json::json!("0xdeadbeef")],
+            ],
+            5 => vec![vec![serde_json::json!("0xcafebabe")]; 2],
+            _ => vec![vec![serde_json::json!("0xcafebabe")]],
+        };
+        assert_eq!(result.rows, expected, "query {i}");
+    }
+}
+
+#[tokio::test]
+#[serial(db)]
 async fn test_query_bool_param() {
     let db = TestDb::new().await;
     let opts = default_options();

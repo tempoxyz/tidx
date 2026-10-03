@@ -411,54 +411,16 @@ impl EventSignature {
     /// Rewrite a SQL query to push down filters on decoded columns to use indexed raw columns.
     /// E.g., WHERE "from" = '0xabc...' becomes WHERE topic1 = '\x000...abc...'
     pub fn rewrite_filters_for_pushdown(&self, sql: &str) -> String {
-        let mapping = self.column_mapping();
-        let filters = extract_equality_filters(sql);
-
-        let mut result = sql.to_string();
-
-        for (col, value) in filters {
-            let col_lower = col.to_lowercase();
-            if let Some((raw_col, ty, is_indexed)) = mapping.get(&col_lower) {
-                // Only push down indexed columns (topics)
-                if !is_indexed {
-                    continue;
-                }
-
-                if let Some(encoded) = Self::encode_value_for_pushdown(ty, &value) {
-                    // Build the replacement patterns
-                    // Match: "col" = 'value' or "col" = '0xvalue'
-                    let patterns = [
-                        format!(r#""{}" = '{}'"#, col, value),
-                        format!(
-                            r#""{}" = '0x{}'"#,
-                            col,
-                            value.strip_prefix("0x").unwrap_or(&value)
-                        ),
-                        format!(r#""{}"='{}'"#, col, value),
-                        format!(
-                            r#""{}"='0x{}'"#,
-                            col,
-                            value.strip_prefix("0x").unwrap_or(&value)
-                        ),
-                    ];
-
-                    let replacement = format!("{} = '0x{}'", raw_col, encoded);
-
-                    for pattern in &patterns {
-                        if result.contains(pattern) {
-                            result = result.replace(pattern, &replacement);
-                            break;
-                        }
-                    }
-                }
-            }
-        }
-
-        result
+        super::filters::rewrite(
+            sql,
+            std::slice::from_ref(self),
+            &ClickHouseDialect {},
+            false,
+        )
     }
 
     /// Encode a filter value based on the ABI type.
-    fn encode_value_for_pushdown(ty: &AbiType, value: &str) -> Option<String> {
+    pub(super) fn encode_value_for_pushdown(ty: &AbiType, value: &str) -> Option<String> {
         match ty {
             AbiType::Address => encode_address_for_topic(value),
             AbiType::Uint(_) | AbiType::Int(_) => encode_uint256_for_topic(value),
@@ -561,8 +523,13 @@ fn apply_event_signature_ctes(
     let mut rewritten_sql = sql.to_string();
     for sig in &sigs {
         rewritten_sql = sig.normalize_table_references(&rewritten_sql);
-        rewritten_sql = sig.rewrite_filters_for_pushdown(&rewritten_sql);
     }
+    rewritten_sql = super::filters::rewrite(
+        &rewritten_sql,
+        &sigs,
+        dialect.parser_dialect().as_ref(),
+        matches!(dialect, EventCteDialect::Postgres),
+    );
 
     let pushdown = |sig: &EventSignature| {
         extract_raw_column_predicates_for_table(
@@ -697,7 +664,7 @@ fn top_level_with_end(sql: &str, dialect: &dyn Dialect) -> Result<usize> {
     Err(anyhow!("Failed to locate WITH clause"))
 }
 
-fn byte_index_for_location(sql: &str, location: Location) -> Option<usize> {
+pub(super) fn byte_index_for_location(sql: &str, location: Location) -> Option<usize> {
     if location.line == 0 || location.column == 0 {
         return None;
     }

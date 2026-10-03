@@ -801,6 +801,70 @@ async fn test_fixed_bytes_cte_returns_declared_width() {
             serde_json::json!(format!("0x{word}")),
         ]]
     );
+
+    // Include a second tag so OR must retain every value, rather than just
+    // the last literal extracted for a decoded column.
+    let second_tag = format!("0xdeadbeef{}", "00".repeat(28));
+    ch.insert_mock_log(
+        2,
+        1,
+        0,
+        &zero,
+        "0x1111111111111111111111111111111111111111",
+        &selector,
+        &second_tag,
+        &zero,
+        &zero,
+        &data,
+    )
+    .await
+    .expect("Failed to insert second log");
+    for (sql, expected) in [
+        (
+            "SELECT tag FROM Fixed WHERE tag = '0xcafebabe'",
+            vec![serde_json::json!("0xcafebabe")],
+        ),
+        (
+            "SELECT tag FROM Fixed WHERE '0xcafebabe' = tag",
+            vec![serde_json::json!("0xcafebabe")],
+        ),
+        (
+            r#"SELECT tag FROM Fixed WHERE "tag" = '0xcafebabe' OR "tag" = '0xdeadbeef' ORDER BY tag"#,
+            vec![
+                serde_json::json!("0xcafebabe"),
+                serde_json::json!("0xdeadbeef"),
+            ],
+        ),
+        (
+            r#"SELECT * FROM (SELECT "tag" FROM Fixed) q WHERE "tag" = '0xcafebabe'"#,
+            vec![serde_json::json!("0xcafebabe")],
+        ),
+        (
+            "WITH q AS (SELECT tag AS renamed FROM Fixed) SELECT renamed FROM q WHERE renamed = '0xcafebabe'",
+            vec![serde_json::json!("0xcafebabe")],
+        ),
+        (
+            r#"WITH q AS (SELECT '0xcafebabe' AS tag) SELECT q.tag FROM q CROSS JOIN Fixed WHERE q."tag" = '0xcafebabe'"#,
+            vec![serde_json::json!("0xcafebabe"); 2],
+        ),
+        (
+            "SELECT value AS tag FROM Fixed WHERE tag = '0xdeadbeef'",
+            vec![serde_json::json!("0xdeadbeef"); 2],
+        ),
+    ] {
+        let result = engine
+            .query_user(sql, &[signature], 5_000, 100)
+            .await
+            .expect("Fixed bytes filter query failed");
+        assert_eq!(
+            result.rows,
+            expected
+                .into_iter()
+                .map(|value| vec![value])
+                .collect::<Vec<_>>(),
+            "{sql}"
+        );
+    }
 }
 
 /// Native ClickHouse timestamps must match PostgreSQL's RFC 3339

@@ -132,12 +132,24 @@ async fn test_fdw_fixed_bytes_returns_declared_width() {
             &opts,
         )
         .await?;
-        anyhow::Ok((all, filtered))
+        let nested = execute_query_postgres_via_clickhouse(
+            &db.pool,
+            r#"SELECT * FROM (SELECT "tag" FROM Fixed) q WHERE "tag" = '0xcafebabe'"#,
+            &[FIXED_EVENT],
+            &opts,
+        ).await?;
+        let unrelated = execute_query_postgres_via_clickhouse(
+            &db.pool,
+            r#"WITH q AS (SELECT '0xcafebabe' AS tag) SELECT q.tag FROM q CROSS JOIN Fixed WHERE q."tag" = '0xcafebabe'"#,
+            &[FIXED_EVENT],
+            &opts,
+        ).await?;
+        anyhow::Ok((all, filtered, nested, unrelated))
     }
     .await;
     teardown(&db).await;
 
-    let (all, filtered) = result.expect("FDW query failed");
+    let (all, filtered, nested, unrelated) = result.expect("FDW query failed");
     assert_eq!(
         all.rows,
         [vec![
@@ -147,4 +159,6 @@ async fn test_fdw_fixed_bytes_returns_declared_width() {
         ]]
     );
     assert_eq!(filtered.rows, [vec![serde_json::json!("0xdeadbeef")]]);
+    assert_eq!(nested.rows, [vec![serde_json::json!("0xcafebabe")]]);
+    assert_eq!(unrelated.rows, nested.rows);
 }
