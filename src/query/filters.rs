@@ -26,7 +26,7 @@ type Columns = Vec<Column>;
 type Ctes = HashMap<String, Option<Columns>>;
 
 struct Relation {
-    qualifier: String,
+    qualifier: Option<Ident>,
     columns: Option<Columns>,
 }
 
@@ -148,7 +148,7 @@ impl Rewrite<'_> {
             } if name.0.len() == 1 => {
                 let Some(name) = name.0[0].as_ident() else {
                     return Relation {
-                        qualifier: String::new(),
+                        qualifier: None,
                         columns: None,
                     };
                 };
@@ -158,20 +158,20 @@ impl Rewrite<'_> {
                         .find(|sig| sig.name.eq_ignore_ascii_case(&name.value))
                         .map(event_columns)
                 });
-                (key(name), alias, columns)
+                (Some(name.clone()), alias, columns)
             }
             TableFactor::Derived {
                 subquery, alias, ..
-            } => (String::new(), alias, self.query_columns(subquery, ctes)),
+            } => (None, alias, self.query_columns(subquery, ctes)),
             _ => {
                 return Relation {
-                    qualifier: String::new(),
+                    qualifier: None,
                     columns: None,
                 };
             }
         };
         Relation {
-            qualifier: alias.as_ref().map_or(name, |alias| key(&alias.name)),
+            qualifier: alias.as_ref().map(|alias| alias.name.clone()).or(name),
             columns: match alias {
                 Some(alias) => rename_columns(columns, alias),
                 None => columns,
@@ -206,7 +206,7 @@ impl Rewrite<'_> {
                             };
                             columns.push(Column {
                                 name,
-                                ty: source.and_then(|c| c.ty.clone()),
+                                ty: source.and_then(|(_, c)| c.ty.clone()),
                                 topic: None,
                             });
                         }
@@ -223,7 +223,11 @@ impl Rewrite<'_> {
                             columns.extend(
                                 relations
                                     .iter()
-                                    .find(|r| r.qualifier == qualifier)?
+                                    .find(|r| {
+                                        r.qualifier
+                                            .as_ref()
+                                            .is_some_and(|name| key(name) == qualifier)
+                                    })?
                                     .columns
                                     .clone()?,
                             );
@@ -258,7 +262,7 @@ impl Rewrite<'_> {
     fn comparison(&mut self, column: &Expr, literal: &Expr, relations: &[Relation]) {
         let column = unnested(column);
         let literal = unnested(literal);
-        let Some(source) = resolve(column, relations) else {
+        let Some((relation, source)) = resolve(column, relations) else {
             return;
         };
         let Some(ty) = &source.ty else {
@@ -274,7 +278,8 @@ impl Rewrite<'_> {
         if let Some(topic) = &source.topic
             && let Some(encoded) = EventSignature::encode_value_for_pushdown(ty, value)
         {
-            // Retain a table alias on qualified references.
+            // Preserve explicit qualifiers and qualify new topic references in joins.
+            // A unique decoded column can map to a topic shared by several relations.
             let replacement = match column {
                 Expr::CompoundIdentifier(parts) => format!(
                     "{}.{}",
@@ -285,6 +290,10 @@ impl Rewrite<'_> {
                         .join("."),
                     topic
                 ),
+                _ if relations.len() > 1 => match &relation.qualifier {
+                    Some(qualifier) => format!("{qualifier}.{topic}"),
+                    None => return,
+                },
                 _ => topic.clone(),
             };
             self.edit(column.span(), replacement);
@@ -382,7 +391,7 @@ fn column_ident(expr: &Expr) -> Option<&Ident> {
     }
 }
 
-fn resolve<'a>(expr: &Expr, relations: &'a [Relation]) -> Option<&'a Column> {
+fn resolve<'a>(expr: &Expr, relations: &'a [Relation]) -> Option<(&'a Relation, &'a Column)> {
     let column = key(column_ident(expr)?);
     let candidates = match unnested(expr) {
         Expr::Identifier(_) => {
@@ -396,16 +405,25 @@ fn resolve<'a>(expr: &Expr, relations: &'a [Relation]) -> Option<&'a Column> {
             let qualifier = key(&parts[0]);
             relations
                 .iter()
-                .filter(|r| r.qualifier == qualifier)
+                .filter(|r| {
+                    r.qualifier
+                        .as_ref()
+                        .is_some_and(|name| key(name) == qualifier)
+                })
                 .collect()
         }
         _ => return None,
     };
     let mut matches = candidates
         .into_iter()
-        .filter_map(|r| r.columns.as_ref())
-        .flat_map(|columns| columns.iter())
-        .filter(|c| c.name == column);
+        .flat_map(|relation| {
+            relation
+                .columns
+                .iter()
+                .flatten()
+                .map(move |column| (relation, column))
+        })
+        .filter(|(_, c)| c.name == column);
     let result = matches.next()?;
     matches.next().is_none().then_some(result)
 }
@@ -544,6 +562,33 @@ mod tests {
         for signatures in [[a.clone(), b.clone()], [b.clone(), a.clone()]] {
             assert_eq!(
                 rewrite(sql, &signatures, &GenericDialect {}, true),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn unqualified_join_filters_use_the_resolved_relation() {
+        let signatures = [
+            EventSignature::parse("A(uint256 indexed amount)").unwrap(),
+            EventSignature::parse("B(uint256 indexed other)").unwrap(),
+        ];
+        for (relation, qualifier) in [
+            ("A", "A"),
+            ("A a", "a"),
+            (r#"A "Event Rows""#, r#""Event Rows""#),
+        ] {
+            let sql = format!("SELECT amount FROM {relation} CROSS JOIN B WHERE amount = 1");
+            let expected = format!(
+                "SELECT amount FROM {relation} CROSS JOIN B WHERE {qualifier}.topic1 = '0x{:064x}'",
+                1
+            );
+            assert_eq!(
+                rewrite(&sql, &signatures, &GenericDialect {}, true),
+                expected
+            );
+            assert_eq!(
+                rewrite(&sql, &signatures, &ClickHouseDialect {}, false),
                 expected
             );
         }

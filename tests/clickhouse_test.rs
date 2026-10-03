@@ -851,6 +851,10 @@ async fn test_fixed_bytes_cte_returns_declared_width() {
             "SELECT value AS tag FROM Fixed WHERE tag = '0xdeadbeef'",
             vec![serde_json::json!("0xdeadbeef"); 2],
         ),
+        (
+            r#"WITH other AS (SELECT block_num, topic1 FROM Fixed) SELECT tag FROM Fixed AS "Event Rows" CROSS JOIN other WHERE tag = '0xcafebabe'"#,
+            vec![serde_json::json!("0xcafebabe"); 2],
+        ),
     ] {
         let result = engine
             .query_user(sql, &[signature], 5_000, 100)
