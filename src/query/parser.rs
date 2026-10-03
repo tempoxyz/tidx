@@ -411,12 +411,7 @@ impl EventSignature {
     /// Rewrite a SQL query to push down filters on decoded columns to use indexed raw columns.
     /// E.g., WHERE "from" = '0xabc...' becomes WHERE topic1 = '\x000...abc...'
     pub fn rewrite_filters_for_pushdown(&self, sql: &str) -> String {
-        super::filters::rewrite(
-            sql,
-            std::slice::from_ref(self),
-            &ClickHouseDialect {},
-            false,
-        )
+        super::filters::rewrite(sql, std::slice::from_ref(self), &ClickHouseDialect {})
     }
 
     /// Encode a filter value based on the ABI type.
@@ -524,12 +519,8 @@ fn apply_event_signature_ctes(
     for sig in &sigs {
         rewritten_sql = sig.normalize_table_references(&rewritten_sql);
     }
-    rewritten_sql = super::filters::rewrite(
-        &rewritten_sql,
-        &sigs,
-        dialect.parser_dialect().as_ref(),
-        matches!(dialect, EventCteDialect::Postgres),
-    );
+    rewritten_sql =
+        super::filters::rewrite(&rewritten_sql, &sigs, dialect.parser_dialect().as_ref());
 
     let pushdown = |sig: &EventSignature| {
         extract_raw_column_predicates_for_table(

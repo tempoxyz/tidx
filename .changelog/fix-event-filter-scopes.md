@@ -2,4 +2,4 @@
 tidx: patch
 ---
 
-Fixed indexed `bytesN` equality filters losing matches when identifiers are unquoted or the same column is compared with multiple values. Event filters now respect table aliases and query scopes, so nested queries and unrelated CTE columns no longer get invalid topic references. PostgreSQL equality filters on projected or non-indexed fixed bytes also accept `0x` literals without changing text comparisons. Topic filters retain their source relation in joins, and grouped comparisons keep using decoded columns.
+Fixed unquoted and repeated indexed event equality filters in simple queries. Topic pushdown now edits individual WHERE predicates on a single event table; it leaves joins, CTEs, derived sources, subquery predicates, and grouped expressions alone instead of inserting out-of-scope topic references. PostgreSQL short fixed-byte comparisons outside this path still require explicit `\x` literals.
