@@ -1423,6 +1423,13 @@ async fn test_query_fixed_bytes_returns_declared_width() {
         &opts,
     )
     .await;
+    let filtered = execute_query_postgres(
+        &db.pool,
+        r#"SELECT "value" FROM Fixed WHERE "tag" = '0xcafebabe'"#,
+        &[signature],
+        &opts,
+    )
+    .await;
     conn.execute(cleanup, &[&selector]).await.unwrap();
 
     let result = result.expect("Query with fixed bytes params failed");
@@ -1434,6 +1441,8 @@ async fn test_query_fixed_bytes_returns_declared_width() {
             serde_json::json!(format!("0x{}", "11".repeat(32))),
         ]]
     );
+    let filtered = filtered.expect("Filter on indexed fixed bytes param failed");
+    assert_eq!(filtered.rows, [vec![serde_json::json!("0xdeadbeef")]]);
 }
 
 #[tokio::test]

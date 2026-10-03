@@ -478,11 +478,11 @@ impl EventSignature {
                     None
                 }
             }
-            AbiType::Bytes(Some(32)) => {
-                // bytes32 - expect 0x-prefixed hex
+            // bytesN: exactly N bytes, left-aligned and zero-padded in the topic
+            AbiType::Bytes(Some(n)) => {
                 let hex = value.strip_prefix("0x").unwrap_or(value);
-                if hex.len() == 64 && hex.chars().all(|c| c.is_ascii_hexdigit()) {
-                    Some(hex.to_lowercase())
+                if hex.len() == 2 * *n as usize && hex.chars().all(|c| c.is_ascii_hexdigit()) {
+                    Some(format!("{:0<64}", hex.to_lowercase()))
                 } else {
                     None
                 }
@@ -2172,6 +2172,27 @@ mod tests {
         let sql = r#"SELECT * FROM Transfer WHERE "value" = '1000000'"#;
         let rewritten = sig.rewrite_filters_for_pushdown(sql);
         assert_eq!(sql, rewritten);
+    }
+
+    #[test]
+    fn test_rewrite_filters_fixed_bytes() {
+        let sig = EventSignature::parse("Fixed(bytes4 indexed tag, bytes4 value)").unwrap();
+
+        // Short literals stay '0x…' text on PostgreSQL; the padded topic
+        // form is converted to bytea and hits the topic index.
+        assert_eq!(
+            sig.rewrite_filters_for_pushdown(r#"SELECT * FROM Fixed WHERE "tag" = '0xCAFEBABE'"#),
+            format!(
+                "SELECT * FROM Fixed WHERE topic1 = '0xcafebabe{}'",
+                "0".repeat(56)
+            )
+        );
+        for sql in [
+            r#"SELECT * FROM Fixed WHERE "tag" = '0xcafe'"#,
+            r#"SELECT * FROM Fixed WHERE "value" = '0xdeadbeef'"#,
+        ] {
+            assert_eq!(sig.rewrite_filters_for_pushdown(sql), sql);
+        }
     }
 
     // ========================================================================
