@@ -42,6 +42,18 @@ async fn setup() -> Option<(TestDb, TestClickHouse)> {
         teardown(&db).await;
         return None;
     }
+    // bootstrap's DDL never contacts ClickHouse; probe the FDW connection.
+    let conn = db.pool.get().await.unwrap();
+    let probe = conn
+        .query_one("SELECT count(*) FROM ch.logs", &[])
+        .await
+        .map_err(anyhow::Error::from);
+    drop(conn);
+    if let Err(e) = probe {
+        println!("ClickHouse unreachable from PostgreSQL at {fdw_url} ({e:#}), skipping test");
+        teardown(&db).await;
+        return None;
+    }
     Some((db, ch))
 }
 
@@ -90,37 +102,49 @@ async fn test_fdw_fixed_bytes_returns_declared_width() {
     let word = "11".repeat(32);
     let data = format!("0xdeadbeef{}{word}", "00".repeat(28));
     let zero = format!("0x{}", "00".repeat(32));
-    ch.insert_mock_log(
-        1,
-        0,
-        0,
-        &zero,
-        "0x1111111111111111111111111111111111111111",
-        &selector,
-        &tag,
-        &zero,
-        &zero,
-        &data,
-    )
-    .await
-    .expect("Failed to insert log");
-
-    let result = execute_query_postgres_via_clickhouse(
-        &db.pool,
-        r#"SELECT tag, "value", word FROM Fixed"#,
-        &[FIXED_EVENT],
-        &QueryOptions::default(),
-    )
+    let opts = QueryOptions::default();
+    // Fallible body so teardown always runs before any assertion.
+    let result = async {
+        ch.insert_mock_log(
+            1,
+            0,
+            0,
+            &zero,
+            "0x1111111111111111111111111111111111111111",
+            &selector,
+            &tag,
+            &zero,
+            &zero,
+            &data,
+        )
+        .await?;
+        let all = execute_query_postgres_via_clickhouse(
+            &db.pool,
+            r#"SELECT tag, "value", word FROM Fixed"#,
+            &[FIXED_EVENT],
+            &opts,
+        )
+        .await?;
+        let filtered = execute_query_postgres_via_clickhouse(
+            &db.pool,
+            r#"SELECT "value" FROM Fixed WHERE "tag" = '0xcafebabe'"#,
+            &[FIXED_EVENT],
+            &opts,
+        )
+        .await?;
+        anyhow::Ok((all, filtered))
+    }
     .await;
     teardown(&db).await;
 
-    let result = result.expect("FDW query failed");
+    let (all, filtered) = result.expect("FDW query failed");
     assert_eq!(
-        result.rows,
+        all.rows,
         [vec![
             serde_json::json!("0xcafebabe"),
             serde_json::json!("0xdeadbeef"),
             serde_json::json!(format!("0x{word}")),
         ]]
     );
+    assert_eq!(filtered.rows, [vec![serde_json::json!("0xdeadbeef")]]);
 }
