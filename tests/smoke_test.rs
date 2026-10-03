@@ -1192,6 +1192,24 @@ async fn test_query_statement_timeout_maps_to_query_timeout() {
 
 #[tokio::test]
 #[serial(db)]
+async fn test_query_empty_result_keeps_columns() {
+    let db = TestDb::empty().await;
+
+    let result = execute_query_postgres(
+        &db.pool,
+        "SELECT num, hash AS block_hash FROM blocks WHERE num < 0",
+        &[],
+        &default_options(),
+    )
+    .await
+    .expect("Query failed");
+
+    assert_eq!(result.columns, vec!["num", "block_hash"]);
+    assert!(result.rows.is_empty());
+}
+
+#[tokio::test]
+#[serial(db)]
 async fn test_query_rejects_forbidden_keywords() {
     let db = TestDb::new().await;
     let opts = default_options();
