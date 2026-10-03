@@ -5,7 +5,7 @@ use serde::Serialize;
 use std::task::Poll;
 use std::time::Instant;
 use tokio_postgres::error::SqlState;
-use tokio_postgres::types::ToSql;
+use tokio_postgres::types::{ToSql, Type};
 
 use crate::db::Pool;
 use crate::metrics;
@@ -211,19 +211,50 @@ pub async fn execute_query_postgres(
     signatures: &[&str],
     options: &QueryOptions,
 ) -> Result<QueryResult> {
-    let sql = apply_event_signature_ctes_postgres(sql, signatures)?;
+    PostgresQuery::new(sql, signatures, options)?
+        .execute(pool, &[], options)
+        .await
+}
 
-    // Validate query (after CTE wrapping so signature-derived table names are valid)
-    validate_query(&sql)?;
+/// A public query rewritten and validated for PostgreSQL once, so that it can
+/// run repeatedly with different parameters, e.g. once per block for a live
+/// stream.
+#[derive(Clone, Debug)]
+pub struct PostgresQuery {
+    sql: String,
+}
 
-    // Add LIMIT if not present (AST-based detection to avoid string matching bypass)
-    let sql = append_limit_if_missing(&sql, options.limit);
+impl PostgresQuery {
+    pub fn new(sql: &str, signatures: &[&str], options: &QueryOptions) -> Result<Self> {
+        let sql = apply_event_signature_ctes_postgres(sql, signatures)?;
 
-    // Convert '0x...' hex literals to '\x...' bytea literals for PostgreSQL
-    // Only replace hex values (40+ chars), not short '0x' prefixes used in concat()
-    let sql = crate::query::convert_hex_literals_postgres(&sql);
+        // Validate query (after CTE wrapping so signature-derived table names are valid)
+        validate_query(&sql)?;
 
-    run_pg_query(pool, &sql, options, &[], "postgres").await
+        // Add LIMIT if not present (AST-based detection to avoid string matching bypass)
+        let sql = append_limit_if_missing(&sql, options.limit);
+
+        // Convert '0x...' hex literals to '\x...' bytea literals for PostgreSQL
+        // Only replace hex values (40+ chars), not short '0x' prefixes used in concat()
+        let sql = crate::query::convert_hex_literals_postgres(&sql);
+
+        Ok(Self { sql })
+    }
+
+    /// The rewritten SQL that runs on PostgreSQL.
+    pub fn sql(&self) -> &str {
+        &self.sql
+    }
+
+    /// Run the query, binding `params` to its `$n` placeholders.
+    pub async fn execute(
+        &self,
+        pool: &Pool,
+        params: &[(&(dyn ToSql + Sync), Type)],
+        options: &QueryOptions,
+    ) -> Result<QueryResult> {
+        run_pg_query(pool, &self.sql, params, options, &[], "postgres").await
+    }
 }
 
 /// ClickHouse settings for public queries (native `engine=clickhouse` and the
@@ -749,6 +780,7 @@ pub async fn execute_query_postgres_via_clickhouse(
     run_pg_query(
         pool,
         &sql,
+        &[],
         options,
         &[
             // Core tables resolve to ch.* FDW; public supplies abi_string().
@@ -768,11 +800,13 @@ pub async fn execute_query_postgres_via_clickhouse(
 }
 
 /// Run prepared SQL on PostgreSQL and stream the result rows into a
-/// [`QueryResult`]. `session_setup` statements (e.g. `SET LOCAL …`) run
-/// inside the transaction before the query.
+/// [`QueryResult`]. `params` are bound to the query's `$n` placeholders, and
+/// `session_setup` statements (e.g. `SET LOCAL …`) run inside the
+/// transaction before the query.
 async fn run_pg_query(
     pool: &Pool,
     sql: &str,
+    params: &[(&(dyn ToSql + Sync), Type)],
     options: &QueryOptions,
     session_setup: &[&str],
     engine: &str,
@@ -800,7 +834,8 @@ async fn run_pg_query(
         // is parsed. Resolve result types before executing: query_typed_raw
         // can deadlock discovering a composite type behind unread data rows.
         let setup = tx.batch_execute(&setup);
-        let prepare = tx.prepare(sql);
+        let param_types: Vec<Type> = params.iter().map(|(_, ty)| ty.clone()).collect();
+        let prepare = tx.prepare_typed(sql, &param_types);
         futures::pin_mut!(setup, prepare);
         let setup_sent = futures::poll!(setup.as_mut());
         let prepare_sent = futures::poll!(prepare.as_mut());
@@ -818,7 +853,7 @@ async fn run_pg_query(
             .map(|column| column.name().to_string())
             .collect();
         let stream = tx
-            .query_raw(&statement, std::iter::empty::<&(dyn ToSql + Sync)>())
+            .query_raw(&statement, params.iter().map(|(value, _)| *value))
             .await?;
         futures::pin_mut!(stream);
         let mut rows = Vec::new();
