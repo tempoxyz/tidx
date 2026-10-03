@@ -1485,6 +1485,7 @@ async fn test_query_fixed_bytes_filter_scopes() {
             "WITH q AS (SELECT tag AS renamed FROM FilterRegression) SELECT renamed FROM q WHERE renamed = '\\xcafebabe'",
             r#"WITH q AS (SELECT '0xcafebabe' AS tag) SELECT q.tag FROM q CROSS JOIN FilterRegression WHERE q."tag" = '0xcafebabe'"#,
             r#"SELECT "value" FROM FilterRegression WHERE "value" = '\xcafebabe'"#,
+            r#"SELECT count(*) FROM (SELECT DISTINCT tx_hash, log_idx FROM FilterRegression WHERE "tag" = '0xcafebabe' LIMIT 1000) capped"#,
         ] {
             results.push(execute_query_postgres(&db.pool, sql, &[signature], &opts).await?);
         }
@@ -1501,6 +1502,7 @@ async fn test_query_fixed_bytes_filter_scopes() {
                 vec![serde_json::json!("0xdeadbeef")],
             ],
             5 => vec![vec![serde_json::json!("0xcafebabe")]; 2],
+            7 => vec![vec![serde_json::json!(1)]],
             _ => vec![vec![serde_json::json!("0xcafebabe")]],
         };
         assert_eq!(result.rows, expected, "query {i}");

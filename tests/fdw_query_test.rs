@@ -144,12 +144,18 @@ async fn test_fdw_fixed_bytes_returns_declared_width() {
             &[FIXED_EVENT],
             &opts,
         ).await?;
-        anyhow::Ok((all, filtered, nested, unrelated))
+        let capped = execute_query_postgres_via_clickhouse(
+            &db.pool,
+            r#"SELECT count(*) FROM (SELECT DISTINCT tx_hash, log_idx FROM Fixed WHERE "tag" = '0xcafebabe' LIMIT 1000) capped"#,
+            &[FIXED_EVENT],
+            &opts,
+        ).await?;
+        anyhow::Ok((all, filtered, nested, unrelated, capped))
     }
     .await;
     teardown(&db).await;
 
-    let (all, filtered, nested, unrelated) = result.expect("FDW query failed");
+    let (all, filtered, nested, unrelated, capped) = result.expect("FDW query failed");
     assert_eq!(
         all.rows,
         [vec![
@@ -161,4 +167,5 @@ async fn test_fdw_fixed_bytes_returns_declared_width() {
     assert_eq!(filtered.rows, [vec![serde_json::json!("0xdeadbeef")]]);
     assert_eq!(nested.rows, [vec![serde_json::json!("0xcafebabe")]]);
     assert_eq!(unrelated.rows, nested.rows);
+    assert_eq!(capped.rows, [vec![serde_json::json!(1)]]);
 }
