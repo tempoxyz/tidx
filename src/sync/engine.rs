@@ -21,7 +21,7 @@ use super::sink::{SinkSet, WriteTarget};
 use super::writer::{
     detect_all_gaps, detect_blocks_missing_receipts, discover_legacy_receipt_repairs,
     find_fork_point, finish_receipt_repair_attempt, get_block_hash, has_gaps, load_sync_state,
-    save_sync_state, update_sync_rate, update_synced_num, update_tip_num,
+    rewind_tip_num, save_sync_state, update_sync_rate, update_synced_num, update_tip_num,
 };
 use crate::virtual_address::mark_virtual_forward_hops;
 
@@ -367,6 +367,17 @@ impl SyncEngine {
             let batch_start = std::time::Instant::now();
             let (blocks, block_rows, all_txs, all_logs, all_receipts) =
                 current_fetch.take().unwrap();
+            // Checked here rather than at fetch time: this batch was fetched while
+            // the previous one was still being written, so its stored parent only
+            // exists now that the previous batch is committed. After a handled
+            // reorg the batch is stale. The tick continues from the fork point: the
+            // next tick could jump ahead and leave the range to loops that may not run.
+            if let Some(fork_block) = self.validate_parent_chain(&blocks).await? {
+                current_from = fork_block + 1;
+                current_to = (current_from + BATCH_SIZE - 1).min(remote_head);
+                current_fetch = Some(self.fetch_range(current_from, current_to).await?);
+                continue;
+            }
             let tx_count = all_txs.len() as u64;
             let log_count = all_logs.len() as u64;
             let mut logs_per_block = HashMap::new();
@@ -464,11 +475,12 @@ impl SyncEngine {
     }
 
     /// Validate parent hash chain for a batch of blocks.
-    /// Returns Ok(()) if chain is valid, Err(ReorgDetected { block }) if a reorg is detected.
+    /// Returns Ok(None) if chain is valid, Ok(Some(fork_block)) if a reorg was detected and
+    /// handled: the batch is then stale and must not be written.
     /// Skipped entirely if trust_rpc is enabled.
-    async fn validate_parent_chain(&self, blocks: &[crate::tempo::Block]) -> Result<()> {
+    async fn validate_parent_chain(&self, blocks: &[crate::tempo::Block]) -> Result<Option<u64>> {
         if blocks.is_empty() || self.trust_rpc {
-            return Ok(());
+            return Ok(None);
         }
 
         let first_block = &blocks[0];
@@ -483,7 +495,7 @@ impl SyncEngine {
                 .map_err(|_| anyhow::anyhow!("Invalid stored hash length"))?;
             if first_block.header.parent_hash().0 != expected_parent {
                 // Reorg detected - handle it automatically
-                return self.handle_reorg(first_num).await;
+                return self.handle_reorg(first_num).await.map(Some);
             }
         }
 
@@ -499,12 +511,12 @@ impl SyncEngine {
             }
         }
 
-        Ok(())
+        Ok(None)
     }
 
     /// Handle a chain reorganization by finding the fork point and deleting orphaned blocks.
-    /// After this, the next sync tick will re-fetch the canonical chain.
-    async fn handle_reorg(&self, mismatch_block: u64) -> Result<()> {
+    /// Returns the fork point, from which the caller re-fetches the canonical chain.
+    async fn handle_reorg(&self, mismatch_block: u64) -> Result<u64> {
         const MAX_REORG_DEPTH: u64 = 128;
 
         info!(
@@ -535,10 +547,10 @@ impl SyncEngine {
                     "Reorg handled: deleted orphaned blocks"
                 );
 
-                // Update tip_num to fork point so realtime sync continues from there
-                update_tip_num(self.pool(), self.chain_id, fork_block, fork_block).await?;
+                // Rewind the pointers to the fork point so realtime sync continues from there.
+                rewind_tip_num(self.pool(), self.chain_id, fork_block).await?;
 
-                Ok(())
+                Ok(fork_block)
             }
             None => Err(anyhow::anyhow!(
                 "Could not find fork point within {} blocks of mismatch at block {}",
@@ -566,6 +578,7 @@ impl SyncEngine {
     }
 
     /// Fetch and decode a range of blocks with receipts (full sync)
+    /// The parent hash chain is not checked here: callers validate right before writing.
     async fn fetch_range(
         &self,
         from: u64,
@@ -581,9 +594,6 @@ impl SyncEngine {
             self.realtime_rpc.get_blocks_batch_adaptive(from..=to),
             self.realtime_rpc.get_receipts_batch_adaptive(from..=to)
         )?;
-
-        // Validate parent hash chain
-        self.validate_parent_chain(&blocks).await?;
 
         let block_timestamps: HashMap<u64, _> = blocks
             .iter()
@@ -646,8 +656,14 @@ impl SyncEngine {
     }
 
     pub async fn sync_range(&self, from: u64, to: u64) -> Result<()> {
-        let (_blocks, block_rows, all_txs, all_logs, all_receipts) =
+        let (blocks, block_rows, all_txs, all_logs, all_receipts) =
             self.fetch_range(from, to).await?;
+
+        if self.validate_parent_chain(&blocks).await?.is_some() {
+            return Err(anyhow::anyhow!(
+                "Reorg detected at block {from}: the stored chain was rewound to the fork point"
+            ));
+        }
 
         self.sinks
             .write_all(&block_rows, &all_txs, &all_logs, &all_receipts)
