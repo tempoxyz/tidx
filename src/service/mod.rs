@@ -2,9 +2,10 @@ use anyhow::{Result, anyhow};
 use chrono::{DateTime, Utc};
 use futures::TryStreamExt;
 use serde::Serialize;
+use std::task::Poll;
 use std::time::Instant;
 use tokio_postgres::error::SqlState;
-use tokio_postgres::types::ToSql;
+use tokio_postgres::types::{ToSql, Type};
 
 use crate::db::Pool;
 use crate::metrics;
@@ -783,34 +784,36 @@ async fn run_pg_query(
     })?;
     let tx = conn.transaction().await.map_err(classify_postgres_error)?;
 
-    tx.execute(
-        &format!("SET LOCAL statement_timeout = {}", options.timeout_ms),
-        &[],
-    )
-    .await
-    .map_err(classify_postgres_error)?;
-
+    let mut setup = format!("SET LOCAL statement_timeout = {}", options.timeout_ms);
     for stmt in session_setup {
-        tx.execute(*stmt, &[])
-            .await
-            .map_err(classify_postgres_error)?;
+        setup.push_str(";\n");
+        setup.push_str(stmt);
     }
 
     let start = Instant::now();
     let timeout = std::time::Duration::from_millis(options.timeout_ms + 100);
     let limit = options.limit as usize;
     let result = tokio::time::timeout(timeout, async {
-        // query_raw prepares a &str anyway; preparing here under the
-        // session setup yields column names even for an empty result.
-        let stmt = tx.prepare(sql).await?;
-        let columns: Vec<String> = stmt
-            .columns()
-            .iter()
-            .map(|c| c.name().to_string())
-            .collect();
-        let params = std::iter::empty::<&(dyn ToSql + Sync)>();
-        let stream = tx.query_raw(&stmt, params).await?;
+        // The settings and the query go out together instead of one round
+        // trip each. A request is sent on its first poll and PostgreSQL runs
+        // requests in arrival order, so the settings apply before the query
+        // is parsed. The query is not prepared separately: a one-shot
+        // statement needs a single round trip.
+        let setup = tx.batch_execute(&setup);
+        let query = tx.query_typed_raw(sql, std::iter::empty::<(&(dyn ToSql + Sync), Type)>());
+        futures::pin_mut!(setup, query);
+        let setup_sent = futures::poll!(setup.as_mut());
+        let query_sent = futures::poll!(query.as_mut());
+        match setup_sent {
+            Poll::Ready(result) => result?,
+            Poll::Pending => setup.await?,
+        }
+        let stream = match query_sent {
+            Poll::Ready(result) => result?,
+            Poll::Pending => query.await?,
+        };
         futures::pin_mut!(stream);
+        let mut columns: Option<Vec<String>> = None;
         let mut rows = Vec::new();
         let mut result_bytes = 0usize;
 
@@ -818,6 +821,9 @@ async fn run_pg_query(
             if rows.len() >= limit {
                 return Err(anyhow!("Query returned more than {limit} rows"));
             }
+            let columns = columns.get_or_insert_with(|| {
+                row.columns().iter().map(|c| c.name().to_string()).collect()
+            });
             let row_values = (0..columns.len())
                 .map(|i| try_format_column_json(&row, i))
                 .collect::<Result<Vec<_>>>()?;
@@ -835,6 +841,19 @@ async fn run_pg_query(
             }
             rows.push(row_values);
         }
+
+        // Rows carry their columns. Only an empty result needs the statement
+        // described, still under the session setup.
+        let columns = match columns {
+            Some(columns) => columns,
+            None => tx
+                .prepare(sql)
+                .await?
+                .columns()
+                .iter()
+                .map(|c| c.name().to_string())
+                .collect(),
+        };
 
         Ok::<_, anyhow::Error>((columns, rows))
     })
