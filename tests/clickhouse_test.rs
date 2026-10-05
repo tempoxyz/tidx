@@ -801,6 +801,70 @@ async fn test_fixed_bytes_cte_returns_declared_width() {
             serde_json::json!(format!("0x{word}")),
         ]]
     );
+
+    // Include a second tag so OR must retain every value, rather than just
+    // the last literal extracted for a decoded column.
+    let second_tag = format!("0xdeadbeef{}", "00".repeat(28));
+    ch.insert_mock_log(
+        2,
+        1,
+        0,
+        &zero,
+        "0x1111111111111111111111111111111111111111",
+        &selector,
+        &second_tag,
+        &zero,
+        &zero,
+        &data,
+    )
+    .await
+    .expect("Failed to insert second log");
+    for (sql, expected) in [
+        (
+            "SELECT tag FROM Fixed WHERE tag = '0xcafebabe'",
+            vec![serde_json::json!("0xcafebabe")],
+        ),
+        (
+            "SELECT tag FROM Fixed WHERE '0xcafebabe' = tag",
+            vec![serde_json::json!("0xcafebabe")],
+        ),
+        (
+            r#"SELECT tag FROM Fixed WHERE "tag" = '0xcafebabe' OR "tag" = '0xdeadbeef' ORDER BY tag"#,
+            vec![
+                serde_json::json!("0xcafebabe"),
+                serde_json::json!("0xdeadbeef"),
+            ],
+        ),
+        (
+            r#"SELECT * FROM (SELECT "tag" FROM Fixed) q WHERE "tag" = '0xcafebabe'"#,
+            vec![serde_json::json!("0xcafebabe")],
+        ),
+        (
+            "WITH q AS (SELECT tag AS renamed FROM Fixed) SELECT renamed FROM q WHERE renamed = '0xcafebabe'",
+            vec![serde_json::json!("0xcafebabe")],
+        ),
+        (
+            r#"WITH q AS (SELECT '0xcafebabe' AS tag) SELECT q.tag FROM q CROSS JOIN Fixed WHERE q."tag" = '0xcafebabe'"#,
+            vec![serde_json::json!("0xcafebabe"); 2],
+        ),
+        (
+            "SELECT value AS tag FROM Fixed WHERE tag = '0xdeadbeef'",
+            vec![serde_json::json!("0xdeadbeef"); 2],
+        ),
+    ] {
+        let result = engine
+            .query_user(sql, &[signature], 5_000, 100)
+            .await
+            .expect("Fixed bytes filter query failed");
+        assert_eq!(
+            result.rows,
+            expected
+                .into_iter()
+                .map(|value| vec![value])
+                .collect::<Vec<_>>(),
+            "{sql}"
+        );
+    }
 }
 
 /// Native ClickHouse timestamps must match PostgreSQL's RFC 3339
@@ -1088,6 +1152,29 @@ async fn test_predicate_pushdown_indexed_param() {
     assert!(data.is_some());
     let cnt = data.unwrap()[0].get("cnt").and_then(|v| v.as_u64());
     assert_eq!(cnt, Some(5), "Expected 5 transfers from address a975...");
+
+    // Identity aliases must retain normalization of mixed-case address literals.
+    for projection in [
+        r#""from" AS "from""#,
+        r#"(t."from") AS "from""#,
+        r#"t."from" AS "from", t.topic1 AS topic1"#,
+    ] {
+        let sql = format!(
+            r#"SELECT {projection} FROM Transfer t WHERE t."from" = '0xA975BA910C2eE169956F3Df99Ee2EcE79d3887CF'"#
+        );
+        let sql = apply_event_signature_ctes_clickhouse(
+            &sql,
+            &["Transfer(address indexed from, address indexed to, uint256 value)"],
+        )
+        .unwrap();
+        let result = ch.query_json(&sql).await.unwrap();
+        let rows = result["data"].as_array().unwrap();
+        assert_eq!(rows.len(), 5, "{sql}");
+        assert!(
+            rows.iter()
+                .all(|row| row["from"] == "0xa975ba910c2ee169956f3df99ee2ece79d3887cf")
+        );
+    }
 }
 
 // ============================================================================
