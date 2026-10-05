@@ -2,6 +2,7 @@ use anyhow::{Result, anyhow};
 use chrono::{DateTime, Utc};
 use futures::TryStreamExt;
 use serde::Serialize;
+use std::task::Poll;
 use std::time::Instant;
 use tokio_postgres::error::SqlState;
 use tokio_postgres::types::ToSql;
@@ -783,33 +784,42 @@ async fn run_pg_query(
     })?;
     let tx = conn.transaction().await.map_err(classify_postgres_error)?;
 
-    tx.execute(
-        &format!("SET LOCAL statement_timeout = {}", options.timeout_ms),
-        &[],
-    )
-    .await
-    .map_err(classify_postgres_error)?;
-
+    let mut setup = format!("SET LOCAL statement_timeout = {}", options.timeout_ms);
     for stmt in session_setup {
-        tx.execute(*stmt, &[])
-            .await
-            .map_err(classify_postgres_error)?;
+        setup.push_str(";\n");
+        setup.push_str(stmt);
     }
 
     let start = Instant::now();
     let timeout = std::time::Duration::from_millis(options.timeout_ms + 100);
     let limit = options.limit as usize;
     let result = tokio::time::timeout(timeout, async {
-        // query_raw prepares a &str anyway; preparing here under the
-        // session setup yields column names even for an empty result.
-        let stmt = tx.prepare(sql).await?;
-        let columns: Vec<String> = stmt
+        // The settings and the prepare go out together instead of one round
+        // trip each. A request is sent on its first poll and PostgreSQL runs
+        // requests in arrival order, so the settings apply before the query
+        // is parsed. Resolve result types before executing: query_typed_raw
+        // can deadlock discovering a composite type behind unread data rows.
+        let setup = tx.batch_execute(&setup);
+        let prepare = tx.prepare(sql);
+        futures::pin_mut!(setup, prepare);
+        let setup_sent = futures::poll!(setup.as_mut());
+        let prepare_sent = futures::poll!(prepare.as_mut());
+        match setup_sent {
+            Poll::Ready(result) => result?,
+            Poll::Pending => setup.await?,
+        }
+        let statement = match prepare_sent {
+            Poll::Ready(result) => result?,
+            Poll::Pending => prepare.await?,
+        };
+        let columns: Vec<String> = statement
             .columns()
             .iter()
-            .map(|c| c.name().to_string())
+            .map(|column| column.name().to_string())
             .collect();
-        let params = std::iter::empty::<&(dyn ToSql + Sync)>();
-        let stream = tx.query_raw(&stmt, params).await?;
+        let stream = tx
+            .query_raw(&statement, std::iter::empty::<&(dyn ToSql + Sync)>())
+            .await?;
         futures::pin_mut!(stream);
         let mut rows = Vec::new();
         let mut result_bytes = 0usize;

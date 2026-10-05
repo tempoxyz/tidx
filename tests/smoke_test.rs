@@ -1192,6 +1192,74 @@ async fn test_query_statement_timeout_maps_to_query_timeout() {
 
 #[tokio::test]
 #[serial(db)]
+async fn test_query_composite_column_with_large_result() {
+    let db = TestDb::empty().await;
+    db.truncate_all().await;
+    db.pool
+        .get()
+        .await
+        .unwrap()
+        .batch_execute(
+            "INSERT INTO blocks (num, hash, parent_hash, timestamp, timestamp_ms,
+                                 gas_limit, gas_used, miner)
+             SELECT n, decode(repeat('ab', 32), 'hex'), decode(repeat('cd', 32), 'hex'),
+                    NOW(), 0, 100, 50, decode(repeat('ef', 20), 'hex')
+             FROM generate_series(1, 10000) n",
+        )
+        .await
+        .unwrap();
+
+    // A fresh connection cannot have the blocks composite type cached. The
+    // result must exceed the driver's response buffer: resolving the type
+    // after execution starts otherwise waits behind the unread result rows.
+    let pool = tidx::db::create_pool_with_size(&std::env::var("DATABASE_URL").unwrap(), 1)
+        .await
+        .unwrap();
+    let result = execute_query_postgres(
+        &pool,
+        "SELECT b.num, b AS block FROM blocks b ORDER BY b.num LIMIT 10000",
+        &[],
+        &QueryOptions {
+            timeout_ms: 5000,
+            limit: 10000,
+        },
+    )
+    .await
+    .expect("composite type discovery must not stall query execution");
+
+    assert_eq!(result.columns, vec!["num", "block"]);
+    assert_eq!(result.row_count, 10000);
+    for (index, row) in result.rows.iter().enumerate() {
+        // Composite cells retain their existing null representation, while
+        // supported columns must still be returned for every row.
+        assert_eq!(
+            *row,
+            vec![serde_json::json!(index + 1), serde_json::Value::Null]
+        );
+    }
+    db.truncate_all().await;
+}
+
+#[tokio::test]
+#[serial(db)]
+async fn test_query_empty_result_keeps_columns() {
+    let db = TestDb::empty().await;
+
+    let result = execute_query_postgres(
+        &db.pool,
+        "SELECT num, hash AS block_hash FROM blocks WHERE num < 0",
+        &[],
+        &default_options(),
+    )
+    .await
+    .expect("Query failed");
+
+    assert_eq!(result.columns, vec!["num", "block_hash"]);
+    assert_eq!(result.rows, Vec::<Vec<serde_json::Value>>::new());
+}
+
+#[tokio::test]
+#[serial(db)]
 async fn test_query_rejects_forbidden_keywords() {
     let db = TestDb::new().await;
     let opts = default_options();
