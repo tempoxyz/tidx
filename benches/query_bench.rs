@@ -1,7 +1,10 @@
 use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 use tokio::runtime::Runtime;
 
+use tidx::db::partitions::ensure_partitions_covering;
 use tidx::db::{create_pool, run_migrations};
+use tidx::query::apply_event_signature_ctes_postgres;
+use tidx::service::{QueryOptions, execute_query_postgres, format_column_json};
 
 fn bench_oltp_queries(c: &mut Criterion) {
     let rt = Runtime::new().unwrap();
@@ -366,11 +369,113 @@ fn bench_comparison(c: &mut Criterion) {
     group.finish();
 }
 
+const PG_JSON_LOG_ROWS: i64 = 10_000;
+const PG_JSON_LOGS_PER_BLOCK: i64 = 20;
+const PG_JSON_START_TS: i64 = 1_767_225_600;
+
+/// ERC-20 Transfer-shaped logs: 6 non-null BYTEA columns per row plus a NULL
+/// topic3, ints and a timestamp.
+const PG_JSON_SEED_LOGS: &str = r#"
+    TRUNCATE logs;
+    INSERT INTO logs (block_num, block_timestamp, log_idx, tx_idx, tx_hash, address,
+                      selector, topic0, topic1, topic2, topic3, data)
+    SELECT 1000000 + g / 20,
+           to_timestamp(1767225600 + g / 20),
+           g % 20,
+           g % 20 / 2,
+           sha256(int8send(g / 2)),
+           substring(sha256(int8send(g % 50)) FROM 1 FOR 20),
+           t.topic0,
+           t.topic0,
+           '\x000000000000000000000000'::bytea || substring(sha256(int8send(g * 7)) FROM 1 FOR 20),
+           '\x000000000000000000000000'::bytea || substring(sha256(int8send(g * 13)) FROM 1 FOR 20),
+           NULL,
+           decode(lpad(to_hex(g * 1000000000007), 64, '0'), 'hex')
+    FROM generate_series(0::int8, 9999) AS g,
+         (SELECT '\xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef'::bytea AS topic0) AS t;
+"#;
+
+/// PostgreSQL row → JSON conversion on the `/query` path. Seeds its own
+/// database (DATABASE_URL with the database name replaced).
+fn bench_pg_json(c: &mut Criterion) {
+    let rt = Runtime::new().unwrap();
+
+    let mut db_url =
+        url::Url::parse(&std::env::var("DATABASE_URL").expect("DATABASE_URL must be set"))
+            .expect("Invalid DATABASE_URL");
+    db_url.set_path("/tidx_bench_pg_json");
+
+    let pool = rt.block_on(async {
+        let pool = create_pool(db_url.as_str())
+            .await
+            .expect("Failed to create pool");
+        run_migrations(&pool)
+            .await
+            .expect("Failed to run migrations");
+        let start = chrono::DateTime::from_timestamp(PG_JSON_START_TS, 0).unwrap();
+        let end = start + chrono::Duration::seconds(PG_JSON_LOG_ROWS / PG_JSON_LOGS_PER_BLOCK);
+        ensure_partitions_covering(&pool, start, end)
+            .await
+            .expect("Failed to create partitions");
+        pool.get()
+            .await
+            .unwrap()
+            .batch_execute(PG_JSON_SEED_LOGS)
+            .await
+            .expect("Failed to seed logs");
+        pool
+    });
+
+    let transfer_sql = apply_event_signature_ctes_postgres(
+        "SELECT * FROM transfer",
+        &["Transfer(address indexed from, address indexed to, uint256 value)"],
+    )
+    .unwrap();
+
+    let mut group = c.benchmark_group("pg_json");
+    group.sample_size(30);
+
+    // Pre-fetched rows isolate the per-cell conversion from query execution.
+    for (name, sql) in [
+        ("logs_10k", "SELECT * FROM logs ORDER BY block_num, log_idx"),
+        ("transfer_10k", transfer_sql.as_str()),
+    ] {
+        let rows = rt.block_on(async { pool.get().await.unwrap().query(sql, &[]).await.unwrap() });
+        assert_eq!(rows.len() as i64, PG_JSON_LOG_ROWS);
+        group.bench_function(BenchmarkId::new("convert", name), |b| {
+            b.iter(|| {
+                rows.iter()
+                    .map(|row| {
+                        (0..row.len())
+                            .map(|i| format_column_json(row, i))
+                            .collect::<Vec<_>>()
+                    })
+                    .collect::<Vec<_>>()
+            });
+        });
+    }
+
+    let options = QueryOptions {
+        timeout_ms: 30_000,
+        limit: PG_JSON_LOG_ROWS,
+    };
+    group.bench_function(BenchmarkId::new("execute", "logs_10k"), |b| {
+        b.to_async(&rt).iter(|| async {
+            execute_query_postgres(&pool, "SELECT * FROM logs", &[], &options)
+                .await
+                .unwrap()
+        });
+    });
+
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_oltp_queries,
     bench_olap_queries,
     bench_olap_materialized,
-    bench_comparison
+    bench_comparison,
+    bench_pg_json
 );
 criterion_main!(benches);
