@@ -1,4 +1,5 @@
 use anyhow::Result;
+use chrono::{DateTime, Utc};
 use std::collections::BTreeSet;
 use std::pin::Pin;
 use std::time::Instant;
@@ -9,24 +10,60 @@ use crate::db::Pool;
 use crate::metrics;
 use crate::types::{BlockRow, LogRow, ReceiptRow, SyncState, TxRow};
 
+/// Margin around a batch's timestamps when deleting the rows it replaces.
+///
+/// Stored rows of a block carry the timestamp of the version of that block that
+/// was written, which differs from the batch's only if a reorg replaced the
+/// block, and then by seconds. The bound lets PostgreSQL prune the delete to the
+/// weekly partitions around the batch instead of planning and scanning all of
+/// them.
+const DELETE_TIMESTAMP_MARGIN: chrono::TimeDelta = chrono::TimeDelta::days(1);
+
+/// Block numbers and time span of the rows in a batch.
+struct BlockSpan {
+    block_nums: Vec<i64>,
+    min_timestamp: DateTime<Utc>,
+    max_timestamp: DateTime<Utc>,
+}
+
+impl BlockSpan {
+    fn new(rows: impl Iterator<Item = (i64, DateTime<Utc>)>) -> Option<Self> {
+        let mut block_nums = BTreeSet::new();
+        let mut span: Option<(DateTime<Utc>, DateTime<Utc>)> = None;
+        for (block_num, timestamp) in rows {
+            block_nums.insert(block_num);
+            span = Some(span.map_or((timestamp, timestamp), |(min, max)| {
+                (min.min(timestamp), max.max(timestamp))
+            }));
+        }
+        let (min_timestamp, max_timestamp) = span?;
+        Some(Self {
+            block_nums: block_nums.into_iter().collect(),
+            min_timestamp,
+            max_timestamp,
+        })
+    }
+}
+
+/// Delete the rows of `table` stored for the blocks in `span`.
 async fn delete_blocks_exact(
     tx: &tokio_postgres::Transaction<'_>,
     table: &str,
-    block_nums: &[i64],
+    span: &BlockSpan,
 ) -> Result<()> {
-    if block_nums.is_empty() {
-        return Ok(());
-    }
     tx.execute(
-        &format!("DELETE FROM {table} WHERE block_num = ANY($1)"),
-        &[&block_nums],
+        &format!(
+            "DELETE FROM {table} WHERE block_num = ANY($1) \
+             AND block_timestamp >= $2 AND block_timestamp <= $3"
+        ),
+        &[
+            &span.block_nums,
+            &(span.min_timestamp - DELETE_TIMESTAMP_MARGIN),
+            &(span.max_timestamp + DELETE_TIMESTAMP_MARGIN),
+        ],
     )
     .await?;
     Ok(())
-}
-
-fn exact_block_nums(nums: impl Iterator<Item = i64>) -> Vec<i64> {
-    nums.collect::<BTreeSet<_>>().into_iter().collect()
 }
 
 /// Replace repair-queue state for the complete set of blocks currently held
@@ -154,8 +191,9 @@ pub async fn write_txs(pool: &Pool, txs: &[TxRow]) -> Result<()> {
     let mut conn = pool.get().await?;
     let tx = conn.transaction().await?;
 
-    let block_nums = exact_block_nums(txs.iter().map(|tx| tx.block_num));
-    delete_blocks_exact(&tx, "txs", &block_nums).await?;
+    let span = BlockSpan::new(txs.iter().map(|tx| (tx.block_num, tx.block_timestamp)))
+        .expect("txs is not empty");
+    delete_blocks_exact(&tx, "txs", &span).await?;
 
     tx.execute(
         "CREATE TEMP TABLE _staging_txs (
@@ -244,7 +282,7 @@ pub async fn write_txs(pool: &Pool, txs: &[TxRow]) -> Result<()> {
         &[],
     )
     .await?;
-    refresh_receipt_repair_queue_from_staging(&tx, &block_nums).await?;
+    refresh_receipt_repair_queue_from_staging(&tx, &span.block_nums).await?;
     tx.commit().await?;
 
     metrics::record_sink_write_duration("postgres", "txs", start.elapsed());
@@ -267,8 +305,9 @@ pub async fn write_logs(pool: &Pool, logs: &[LogRow]) -> Result<()> {
     let mut conn = pool.get().await?;
     let tx = conn.transaction().await?;
 
-    let block_nums = exact_block_nums(logs.iter().map(|log| log.block_num));
-    delete_blocks_exact(&tx, "logs", &block_nums).await?;
+    let span = BlockSpan::new(logs.iter().map(|log| (log.block_num, log.block_timestamp)))
+        .expect("logs is not empty");
+    delete_blocks_exact(&tx, "logs", &span).await?;
 
     tx.execute(
         "CREATE TEMP TABLE _staging_logs (
@@ -356,8 +395,13 @@ pub async fn write_receipts(pool: &Pool, receipts: &[ReceiptRow]) -> Result<()> 
     let mut conn = pool.get().await?;
     let tx = conn.transaction().await?;
 
-    let block_nums = exact_block_nums(receipts.iter().map(|receipt| receipt.block_num));
-    delete_blocks_exact(&tx, "receipts", &block_nums).await?;
+    let span = BlockSpan::new(
+        receipts
+            .iter()
+            .map(|receipt| (receipt.block_num, receipt.block_timestamp)),
+    )
+    .expect("receipts is not empty");
+    delete_blocks_exact(&tx, "receipts", &span).await?;
 
     tx.execute(
         "CREATE TEMP TABLE _staging_receipts (
@@ -543,8 +587,9 @@ async fn write_batch_inner(
 
     // ── txs ───────────────────────────────────────────────────────────────
     if !txs.is_empty() {
-        let block_nums = exact_block_nums(txs.iter().map(|tx| tx.block_num));
-        delete_blocks_exact(&tx, "txs", &block_nums).await?;
+        let span = BlockSpan::new(txs.iter().map(|tx| (tx.block_num, tx.block_timestamp)))
+            .expect("txs is not empty");
+        delete_blocks_exact(&tx, "txs", &span).await?;
 
         tx.execute(
             "CREATE TEMP TABLE _staging_txs (
@@ -633,13 +678,14 @@ async fn write_batch_inner(
             &[],
         )
         .await?;
-        refresh_receipt_repair_queue_from_staging(&tx, &block_nums).await?;
+        refresh_receipt_repair_queue_from_staging(&tx, &span.block_nums).await?;
     }
 
     // ── logs ──────────────────────────────────────────────────────────────
     if !logs.is_empty() {
-        let block_nums = exact_block_nums(logs.iter().map(|log| log.block_num));
-        delete_blocks_exact(&tx, "logs", &block_nums).await?;
+        let span = BlockSpan::new(logs.iter().map(|log| (log.block_num, log.block_timestamp)))
+            .expect("logs is not empty");
+        delete_blocks_exact(&tx, "logs", &span).await?;
 
         tx.execute(
             "CREATE TEMP TABLE _staging_logs (
@@ -709,8 +755,13 @@ async fn write_batch_inner(
 
     // ── receipts ──────────────────────────────────────────────────────────
     if !receipts.is_empty() {
-        let block_nums = exact_block_nums(receipts.iter().map(|receipt| receipt.block_num));
-        delete_blocks_exact(&tx, "receipts", &block_nums).await?;
+        let span = BlockSpan::new(
+            receipts
+                .iter()
+                .map(|receipt| (receipt.block_num, receipt.block_timestamp)),
+        )
+        .expect("receipts is not empty");
+        delete_blocks_exact(&tx, "receipts", &span).await?;
 
         tx.execute(
             "CREATE TEMP TABLE _staging_receipts (

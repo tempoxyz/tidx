@@ -9,9 +9,9 @@ use tidx::sync::engine::SyncEngine;
 use tidx::sync::sink::SinkSet;
 use tidx::sync::writer::{
     detect_blocks_missing_receipts, discover_legacy_receipt_repairs, finish_receipt_repair_attempt,
-    write_blocks, write_logs, write_txs,
+    write_batch, write_blocks, write_logs, write_txs,
 };
-use tidx::types::{BlockRow, LogRow, TxRow};
+use tidx::types::{BlockRow, LogRow, ReceiptRow, TxRow};
 
 fn generate_blocks(count: usize, offset: i64) -> Vec<BlockRow> {
     (0..count)
@@ -494,6 +494,76 @@ async fn test_delete_copy_overwrites_existing_data() {
         .unwrap()
         .get(0);
     assert_eq!(count, 50, "Should still have exactly 50 logs");
+}
+
+#[tokio::test]
+#[serial(db)]
+async fn test_rewrite_replaces_rows_of_block_with_other_timestamp() {
+    let db = TestDb::empty().await;
+    db.truncate_all().await;
+
+    let block_num = 72_000_000;
+    let receipts = |timestamp| -> Vec<ReceiptRow> {
+        (0..3)
+            .map(|i| ReceiptRow {
+                block_num,
+                block_timestamp: timestamp,
+                tx_idx: i,
+                tx_hash: vec![i as u8; 32],
+                from: vec![1u8; 20],
+                gas_used: 21000,
+                cumulative_gas_used: 21000,
+                ..Default::default()
+            })
+            .collect()
+    };
+    let rows = |timestamp, txs: usize, logs: usize| {
+        let mut block = generate_blocks(1, block_num);
+        block[0].timestamp = timestamp;
+        let mut tx_rows = generate_txs(txs, block_num);
+        for tx in &mut tx_rows {
+            tx.block_timestamp = timestamp;
+        }
+        let mut log_rows = generate_logs(logs, block_num);
+        for log in &mut log_rows {
+            log.block_timestamp = timestamp;
+        }
+        (block, tx_rows, log_rows)
+    };
+
+    // The block as first stored, then the version a reorg replaced it with,
+    // produced a few seconds later and carrying fewer rows.
+    let first = chrono::Utc::now() - chrono::Duration::minutes(5);
+    let (blocks, txs, logs) = rows(first, 3, 6);
+    write_batch(&db.pool, &blocks, &txs, &logs, &receipts(first))
+        .await
+        .unwrap();
+
+    let second = first + chrono::Duration::seconds(3);
+    let (blocks, txs, logs) = rows(second, 2, 4);
+    write_batch(&db.pool, &blocks, &txs, &logs, &receipts(second)[..2])
+        .await
+        .unwrap();
+
+    let conn = db.pool.get().await.unwrap();
+    for (table, expected) in [("txs", 2), ("logs", 4), ("receipts", 2)] {
+        let row = conn
+            .query_one(
+                &format!(
+                    "SELECT COUNT(*), COUNT(*) FILTER (WHERE block_timestamp = $2) \
+                     FROM {table} WHERE block_num = $1"
+                ),
+                &[&block_num, &second],
+            )
+            .await
+            .unwrap();
+        let (total, current): (i64, i64) = (row.get(0), row.get(1));
+        assert_eq!(total, expected, "{table} should hold only the new version");
+        assert_eq!(
+            current, expected,
+            "{table} rows should carry the new timestamp"
+        );
+    }
 }
 
 #[tokio::test]
