@@ -5,7 +5,7 @@ use std::convert::Infallible;
 use std::net::IpAddr;
 use std::sync::{Arc, RwLock as StdRwLock};
 
-use tokio::sync::RwLock;
+use tokio::sync::{RwLock, Semaphore};
 
 use anyhow::{Result as AnyhowResult, anyhow};
 use axum::{
@@ -21,7 +21,7 @@ use axum::{
 use chrono::Utc;
 use futures::Stream;
 use serde::{Deserialize, Serialize};
-use tower::limit::ConcurrencyLimitLayer;
+use tower::limit::GlobalConcurrencyLimitLayer;
 use tower_http::cors::CorsLayer;
 use tower_http::trace::TraceLayer;
 
@@ -29,7 +29,8 @@ use crate::broadcast::Broadcaster;
 use crate::clickhouse::ClickHouseEngine;
 use crate::config::HttpConfig;
 use crate::db::Pool;
-use crate::service::{QueryOptions, QueryResult, SyncStatus};
+use crate::service::{PostgresQuery, QueryOptions, QueryResult, SyncStatus};
+use tokio_postgres::types::Type;
 
 pub type SharedPools = Arc<RwLock<HashMap<u64, Pool>>>;
 pub type SharedClickHouseEngines = Arc<RwLock<HashMap<u64, Arc<ClickHouseEngine>>>>;
@@ -59,6 +60,9 @@ pub struct AppState {
     pub clickhouse_engines: SharedClickHouseEngines,
     /// Parsed trusted CIDRs for admin operations
     pub trusted_cidrs: SharedTrustedCidrs,
+    /// Permits for the API statements that may run at once. One-shot queries
+    /// and every statement of a live stream draw from the same permits.
+    pub query_permits: Arc<Semaphore>,
 }
 
 impl AppState {
@@ -173,6 +177,7 @@ pub fn router_with_options(
         clickhouse_configs: Arc::new(RwLock::new(clickhouse_configs)),
         clickhouse_engines: Arc::new(RwLock::new(HashMap::new())),
         trusted_cidrs,
+        query_permits: Arc::new(Semaphore::new(MAX_CONCURRENT_API_QUERIES)),
     };
 
     Ok(build_router(state))
@@ -193,6 +198,7 @@ pub fn router_shared(
         clickhouse_configs,
         clickhouse_engines,
         trusted_cidrs,
+        query_permits: Arc::new(Semaphore::new(MAX_CONCURRENT_API_QUERIES)),
     };
 
     build_router(state)
@@ -209,7 +215,9 @@ fn build_router(state: AppState) -> Router<()> {
         .route("/status", get(handle_status))
         .route(
             "/query",
-            get(handle_query).layer(ConcurrencyLimitLayer::new(MAX_CONCURRENT_API_QUERIES)),
+            get(handle_query).layer(GlobalConcurrencyLimitLayer::with_semaphore(
+                state.query_permits.clone(),
+            )),
         )
         .route("/views", get(views::list_views).post(views::create_view))
         .route(
@@ -471,16 +479,8 @@ async fn handle_query_once(
                     ))
                 })?;
 
-            clickhouse
-                .query_user(&params.sql, &sigs, options.timeout_ms, options.limit)
+            crate::service::execute_query_clickhouse(&clickhouse, &params.sql, &sigs, &options)
                 .await
-                .map(|r| QueryResult {
-                    columns: r.columns,
-                    rows: r.rows,
-                    row_count: r.row_count,
-                    engine: r.engine,
-                    query_time_ms: r.query_time_ms,
-                })
                 .map_err(|e| ApiError::QueryError(e.to_string()))?
         }
         crate::query::QueryRoute::Tiered => {
@@ -560,13 +560,15 @@ async fn handle_query_live(
         timeout_ms: params.timeout_ms.clamp(100, 30000),
         limit: params.limit.clamp(1, crate::query::HARD_LIMIT_MAX),
     };
+    let permits = state.query_permits.clone();
 
     let stream = async_stream::stream! {
         let mut last_block_num: u64 = 0;
         let sigs: Vec<&str> = signatures.iter().map(String::as_str).collect();
+        let mut block_query: Option<PostgresQuery> = None;
 
         // Execute initial query (live streaming uses Postgres for realtime data)
-        match crate::service::execute_query_postgres(&pool, &sql, &sigs, &options).await {
+        match execute_live_query(&permits, &pool, &sql, &sigs, &options).await {
             Ok(result) => {
                 yield Ok(SseEvent::default()
                     .event("result")
@@ -620,17 +622,32 @@ async fn handle_query_live(
                     // Filter by each block for per-block streaming
                     let catch_up_start = last_block_num + 1;
                     for block_num in catch_up_start..=end {
-                        let filtered_sql = match inject_block_filter(&sql, block_num) {
-                            Ok(s) => s,
-                            Err(e) => {
-                                yield Ok(SseEvent::default()
-                                    .event("error")
-                                    .json_data(serde_json::json!({ "ok": false, "error": e.to_string() }))
-                                    .unwrap());
-                                return;
+                        // The block number is a parameter, so the query is
+                        // rewritten and validated once for the stream.
+                        if block_query.is_none() {
+                            let filtered_sql = match inject_block_filter(&sql) {
+                                Ok(s) => s,
+                                Err(e) => {
+                                    yield Ok(SseEvent::default()
+                                        .event("error")
+                                        .json_data(serde_json::json!({ "ok": false, "error": e.to_string() }))
+                                        .unwrap());
+                                    return;
+                                }
+                            };
+                            match PostgresQuery::new(&filtered_sql, &sigs, &options) {
+                                Ok(query) => block_query = Some(query),
+                                Err(e) => {
+                                    yield Ok(SseEvent::default()
+                                        .event("error")
+                                        .json_data(serde_json::json!({ "ok": false, "error": e.to_string() }))
+                                        .unwrap());
+                                    continue;
+                                }
                             }
-                        };
-                        match crate::service::execute_query_postgres(&pool, &filtered_sql, &sigs, &options).await {
+                        }
+                        let Some(query) = &block_query else { continue };
+                        match execute_live_block_query(&permits, &pool, query, block_num as i64, &options).await {
                             Ok(result) => {
                                 yield Ok(SseEvent::default()
                                     .event("result")
@@ -664,14 +681,44 @@ async fn handle_query_live(
     Sse::new(stream).keep_alive(KeepAlive::default())
 }
 
+/// Runs one statement of a live stream under an API query permit.
+///
+/// The route's concurrency limit is released as soon as the SSE response
+/// starts, so each statement the stream runs afterwards takes a permit from
+/// the same budget for as long as it executes.
+async fn execute_live_query(
+    permits: &Semaphore,
+    pool: &Pool,
+    sql: &str,
+    signatures: &[&str],
+    options: &QueryOptions,
+) -> AnyhowResult<QueryResult> {
+    let _permit = permits.acquire().await?;
+    crate::service::execute_query_postgres(pool, sql, signatures, options).await
+}
+
+/// Runs a prepared block query under the same API query permit budget.
+async fn execute_live_block_query(
+    permits: &Semaphore,
+    pool: &Pool,
+    query: &PostgresQuery,
+    block_num: i64,
+    options: &QueryOptions,
+) -> AnyhowResult<QueryResult> {
+    let _permit = permits.acquire().await?;
+    query
+        .execute(pool, &[(&block_num, Type::INT8)], options)
+        .await
+}
+
 /// Inject a block number filter into SQL query for live streaming.
-/// Transforms queries to only return data for the specific block.
+/// Transforms queries to only return data for the block bound to `$1`.
 /// Uses 'num' for blocks table, 'block_num' for txs/logs tables.
 ///
 /// Uses sqlparser AST manipulation to safely add the filter condition,
 /// avoiding SQL injection risks from string-based splicing.
 #[doc(hidden)]
-pub fn inject_block_filter(sql: &str, block_num: u64) -> Result<String, ApiError> {
+pub fn inject_block_filter(sql: &str) -> Result<String, ApiError> {
     use sqlparser::ast::{BinaryOperator, Expr, Ident, SetExpr, Statement, Value};
     use sqlparser::dialect::GenericDialect;
     use sqlparser::parser::Parser;
@@ -732,9 +779,7 @@ pub fn inject_block_filter(sql: &str, block_num: u64) -> Result<String, ApiError
     let block_filter = Expr::BinaryOp {
         left: Box::new(col_expr),
         op: BinaryOperator::Eq,
-        right: Box::new(Expr::Value(
-            Value::Number(block_num.to_string(), false).into(),
-        )),
+        right: Box::new(Expr::Value(Value::Placeholder("$1".to_string()).into())),
     };
 
     select.selection = Some(match select.selection.take() {
@@ -796,6 +841,8 @@ impl IntoResponse for ApiError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use futures::StreamExt;
+    use std::time::Duration;
 
     #[test]
     fn test_parse_cidrs() {
@@ -850,6 +897,7 @@ mod tests {
             clickhouse_configs: Arc::new(RwLock::new(HashMap::new())),
             clickhouse_engines: Arc::new(RwLock::new(HashMap::new())),
             trusted_cidrs: Arc::new(std::sync::RwLock::new(Vec::new())),
+            query_permits: Arc::new(Semaphore::new(MAX_CONCURRENT_API_QUERIES)),
         };
         assert!(!state.is_trusted_ip(&"127.0.0.1".parse().unwrap()));
     }
@@ -903,5 +951,57 @@ mod tests {
             48
         ));
         assert!(!ip_in_cidr(&"2001:db8::1".parse().unwrap(), &network, 48));
+    }
+
+    #[tokio::test]
+    async fn test_live_stream_statements_wait_for_a_query_permit() {
+        // Nothing listens on port 1, so a statement that starts fails at once.
+        let mut config = deadpool_postgres::Config::new();
+        config.url = Some("postgres://tidx@127.0.0.1:1/tidx".to_string());
+        let pool = config
+            .create_pool(
+                Some(deadpool_postgres::Runtime::Tokio1),
+                tokio_postgres::NoTls,
+            )
+            .unwrap();
+        let state = AppState {
+            pools: Arc::new(RwLock::new(HashMap::from([(1, pool)]))),
+            default_chain_id: 1,
+            broadcaster: Arc::new(Broadcaster::new()),
+            clickhouse_configs: Arc::new(RwLock::new(HashMap::new())),
+            clickhouse_engines: Arc::new(RwLock::new(HashMap::new())),
+            trusted_cidrs: Arc::new(std::sync::RwLock::new(Vec::new())),
+            query_permits: Arc::new(Semaphore::new(0)),
+        };
+        let permits = state.query_permits.clone();
+        let params = QueryParams {
+            sql: "SELECT num FROM blocks".to_string(),
+            chain_id: 1,
+            live: true,
+            timeout_ms: 1_000,
+            limit: 1,
+            engine: None,
+            source: None,
+        };
+        let mut events = handle_query_live(state, params, vec![])
+            .await
+            .into_response()
+            .into_body()
+            .into_data_stream();
+
+        // Every permit is taken, so the stream must not run its first statement.
+        assert!(
+            tokio::time::timeout(Duration::from_millis(200), events.next())
+                .await
+                .is_err()
+        );
+
+        permits.add_permits(1);
+        let event = tokio::time::timeout(Duration::from_secs(5), events.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert!(String::from_utf8_lossy(&event).starts_with("event: error"));
     }
 }

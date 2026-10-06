@@ -14,7 +14,7 @@ use crate::types::{LogRow, ReceiptRow, SyncState};
 
 use super::decoder::{
     decode_block, decode_log, decode_receipt, decode_transaction, enrich_receipts_from_txs,
-    enrich_txs_from_receipts, timestamp_from_secs,
+    enrich_txs_from_receipts, timestamp_from_secs, validate_receipts,
 };
 use super::fetcher::RpcClient;
 use super::sink::{SinkSet, WriteTarget};
@@ -594,6 +594,7 @@ impl SyncEngine {
             self.realtime_rpc.get_blocks_batch_adaptive(from..=to),
             self.realtime_rpc.get_receipts_batch_adaptive(from..=to)
         )?;
+        validate_receipts(&blocks, &receipts)?;
 
         let block_timestamps: HashMap<u64, _> = blocks
             .iter()
@@ -676,6 +677,10 @@ impl SyncEngine {
         let (block, receipts) = tokio::try_join!(
             self.realtime_rpc.get_block(num, true),
             self.realtime_rpc.get_block_receipts(num)
+        )?;
+        validate_receipts(
+            std::slice::from_ref(&block),
+            std::slice::from_ref(&receipts),
         )?;
 
         let block_row = decode_block(&block);
@@ -1437,7 +1442,7 @@ pub(crate) async fn sync_range_standalone_to(
 ) -> Result<()> {
     use super::decoder::{
         decode_block, decode_log, decode_receipt, decode_transaction, enrich_receipts_from_txs,
-        enrich_txs_from_receipts, timestamp_from_secs,
+        enrich_txs_from_receipts, timestamp_from_secs, validate_receipts,
     };
     use alloy::network::ReceiptResponse;
 
@@ -1445,6 +1450,7 @@ pub(crate) async fn sync_range_standalone_to(
         rpc.get_blocks_batch_adaptive(from..=to),
         rpc.get_receipts_batch_adaptive(from..=to)
     )?;
+    validate_receipts(&blocks, &receipts)?;
 
     let block_timestamps: HashMap<u64, _> = blocks
         .iter()
@@ -1609,21 +1615,22 @@ async fn tick_receipt_backfill(sinks: &SinkSet, rpc: &RpcClient, chain_id: u64) 
             }
         };
 
-        // Get block timestamps from DB (blocks already exist)
+        // Get block timestamps from DB (blocks already exist). They are keyed by hash so that
+        // receipts of a block that is not stored (another fork at that height) are skipped.
         let conn = pool.get().await?;
         let rows = conn
             .query(
-                "SELECT num, timestamp FROM blocks WHERE num >= $1 AND num <= $2",
+                "SELECT hash, timestamp FROM blocks WHERE num >= $1 AND num <= $2",
                 &[&(from as i64), &(to as i64)],
             )
             .await?;
 
-        let block_timestamps: HashMap<u64, _> = rows
+        let block_timestamps: HashMap<Vec<u8>, _> = rows
             .iter()
             .map(|r| {
-                let num: i64 = r.get(0);
+                let hash: Vec<u8> = r.get(0);
                 let ts: chrono::DateTime<chrono::Utc> = r.get(1);
-                (num as u64, ts)
+                (hash, ts)
             })
             .collect();
 
@@ -1636,9 +1643,9 @@ async fn tick_receipt_backfill(sinks: &SinkSet, rpc: &RpcClient, chain_id: u64) 
             let mut block_logs: Vec<_> = block_receipts
                 .iter()
                 .flat_map(|receipt| {
-                    let block_num = receipt.block_number().unwrap_or(0);
-                    block_timestamps
-                        .get(&block_num)
+                    receipt
+                        .block_hash()
+                        .and_then(|hash| block_timestamps.get(hash.as_slice()))
                         .map(|&ts| {
                             receipt
                                 .inner
@@ -1661,9 +1668,9 @@ async fn tick_receipt_backfill(sinks: &SinkSet, rpc: &RpcClient, chain_id: u64) 
             let block_receipt_rows: Vec<_> = block_receipts
                 .iter()
                 .filter_map(|receipt| {
-                    let block_num = receipt.block_number().unwrap_or(0);
-                    block_timestamps
-                        .get(&block_num)
+                    receipt
+                        .block_hash()
+                        .and_then(|hash| block_timestamps.get(hash.as_slice()))
                         .map(|&ts| decode_receipt(receipt, ts))
                 })
                 .collect();
