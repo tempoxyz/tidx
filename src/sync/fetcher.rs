@@ -911,7 +911,7 @@ mod tests {
     #[test]
     fn test_equal_limit_does_not_extend_expiry() {
         let limit = BatchLimit::default();
-        let learned_at = Instant::now() - Duration::from_secs(30);
+        let learned_at = Instant::now().checked_sub(Duration::from_secs(30)).unwrap();
         *limit.0.lock().unwrap() = Some((4, learned_at));
         limit.lower(4);
         assert_eq!(limit.0.lock().unwrap().unwrap().1, learned_at);
