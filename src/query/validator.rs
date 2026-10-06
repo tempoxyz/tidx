@@ -1361,6 +1361,8 @@ fn validate_function(func: &Function, cte_names: &HashSet<String>, depth: usize)
         return Err(anyhow!("Function '{}' is not allowed", func_name));
     }
 
+    validate_pad_length(&func_name, &func.args)?;
+
     if let FunctionArguments::List(arg_list) = &func.args {
         for arg in &arg_list.args {
             if let FunctionArg::Unnamed(FunctionArgExpr::Expr(expr))
@@ -1393,6 +1395,39 @@ fn validate_function(func: &Function, cte_names: &HashSet<String>, depth: usize)
     }
 
     Ok(())
+}
+
+/// Largest length `lpad` and `rpad` may pad to. Typical use pads hex strings
+/// to 64 characters, and with the [`HARD_LIMIT_MAX`] row cap this keeps a
+/// padded column near 10 MB per query.
+const MAX_PAD_LENGTH: u64 = 1024;
+
+/// Requires the length argument of `lpad` and `rpad` to be an integer literal
+/// of at most [`MAX_PAD_LENGTH`].
+///
+/// PostgreSQL builds the padded string before any result-size limit applies,
+/// so the length must be bounded here. Only a plain positional integer literal
+/// is accepted; named arguments, casts, parenthesised or signed values,
+/// subqueries and any other expression are rejected.
+fn validate_pad_length(func_name: &str, args: &FunctionArguments) -> Result<()> {
+    let bare_name = func_name.rsplit('.').next().unwrap_or(func_name);
+    if !matches!(bare_name, "lpad" | "rpad") {
+        return Ok(());
+    }
+
+    // The length is the second argument: lpad(string, length [, fill]).
+    if let FunctionArguments::List(arg_list) = args
+        && let Some(FunctionArg::Unnamed(FunctionArgExpr::Expr(Expr::Value(v)))) =
+            arg_list.args.get(1)
+        && let sqlparser::ast::Value::Number(n, false) = &v.value
+        && n.parse::<u64>().is_ok_and(|len| len <= MAX_PAD_LENGTH)
+    {
+        return Ok(());
+    }
+
+    Err(anyhow!(
+        "Function '{bare_name}' length must be an integer literal no larger than {MAX_PAD_LENGTH}"
+    ))
 }
 
 fn validate_function_argument_clause(
@@ -1698,6 +1733,40 @@ mod tests {
     #[test]
     fn test_rejects_string_amplification_functions() {
         assert!(validate_query("SELECT repeat('x', 1000000) FROM blocks").is_err());
+    }
+
+    #[test]
+    fn test_allows_bounded_pad_length() {
+        assert!(
+            validate_query("SELECT decode(lpad(to_hex(num), 64, '0'), 'hex') FROM blocks").is_ok()
+        );
+        assert!(validate_query("SELECT rpad('x', 1024) FROM blocks").is_ok());
+    }
+
+    #[test]
+    fn test_rejects_unbounded_pad_length() {
+        for sql in [
+            // Above the cap.
+            "SELECT lpad('x', 1025) FROM blocks",
+            "SELECT rpad('x', 1000000000, '0') FROM blocks",
+            "SELECT pg_catalog.LPAD('x', 1025) FROM blocks",
+            // Not a plain integer literal.
+            "SELECT lpad('x', num) FROM blocks",
+            "SELECT lpad('x', 64::int) FROM blocks",
+            "SELECT lpad('x', (64)) FROM blocks",
+            "SELECT lpad('x', length => 64) FROM blocks",
+            "SELECT lpad('x', 64.0) FROM blocks",
+            // Negative.
+            "SELECT lpad('x', -1) FROM blocks",
+            // Nested inside another call.
+            "SELECT length(lpad('x', 1000000000)) FROM blocks",
+        ] {
+            let error = validate_query(sql).unwrap_err().to_string();
+            assert!(
+                error.ends_with("length must be an integer literal no larger than 1024"),
+                "{sql}: {error}"
+            );
+        }
     }
 
     #[test]
