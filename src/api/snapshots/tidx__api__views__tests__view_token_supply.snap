@@ -11,8 +11,8 @@ WITH Transfer AS (
 ) SELECT 
                 address as token,
                 SUM(CASE 
-                    WHEN topic1 = '0x0000000000000000000000000000000000000000000000000000000000000000' THEN CAST("value" AS Int256)
-                    WHEN topic2 = '0x0000000000000000000000000000000000000000000000000000000000000000' THEN -CAST("value" AS Int256)
+                    WHEN "from" = '0x0000000000000000000000000000000000000000' THEN CAST("value" AS Int256)
+                    WHEN "to" = '0x0000000000000000000000000000000000000000' THEN -CAST("value" AS Int256)
                     ELSE 0
                 END) as supply
             FROM Transfer

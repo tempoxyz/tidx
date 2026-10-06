@@ -14,7 +14,8 @@ use tower::Service;
 use common::testdb::TestDb;
 use serial_test::serial;
 use tidx::api::{self, inject_block_filter};
-use tidx::broadcast::Broadcaster;
+use tidx::broadcast::{BlockUpdate, Broadcaster};
+use tidx::service::{PostgresQuery, QueryOptions};
 
 fn make_pools(pool: tidx::db::Pool) -> (HashMap<u64, tidx::db::Pool>, u64) {
     let mut pools = HashMap::new();
@@ -411,28 +412,134 @@ async fn test_query_live_rejects_when_stream_capacity_reached() {
     assert!(body.contains("Live stream capacity reached"), "got: {body}");
 }
 
+#[tokio::test]
+#[serial(db)]
+async fn test_query_live_streams_each_new_block() {
+    let db = TestDb::empty().await;
+    db.truncate_all().await;
+    let now = chrono::Utc::now();
+    let blocks: Vec<tidx::types::BlockRow> = (1..=4)
+        .map(|num| tidx::types::BlockRow {
+            num,
+            hash: vec![num as u8; 32],
+            parent_hash: vec![0; 32],
+            timestamp: now,
+            timestamp_ms: now.timestamp_millis(),
+            gas_limit: 1,
+            gas_used: 1,
+            miner: vec![0; 20],
+            extra_data: None,
+            consensus_proposer: None,
+        })
+        .collect();
+    tidx::sync::writer::write_blocks(&db.pool, &blocks)
+        .await
+        .unwrap();
+    tidx::sync::writer::save_sync_state(
+        &db.pool,
+        &tidx::types::SyncState {
+            chain_id: 1,
+            synced_num: 2,
+            tip_num: 2,
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+
+    let broadcaster = Arc::new(Broadcaster::new());
+    let (pools, chain_id) = make_pools(db.pool.clone());
+    let mut app = make_test_service(pools, chain_id, broadcaster.clone()).await;
+    let response = app
+        .call(
+            Request::builder()
+                .method("GET")
+                .uri("/query?sql=SELECT%20num%20FROM%20blocks%20ORDER%20BY%20num&chainId=1&live=true")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    // Blocks 3 and 4 arrive after the stream caught up to block 2.
+    broadcaster.send(BlockUpdate {
+        chain_id: 1,
+        block_num: 4,
+        block_hash: String::new(),
+        tx_count: 0,
+        log_count: 0,
+        timestamp: now.timestamp(),
+    });
+
+    let mut body = response.into_body().into_data_stream();
+    let mut events = String::new();
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while events.matches("event: result").count() < 3 {
+            let chunk = futures::StreamExt::next(&mut body).await.unwrap().unwrap();
+            events.push_str(std::str::from_utf8(&chunk).unwrap());
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("expected three results, got: {events}"));
+
+    let rows: Vec<serde_json::Value> = events
+        .lines()
+        .filter_map(|line| line.strip_prefix("data: "))
+        .map(|data| serde_json::from_str::<serde_json::Value>(data).unwrap()["rows"].clone())
+        .collect();
+    assert_eq!(
+        rows,
+        vec![
+            serde_json::json!([[1], [2], [3], [4]]),
+            serde_json::json!([[3]]),
+            serde_json::json!([[4]]),
+        ]
+    );
+}
+
+#[test]
+fn test_live_block_query_matches_literal_block_filter() {
+    // The block number is bound as $1 instead of spliced in, so the rewritten
+    // SQL must be the same as for a literal block number.
+    let sql = r#"SELECT "from", value FROM Transfer WHERE "to" = '0x00000000000000000000000000000000000000aa' ORDER BY log_idx"#;
+    let signatures = ["Transfer(address indexed from, address indexed to, uint256 value)"];
+    let options = QueryOptions {
+        timeout_ms: 5000,
+        limit: 100,
+    };
+
+    let filtered = inject_block_filter(sql).unwrap();
+    let parameterized = PostgresQuery::new(&filtered, &signatures, &options).unwrap();
+    let literal =
+        PostgresQuery::new(&filtered.replace("$1", "123"), &signatures, &options).unwrap();
+
+    assert_eq!(parameterized.sql().matches("$1").count(), 1);
+    assert_eq!(parameterized.sql().replace("$1", "123"), literal.sql());
+}
+
 // Unit tests for inject_block_filter (no DB required)
 
 #[test]
 fn test_inject_block_filter_blocks_table() {
     let sql = "SELECT num, hash FROM blocks ORDER BY num DESC LIMIT 1";
-    let filtered = inject_block_filter(sql, 100).unwrap();
-    assert!(filtered.contains("blocks.num = 100"), "got: {filtered}");
+    let filtered = inject_block_filter(sql).unwrap();
+    assert!(filtered.contains("blocks.num = $1"), "got: {filtered}");
     assert!(filtered.contains("ORDER BY"), "should preserve ORDER BY");
 }
 
 #[test]
 fn test_inject_block_filter_txs_table() {
     let sql = "SELECT * FROM txs ORDER BY block_num DESC LIMIT 10";
-    let filtered = inject_block_filter(sql, 200).unwrap();
-    assert!(filtered.contains("txs.block_num = 200"), "got: {filtered}");
+    let filtered = inject_block_filter(sql).unwrap();
+    assert!(filtered.contains("txs.block_num = $1"), "got: {filtered}");
 }
 
 #[test]
 fn test_inject_block_filter_logs_table() {
     let sql = "SELECT * FROM logs WHERE address = '0x123' ORDER BY block_num DESC";
-    let filtered = inject_block_filter(sql, 300).unwrap();
-    assert!(filtered.contains("logs.block_num = 300"), "got: {filtered}");
+    let filtered = inject_block_filter(sql).unwrap();
+    assert!(filtered.contains("logs.block_num = $1"), "got: {filtered}");
     assert!(
         filtered.contains("address = '0x123'"),
         "should preserve existing WHERE"
@@ -442,8 +549,8 @@ fn test_inject_block_filter_logs_table() {
 #[test]
 fn test_inject_block_filter_with_existing_where() {
     let sql = "SELECT * FROM txs WHERE gas_used > 21000 ORDER BY block_num DESC";
-    let filtered = inject_block_filter(sql, 400).unwrap();
-    assert!(filtered.contains("txs.block_num = 400"), "got: {filtered}");
+    let filtered = inject_block_filter(sql).unwrap();
+    assert!(filtered.contains("txs.block_num = $1"), "got: {filtered}");
     assert!(
         filtered.contains("gas_used > 21000"),
         "should preserve existing condition"
@@ -453,9 +560,9 @@ fn test_inject_block_filter_with_existing_where() {
 #[test]
 fn test_inject_block_filter_with_user_cte() {
     let sql = "WITH filtered AS (SELECT * FROM txs WHERE gas_used > 21000) SELECT * FROM filtered";
-    let filtered = inject_block_filter(sql, 450).unwrap();
+    let filtered = inject_block_filter(sql).unwrap();
     assert!(
-        filtered.contains("filtered.block_num = 450"),
+        filtered.contains("filtered.block_num = $1"),
         "got: {filtered}"
     );
     assert!(
@@ -467,27 +574,27 @@ fn test_inject_block_filter_with_user_cte() {
 #[test]
 fn test_inject_block_filter_no_order_by() {
     let sql = "SELECT COUNT(*) FROM blocks LIMIT 1";
-    let filtered = inject_block_filter(sql, 500).unwrap();
-    assert!(filtered.contains("blocks.num = 500"), "got: {filtered}");
+    let filtered = inject_block_filter(sql).unwrap();
+    assert!(filtered.contains("blocks.num = $1"), "got: {filtered}");
 }
 
 #[test]
 fn test_inject_block_filter_rejects_union() {
     let sql = "SELECT * FROM txs UNION SELECT * FROM logs";
-    assert!(inject_block_filter(sql, 100).is_err());
+    assert!(inject_block_filter(sql).is_err());
 }
 
 #[test]
 fn test_inject_block_filter_rejects_non_select() {
     let sql = "INSERT INTO txs VALUES (1)";
-    assert!(inject_block_filter(sql, 100).is_err());
+    assert!(inject_block_filter(sql).is_err());
 }
 
 #[test]
 fn test_inject_block_filter_where_keyword_in_string_literal() {
     let sql = "SELECT * FROM txs WHERE input = 'WHERE clause test'";
-    let filtered = inject_block_filter(sql, 100).unwrap();
-    assert!(filtered.contains("txs.block_num = 100"), "got: {filtered}");
+    let filtered = inject_block_filter(sql).unwrap();
+    assert!(filtered.contains("txs.block_num = $1"), "got: {filtered}");
     assert!(
         filtered.contains("'WHERE clause test'"),
         "should preserve string literal"

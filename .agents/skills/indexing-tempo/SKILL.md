@@ -244,10 +244,10 @@ docker compose -f docker/prod/docker-compose.yml --profile monitoring up -d
 # View logs
 docker compose -f docker/prod/docker-compose.yml logs -f tidx
 
-# Access:
+# Access (PostgreSQL, ClickHouse, Prometheus and Grafana listen on 127.0.0.1 only):
 #   HTTP API:    http://localhost:8080
 #   Prometheus:  http://localhost:9091
-#   Grafana:     http://localhost:3000 (admin/admin)
+#   Grafana:     http://localhost:3000 (admin / $GRAFANA_PASSWORD, default admin)
 ```
 
 ### Bare Metal

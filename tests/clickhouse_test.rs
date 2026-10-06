@@ -736,6 +736,200 @@ async fn test_role_granted_cte() {
     assert_eq!(data.unwrap().len(), 1);
 }
 
+#[tokio::test]
+#[serial(clickhouse)]
+async fn test_fixed_bytes_cte_returns_declared_width() {
+    let ch =
+        TestClickHouse::new("tidx_test_fixed_bytes").expect("Failed to create ClickHouse client");
+
+    if ch.wait_for_ready().await.is_err() {
+        println!("ClickHouse not available, skipping test");
+        return;
+    }
+
+    ch.reset_database().await.expect("Failed to reset database");
+    ch.create_mock_logs_table()
+        .await
+        .expect("Failed to create logs table");
+
+    let signature = "Fixed(bytes4 indexed tag, bytes4 value, bytes32 word)";
+    let selector = format!(
+        "0x{}",
+        EventSignature::parse(signature).unwrap().topic0_hex()
+    );
+    let tag = format!("0xcafebabe{}", "00".repeat(28));
+    let word = "11".repeat(32);
+    let data = format!("0xdeadbeef{}{word}", "00".repeat(28));
+    let zero = format!("0x{}", "00".repeat(32));
+    ch.insert_mock_log(
+        1,
+        0,
+        0,
+        &zero,
+        "0x1111111111111111111111111111111111111111",
+        &selector,
+        &tag,
+        &zero,
+        &zero,
+        &data,
+    )
+    .await
+    .expect("Failed to insert log");
+
+    let config = ClickHouseConfig {
+        enabled: true,
+        url: ch.url.clone(),
+        database: Some(ch.database.clone()),
+        ..Default::default()
+    };
+    let engine = ClickHouseEngine::new(&config, 4217).expect("Failed to create engine");
+    let result = engine
+        .query_user(
+            "SELECT tag, value, word FROM Fixed",
+            &[signature],
+            5_000,
+            100,
+        )
+        .await
+        .expect("Query failed");
+
+    assert_eq!(
+        result.rows,
+        [vec![
+            serde_json::json!("0xcafebabe"),
+            serde_json::json!("0xdeadbeef"),
+            serde_json::json!(format!("0x{word}")),
+        ]]
+    );
+
+    // Include a second tag so OR must retain every value, rather than just
+    // the last literal extracted for a decoded column.
+    let second_tag = format!("0xdeadbeef{}", "00".repeat(28));
+    ch.insert_mock_log(
+        2,
+        1,
+        0,
+        &zero,
+        "0x1111111111111111111111111111111111111111",
+        &selector,
+        &second_tag,
+        &zero,
+        &zero,
+        &data,
+    )
+    .await
+    .expect("Failed to insert second log");
+    for (sql, expected) in [
+        (
+            "SELECT tag FROM Fixed WHERE tag = '0xcafebabe'",
+            vec![serde_json::json!("0xcafebabe")],
+        ),
+        (
+            "SELECT tag FROM Fixed WHERE '0xcafebabe' = tag",
+            vec![serde_json::json!("0xcafebabe")],
+        ),
+        (
+            r#"SELECT tag FROM Fixed WHERE "tag" = '0xcafebabe' OR "tag" = '0xdeadbeef' ORDER BY tag"#,
+            vec![
+                serde_json::json!("0xcafebabe"),
+                serde_json::json!("0xdeadbeef"),
+            ],
+        ),
+        (
+            r#"SELECT * FROM (SELECT "tag" FROM Fixed) q WHERE "tag" = '0xcafebabe'"#,
+            vec![serde_json::json!("0xcafebabe")],
+        ),
+        (
+            "WITH q AS (SELECT tag AS renamed FROM Fixed) SELECT renamed FROM q WHERE renamed = '0xcafebabe'",
+            vec![serde_json::json!("0xcafebabe")],
+        ),
+        (
+            r#"WITH q AS (SELECT '0xcafebabe' AS tag) SELECT q.tag FROM q CROSS JOIN Fixed WHERE q."tag" = '0xcafebabe'"#,
+            vec![serde_json::json!("0xcafebabe"); 2],
+        ),
+        (
+            "SELECT value AS tag FROM Fixed WHERE tag = '0xdeadbeef'",
+            vec![serde_json::json!("0xdeadbeef"); 2],
+        ),
+    ] {
+        let result = engine
+            .query_user(sql, &[signature], 5_000, 100)
+            .await
+            .expect("Fixed bytes filter query failed");
+        assert_eq!(
+            result.rows,
+            expected
+                .into_iter()
+                .map(|value| vec![value])
+                .collect::<Vec<_>>(),
+            "{sql}"
+        );
+    }
+}
+
+/// Native ClickHouse timestamps must match PostgreSQL's RFC 3339
+/// `timestamptz` formatting, not ClickHouse's zone-less default
+/// (`2026-09-11 22:38:08.000`, which JavaScript parses as local time).
+#[tokio::test]
+#[serial(clickhouse)]
+async fn test_execute_query_clickhouse_formats_timestamps_like_postgres() {
+    let ch = TestClickHouse::new("tidx_test_native_timestamps")
+        .expect("Failed to create ClickHouse client");
+
+    if ch.wait_for_ready().await.is_err() {
+        println!("ClickHouse not available, skipping test");
+        return;
+    }
+
+    ch.reset_database().await.expect("Failed to reset database");
+    ch.create_mock_logs_table()
+        .await
+        .expect("Failed to create logs table");
+    ch.query(
+        "INSERT INTO logs (block_num, block_timestamp, log_idx, tx_idx, tx_hash, address, data) VALUES \
+         (1, '2026-09-11 22:38:08.000', 0, 0, '0x01', '0x02', '0x'), \
+         (2, '2026-09-11 22:38:08.123', 0, 0, '0x01', '0x02', '0x')",
+    )
+    .await
+    .expect("Failed to insert logs");
+
+    let config = ClickHouseConfig {
+        enabled: true,
+        url: ch.url.clone(),
+        database: Some(ch.database.clone()),
+        ..Default::default()
+    };
+    let engine = ClickHouseEngine::new(&config, 4217).expect("Failed to create engine");
+    let result = tidx::service::execute_query_clickhouse(
+        &engine,
+        "SELECT block_timestamp FROM logs ORDER BY block_num",
+        &[],
+        &tidx::service::QueryOptions::default(),
+    )
+    .await
+    .expect("ClickHouse query failed");
+
+    let db = common::testdb::TestDb::empty().await;
+    let pg = tidx::service::execute_query_postgres(
+        &db.pool,
+        "SELECT ts FROM (VALUES (TIMESTAMPTZ '2026-09-11 22:38:08+00'), \
+         (TIMESTAMPTZ '2026-09-11 22:38:08.123+00')) AS t(ts)",
+        &[],
+        &tidx::service::QueryOptions::default(),
+    )
+    .await
+    .expect("PostgreSQL query failed");
+
+    assert_eq!(
+        result.rows,
+        [
+            [serde_json::json!("2026-09-11T22:38:08+00:00")],
+            [serde_json::json!("2026-09-11T22:38:08.123+00:00")],
+        ]
+    );
+    assert_eq!(result.rows, pg.rows);
+}
+
 /// `query_user` (the public /query path) must execute parenthesized UNION arms
 /// with a trailing ORDER BY/LIMIT, a shape valid in PostgreSQL. ClickHouse
 /// grammar rejects the trailing clauses (Code 62) unless they are hoisted
@@ -958,6 +1152,29 @@ async fn test_predicate_pushdown_indexed_param() {
     assert!(data.is_some());
     let cnt = data.unwrap()[0].get("cnt").and_then(|v| v.as_u64());
     assert_eq!(cnt, Some(5), "Expected 5 transfers from address a975...");
+
+    // Identity aliases must retain normalization of mixed-case address literals.
+    for projection in [
+        r#""from" AS "from""#,
+        r#"(t."from") AS "from""#,
+        r#"t."from" AS "from", t.topic1 AS topic1"#,
+    ] {
+        let sql = format!(
+            r#"SELECT {projection} FROM Transfer t WHERE t."from" = '0xA975BA910C2eE169956F3Df99Ee2EcE79d3887CF'"#
+        );
+        let sql = apply_event_signature_ctes_clickhouse(
+            &sql,
+            &["Transfer(address indexed from, address indexed to, uint256 value)"],
+        )
+        .unwrap();
+        let result = ch.query_json(&sql).await.unwrap();
+        let rows = result["data"].as_array().unwrap();
+        assert_eq!(rows.len(), 5, "{sql}");
+        assert!(
+            rows.iter()
+                .all(|row| row["from"] == "0xa975ba910c2ee169956f3df99ee2ece79d3887cf")
+        );
+    }
 }
 
 // ============================================================================
@@ -2964,7 +3181,8 @@ async fn test_backfill_replays_blocks_with_stale_child_rows() {
     assert_eq!(receipt_result["data"][0]["gas_used"].as_i64(), Some(21_000));
 }
 
-/// A canonical block can coexist with an older distinct version until a merge.
+/// A canonical block can coexist with an older distinct version that
+/// ReplacingMergeTree has not collapsed (an unmerged part or another partition).
 /// Backfill must replace the entire block instead of treating the canonical row
 /// as sufficient.
 #[tokio::test]
@@ -2977,10 +3195,15 @@ async fn test_backfill_replays_blocks_with_extra_block_versions() {
     let blocks = vec![make_block(1)];
     writer::write_blocks(&pool, &blocks).await.unwrap();
 
-    let mut stale_blocks = blocks.clone();
-    stale_blocks[0].hash = vec![0xee; 32];
-    stale_blocks.extend(blocks.clone());
-    ch_sink.write_blocks(&stale_blocks).await.unwrap();
+    // Versions sharing a part are collapsed on insert, and stopping merges
+    // would also block the repair's DELETE mutation, so write the stale
+    // version separately into another monthly partition.
+    let mut stale_block = blocks[0].clone();
+    stale_block.hash = vec![0xee; 32];
+    stale_block.timestamp -= chrono::Duration::days(31);
+    stale_block.timestamp_ms = stale_block.timestamp.timestamp_millis();
+    ch_sink.write_blocks(&[stale_block]).await.unwrap();
+    ch_sink.write_blocks(&blocks).await.unwrap();
     assert_eq!(ch.table_count("blocks").await.unwrap(), 2);
 
     sinks.backfill_clickhouse(TEST_CHAIN_ID).await.unwrap();

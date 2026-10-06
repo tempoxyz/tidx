@@ -1252,6 +1252,73 @@ async fn test_query_receipts() {
 
 #[tokio::test]
 #[serial(db)]
+async fn test_query_postgres_cell_json_formats() {
+    let db = TestDb::empty().await;
+    let opts = default_options();
+
+    // NUMERIC past rust_decimal's 96-bit mantissa and non-finite floats are NULL.
+    let result = execute_query_postgres(
+        &db.pool,
+        r#"SELECT 7::int2 AS i2, -42::int4 AS i4, 9007199254740993::int8 AS i8,
+            123.4500::numeric AS num, -0.5::numeric AS neg_num,
+            1234567890123456789012345678901234567890::numeric AS big_num,
+            1.5::float8 AS f8, 'NaN'::float8 AS nan,
+            '\xDEADbeef'::bytea AS bytes, ''::bytea AS empty_bytes,
+            'héllo "q"'::text AS txt, 'v'::varchar AS vc, 'n'::name AS nm,
+            '2024-01-02 03:04:05.678+05:30'::timestamptz AS ts, true AS flag,
+            NULL::int8 AS null_i8, NULL::numeric AS null_num, NULL::float8 AS null_f8,
+            NULL::bytea AS null_bytes, NULL::text AS null_txt,
+            NULL::timestamptz AS null_ts, NULL::bool AS null_flag"#,
+        &[],
+        &opts,
+    )
+    .await
+    .expect("Query failed");
+
+    assert_eq!(
+        serde_json::to_string(&result.rows).unwrap(),
+        r#"[[7,-42,9007199254740993,"123.4500","-0.5",null,1.5,null,"0xdeadbeef","0x","héllo \"q\"","v","n","2024-01-01T21:34:05.678+00:00",true,null,null,null,null,null,null,null]]"#
+    );
+
+    // Cells over 1 MiB fail the query. They are stored directly so the
+    // query itself does not need functions that build large values.
+    let block_num = 74_000_000_i64;
+    let conn = db.pool.get().await.unwrap();
+    conn.execute("DELETE FROM logs WHERE block_num = $1", &[&block_num])
+        .await
+        .unwrap();
+    conn.execute(
+        "INSERT INTO logs (block_num, block_timestamp, log_idx, tx_idx, tx_hash, address, data)
+         VALUES ($1, NOW(), 0, 0, $2, $2, $3), ($1, NOW(), 1, 0, $2, $2, $4)",
+        &[
+            &block_num,
+            &vec![0_u8; 20],
+            &vec![0xab_u8; 1024 * 1024 + 1],
+            &vec![b'a'; 1024 * 1024 + 1],
+        ],
+    )
+    .await
+    .unwrap();
+    for sql in [
+        "SELECT data FROM logs WHERE block_num = 74000000 AND log_idx = 0",
+        "SELECT encode(data, 'escape') FROM logs WHERE block_num = 74000000 AND log_idx = 1",
+    ] {
+        let err = execute_query_postgres(&db.pool, sql, &[], &opts)
+            .await
+            .expect_err("cell over 1 MiB should fail");
+        assert!(
+            err.to_string()
+                .contains("Query result cell exceeded 1048576 bytes"),
+            "got: {err}"
+        );
+    }
+    conn.execute("DELETE FROM logs WHERE block_num = $1", &[&block_num])
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+#[serial(db)]
 async fn test_query_rejects_non_select() {
     let db = TestDb::new().await;
     let opts = default_options();
@@ -1327,6 +1394,95 @@ async fn test_query_statement_timeout_maps_to_query_timeout() {
 
     // SQLSTATE 57014 (query_canceled) reduces to the exact timeout marker.
     assert_eq!(err.to_string(), "Query timeout");
+}
+
+#[tokio::test]
+#[serial(db)]
+async fn test_query_float4_timestamp_bpchar_cells() {
+    let db = TestDb::empty().await;
+    let opts = default_options();
+
+    let result = execute_query_postgres(
+        &db.pool,
+        "SELECT 1.5::float4, 1.1::float4, '2024-01-02 03:04:05'::timestamp, 'ab'::char(3)",
+        &[],
+        &opts,
+    )
+    .await
+    .expect("Query failed");
+
+    assert_eq!(
+        serde_json::to_string(&result.rows).unwrap(),
+        r#"[[1.5,1.1,"2024-01-02T03:04:05+00:00","ab "]]"#
+    );
+}
+
+#[tokio::test]
+#[serial(db)]
+async fn test_query_composite_column_with_large_result() {
+    let db = TestDb::empty().await;
+    db.truncate_all().await;
+    db.pool
+        .get()
+        .await
+        .unwrap()
+        .batch_execute(
+            "INSERT INTO blocks (num, hash, parent_hash, timestamp, timestamp_ms,
+                                 gas_limit, gas_used, miner)
+             SELECT n, decode(repeat('ab', 32), 'hex'), decode(repeat('cd', 32), 'hex'),
+                    NOW(), 0, 100, 50, decode(repeat('ef', 20), 'hex')
+             FROM generate_series(1, 10000) n",
+        )
+        .await
+        .unwrap();
+
+    // A fresh connection cannot have the blocks composite type cached. The
+    // result must exceed the driver's response buffer: resolving the type
+    // after execution starts otherwise waits behind the unread result rows.
+    let pool = tidx::db::create_pool_with_size(&std::env::var("DATABASE_URL").unwrap(), 1)
+        .await
+        .unwrap();
+    let result = execute_query_postgres(
+        &pool,
+        "SELECT b.num, b AS block FROM blocks b ORDER BY b.num LIMIT 10000",
+        &[],
+        &QueryOptions {
+            timeout_ms: 5000,
+            limit: 10000,
+        },
+    )
+    .await
+    .expect("composite type discovery must not stall query execution");
+
+    assert_eq!(result.columns, vec!["num", "block"]);
+    assert_eq!(result.row_count, 10000);
+    for (index, row) in result.rows.iter().enumerate() {
+        // Composite cells retain their existing null representation, while
+        // supported columns must still be returned for every row.
+        assert_eq!(
+            *row,
+            vec![serde_json::json!(index + 1), serde_json::Value::Null]
+        );
+    }
+    db.truncate_all().await;
+}
+
+#[tokio::test]
+#[serial(db)]
+async fn test_query_empty_result_keeps_columns() {
+    let db = TestDb::empty().await;
+
+    let result = execute_query_postgres(
+        &db.pool,
+        "SELECT num, hash AS block_hash FROM blocks WHERE num < 0",
+        &[],
+        &default_options(),
+    )
+    .await
+    .expect("Query failed");
+
+    assert_eq!(result.columns, vec!["num", "block_hash"]);
+    assert_eq!(result.rows, Vec::<Vec<serde_json::Value>>::new());
 }
 
 #[tokio::test]
@@ -1526,6 +1682,126 @@ async fn test_query_bytes32_indexed_param() {
 
     assert!(result.columns.contains(&"role".to_string()));
     assert!(result.columns.contains(&"account".to_string()));
+}
+
+#[tokio::test]
+#[serial(db)]
+async fn test_query_fixed_bytes_returns_declared_width() {
+    let db = TestDb::empty().await;
+    let opts = default_options();
+    let signature = "Fixed(bytes4 indexed tag, bytes4 value, bytes32 word)";
+    let selector = EventSignature::parse(signature).unwrap().topic0.to_vec();
+
+    let pad = |head: [u8; 4]| [head.as_slice(), &[0u8; 28]].concat();
+    let log = tidx::types::LogRow {
+        block_num: 1,
+        block_timestamp: chrono::Utc::now(),
+        tx_hash: vec![0xfb; 32],
+        address: vec![0x11; 20],
+        selector: Some(selector.clone()),
+        topic0: Some(selector.clone()),
+        topic1: Some(pad([0xca, 0xfe, 0xba, 0xbe])),
+        data: [pad([0xde, 0xad, 0xbe, 0xef]), vec![0x11; 32]].concat(),
+        ..Default::default()
+    };
+    let conn = db.pool.get().await.unwrap();
+    let cleanup = "DELETE FROM logs WHERE selector = $1";
+    conn.execute(cleanup, &[&selector]).await.unwrap();
+    tidx::sync::writer::write_logs(&db.pool, std::slice::from_ref(&log))
+        .await
+        .unwrap();
+
+    let result = execute_query_postgres(
+        &db.pool,
+        r#"SELECT tag, "value", word FROM Fixed"#,
+        &[signature],
+        &opts,
+    )
+    .await;
+    let filtered = execute_query_postgres(
+        &db.pool,
+        r#"SELECT "value" FROM Fixed WHERE "tag" = '0xcafebabe'"#,
+        &[signature],
+        &opts,
+    )
+    .await;
+    conn.execute(cleanup, &[&selector]).await.unwrap();
+
+    let result = result.expect("Query with fixed bytes params failed");
+    assert_eq!(
+        result.rows,
+        [vec![
+            serde_json::json!("0xcafebabe"),
+            serde_json::json!("0xdeadbeef"),
+            serde_json::json!(format!("0x{}", "11".repeat(32))),
+        ]]
+    );
+    let filtered = filtered.expect("Filter on indexed fixed bytes param failed");
+    assert_eq!(filtered.rows, [vec![serde_json::json!("0xdeadbeef")]]);
+}
+
+#[tokio::test]
+#[serial(db)]
+async fn test_query_fixed_bytes_filter_scopes() {
+    let db = TestDb::empty().await;
+    let signature = "FilterRegression(bytes4 indexed tag, bytes4 value)";
+    let selector = EventSignature::parse(signature).unwrap().topic0.to_vec();
+    let opts = default_options();
+    let pad = |head: [u8; 4]| [head.as_slice(), &[0u8; 28]].concat();
+    let timestamp = chrono::Utc::now();
+    let logs = [[0xca, 0xfe, 0xba, 0xbe], [0xde, 0xad, 0xbe, 0xef]]
+        .into_iter()
+        .enumerate()
+        .map(|(i, tag)| tidx::types::LogRow {
+            block_num: 9_342_001,
+            block_timestamp: timestamp,
+            log_idx: i as i32,
+            tx_hash: vec![0x34; 32],
+            address: vec![0x34; 20],
+            selector: Some(selector.clone()),
+            topic0: Some(selector.clone()),
+            topic1: Some(pad(tag)),
+            data: pad(tag),
+            ..Default::default()
+        })
+        .collect::<Vec<_>>();
+    let conn = db.pool.get().await.unwrap();
+    conn.execute("DELETE FROM logs WHERE selector = $1", &[&selector])
+        .await
+        .unwrap();
+    let result = async {
+        tidx::sync::writer::write_logs(&db.pool, &logs).await?;
+        let mut results = Vec::new();
+        for sql in [
+            "SELECT tag FROM FilterRegression WHERE tag = '0xcafebabe'",
+            "SELECT tag FROM FilterRegression WHERE '0xcafebabe' = tag",
+            r#"SELECT tag FROM FilterRegression WHERE "tag" = '0xcafebabe' OR "tag" = '0xdeadbeef' ORDER BY tag"#,
+            r#"SELECT * FROM (SELECT "tag" FROM FilterRegression) q WHERE "tag" = '\xcafebabe'"#,
+            "WITH q AS (SELECT tag AS renamed FROM FilterRegression) SELECT renamed FROM q WHERE renamed = '\\xcafebabe'",
+            r#"WITH q AS (SELECT '0xcafebabe' AS tag) SELECT q.tag FROM q CROSS JOIN FilterRegression WHERE q."tag" = '0xcafebabe'"#,
+            r#"SELECT "value" FROM FilterRegression WHERE "value" = '\xcafebabe'"#,
+            r#"SELECT count(*) FROM (SELECT DISTINCT tx_hash, log_idx FROM FilterRegression WHERE "tag" = '0xcafebabe' LIMIT 1000) capped"#,
+        ] {
+            results.push(execute_query_postgres(&db.pool, sql, &[signature], &opts).await?);
+        }
+        Ok::<_, anyhow::Error>(results)
+    }.await;
+    conn.execute("DELETE FROM logs WHERE selector = $1", &[&selector])
+        .await
+        .unwrap();
+    let results = result.expect("fixed bytes filter regression query failed");
+    for (i, result) in results.iter().enumerate() {
+        let expected = match i {
+            2 => vec![
+                vec![serde_json::json!("0xcafebabe")],
+                vec![serde_json::json!("0xdeadbeef")],
+            ],
+            5 => vec![vec![serde_json::json!("0xcafebabe")]; 2],
+            7 => vec![vec![serde_json::json!(1)]],
+            _ => vec![vec![serde_json::json!("0xcafebabe")]],
+        };
+        assert_eq!(result.rows, expected, "query {i}");
+    }
 }
 
 #[tokio::test]

@@ -1,9 +1,9 @@
-use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
+use criterion::{BatchSize, BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use tokio::runtime::Runtime;
 
-use tidx::db::{create_pool, run_migrations};
-use tidx::sync::writer::{write_blocks, write_logs, write_txs};
-use tidx::types::{BlockRow, LogRow, TxRow};
+use tidx::db::{create_pool, partitions, run_migrations};
+use tidx::sync::writer::{write_batch, write_blocks, write_logs, write_txs};
+use tidx::types::{BlockRow, LogRow, ReceiptRow, TxRow};
 
 fn generate_blocks(count: usize, offset: usize) -> Vec<BlockRow> {
     (0..count)
@@ -282,10 +282,149 @@ fn bench_copy_throughput(c: &mut Criterion) {
     group.finish();
 }
 
+/// Rows of `blocks` consecutive blocks with 8 txs, 8 receipts and 24 logs each,
+/// with distinct hashes and addresses like real blocks.
+fn generate_batch(
+    first: i64,
+    blocks: usize,
+) -> (Vec<BlockRow>, Vec<TxRow>, Vec<LogRow>, Vec<ReceiptRow>) {
+    fn bytes(seed: i64, tag: u8, len: usize) -> Vec<u8> {
+        let mut out = vec![tag; len];
+        out[..8].copy_from_slice(&seed.to_be_bytes());
+        out
+    }
+
+    let now = chrono::Utc::now();
+    let (mut block_rows, mut txs, mut logs, mut receipts) = (vec![], vec![], vec![], vec![]);
+    for num in first..first + blocks as i64 {
+        block_rows.extend(generate_blocks(1, num as usize));
+        for idx in 0..8 {
+            let id = num * 8 + i64::from(idx);
+            let from = bytes(id % 5000, 1, 20);
+            txs.push(TxRow {
+                block_num: num,
+                block_timestamp: now,
+                idx,
+                hash: bytes(id, 2, 32),
+                tx_type: 118,
+                from: from.clone(),
+                to: Some(bytes(id % 300, 3, 20)),
+                value: "0".to_string(),
+                input: vec![0u8; 68],
+                gas_limit: 100_000,
+                max_fee_per_gas: "1000".to_string(),
+                max_priority_fee_per_gas: "0".to_string(),
+                gas_used: Some(50_000),
+                nonce_key: vec![0u8; 32],
+                nonce: id,
+                fee_token: Some(vec![4u8; 20]),
+                fee_payer: Some(from.clone()),
+                calls: None,
+                call_count: 1,
+                valid_before: None,
+                valid_after: None,
+                signature_type: Some(0),
+            });
+            receipts.push(ReceiptRow {
+                block_num: num,
+                block_timestamp: now,
+                tx_idx: idx,
+                tx_hash: bytes(id, 2, 32),
+                from: from.clone(),
+                to: Some(bytes(id % 300, 3, 20)),
+                contract_address: None,
+                gas_used: 50_000,
+                cumulative_gas_used: 50_000 * i64::from(idx + 1),
+                effective_gas_price: Some("1000".to_string()),
+                status: Some(1),
+                fee_payer: Some(from.clone()),
+                tx_type: Some(118),
+                fee_token: Some(vec![4u8; 20]),
+            });
+            for i in 0..3 {
+                logs.push(LogRow {
+                    block_num: num,
+                    block_timestamp: now,
+                    log_idx: idx * 3 + i,
+                    tx_idx: idx,
+                    tx_hash: bytes(id, 2, 32),
+                    address: bytes(i64::from(i), 5, 20),
+                    selector: Some(vec![0xdd; 32]),
+                    topic0: Some(vec![0xdd; 32]),
+                    topic1: Some(bytes(id % 5000, 6, 32)),
+                    topic2: Some(bytes(id % 300, 7, 32)),
+                    topic3: None,
+                    data: bytes(id, 8, 32),
+                    is_virtual_forward: false,
+                });
+            }
+        }
+    }
+    (block_rows, txs, logs, receipts)
+}
+
+/// `write_batch` as called by every sync path, on a database holding a year of
+/// weekly partitions like a long-running deployment.
+fn bench_write_batch(c: &mut Criterion) {
+    let rt = Runtime::new().unwrap();
+
+    let db_url = std::env::var("DATABASE_URL").expect("DATABASE_URL must be set");
+
+    let (pool, first_block) = rt.block_on(async {
+        let pool = create_pool(&db_url).await.expect("Failed to create pool");
+        run_migrations(&pool)
+            .await
+            .expect("Failed to run migrations");
+        let now = chrono::Utc::now();
+        partitions::ensure_partitions_covering(&pool, now - chrono::Duration::weeks(52), now)
+            .await
+            .expect("Failed to create partitions");
+        // Write new blocks on every run instead of replacing earlier runs' rows.
+        let first_block: i64 = pool
+            .get()
+            .await
+            .unwrap()
+            .query_one("SELECT GREATEST(MAX(num) + 1, 300000000) FROM blocks", &[])
+            .await
+            .unwrap()
+            .get(0);
+        (pool, first_block)
+    });
+
+    let mut group = c.benchmark_group("write_batch");
+    group.sample_size(50);
+
+    for blocks in [1, 10, 100] {
+        group.throughput(Throughput::Elements(blocks as u64));
+        group.bench_with_input(BenchmarkId::new("blocks", blocks), &blocks, |b, &blocks| {
+            let mut next_block = first_block + blocks as i64 * 1_000_000;
+            b.to_async(&rt).iter_batched(
+                || {
+                    let batch = generate_batch(next_block, blocks);
+                    next_block += blocks as i64;
+                    batch
+                },
+                |(block_rows, txs, logs, receipts)| {
+                    let pool = pool.clone();
+                    async move {
+                        write_batch(&pool, &block_rows, &txs, &logs, &receipts)
+                            .await
+                            .unwrap();
+                    }
+                },
+                BatchSize::SmallInput,
+            );
+        });
+    }
+
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_batch_writes,
     bench_mixed_workload,
-    bench_copy_throughput
+    bench_copy_throughput,
+    bench_write_batch
 );
 criterion_main!(benches);
