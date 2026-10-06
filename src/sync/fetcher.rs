@@ -1,10 +1,11 @@
 use anyhow::{Result, anyhow};
 use futures::future::BoxFuture;
 use serde::{Deserialize, Serialize};
+use std::future::Future;
 use std::ops::RangeInclusive;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Instant;
+use std::sync::{Arc, Mutex, PoisonError};
+use std::time::{Duration, Instant};
 use tokio::sync::Semaphore;
 
 use crate::metrics;
@@ -21,6 +22,66 @@ pub struct RpcClient {
     log_chunk_size: Arc<AtomicU64>,
     /// Semaphore to limit concurrent RPC requests
     concurrency_limiter: Arc<Semaphore>,
+    /// Largest full-block batch the RPC is expected to accept
+    block_batch_limit: Arc<BatchLimit>,
+    /// Largest receipts batch the RPC is expected to accept
+    receipt_batch_limit: Arc<BatchLimit>,
+}
+
+/// How long a learned batch limit applies after it was last lowered.
+///
+/// Response size limits depend on block contents, so a limit learned from a
+/// run of large blocks must not shrink batches of small blocks forever.
+const BATCH_LIMIT_TTL: Duration = Duration::from_secs(60);
+
+/// Batch size learned from "too large" RPC errors.
+#[derive(Default)]
+struct BatchLimit(Mutex<Option<(u64, Instant)>>);
+
+impl BatchLimit {
+    /// Returns the current limit, or `None` if no limit was learned recently.
+    fn get(&self) -> Option<u64> {
+        let mut limit = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        match *limit {
+            Some((size, lowered_at)) if lowered_at.elapsed() < BATCH_LIMIT_TTL => Some(size),
+            _ => {
+                *limit = None;
+                None
+            }
+        }
+    }
+
+    /// Restarts the TTL only when the learned limit actually decreases.
+    fn lower(&self, size: u64) {
+        let mut limit = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        let size = match *limit {
+            Some((current, lowered_at)) if lowered_at.elapsed() < BATCH_LIMIT_TTL => {
+                if size >= current {
+                    return;
+                }
+                size
+            }
+            _ => size,
+        };
+        *limit = Some((size.max(1), Instant::now()));
+    }
+}
+
+/// Splits `range` into consecutive ranges of at most `size` blocks.
+fn split_range(range: RangeInclusive<u64>, size: Option<u64>) -> Vec<RangeInclusive<u64>> {
+    let (mut from, to) = range.into_inner();
+    let size = size.unwrap_or(u64::MAX).max(1);
+
+    let mut ranges = Vec::new();
+    while from <= to {
+        let end = from.saturating_add(size - 1).min(to);
+        ranges.push(from..=end);
+        if end == to {
+            break;
+        }
+        from = end + 1;
+    }
+    ranges
 }
 
 #[derive(Serialize)]
@@ -81,6 +142,8 @@ impl RpcClient {
             url: url.to_string(),
             log_chunk_size: Arc::new(AtomicU64::new(1000)),
             concurrency_limiter: Arc::new(Semaphore::new(max_concurrent)),
+            block_batch_limit: Arc::default(),
+            receipt_batch_limit: Arc::default(),
         }
     }
 
@@ -199,33 +262,12 @@ impl RpcClient {
         &self,
         range: RangeInclusive<u64>,
     ) -> BoxFuture<'_, Result<Vec<Block>>> {
-        Box::pin(async move {
-            let from = *range.start();
-            let to = *range.end();
-
-            match self.get_blocks_batch(range).await {
-                Ok(blocks) => Ok(blocks),
-                Err(e) if Self::is_batch_too_large(&e) => {
-                    if from == to {
-                        anyhow::bail!("Single full block {from} exceeds RPC response size limit");
-                    }
-
-                    let mid = from + (to - from) / 2;
-                    tracing::debug!(
-                        from,
-                        to,
-                        mid,
-                        "RPC full-block batch too large, splitting range"
-                    );
-
-                    let mut left = self.get_blocks_batch_adaptive(from..=mid).await?;
-                    let right = self.get_blocks_batch_adaptive((mid + 1)..=to).await?;
-                    left.extend(right);
-                    Ok(left)
-                }
-                Err(e) => Err(e),
-            }
-        })
+        Box::pin(Self::fetch_adaptive(
+            range,
+            &self.block_batch_limit,
+            |range| self.get_blocks_batch(range),
+            |block| anyhow!("Single full block {block} exceeds RPC response size limit"),
+        ))
     }
 
     /// Fetch receipts for a block (includes logs)
@@ -343,29 +385,74 @@ impl RpcClient {
         &self,
         range: RangeInclusive<u64>,
     ) -> BoxFuture<'_, Result<Vec<Vec<Receipt>>>> {
-        Box::pin(async move {
-            let from = *range.start();
-            let to = *range.end();
+        Box::pin(Self::fetch_adaptive(
+            range,
+            &self.receipt_batch_limit,
+            |range| self.get_receipts_batch(range),
+            |block| anyhow!("Single block {block} receipts exceed RPC response size limit"),
+        ))
+    }
 
-            match self.get_receipts_batch(range).await {
-                Ok(receipts) => Ok(receipts),
+    /// Fetch `range` in batches no larger than the learned `limit`, concurrently.
+    ///
+    /// A batch the RPC rejects as too large is split in half and both halves
+    /// are fetched concurrently. The size of the first half becomes the new
+    /// limit, so later ranges are requested in batches that fit right away
+    /// instead of being split again from the full size.
+    async fn fetch_adaptive<'a, T, F, Fut>(
+        range: RangeInclusive<u64>,
+        limit: &'a BatchLimit,
+        fetch: F,
+        single_block_error: fn(u64) -> anyhow::Error,
+    ) -> Result<Vec<T>>
+    where
+        T: Send + 'a,
+        F: Fn(RangeInclusive<u64>) -> Fut + Sync,
+        Fut: Future<Output = Result<Vec<T>>> + Send + 'a,
+    {
+        let batches = split_range(range, limit.get());
+        let results = futures::future::try_join_all(
+            batches
+                .into_iter()
+                .map(|batch| Self::fetch_splitting(batch, limit, &fetch, single_block_error)),
+        )
+        .await?;
+        Ok(results.into_iter().flatten().collect())
+    }
+
+    fn fetch_splitting<'a, T, F, Fut>(
+        range: RangeInclusive<u64>,
+        limit: &'a BatchLimit,
+        fetch: &'a F,
+        single_block_error: fn(u64) -> anyhow::Error,
+    ) -> BoxFuture<'a, Result<Vec<T>>>
+    where
+        T: Send + 'a,
+        F: Fn(RangeInclusive<u64>) -> Fut + Sync,
+        Fut: Future<Output = Result<Vec<T>>> + Send + 'a,
+    {
+        Box::pin(async move {
+            let (from, to) = (*range.start(), *range.end());
+
+            match fetch(range).await {
+                Ok(items) => Ok(items),
                 Err(e) if Self::is_batch_too_large(&e) => {
                     if from == to {
-                        anyhow::bail!(
-                            "Single block {from} receipts exceed RPC response size limit"
-                        );
+                        return Err(single_block_error(from));
                     }
 
                     let mid = from + (to - from) / 2;
-                    tracing::debug!(
-                        from,
-                        to,
-                        mid,
-                        "RPC receipts batch too large, splitting range"
-                    );
+                    // A two-block rejection can be a single outlier. Split it
+                    // without forcing every later request down to one block.
+                    if to - from > 1 {
+                        limit.lower(mid - from + 1);
+                    }
+                    tracing::debug!(from, to, mid, "RPC batch too large, splitting range");
 
-                    let mut left = self.get_receipts_batch_adaptive(from..=mid).await?;
-                    let right = self.get_receipts_batch_adaptive((mid + 1)..=to).await?;
+                    let (mut left, right) = tokio::try_join!(
+                        Self::fetch_splitting(from..=mid, limit, fetch, single_block_error),
+                        Self::fetch_splitting(mid + 1..=to, limit, fetch, single_block_error),
+                    )?;
                     left.extend(right);
                     Ok(left)
                 }
@@ -634,8 +721,10 @@ mod tests {
         );
         assert!(receipts.iter().all(Vec::is_empty));
 
-        let sizes = request_sizes.lock().await.clone();
-        assert_eq!(sizes, vec![5, 3, 2, 1, 2]);
+        // Halves are fetched concurrently, so only the set of requests is fixed.
+        let mut sizes = request_sizes.lock().await.clone();
+        sizes.sort_unstable();
+        assert_eq!(sizes, vec![1, 2, 2, 3, 5]);
 
         server.abort();
     }
@@ -681,8 +770,84 @@ mod tests {
             vec![1, 2, 3, 4, 5]
         );
 
-        let sizes = request_sizes.lock().await.clone();
-        assert_eq!(sizes, vec![5, 3, 2, 1, 2]);
+        let mut sizes = request_sizes.lock().await.clone();
+        sizes.sort_unstable();
+        assert_eq!(sizes, vec![1, 2, 2, 3, 5]);
+
+        // The next range is requested in batches the RPC accepted, without
+        // being rejected and split again.
+        request_sizes.lock().await.clear();
+        let blocks = client
+            .get_blocks_batch_adaptive(6..=10)
+            .await
+            .expect("adaptive full-block fetch should succeed");
+        assert_eq!(
+            blocks
+                .iter()
+                .map(|block| alloy::consensus::BlockHeader::number(&block.header))
+                .collect::<Vec<_>>(),
+            vec![6, 7, 8, 9, 10]
+        );
+        let mut sizes = request_sizes.lock().await.clone();
+        sizes.sort_unstable();
+        assert_eq!(sizes, vec![1, 2, 2]);
+
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn test_get_receipts_batch_adaptive_fetches_batches_concurrently() {
+        let in_flight = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let max_in_flight = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (in_flight_handler, max_in_flight_handler) = (in_flight.clone(), max_in_flight.clone());
+
+        let app = Router::new().route(
+            "/",
+            post(move |Json(body): Json<Value>| {
+                let in_flight = in_flight_handler.clone();
+                let max_in_flight = max_in_flight_handler.clone();
+                async move {
+                    let requests = body.as_array().expect("expected batch request").clone();
+                    if requests.len() > 2 {
+                        return Json(json!({
+                            "jsonrpc": "2.0",
+                            "id": 0,
+                            "error": { "code": -32000, "message": "response size exceeded" }
+                        }));
+                    }
+                    let current = in_flight.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+                    max_in_flight.fetch_max(current, std::sync::atomic::Ordering::SeqCst);
+                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                    in_flight.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+                    Json(Value::Array(
+                        requests
+                            .iter()
+                            .map(|req| json!({ "jsonrpc": "2.0", "id": req["id"], "result": [] }))
+                            .collect(),
+                    ))
+                }
+            }),
+        );
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("Failed to bind test RPC server");
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("RPC server failed");
+        });
+
+        let client = RpcClient::new(&format!("http://127.0.0.1:{}", addr.port()));
+        let receipts = client
+            .get_receipts_batch_adaptive(1..=16)
+            .await
+            .expect("adaptive receipt fetch should succeed");
+
+        assert_eq!(receipts.len(), 16);
+        assert!(
+            max_in_flight.load(std::sync::atomic::Ordering::SeqCst) > 1,
+            "batches of one range should be fetched concurrently"
+        );
 
         server.abort();
     }
@@ -715,6 +880,43 @@ mod tests {
 
     fn rpc_error(id: &Value, message: &str) -> Value {
         json!({ "jsonrpc": "2.0", "id": id, "error": { "code": -32000, "message": message } })
+    }
+
+    #[tokio::test]
+    async fn test_two_block_outlier_does_not_shrink_later_batches() {
+        let sizes = Arc::new(Mutex::new(Vec::new()));
+        let recorded = sizes.clone();
+        let (client, server) = serve(move |body| {
+            let requests = body.as_array().unwrap();
+            recorded.try_lock().unwrap().push(requests.len());
+            if requests.len() > 1 && requests.iter().any(|req| req["params"][0] == "0x1") {
+                rpc_error(&json!(0), "response size exceeded")
+            } else {
+                requests
+                    .iter()
+                    .map(|req| rpc_result(&req["id"], json!([])))
+                    .collect()
+            }
+        })
+        .await;
+        client.get_receipts_batch_adaptive(1..=2).await.unwrap();
+        client.get_receipts_batch_adaptive(3..=6).await.unwrap();
+        let sizes = sizes.lock().await;
+        assert_eq!(sizes.len(), 4);
+        assert_eq!(sizes[0], 2);
+        assert_eq!(sizes[3], 4);
+        server.abort();
+    }
+
+    #[test]
+    fn test_equal_limit_does_not_extend_expiry() {
+        let limit = BatchLimit::default();
+        let learned_at = Instant::now().checked_sub(Duration::from_secs(30)).unwrap();
+        *limit.0.lock().unwrap() = Some((4, learned_at));
+        limit.lower(4);
+        assert_eq!(limit.0.lock().unwrap().unwrap().1, learned_at);
+        limit.lower(8);
+        assert_eq!(limit.0.lock().unwrap().unwrap().1, learned_at);
     }
 
     #[tokio::test]
@@ -769,7 +971,9 @@ mod tests {
             .await
             .expect("adaptive receipt fetch should succeed");
         assert_eq!(receipts.len(), 5);
-        assert_eq!(*request_sizes.lock().unwrap(), vec![5, 3, 2, 1, 2]);
+        let mut sizes = request_sizes.lock().unwrap().clone();
+        sizes.sort_unstable();
+        assert_eq!(sizes, vec![1, 2, 2, 3, 5]);
 
         server.abort();
     }

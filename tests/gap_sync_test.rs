@@ -218,22 +218,9 @@ async fn test_detect_all_gaps_only_genesis() {
         "No gaps when only genesis exists and tip is 0"
     );
 
-    // With tip = 10 and only block 0, detect_all_gaps uses detect_gaps between existing blocks
-    // Since there's only one block, detect_gaps returns empty, and there's no genesis gap
-    // (min block is 0), so no gaps are reported. The gap 1-10 is an "unfilled region" but
-    // detect_all_gaps only reports gaps between MIN(blocks) and tip. Since we have block 0,
-    // there's no gap from genesis. The gap from 1-10 would be detected as a gap between
-    // existing blocks if we had block 11+. This is correct behavior - gap detection finds
-    // discontinuities, not "how far we've synced."
-    let gaps = detect_all_gaps(&db.pool, 1, 10)
-        .await
-        .expect("Failed to detect gaps");
-    // No gaps detected because there are no discontinuities from block 0 onward that are
-    // bounded by existing blocks
-    assert!(
-        gaps.is_empty(),
-        "No gaps when only block 0 exists (no upper bound block)"
-    );
+    // The unfilled tail is a gap even without an upper stored block.
+    let gaps = detect_all_gaps(&db.pool, 1, 10).await.unwrap();
+    assert_eq!(gaps, vec![(1, 10)]);
 }
 
 #[tokio::test]
@@ -266,15 +253,7 @@ async fn test_detect_all_gaps_filters_beyond_tip() {
         .await
         .expect("Failed to detect gaps");
 
-    // Gap 7-19 extends beyond tip, but we filter to gaps where end <= tip
-    // Since the gap 7-19 has end=19 > tip=10, it should be filtered out
-    // Only the gap from block 1 (1-4) should remain
-    assert_eq!(gaps.len(), 1, "Should only show gaps within tip range");
-    assert_eq!(
-        gaps[0],
-        (1, 4),
-        "Only gap from block 1 should be reported (block 0 is genesis)"
-    );
+    assert_eq!(gaps, vec![(7, 10), (1, 4)]);
 }
 
 #[tokio::test]
