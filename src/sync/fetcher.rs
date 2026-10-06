@@ -51,12 +51,15 @@ impl BatchLimit {
         }
     }
 
-    /// Lowers the limit to `size` and restarts its TTL.
+    /// Restarts the TTL only when the learned limit actually decreases.
     fn lower(&self, size: u64) {
         let mut limit = self.0.lock().unwrap_or_else(PoisonError::into_inner);
         let size = match *limit {
             Some((current, lowered_at)) if lowered_at.elapsed() < BATCH_LIMIT_TTL => {
-                current.min(size)
+                if size >= current {
+                    return;
+                }
+                size
             }
             _ => size,
         };
@@ -439,7 +442,11 @@ impl RpcClient {
                     }
 
                     let mid = from + (to - from) / 2;
-                    limit.lower(mid - from + 1);
+                    // A two-block rejection can be a single outlier. Split it
+                    // without forcing every later request down to one block.
+                    if to - from > 1 {
+                        limit.lower(mid - from + 1);
+                    }
                     tracing::debug!(from, to, mid, "RPC batch too large, splitting range");
 
                     let (mut left, right) = tokio::try_join!(
@@ -873,6 +880,43 @@ mod tests {
 
     fn rpc_error(id: &Value, message: &str) -> Value {
         json!({ "jsonrpc": "2.0", "id": id, "error": { "code": -32000, "message": message } })
+    }
+
+    #[tokio::test]
+    async fn test_two_block_outlier_does_not_shrink_later_batches() {
+        let sizes = Arc::new(Mutex::new(Vec::new()));
+        let recorded = sizes.clone();
+        let (client, server) = serve(move |body| {
+            let requests = body.as_array().unwrap();
+            recorded.try_lock().unwrap().push(requests.len());
+            if requests.len() > 1 && requests.iter().any(|req| req["params"][0] == "0x1") {
+                rpc_error(&json!(0), "response size exceeded")
+            } else {
+                requests
+                    .iter()
+                    .map(|req| rpc_result(&req["id"], json!([])))
+                    .collect()
+            }
+        })
+        .await;
+        client.get_receipts_batch_adaptive(1..=2).await.unwrap();
+        client.get_receipts_batch_adaptive(3..=6).await.unwrap();
+        let sizes = sizes.lock().await;
+        assert_eq!(sizes.len(), 4);
+        assert_eq!(sizes[0], 2);
+        assert_eq!(sizes[3], 4);
+        server.abort();
+    }
+
+    #[test]
+    fn test_equal_limit_does_not_extend_expiry() {
+        let limit = BatchLimit::default();
+        let learned_at = Instant::now() - Duration::from_secs(30);
+        *limit.0.lock().unwrap() = Some((4, learned_at));
+        limit.lower(4);
+        assert_eq!(limit.0.lock().unwrap().unwrap().1, learned_at);
+        limit.lower(8);
+        assert_eq!(limit.0.lock().unwrap().unwrap().1, learned_at);
     }
 
     #[tokio::test]
