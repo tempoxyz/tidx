@@ -160,7 +160,11 @@ impl ClickHouseSink {
         }
 
         let url = url.trim_end_matches('/');
-        let mut base_client = clickhouse::Client::default().with_url(url);
+        // ClickHouse 26.9 frames `compress=1` responses with ZSTD by default,
+        // but the clickhouse crate only decodes LZ4 native frames.
+        let mut base_client = clickhouse::Client::default()
+            .with_url(url)
+            .with_option("network_compression_method", "lz4");
         if let Some(user) = user {
             base_client = base_client.with_user(user);
         }

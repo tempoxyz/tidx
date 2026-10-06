@@ -8,8 +8,10 @@ services:
       POSTGRES_USER: tidx
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-tidx}
       POSTGRES_DB: tidx
+    # Loopback only: the default password is public and the account is a
+    # superuser. tidx connects over the compose network.
     ports:
-      - "5432:5432"
+      - "127.0.0.1:5432:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
     command:
@@ -37,9 +39,10 @@ services:
 
   clickhouse:
     image: clickhouse/clickhouse-server:latest
+    # Loopback only: the default user has no password.
     ports:
-      - "8123:8123"   # HTTP interface
-      - "9000:9000"   # Native interface
+      - "127.0.0.1:8123:8123"   # HTTP interface
+      - "127.0.0.1:9000:9000"   # Native interface
     volumes:
       - clickhouse_data:/var/lib/clickhouse
       - ./clickhouse-config.xml:/etc/clickhouse-server/config.d/custom.xml:ro
@@ -80,8 +83,9 @@ services:
   # Optional: Prometheus for metrics collection
   prometheus:
     image: prom/prometheus:latest
+    # Loopback only: the lifecycle API enabled below is unauthenticated.
     ports:
-      - "9091:9090"
+      - "127.0.0.1:9091:9090"
     volumes:
       - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
       - ./alerts.yml:/etc/prometheus/alerts.yml:ro
@@ -98,8 +102,9 @@ services:
   # Optional: Grafana for dashboards
   grafana:
     image: grafana/grafana:latest
+    # Loopback only. Set GRAFANA_PASSWORD before exposing it any further.
     ports:
-      - "3000:3000"
+      - "127.0.0.1:3000:3000"
     volumes:
       - grafana_data:/var/lib/grafana
     environment:

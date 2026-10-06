@@ -2,9 +2,10 @@ use anyhow::{Result, anyhow};
 use chrono::{DateTime, Utc};
 use futures::TryStreamExt;
 use serde::Serialize;
+use std::task::Poll;
 use std::time::Instant;
 use tokio_postgres::error::SqlState;
-use tokio_postgres::types::ToSql;
+use tokio_postgres::types::{ToSql, Type};
 
 use crate::db::Pool;
 use crate::metrics;
@@ -225,21 +226,74 @@ pub async fn execute_query_postgres(
     run_pg_query(pool, &sql, options, &[], "postgres").await
 }
 
-/// ClickHouse settings for the tiered cold arm. 64-bit+ integers keep
-/// ClickHouse's default quoting (exact strings; unquoted UInt256 would parse
-/// lossily as f64) — [`normalize_cold_result`] then converts per column type.
-const TIERED_COLD_CH_SETTINGS: &[(&str, &str)] = &[
+/// ClickHouse settings for public queries (native `engine=clickhouse` and the
+/// tiered cold arm): ISO timestamps for [`normalize_datetime_columns`].
+/// 64-bit+ integers keep ClickHouse's default quoting (exact strings;
+/// unquoted UInt256 would parse lossily as f64) — [`normalize_cold_result`]
+/// then converts per column type for the tiered cold arm.
+const CH_QUERY_SETTINGS: &[(&str, &str)] = &[
     ("date_time_output_format", "iso"),
     // No `final = 1`: reads match the native ClickHouse engine's semantics
     // (unmerged ReplacingMergeTree duplicates are possible but rare, and the
     // split cold arm only reads long-merged history below the prune boundary).
 ];
 
+/// Execute a public query directly on ClickHouse.
+pub async fn execute_query_clickhouse(
+    clickhouse: &crate::clickhouse::ClickHouseEngine,
+    sql: &str,
+    signatures: &[&str],
+    options: &QueryOptions,
+) -> Result<QueryResult> {
+    let mut result = clickhouse
+        .query_user_with_settings(
+            sql,
+            signatures,
+            options.timeout_ms,
+            options.limit,
+            CH_QUERY_SETTINGS,
+        )
+        .await?;
+    normalize_datetime_columns(&mut result);
+    Ok(result.into())
+}
+
+/// Strip `LowCardinality(...)` and `Nullable(...)` from a ClickHouse column
+/// type, e.g. `LowCardinality(Nullable(DateTime('UTC')))` → `DateTime('UTC')`.
+fn ch_base_type(mut ty: &str) -> &str {
+    while let Some(inner) = ty
+        .strip_prefix("Nullable(")
+        .or_else(|| ty.strip_prefix("LowCardinality("))
+        .and_then(|t| t.strip_suffix(')'))
+    {
+        ty = inner;
+    }
+    ty
+}
+
+/// Rewrite `DateTime*` columns (fetched with `date_time_output_format=iso`)
+/// from ClickHouse ISO strings to chrono RFC 3339, the formatting
+/// [`try_format_column_json`] gives PostgreSQL `timestamptz`.
+fn normalize_datetime_columns(result: &mut crate::clickhouse::QueryResult) {
+    for (i, ty) in result.column_types.iter().enumerate() {
+        if !ch_base_type(ty).starts_with("DateTime") {
+            continue;
+        }
+        for row in &mut result.rows {
+            if let Some(serde_json::Value::String(s)) = row.get_mut(i)
+                && let Ok(v) = DateTime::parse_from_rfc3339(s)
+            {
+                *s = v.with_timezone(&Utc).to_rfc3339();
+            }
+        }
+    }
+}
+
 /// Rewrite ClickHouse JSON values to the hot (PostgreSQL) arm's
 /// representations, per column type:
 ///
 /// - `Int64`/`UInt64`: quoted string → JSON number (PG int8 is a number);
-/// - `DateTime*`: ISO string → chrono RFC 3339 (PG timestamptz formatting);
+/// - `DateTime*`: see [`normalize_datetime_columns`];
 /// - `(U)Int128`/`(U)Int256`: PG NUMERIC parity — decimal string when the
 ///   value fits [`rust_decimal::Decimal`], else NULL (PG's formatter nulls
 ///   values past Decimal's 96-bit mantissa, see [`try_format_column_json`]);
@@ -258,22 +312,17 @@ fn normalize_cold_result(
             }
         }
     }
+    normalize_datetime_columns(result);
     for (i, ty) in result.column_types.iter().enumerate() {
-        let base = ty
-            .strip_prefix("Nullable(")
-            .and_then(|t| t.strip_suffix(')'))
-            .unwrap_or(ty);
         enum Kind {
             Int64,
             UInt64,
             BigNum,
-            DateTime,
         }
-        let kind = match base {
+        let kind = match ch_base_type(ty) {
             "Int64" => Kind::Int64,
             "UInt64" => Kind::UInt64,
             "Int128" | "UInt128" | "Int256" | "UInt256" => Kind::BigNum,
-            t if t.starts_with("DateTime") => Kind::DateTime,
             _ => continue,
         };
         for row in &mut result.rows {
@@ -297,11 +346,6 @@ fn normalize_cold_result(
                         Ok(v) => serde_json::Value::String(v.to_string()),
                         Err(_) => serde_json::Value::Null,
                     };
-                }
-                Kind::DateTime => {
-                    if let Ok(v) = DateTime::parse_from_rfc3339(s) {
-                        *cell = serde_json::Value::String(v.with_timezone(&Utc).to_rfc3339());
-                    }
                 }
             }
         }
@@ -389,7 +433,7 @@ pub async fn execute_query_tiered(
                         signatures,
                         options.timeout_ms,
                         options.limit,
-                        TIERED_COLD_CH_SETTINGS,
+                        CH_QUERY_SETTINGS,
                     )
                     .await,
                 ),
@@ -509,7 +553,7 @@ async fn try_execute_tiered_split(
                 signatures,
                 timeout_ms,
                 eff_limit.max(1),
-                TIERED_COLD_CH_SETTINGS,
+                CH_QUERY_SETTINGS,
             ),
             execute_query_postgres(pool, &hot_sql, signatures, &hot_options),
         );
@@ -571,7 +615,7 @@ async fn try_execute_tiered_split(
                 signatures,
                 budget(&start),
                 remaining,
-                TIERED_COLD_CH_SETTINGS,
+                CH_QUERY_SETTINGS,
             )
             .await?;
         normalize_cold_result(&mut cold_raw, &plan.selector_null_cols);
@@ -625,7 +669,7 @@ async fn degrade_split_to_clickhouse(
             signatures,
             timeout_ms,
             options.limit,
-            TIERED_COLD_CH_SETTINGS,
+            CH_QUERY_SETTINGS,
         )
         .await
         .map_err(|ch_err| {
@@ -740,41 +784,51 @@ async fn run_pg_query(
     })?;
     let tx = conn.transaction().await.map_err(classify_postgres_error)?;
 
-    tx.execute(
-        &format!("SET LOCAL statement_timeout = {}", options.timeout_ms),
-        &[],
-    )
-    .await
-    .map_err(classify_postgres_error)?;
-
+    let mut setup = format!("SET LOCAL statement_timeout = {}", options.timeout_ms);
     for stmt in session_setup {
-        tx.execute(*stmt, &[])
-            .await
-            .map_err(classify_postgres_error)?;
+        setup.push_str(";\n");
+        setup.push_str(stmt);
     }
 
     let start = Instant::now();
     let timeout = std::time::Duration::from_millis(options.timeout_ms + 100);
     let limit = options.limit as usize;
     let result = tokio::time::timeout(timeout, async {
-        let params = std::iter::empty::<&(dyn ToSql + Sync)>();
-        let stream = tx.query_raw(sql, params).await?;
+        // The settings and the prepare go out together instead of one round
+        // trip each. A request is sent on its first poll and PostgreSQL runs
+        // requests in arrival order, so the settings apply before the query
+        // is parsed. Resolve result types before executing: query_typed_raw
+        // can deadlock discovering a composite type behind unread data rows.
+        let setup = tx.batch_execute(&setup);
+        let prepare = tx.prepare(sql);
+        futures::pin_mut!(setup, prepare);
+        let setup_sent = futures::poll!(setup.as_mut());
+        let prepare_sent = futures::poll!(prepare.as_mut());
+        match setup_sent {
+            Poll::Ready(result) => result?,
+            Poll::Pending => setup.await?,
+        }
+        let statement = match prepare_sent {
+            Poll::Ready(result) => result?,
+            Poll::Pending => prepare.await?,
+        };
+        let columns: Vec<String> = statement
+            .columns()
+            .iter()
+            .map(|column| column.name().to_string())
+            .collect();
+        let stream = tx
+            .query_raw(&statement, std::iter::empty::<&(dyn ToSql + Sync)>())
+            .await?;
         futures::pin_mut!(stream);
-        let mut columns: Option<Vec<String>> = None;
         let mut rows = Vec::new();
         let mut result_bytes = 0usize;
 
         while let Some(row) = stream.try_next().await? {
-            if columns.is_none() {
-                columns = Some(row.columns().iter().map(|c| c.name().to_string()).collect());
-            }
             if rows.len() >= limit {
                 return Err(anyhow!("Query returned more than {limit} rows"));
             }
-            let cols = columns
-                .as_ref()
-                .expect("columns initialized from first row");
-            let row_values = (0..cols.len())
+            let row_values = (0..columns.len())
                 .map(|i| try_format_column_json(&row, i))
                 .collect::<Result<Vec<_>>>()?;
             result_bytes = result_bytes.saturating_add(
@@ -792,11 +846,11 @@ async fn run_pg_query(
             rows.push(row_values);
         }
 
-        Ok::<_, anyhow::Error>((columns.unwrap_or_default(), rows))
+        Ok::<_, anyhow::Error>((columns, rows))
     })
     .await;
 
-    let (mut columns, result_rows) = match result {
+    let (columns, result_rows) = match result {
         Ok(Ok(result)) => {
             metrics::record_query_duration(start.elapsed());
             result
@@ -808,15 +862,6 @@ async fn run_pg_query(
     };
 
     tx.commit().await.map_err(classify_postgres_error)?;
-
-    if columns.is_empty() {
-        columns = conn
-            .prepare(sql)
-            .await
-            .ok()
-            .map(|s| s.columns().iter().map(|c| c.name().to_string()).collect())
-            .unwrap_or_default();
-    }
 
     let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
     let row_count = result_rows.len();
@@ -850,89 +895,101 @@ pub fn format_column_json(row: &tokio_postgres::Row, idx: usize) -> serde_json::
     try_format_column_json(row, idx).unwrap_or(serde_json::Value::Null)
 }
 
+/// Cells decode as `Option<T>` so NULLs don't allocate a `WasNull` error.
+/// Dispatching on the built-in [`Type`] rather than the type name is
+/// equivalent: none of these decoders accept a custom type that merely shares
+/// a built-in's name, so such columns were already NULL.
 fn try_format_column_json(row: &tokio_postgres::Row, idx: usize) -> Result<serde_json::Value> {
-    let col = &row.columns()[idx];
-
-    let value = match col.type_().name() {
-        "int2" => row
-            .try_get::<_, i16>(idx)
+    let value = match *row.columns()[idx].type_() {
+        Type::INT2 => row
+            .try_get::<_, Option<i16>>(idx)
             .ok()
+            .flatten()
             .map_or(serde_json::Value::Null, |v| {
                 serde_json::Value::Number(v.into())
             }),
-        "int4" => row
-            .try_get::<_, i32>(idx)
+        Type::INT4 => row
+            .try_get::<_, Option<i32>>(idx)
             .ok()
+            .flatten()
             .map_or(serde_json::Value::Null, |v| {
                 serde_json::Value::Number(v.into())
             }),
-        "int8" => row
-            .try_get::<_, i64>(idx)
+        Type::INT8 => row
+            .try_get::<_, Option<i64>>(idx)
             .ok()
+            .flatten()
             .map_or(serde_json::Value::Null, |v| {
                 serde_json::Value::Number(v.into())
             }),
-        "numeric" => {
+        Type::NUMERIC => {
             // rust_decimal::Decimal panics (not errors) for values exceeding its
             // 96-bit mantissa (~28 digits). Postgres NUMERIC is arbitrary precision
             // (e.g. abi_uint() on uint256 = 78 digits), so catch the panic.
             match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                row.try_get::<_, rust_decimal::Decimal>(idx)
+                row.try_get::<_, Option<rust_decimal::Decimal>>(idx)
             })) {
-                Ok(Ok(v)) => serde_json::Value::String(v.to_string()),
+                Ok(Ok(Some(v))) => serde_json::Value::String(v.to_string()),
                 _ => serde_json::Value::Null,
             }
         }
         // Widen via the shortest decimal so 1.1::float4 is 1.1, as PostgreSQL
         // prints it, rather than 1.100000023841858.
-        "float4" => row
-            .try_get::<_, f32>(idx)
+        Type::FLOAT4 => row
+            .try_get::<_, Option<f32>>(idx)
             .ok()
+            .flatten()
             .and_then(|v| v.to_string().parse::<f64>().ok())
             .and_then(serde_json::Number::from_f64)
             .map_or(serde_json::Value::Null, serde_json::Value::Number),
-        "float8" => row
-            .try_get::<_, f64>(idx)
+        Type::FLOAT8 => row
+            .try_get::<_, Option<f64>>(idx)
             .ok()
+            .flatten()
             .and_then(serde_json::Number::from_f64)
             .map_or(serde_json::Value::Null, serde_json::Value::Number),
-        "bytea" => match row.try_get::<_, &[u8]>(idx) {
-            Ok(v) if v.len() > MAX_CELL_BYTES => {
+        Type::BYTEA => match row.try_get::<_, Option<&[u8]>>(idx) {
+            Ok(Some(v)) if v.len() > MAX_CELL_BYTES => {
                 return Err(anyhow!(
                     "Query result cell exceeded {} bytes",
                     MAX_CELL_BYTES
                 ));
             }
-            Ok(v) => serde_json::Value::String(format!("0x{}", hex::encode(v))),
-            Err(_) => serde_json::Value::Null,
+            Ok(Some(v)) => serde_json::Value::String(alloy::hex::encode_prefixed(v)),
+            _ => serde_json::Value::Null,
         },
-        "text" | "varchar" | "bpchar" | "name" => match row.try_get::<_, &str>(idx) {
-            Ok(v) if v.len() > MAX_CELL_BYTES => {
-                return Err(anyhow!(
-                    "Query result cell exceeded {} bytes",
-                    MAX_CELL_BYTES
-                ));
+        Type::TEXT | Type::VARCHAR | Type::BPCHAR | Type::NAME => {
+            match row.try_get::<_, Option<&str>>(idx) {
+                Ok(Some(v)) if v.len() > MAX_CELL_BYTES => {
+                    return Err(anyhow!(
+                        "Query result cell exceeded {} bytes",
+                        MAX_CELL_BYTES
+                    ));
+                }
+                Ok(Some(v)) => serde_json::Value::String(v.to_string()),
+                _ => serde_json::Value::Null,
             }
-            Ok(v) => serde_json::Value::String(v.to_string()),
-            Err(_) => serde_json::Value::Null,
-        },
-        "timestamptz" => row
-            .try_get::<_, DateTime<Utc>>(idx)
+        }
+        Type::TIMESTAMPTZ => row
+            .try_get::<_, Option<DateTime<Utc>>>(idx)
             .ok()
+            .flatten()
             .map_or(serde_json::Value::Null, |v| {
                 serde_json::Value::String(v.to_rfc3339())
             }),
         // Zoneless; read as UTC so it formats like timestamptz and ClickHouse
         // DateTime columns (e.g. `block_timestamp AT TIME ZONE 'UTC'`).
-        "timestamp" => row
-            .try_get::<_, chrono::NaiveDateTime>(idx)
+        Type::TIMESTAMP => row
+            .try_get::<_, Option<chrono::NaiveDateTime>>(idx)
             .ok()
+            .flatten()
             .map_or(serde_json::Value::Null, |v| {
                 serde_json::Value::String(v.and_utc().to_rfc3339())
             }),
-        "bool" => row
-            .try_get::<_, bool>(idx)
+        Type::BOOL => row
+            .try_get::<_, Option<bool>>(idx)
             .ok()
+            .flatten()
             .map_or(serde_json::Value::Null, serde_json::Value::Bool),
         _ => serde_json::Value::Null,
     };
@@ -944,7 +1001,20 @@ fn estimated_json_value_bytes(value: &serde_json::Value) -> usize {
     match value {
         serde_json::Value::Null => 4,
         serde_json::Value::Bool(_) => 5,
-        serde_json::Value::Number(n) => n.to_string().len(),
+        serde_json::Value::Number(n) => {
+            use std::fmt::Write;
+
+            struct ByteCount(usize);
+            impl Write for ByteCount {
+                fn write_str(&mut self, s: &str) -> std::fmt::Result {
+                    self.0 += s.len();
+                    Ok(())
+                }
+            }
+            let mut count = ByteCount(0);
+            let _ = write!(count, "{n}");
+            count.0
+        }
         serde_json::Value::String(s) => s.len(),
         serde_json::Value::Array(values) => values.iter().map(estimated_json_value_bytes).sum(),
         serde_json::Value::Object(values) => values
@@ -1096,6 +1166,19 @@ mod tests {
         assert_eq!(r.rows[0][4], json!("1000000000000000000"));
         // Exceeds Decimal's 96-bit mantissa: NULL, matching PG's formatter.
         assert_eq!(r.rows[0][5], J::Null);
+    }
+
+    #[test]
+    fn normalize_datetime_unwraps_low_cardinality() {
+        let mut r = ch_result(
+            &[
+                "LowCardinality(DateTime('UTC'))",
+                "LowCardinality(Nullable(DateTime('UTC')))",
+            ],
+            vec![vec![json!("2026-09-11T22:38:08Z"), J::Null]],
+        );
+        normalize_datetime_columns(&mut r);
+        assert_eq!(r.rows[0], [json!("2026-09-11T22:38:08+00:00"), J::Null]);
     }
 
     #[test]
@@ -1355,6 +1438,20 @@ mod tests {
         });
 
         assert!(estimated_json_value_bytes(&value) >= 10);
+    }
+
+    #[test]
+    fn test_estimated_json_value_bytes_numbers_match_json_text() {
+        for n in [
+            json!(0),
+            json!(-42),
+            json!(u64::MAX),
+            json!(i64::MIN),
+            json!(1.5),
+            json!(1e-7),
+        ] {
+            assert_eq!(estimated_json_value_bytes(&n), n.to_string().len(), "{n}");
+        }
     }
 
     // ========================================================================
