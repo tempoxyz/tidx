@@ -29,7 +29,8 @@ use crate::broadcast::Broadcaster;
 use crate::clickhouse::ClickHouseEngine;
 use crate::config::HttpConfig;
 use crate::db::Pool;
-use crate::service::{QueryOptions, QueryResult, SyncStatus};
+use crate::service::{PostgresQuery, QueryOptions, QueryResult, SyncStatus};
+use tokio_postgres::types::Type;
 
 pub type SharedPools = Arc<RwLock<HashMap<u64, Pool>>>;
 pub type SharedClickHouseEngines = Arc<RwLock<HashMap<u64, Arc<ClickHouseEngine>>>>;
@@ -478,16 +479,8 @@ async fn handle_query_once(
                     ))
                 })?;
 
-            clickhouse
-                .query_user(&params.sql, &sigs, options.timeout_ms, options.limit)
+            crate::service::execute_query_clickhouse(&clickhouse, &params.sql, &sigs, &options)
                 .await
-                .map(|r| QueryResult {
-                    columns: r.columns,
-                    rows: r.rows,
-                    row_count: r.row_count,
-                    engine: r.engine,
-                    query_time_ms: r.query_time_ms,
-                })
                 .map_err(|e| ApiError::QueryError(e.to_string()))?
         }
         crate::query::QueryRoute::Tiered => {
@@ -572,6 +565,7 @@ async fn handle_query_live(
     let stream = async_stream::stream! {
         let mut last_block_num: u64 = 0;
         let sigs: Vec<&str> = signatures.iter().map(String::as_str).collect();
+        let mut block_query: Option<PostgresQuery> = None;
 
         // Execute initial query (live streaming uses Postgres for realtime data)
         match execute_live_query(&permits, &pool, &sql, &sigs, &options).await {
@@ -628,17 +622,32 @@ async fn handle_query_live(
                     // Filter by each block for per-block streaming
                     let catch_up_start = last_block_num + 1;
                     for block_num in catch_up_start..=end {
-                        let filtered_sql = match inject_block_filter(&sql, block_num) {
-                            Ok(s) => s,
-                            Err(e) => {
-                                yield Ok(SseEvent::default()
-                                    .event("error")
-                                    .json_data(serde_json::json!({ "ok": false, "error": e.to_string() }))
-                                    .unwrap());
-                                return;
+                        // The block number is a parameter, so the query is
+                        // rewritten and validated once for the stream.
+                        if block_query.is_none() {
+                            let filtered_sql = match inject_block_filter(&sql) {
+                                Ok(s) => s,
+                                Err(e) => {
+                                    yield Ok(SseEvent::default()
+                                        .event("error")
+                                        .json_data(serde_json::json!({ "ok": false, "error": e.to_string() }))
+                                        .unwrap());
+                                    return;
+                                }
+                            };
+                            match PostgresQuery::new(&filtered_sql, &sigs, &options) {
+                                Ok(query) => block_query = Some(query),
+                                Err(e) => {
+                                    yield Ok(SseEvent::default()
+                                        .event("error")
+                                        .json_data(serde_json::json!({ "ok": false, "error": e.to_string() }))
+                                        .unwrap());
+                                    continue;
+                                }
                             }
-                        };
-                        match execute_live_query(&permits, &pool, &filtered_sql, &sigs, &options).await {
+                        }
+                        let Some(query) = &block_query else { continue };
+                        match execute_live_block_query(&permits, &pool, query, block_num as i64, &options).await {
                             Ok(result) => {
                                 yield Ok(SseEvent::default()
                                     .event("result")
@@ -688,14 +697,28 @@ async fn execute_live_query(
     crate::service::execute_query_postgres(pool, sql, signatures, options).await
 }
 
+/// Runs a prepared block query under the same API query permit budget.
+async fn execute_live_block_query(
+    permits: &Semaphore,
+    pool: &Pool,
+    query: &PostgresQuery,
+    block_num: i64,
+    options: &QueryOptions,
+) -> AnyhowResult<QueryResult> {
+    let _permit = permits.acquire().await?;
+    query
+        .execute(pool, &[(&block_num, Type::INT8)], options)
+        .await
+}
+
 /// Inject a block number filter into SQL query for live streaming.
-/// Transforms queries to only return data for the specific block.
+/// Transforms queries to only return data for the block bound to `$1`.
 /// Uses 'num' for blocks table, 'block_num' for txs/logs tables.
 ///
 /// Uses sqlparser AST manipulation to safely add the filter condition,
 /// avoiding SQL injection risks from string-based splicing.
 #[doc(hidden)]
-pub fn inject_block_filter(sql: &str, block_num: u64) -> Result<String, ApiError> {
+pub fn inject_block_filter(sql: &str) -> Result<String, ApiError> {
     use sqlparser::ast::{BinaryOperator, Expr, Ident, SetExpr, Statement, Value};
     use sqlparser::dialect::GenericDialect;
     use sqlparser::parser::Parser;
@@ -756,9 +779,7 @@ pub fn inject_block_filter(sql: &str, block_num: u64) -> Result<String, ApiError
     let block_filter = Expr::BinaryOp {
         left: Box::new(col_expr),
         op: BinaryOperator::Eq,
-        right: Box::new(Expr::Value(
-            Value::Number(block_num.to_string(), false).into(),
-        )),
+        right: Box::new(Expr::Value(Value::Placeholder("$1".to_string()).into())),
     };
 
     select.selection = Some(match select.selection.take() {

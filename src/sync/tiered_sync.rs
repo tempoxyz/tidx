@@ -9,6 +9,7 @@
 use alloy::consensus::BlockHeader as _;
 use anyhow::Result;
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 use tokio::sync::broadcast;
 use tokio::task::JoinSet;
@@ -35,6 +36,14 @@ pub struct TieredSync {
     require_clickhouse: bool,
     batch_size: u64,
     concurrency: usize,
+    hot_floor: Arc<Mutex<Option<HotFloor>>>,
+}
+
+/// First block of the hot window found for a week-aligned boundary.
+#[derive(Clone, Copy)]
+struct HotFloor {
+    boundary_ts: DateTime<Utc>,
+    block: u64,
 }
 
 impl TieredSync {
@@ -56,6 +65,7 @@ impl TieredSync {
             require_clickhouse: retention.require_clickhouse,
             batch_size: batch_size.max(1),
             concurrency,
+            hot_floor: Arc::default(),
         })
     }
 
@@ -262,11 +272,12 @@ impl TieredSync {
         }
 
         let boundary_ts = hot_window_start(Utc::now(), self.keep);
-        let floor = self.first_block_at_or_after(head, boundary_ts).await?;
+        let floor = self.hot_window_floor(head, boundary_ts).await?;
         let boundary = floor.saturating_sub(1);
 
         if has_gaps(self.sinks.pool(), floor, head).await? {
             let gaps = detect_all_gaps(self.sinks.pool(), floor, head).await?;
+            // Fill every gap found before scanning the hot window again.
             let ranges = if self.sinks.has_clickhouse() {
                 let archive = load_archive_state(self.sinks.pool(), self.chain_id).await?;
                 let Some(archive_low) = archive.backfill_num else {
@@ -278,23 +289,24 @@ impl TieredSync {
                 };
                 let archived_gaps =
                     intersect_gaps(&gaps, archive_low.max(1), archive.tip_num.min(head));
-                newest_gap_ranges(&archived_gaps, self.batch_size, self.concurrency)
+                newest_gap_ranges(&archived_gaps, self.batch_size, usize::MAX)
             } else {
-                newest_gap_ranges(&gaps, self.batch_size, self.concurrency)
+                newest_gap_ranges(&gaps, self.batch_size, usize::MAX)
             };
             if !ranges.is_empty() {
-                let blocks: u64 = ranges.iter().map(|(start, end)| end - start + 1).sum();
-                if self.sinks.has_clickhouse() {
-                    self.hydrate_postgres_ranges(ranges).await?;
-                } else {
-                    self.sync_ranges(ranges, WriteTarget::Postgres).await?;
+                let mut remaining: u64 = gaps.iter().map(|(start, end)| end - start + 1).sum();
+                for window in ranges.chunks(self.concurrency) {
+                    let blocks: u64 = window.iter().map(|(start, end)| end - start + 1).sum();
+                    if self.sinks.has_clickhouse() {
+                        self.hydrate_postgres_ranges(window.to_vec()).await?;
+                    } else {
+                        self.sync_ranges(window.to_vec(), WriteTarget::Postgres)
+                            .await?;
+                    }
+                    remaining = remaining.saturating_sub(blocks);
+                    metrics::record_blocks_indexed(self.chain_id, blocks);
+                    metrics::set_backfill_remaining(self.chain_id, "postgres_hot", remaining);
                 }
-                metrics::record_blocks_indexed(self.chain_id, blocks);
-                metrics::set_backfill_remaining(
-                    self.chain_id,
-                    "postgres_hot",
-                    gaps.iter().map(|(start, end)| end - start + 1).sum(),
-                );
                 return Ok(Duration::ZERO);
             }
             if self.sinks.has_clickhouse() {
@@ -350,6 +362,31 @@ impl TieredSync {
             "PostgreSQL hot boundary reconciled"
         );
         Ok(self.reconcile_interval)
+    }
+
+    /// First block of the hot window starting at `boundary_ts`.
+    ///
+    /// Once a block at or after the boundary exists, the floor no longer
+    /// changes, so it is searched for once per boundary instead of every tick.
+    async fn hot_window_floor(&self, head: u64, boundary_ts: DateTime<Utc>) -> Result<u64> {
+        let cached = *self
+            .hot_floor
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if let Some(floor) = cached
+            && floor.boundary_ts == boundary_ts
+        {
+            return Ok(floor.block);
+        }
+
+        let block = self.first_block_at_or_after(head, boundary_ts).await?;
+        if block <= head {
+            *self
+                .hot_floor
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner) = Some(HotFloor { boundary_ts, block });
+        }
+        Ok(block)
     }
 
     async fn first_block_at_or_after(&self, head: u64, target: DateTime<Utc>) -> Result<u64> {

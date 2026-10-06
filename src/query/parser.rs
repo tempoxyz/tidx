@@ -411,54 +411,11 @@ impl EventSignature {
     /// Rewrite a SQL query to push down filters on decoded columns to use indexed raw columns.
     /// E.g., WHERE "from" = '0xabc...' becomes WHERE topic1 = '\x000...abc...'
     pub fn rewrite_filters_for_pushdown(&self, sql: &str) -> String {
-        let mapping = self.column_mapping();
-        let filters = extract_equality_filters(sql);
-
-        let mut result = sql.to_string();
-
-        for (col, value) in filters {
-            let col_lower = col.to_lowercase();
-            if let Some((raw_col, ty, is_indexed)) = mapping.get(&col_lower) {
-                // Only push down indexed columns (topics)
-                if !is_indexed {
-                    continue;
-                }
-
-                if let Some(encoded) = Self::encode_value_for_pushdown(ty, &value) {
-                    // Build the replacement patterns
-                    // Match: "col" = 'value' or "col" = '0xvalue'
-                    let patterns = [
-                        format!(r#""{}" = '{}'"#, col, value),
-                        format!(
-                            r#""{}" = '0x{}'"#,
-                            col,
-                            value.strip_prefix("0x").unwrap_or(&value)
-                        ),
-                        format!(r#""{}"='{}'"#, col, value),
-                        format!(
-                            r#""{}"='0x{}'"#,
-                            col,
-                            value.strip_prefix("0x").unwrap_or(&value)
-                        ),
-                    ];
-
-                    let replacement = format!("{} = '0x{}'", raw_col, encoded);
-
-                    for pattern in &patterns {
-                        if result.contains(pattern) {
-                            result = result.replace(pattern, &replacement);
-                            break;
-                        }
-                    }
-                }
-            }
-        }
-
-        result
+        super::filters::rewrite(sql, std::slice::from_ref(self), &ClickHouseDialect {})
     }
 
     /// Encode a filter value based on the ABI type.
-    fn encode_value_for_pushdown(ty: &AbiType, value: &str) -> Option<String> {
+    pub(super) fn encode_value_for_pushdown(ty: &AbiType, value: &str) -> Option<String> {
         match ty {
             AbiType::Address => encode_address_for_topic(value),
             AbiType::Uint(_) | AbiType::Int(_) => encode_uint256_for_topic(value),
@@ -478,11 +435,11 @@ impl EventSignature {
                     None
                 }
             }
-            AbiType::Bytes(Some(32)) => {
-                // bytes32 - expect 0x-prefixed hex
+            // bytesN: exactly N bytes, left-aligned and zero-padded in the topic
+            AbiType::Bytes(Some(n)) => {
                 let hex = value.strip_prefix("0x").unwrap_or(value);
-                if hex.len() == 64 && hex.chars().all(|c| c.is_ascii_hexdigit()) {
-                    Some(hex.to_lowercase())
+                if hex.len() == 2 * *n as usize && hex.chars().all(|c| c.is_ascii_hexdigit()) {
+                    Some(format!("{:0<64}", hex.to_lowercase()))
                 } else {
                     None
                 }
@@ -561,8 +518,9 @@ fn apply_event_signature_ctes(
     let mut rewritten_sql = sql.to_string();
     for sig in &sigs {
         rewritten_sql = sig.normalize_table_references(&rewritten_sql);
-        rewritten_sql = sig.rewrite_filters_for_pushdown(&rewritten_sql);
     }
+    rewritten_sql =
+        super::filters::rewrite(&rewritten_sql, &sigs, dialect.parser_dialect().as_ref());
 
     let pushdown = |sig: &EventSignature| {
         extract_raw_column_predicates_for_table(
@@ -697,7 +655,7 @@ fn top_level_with_end(sql: &str, dialect: &dyn Dialect) -> Result<usize> {
     Err(anyhow!("Failed to locate WITH clause"))
 }
 
-fn byte_index_for_location(sql: &str, location: Location) -> Option<usize> {
+pub(super) fn byte_index_for_location(sql: &str, location: Location) -> Option<usize> {
     if location.line == 0 || location.column == 0 {
         return None;
     }
@@ -1335,7 +1293,9 @@ impl AbiType {
             }
             let size: u8 = rest
                 .parse()
-                .map_err(|_| anyhow!("Invalid bytes size: {rest}"))?;
+                .ok()
+                .filter(|n| (1..=32).contains(n))
+                .ok_or_else(|| anyhow!("Invalid bytes size: {rest} (must be 1-32)"))?;
             return Ok(AbiType::Bytes(Some(size)));
         }
 
@@ -1369,6 +1329,8 @@ impl AbiType {
             AbiType::Address => format!("abi_address({col})"),
             AbiType::Uint(_) | AbiType::Int(_) => format!("abi_uint({col})"),
             AbiType::Bool => format!("abi_bool({col})"),
+            // bytesN is left-aligned in its 32-byte word
+            AbiType::Bytes(Some(n)) if *n < 32 => format!("substring({col} FROM 1 FOR {n})"),
             AbiType::Bytes(Some(_) | None) => col,
             _ => col,
         }
@@ -1385,9 +1347,7 @@ impl AbiType {
                 format!("abi_int(substring(data FROM {start} FOR 32))")
             }
             AbiType::Bool => format!("abi_bool(substring(data FROM {start} FOR 32))"),
-            AbiType::Bytes(Some(_) | None) => {
-                format!("substring(data FROM {start} FOR 32)")
-            }
+            AbiType::Bytes(Some(n)) => format!("substring(data FROM {start} FOR {n})"),
             AbiType::String => format!("abi_string(data, {offset})"),
             _ => format!("substring(data FROM {start} FOR 32)"),
         }
@@ -1415,7 +1375,10 @@ impl AbiType {
             }
             // Bool: check last byte (last 2 hex chars)
             AbiType::Bool => format!("unhex(substring({col}, 67, 2)) != unhex('00')"),
-            // Bytes32: just format as 0x-prefixed, already lowercase
+            // bytesN: left-aligned first N bytes (2N hex chars); already lowercase
+            AbiType::Bytes(Some(n)) if *n < 32 => {
+                format!("concat('0x', substring({col}, 3, {}))", 2 * *n as usize)
+            }
             AbiType::Bytes(Some(_) | None) => format!("concat('0x', substring({col}, 3))"),
             _ => format!("concat('0x', substring({col}, 3))"),
         }
@@ -1448,9 +1411,12 @@ impl AbiType {
                     hex_start + 62
                 )
             }
-            // Bytes32: take 64 hex chars, format with 0x prefix
-            AbiType::Bytes(Some(_) | None) => {
-                format!("concat('0x', lower(substring(data, {hex_start}, 64)))")
+            // bytesN: left-aligned first N bytes (2N hex chars), 0x-prefixed
+            AbiType::Bytes(Some(n)) => {
+                format!(
+                    "concat('0x', lower(substring(data, {hex_start}, {})))",
+                    2 * *n as usize
+                )
             }
             // String: offset word → length word → UTF-8 bytes, mirroring
             // PostgreSQL's abi_string (db/functions.sql). Offsets/lengths fit
@@ -1483,6 +1449,10 @@ impl AbiType {
                 format!("abi_uint(decode(substring({col} FROM 3), 'hex'))")
             }
             AbiType::Bool => format!("abi_bool(decode(substring({col} FROM 3), 'hex'))"),
+            // bytesN: '0x' plus the left-aligned first N bytes (2N hex chars)
+            AbiType::Bytes(Some(n)) if *n < 32 => {
+                format!("substring({col} FROM 1 FOR {})", 2 + 2 * *n as usize)
+            }
             AbiType::Bytes(Some(_) | None) => col,
             _ => col,
         }
@@ -1508,8 +1478,11 @@ impl AbiType {
             AbiType::Bool => {
                 format!("abi_bool(decode(substring(data FROM {hex_start} FOR 64), 'hex'))")
             }
-            AbiType::Bytes(Some(_) | None) => {
-                format!("'0x' || lower(substring(data FROM {hex_start} FOR 64))")
+            AbiType::Bytes(Some(n)) => {
+                format!(
+                    "'0x' || lower(substring(data FROM {hex_start} FOR {}))",
+                    2 * *n as usize
+                )
             }
             AbiType::String => {
                 format!("abi_string(decode(substring(data FROM 3), 'hex'), {offset})")
@@ -1690,6 +1663,67 @@ mod tests {
     fn test_parse_dynamic_bytes() {
         let sig = EventSignature::parse("SomeEvent(bytes)").unwrap();
         assert_eq!(sig.params[0].ty, AbiType::Bytes(None));
+    }
+
+    #[test]
+    fn test_parse_fixed_bytes_width_bounds() {
+        assert_eq!(AbiType::parse("bytes1").unwrap(), AbiType::Bytes(Some(1)));
+        assert_eq!(AbiType::parse("bytes32").unwrap(), AbiType::Bytes(Some(32)));
+        for ty in ["bytes0", "bytes33", "bytes255", "bytes256"] {
+            assert!(AbiType::parse(ty).is_err(), "{ty} should be rejected");
+        }
+    }
+
+    #[test]
+    fn test_fixed_bytes_decode_returns_declared_width() {
+        let b4 = AbiType::Bytes(Some(4));
+        assert_eq!(
+            b4.topic_decode_sql_postgres(2),
+            "substring(topic1 FROM 1 FOR 4)"
+        );
+        assert_eq!(
+            b4.data_decode_sql_postgres(32),
+            "substring(data FROM 33 FOR 4)"
+        );
+        assert_eq!(
+            b4.topic_decode_sql_clickhouse(2),
+            "concat('0x', substring(topic1, 3, 8))"
+        );
+        assert_eq!(
+            b4.data_decode_sql_clickhouse(32),
+            "concat('0x', lower(substring(data, 67, 8)))"
+        );
+        assert_eq!(
+            b4.topic_decode_sql_tiered(2),
+            "substring(topic1 FROM 1 FOR 10)"
+        );
+        assert_eq!(
+            b4.data_decode_sql_tiered(32),
+            "'0x' || lower(substring(data FROM 67 FOR 8))"
+        );
+
+        // bytes32 is the whole word; indexed dynamic bytes is a keccak hash.
+        for ty in [AbiType::Bytes(Some(32)), AbiType::Bytes(None)] {
+            assert_eq!(ty.topic_decode_sql_postgres(2), "topic1");
+            assert_eq!(
+                ty.topic_decode_sql_clickhouse(2),
+                "concat('0x', substring(topic1, 3))"
+            );
+            assert_eq!(ty.topic_decode_sql_tiered(2), "topic1");
+        }
+        let b32 = AbiType::Bytes(Some(32));
+        assert_eq!(
+            b32.data_decode_sql_postgres(0),
+            "substring(data FROM 1 FOR 32)"
+        );
+        assert_eq!(
+            b32.data_decode_sql_clickhouse(0),
+            "concat('0x', lower(substring(data, 3, 64)))"
+        );
+        assert_eq!(
+            b32.data_decode_sql_tiered(0),
+            "'0x' || lower(substring(data FROM 3 FOR 64))"
+        );
     }
 
     #[test]
@@ -2096,6 +2130,27 @@ mod tests {
         let sql = r#"SELECT * FROM Transfer WHERE "value" = '1000000'"#;
         let rewritten = sig.rewrite_filters_for_pushdown(sql);
         assert_eq!(sql, rewritten);
+    }
+
+    #[test]
+    fn test_rewrite_filters_fixed_bytes() {
+        let sig = EventSignature::parse("Fixed(bytes4 indexed tag, bytes4 value)").unwrap();
+
+        // Short literals stay '0x…' text on PostgreSQL; the padded topic
+        // form is converted to bytea and hits the topic index.
+        assert_eq!(
+            sig.rewrite_filters_for_pushdown(r#"SELECT * FROM Fixed WHERE "tag" = '0xCAFEBABE'"#),
+            format!(
+                "SELECT * FROM Fixed WHERE topic1 = '0xcafebabe{}'",
+                "0".repeat(56)
+            )
+        );
+        for sql in [
+            r#"SELECT * FROM Fixed WHERE "tag" = '0xcafe'"#,
+            r#"SELECT * FROM Fixed WHERE "value" = '0xdeadbeef'"#,
+        ] {
+            assert_eq!(sig.rewrite_filters_for_pushdown(sql), sql);
+        }
     }
 
     // ========================================================================

@@ -32,6 +32,7 @@
 
 use anyhow::{Context, Result, anyhow};
 use chrono::{DateTime, Utc};
+use tokio_postgres::types::Type;
 use tracing::{debug, info};
 
 use super::Pool;
@@ -323,10 +324,11 @@ pub struct PruneBoundary {
 /// tip. Returns the default (all zero/None) when the chain has no state row.
 pub async fn fetch_prune_boundary(pool: &Pool, chain_id: u64) -> Result<PruneBoundary> {
     let conn = pool.get().await?;
+    // Runs on every tiered `/query`: unprepared, so it costs one round trip.
     let row = conn
-        .query_opt(
+        .query_typed_opt(
             "SELECT pruned_below, pruned_below_ts, tip_num FROM sync_state WHERE chain_id = $1",
-            &[&(chain_id as i64)],
+            &[(&(chain_id as i64), Type::INT8)],
         )
         .await?;
     Ok(row
@@ -342,9 +344,9 @@ pub async fn fetch_prune_boundary(pool: &Pool, chain_id: u64) -> Result<PruneBou
 pub async fn is_bootstrapped(pool: &Pool) -> Result<bool> {
     let conn = pool.get().await?;
     let row = conn
-        .query_one(
+        .query_typed_one(
             "SELECT EXISTS (SELECT 1 FROM pg_foreign_server WHERE srvname = $1)",
-            &[&SERVER],
+            &[(&SERVER, Type::TEXT)],
         )
         .await?;
     Ok(row.get(0))
