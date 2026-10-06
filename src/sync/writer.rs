@@ -647,6 +647,34 @@ pub async fn update_tip_num(pool: &Pool, chain_id: u64, tip_num: u64, head_num: 
     Ok(())
 }
 
+/// Rewind the sync pointers to the fork point of a reorg.
+///
+/// Every other writer of these pointers only raises them, so a reorg needs
+/// its own path to move them back. `SinkSet::delete_from` has removed all rows
+/// above `fork_block` from PostgreSQL and ClickHouse: `tip_num` is lowered so
+/// realtime sync refetches that range, `synced_num` because the range is no
+/// longer gap-free, and `archive_tip_num` so the archive verifies the range
+/// again instead of counting the deleted ClickHouse rows as archived.
+/// Pointers at or below the fork point are left unchanged.
+pub async fn rewind_tip_num(pool: &Pool, chain_id: u64, fork_block: u64) -> Result<()> {
+    let conn = pool.get().await?;
+
+    conn.execute(
+        r#"
+        UPDATE sync_state
+        SET tip_num = LEAST(tip_num, $1),
+            synced_num = LEAST(synced_num, $1),
+            archive_tip_num = LEAST(archive_tip_num, $1),
+            updated_at = NOW()
+        WHERE chain_id = $2
+        "#,
+        &[&(fork_block as i64), &(chain_id as i64)],
+    )
+    .await?;
+
+    Ok(())
+}
+
 /// Update only synced_num (for gap-fill sync - avoids clobbering tip_num)
 pub async fn update_synced_num(pool: &Pool, chain_id: u64, synced_num: u64) -> Result<()> {
     let conn = pool.get().await?;
