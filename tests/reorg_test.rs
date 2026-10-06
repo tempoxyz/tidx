@@ -414,3 +414,76 @@ async fn pointers(pool: &Pool) -> (u64, u64, u64) {
         .expect("Failed to load archive state");
     (state.tip_num, state.synced_num, archive.tip_num)
 }
+
+#[tokio::test]
+#[serial(db)]
+async fn test_gapfill_progress_does_not_undo_reorg_rewind() {
+    use tidx::sync::writer::{advance_checked_synced_num, update_backfill_num};
+    let db = TestDb::empty().await;
+    db.truncate_all().await;
+    update_tip_num(&db.pool, CHAIN_ID, 100, 105).await.unwrap();
+    update_synced_num(&db.pool, CHAIN_ID, 90).await.unwrap();
+    rewind_tip_num(&db.pool, CHAIN_ID, 80).await.unwrap();
+
+    // A gap-fill round that loaded (tip=100, synced=90) before the rewind
+    // must only save its backfill progress.
+    update_backfill_num(&db.pool, CHAIN_ID, 10).await.unwrap();
+    advance_checked_synced_num(&db.pool, CHAIN_ID, 90, 100)
+        .await
+        .unwrap();
+    let state = load_sync_state(&db.pool, CHAIN_ID).await.unwrap().unwrap();
+    assert_eq!((state.tip_num, state.synced_num), (80, 80));
+    assert_eq!(state.backfill_num, Some(10));
+    update_backfill_num(&db.pool, CHAIN_ID, 20).await.unwrap();
+    assert_eq!(
+        load_sync_state(&db.pool, CHAIN_ID)
+            .await
+            .unwrap()
+            .unwrap()
+            .backfill_num,
+        Some(10)
+    );
+
+    // Even if tip_num still names the old head during deletion, the missing
+    // stored tip must prevent a previously checked range from advancing.
+    update_tip_num(&db.pool, CHAIN_ID, 100, 105).await.unwrap();
+    advance_checked_synced_num(&db.pool, CHAIN_ID, 80, 100)
+        .await
+        .unwrap();
+    assert_eq!(
+        load_sync_state(&db.pool, CHAIN_ID)
+            .await
+            .unwrap()
+            .unwrap()
+            .synced_num,
+        80
+    );
+    let conn = db.pool.get().await.unwrap();
+    conn.execute(
+        "INSERT INTO blocks (num, hash, parent_hash, timestamp, timestamp_ms, gas_limit, gas_used, miner) VALUES (100, $1, $2, NOW(), 0, 1000000, 100000, $3)",
+        &[&vec![1u8;32], &vec![0u8;32], &vec![0u8;20]],
+    ).await.unwrap();
+    drop(conn);
+    advance_checked_synced_num(&db.pool, CHAIN_ID, 90, 100)
+        .await
+        .unwrap();
+    assert_eq!(
+        load_sync_state(&db.pool, CHAIN_ID)
+            .await
+            .unwrap()
+            .unwrap()
+            .synced_num,
+        80
+    );
+    advance_checked_synced_num(&db.pool, CHAIN_ID, 80, 100)
+        .await
+        .unwrap();
+    assert_eq!(
+        load_sync_state(&db.pool, CHAIN_ID)
+            .await
+            .unwrap()
+            .unwrap()
+            .synced_num,
+        100
+    );
+}

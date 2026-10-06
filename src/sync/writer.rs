@@ -675,6 +675,39 @@ pub async fn rewind_tip_num(pool: &Pool, chain_id: u64, fork_block: u64) -> Resu
     Ok(())
 }
 
+/// Record backfill progress without restoring stale realtime pointers after a reorg.
+pub async fn update_backfill_num(pool: &Pool, chain_id: u64, block_num: u64) -> Result<()> {
+    let conn = pool.get().await?;
+    conn.execute(
+        "UPDATE sync_state SET backfill_num = LEAST(backfill_num, $1), updated_at = NOW() WHERE chain_id = $2",
+        &[&(block_num as i64), &(chain_id as i64)],
+    ).await?;
+    Ok(())
+}
+
+/// Advance a checked range only while the sync pointer still matches the snapshot.
+/// A rewind invalidates the check; a missing tip must never be marked synced.
+pub async fn advance_checked_synced_num(
+    pool: &Pool,
+    chain_id: u64,
+    previous_synced_num: u64,
+    checked_tip: u64,
+) -> Result<()> {
+    let conn = pool.get().await?;
+    conn.execute(
+        r#"UPDATE sync_state SET synced_num = $1, updated_at = NOW()
+           WHERE chain_id = $2 AND synced_num = $3 AND tip_num >= $1
+             AND EXISTS (SELECT 1 FROM blocks WHERE num = $1)"#,
+        &[
+            &(checked_tip as i64),
+            &(chain_id as i64),
+            &(previous_synced_num as i64),
+        ],
+    )
+    .await?;
+    Ok(())
+}
+
 /// Update only synced_num (for gap-fill sync - avoids clobbering tip_num)
 pub async fn update_synced_num(pool: &Pool, chain_id: u64, synced_num: u64) -> Result<()> {
     let conn = pool.get().await?;
@@ -1045,8 +1078,8 @@ pub async fn finish_receipt_repair_attempt(pool: &Pool, block_nums: &[u64]) -> R
     Ok((completed, deferred))
 }
 
-/// Detect ALL gaps between `floor` and `tip_num`, including the leading gap
-/// from `floor` to the first stored block.
+/// Detect ALL gaps between `floor` and `tip_num`, including leading and trailing gaps
+/// outside the stored block range.
 /// `floor` is the lowest block expected in PG (`SyncState::prune_floor()`);
 /// pass 1 when no pruning is configured (block 0 is genesis/empty).
 /// Returns gaps sorted by end block descending (most recent first).
@@ -1057,10 +1090,14 @@ pub async fn detect_all_gaps(pool: &Pool, floor: u64, tip_num: u64) -> Result<Ve
     // Lowest stored block, unfiltered: a stored block at/below the floor
     // (e.g. genesis 0) means there is no leading gap; detect_gaps already
     // reports discontinuities above it.
-    let min_block: Option<i64> = conn
-        .query_one("SELECT MIN(num) FROM blocks", &[])
-        .await?
-        .get(0);
+    let bounds = conn
+        .query_one(
+            "SELECT MIN(num), MAX(num) FROM blocks WHERE num <= $1",
+            &[&(tip_num as i64)],
+        )
+        .await?;
+    let min_block: Option<i64> = bounds.get(0);
+    let max_block: Option<i64> = bounds.get(1);
 
     let mut gaps = detect_gaps(pool, tip_num).await?;
 
@@ -1072,6 +1109,14 @@ pub async fn detect_all_gaps(pool: &Pool, floor: u64, tip_num: u64) -> Result<Ve
     } else if tip_num >= floor {
         // No blocks at all - entire range is a gap
         gaps.push((floor, tip_num));
+    }
+
+    // A reorg can remove the tail before realtime refetches it. LAG only
+    // finds internal gaps, so explicitly include the missing trailing range.
+    if let Some(max) = max_block {
+        if (max as u64) < tip_num {
+            gaps.push(((max as u64).saturating_add(1).max(floor), tip_num));
+        }
     }
 
     // Clamp to [floor, tip_num]: anything below floor was intentionally pruned
