@@ -3,7 +3,11 @@ mod common;
 use common::tempo::TempoNode;
 use common::testdb::TestDb;
 
+use alloy::primitives::{Address, B256, Bloom};
+use axum::{Json, Router, routing::post};
+use serde_json::{Value, json};
 use serial_test::serial;
+use std::time::Duration;
 use tidx::db::ThrottledPool;
 use tidx::sync::engine::SyncEngine;
 use tidx::sync::sink::SinkSet;
@@ -258,6 +262,141 @@ async fn test_receipt_repair_legacy_discovery_is_bounded_and_durable() {
         detect_blocks_missing_receipts(&db.pool, 100).await.unwrap(),
         vec![21_100_000]
     );
+}
+
+#[tokio::test]
+#[serial(db)]
+async fn test_receipt_backfill_skips_receipts_of_blocks_not_stored() {
+    let db = TestDb::empty().await;
+    db.truncate_all().await;
+
+    // Two blocks stored without receipt data. The node serves the first one, but a
+    // different block (another fork) at the second height.
+    let mut blocks = generate_blocks(2, 21_200_000);
+    blocks[1].hash = vec![0xff; 32];
+    write_blocks(&db.pool, &blocks).await.unwrap();
+
+    let mut txs: Vec<_> = blocks
+        .iter()
+        .flat_map(|block| generate_txs(1, block.num))
+        .collect();
+    for tx in &mut txs {
+        tx.gas_used = None;
+    }
+    write_txs(&db.pool, &txs).await.unwrap();
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("Failed to bind test RPC server");
+    let rpc_url = format!("http://{}", listener.local_addr().unwrap());
+    let server = tokio::spawn(async move {
+        axum::serve(listener, Router::new().route("/", post(receipt_rpc)))
+            .await
+            .expect("RPC server failed");
+    });
+
+    let mut engine = SyncEngine::new(
+        ThrottledPool::from_pool(db.pool.clone()),
+        SinkSet::new(db.pool.clone()),
+        &rpc_url,
+    )
+    .await
+    .expect("Failed to create sync engine")
+    .with_gapfill_enabled(false);
+
+    let (shutdown_tx, shutdown_rx) = tokio::sync::broadcast::channel::<()>(1);
+    let engine_handle = tokio::spawn(async move {
+        let _ = engine.run(shutdown_rx).await;
+    });
+
+    // The first repair attempt is over once the block the node serves has left the queue.
+    let conn = db.pool.get().await.unwrap();
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let queued: i64 = conn
+                .query_one(
+                    "SELECT COUNT(*) FROM receipt_repair_queue WHERE block_num = $1",
+                    &[&blocks[0].num],
+                )
+                .await
+                .unwrap()
+                .get(0);
+            if queued == 0 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("receipt backfill did not repair the stored block");
+
+    let _ = shutdown_tx.send(());
+    let _ = engine_handle.await;
+    server.abort();
+
+    let receipt_blocks: Vec<i64> = conn
+        .query("SELECT block_num FROM receipts ORDER BY block_num", &[])
+        .await
+        .unwrap()
+        .iter()
+        .map(|row| row.get(0))
+        .collect();
+    assert_eq!(
+        receipt_blocks,
+        vec![blocks[0].num],
+        "receipts of a block that is not stored must not be written"
+    );
+
+    let queued: Vec<i64> = conn
+        .query("SELECT block_num FROM receipt_repair_queue", &[])
+        .await
+        .unwrap()
+        .iter()
+        .map(|row| row.get(0))
+        .collect();
+    assert_eq!(
+        queued,
+        vec![blocks[1].num],
+        "a block without usable receipts must stay queued"
+    );
+}
+
+/// JSON-RPC node at head 0 (keeps realtime sync idle) that serves one receipt per block,
+/// carrying the block hash `generate_blocks` assigns to that height.
+async fn receipt_rpc(Json(body): Json<Value>) -> Json<Value> {
+    fn respond(req: &Value) -> Value {
+        let result = match req["method"].as_str().expect("missing method") {
+            "eth_chainId" => json!("0x1"),
+            "eth_blockNumber" => json!("0x0"),
+            "eth_getBlockReceipts" => {
+                let block = req["params"][0].as_str().expect("missing block number");
+                let num = u64::from_str_radix(block.trim_start_matches("0x"), 16).unwrap();
+                json!([{
+                    "type": "0x2",
+                    "status": "0x1",
+                    "cumulativeGasUsed": "0x5208",
+                    "logs": [],
+                    "logsBloom": Bloom::ZERO,
+                    "transactionHash": B256::ZERO,
+                    "transactionIndex": "0x0",
+                    "blockHash": B256::repeat_byte((num % 256) as u8),
+                    "blockNumber": block,
+                    "gasUsed": "0x5208",
+                    "from": Address::ZERO,
+                    "to": null,
+                    "contractAddress": null,
+                    "feePayer": Address::ZERO,
+                }])
+            }
+            method => panic!("unexpected RPC method {method}"),
+        };
+        json!({ "jsonrpc": "2.0", "id": req["id"], "result": result })
+    }
+
+    match body.as_array() {
+        Some(batch) => Json(batch.iter().map(respond).collect()),
+        None => Json(respond(&body)),
+    }
 }
 
 #[tokio::test]
