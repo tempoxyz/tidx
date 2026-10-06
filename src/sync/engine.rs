@@ -19,9 +19,10 @@ use super::decoder::{
 use super::fetcher::RpcClient;
 use super::sink::{SinkSet, WriteTarget};
 use super::writer::{
-    detect_all_gaps, detect_blocks_missing_receipts, discover_legacy_receipt_repairs,
-    find_fork_point, finish_receipt_repair_attempt, get_block_hash, has_gaps, load_sync_state,
-    rewind_tip_num, save_sync_state, update_sync_rate, update_synced_num, update_tip_num,
+    advance_checked_synced_num, detect_all_gaps, detect_blocks_missing_receipts,
+    discover_legacy_receipt_repairs, find_fork_point, finish_receipt_repair_attempt,
+    get_block_hash, has_gaps, load_sync_state, rewind_tip_num, save_sync_state,
+    update_backfill_num, update_sync_rate, update_tip_num,
 };
 use crate::virtual_address::mark_virtual_forward_hops;
 
@@ -970,7 +971,7 @@ async fn tick_gapfill_parallel(
         metrics::set_gap_ranges(chain_id, "postgres", &[]);
         metrics::set_synced(chain_id, realtime_lag == 0);
         if state.synced_num < state.tip_num {
-            update_synced_num(pool, chain_id, state.tip_num).await?;
+            advance_checked_synced_num(pool, chain_id, state.synced_num, state.tip_num).await?;
         }
         tokio::time::sleep(Duration::from_secs(2)).await;
         return Ok(());
@@ -984,7 +985,7 @@ async fn tick_gapfill_parallel(
         metrics::set_gap_ranges(chain_id, "postgres", &[]);
         metrics::set_synced(chain_id, realtime_lag == 0);
         if state.synced_num < state.tip_num {
-            update_synced_num(pool, chain_id, state.tip_num).await?;
+            advance_checked_synced_num(pool, chain_id, state.synced_num, state.tip_num).await?;
             info!(synced_num = state.tip_num, "Gap sync: fully synced");
         }
         tokio::time::sleep(Duration::from_secs(2)).await;
@@ -1230,9 +1231,7 @@ async fn tick_gapfill_parallel(
 
     // Update backfill_num to track progress (lowest block we've reached)
     if lowest_block < u64::MAX {
-        let mut updated_state = state.clone();
-        updated_state.backfill_num = Some(lowest_block);
-        save_sync_state(pool, &updated_state).await?;
+        update_backfill_num(pool, chain_id, lowest_block).await?;
     }
 
     Ok(())
@@ -1256,7 +1255,7 @@ async fn tick_gapfill_parallel_no_throttle(
     if gaps.is_empty() {
         metrics::set_gap_ranges(chain_id, "postgres", &[]);
         if state.synced_num < state.tip_num {
-            update_synced_num(pool, chain_id, state.tip_num).await?;
+            advance_checked_synced_num(pool, chain_id, state.synced_num, state.tip_num).await?;
             info!(synced_num = state.tip_num, "Backfill: fully synced");
         }
         return Ok(());
@@ -1417,9 +1416,7 @@ async fn tick_gapfill_parallel_no_throttle(
 
     // Update backfill_num to track progress
     if lowest_block < u64::MAX {
-        let mut updated_state = state.clone();
-        updated_state.backfill_num = Some(lowest_block);
-        save_sync_state(pool, &updated_state).await?;
+        update_backfill_num(pool, chain_id, lowest_block).await?;
     }
 
     Ok(())
