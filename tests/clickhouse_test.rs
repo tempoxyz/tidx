@@ -3181,7 +3181,8 @@ async fn test_backfill_replays_blocks_with_stale_child_rows() {
     assert_eq!(receipt_result["data"][0]["gas_used"].as_i64(), Some(21_000));
 }
 
-/// A canonical block can coexist with an older distinct version until a merge.
+/// A canonical block can coexist with an older distinct version that
+/// ReplacingMergeTree has not collapsed (an unmerged part or another partition).
 /// Backfill must replace the entire block instead of treating the canonical row
 /// as sufficient.
 #[tokio::test]
@@ -3194,10 +3195,15 @@ async fn test_backfill_replays_blocks_with_extra_block_versions() {
     let blocks = vec![make_block(1)];
     writer::write_blocks(&pool, &blocks).await.unwrap();
 
-    let mut stale_blocks = blocks.clone();
-    stale_blocks[0].hash = vec![0xee; 32];
-    stale_blocks.extend(blocks.clone());
-    ch_sink.write_blocks(&stale_blocks).await.unwrap();
+    // Versions sharing a part are collapsed on insert, and stopping merges
+    // would also block the repair's DELETE mutation, so write the stale
+    // version separately into another monthly partition.
+    let mut stale_block = blocks[0].clone();
+    stale_block.hash = vec![0xee; 32];
+    stale_block.timestamp -= chrono::Duration::days(31);
+    stale_block.timestamp_ms = stale_block.timestamp.timestamp_millis();
+    ch_sink.write_blocks(&[stale_block]).await.unwrap();
+    ch_sink.write_blocks(&blocks).await.unwrap();
     assert_eq!(ch.table_count("blocks").await.unwrap(), 2);
 
     sinks.backfill_clickhouse(TEST_CHAIN_ID).await.unwrap();
