@@ -14,14 +14,21 @@ main() {
     # Create directories
     mkdir -p "$TIDX_HOME" "$BIN_DIR"
 
-    # Download docker-compose and config
+    # Download docker-compose and the files it bind-mounts
     echo "Downloading docker-compose.yml..."
-    curl -sL "$BASE_URL/docker/prod/docker-compose.yml" -o "$TIDX_HOME/docker-compose.yml"
+    curl -fsSL "$BASE_URL/docker/prod/docker-compose.yml" -o "$TIDX_HOME/docker-compose.yml"
 
-    if [ ! -f "$TIDX_HOME/config.toml" ]; then
-        echo "Downloading config.toml..."
-        curl -sL "$BASE_URL/docker/prod/config.toml" -o "$TIDX_HOME/config.toml"
-    fi
+    for file in config.toml clickhouse-config.xml prometheus.yml alerts.yml; do
+        # Docker creates a missing bind-mount source as an empty directory
+        if [ -d "$TIDX_HOME/$file" ]; then
+            rmdir "$TIDX_HOME/$file"
+        fi
+
+        if [ ! -f "$TIDX_HOME/$file" ]; then
+            echo "Downloading $file..."
+            curl -fsSL "$BASE_URL/docker/prod/$file" -o "$TIDX_HOME/$file"
+        fi
+    done
 
     # Create tidx wrapper script
     cat > "$BIN_DIR/tidx" << 'EOF'
