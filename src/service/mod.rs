@@ -968,7 +968,16 @@ fn try_format_column_json(row: &tokio_postgres::Row, idx: usize) -> Result<serde
                 _ => serde_json::Value::Null,
             }
         }
-        Type::FLOAT4 | Type::FLOAT8 => row
+        // Widen via the shortest decimal so 1.1::float4 is 1.1, as PostgreSQL
+        // prints it, rather than 1.100000023841858.
+        Type::FLOAT4 => row
+            .try_get::<_, Option<f32>>(idx)
+            .ok()
+            .flatten()
+            .and_then(|v| v.to_string().parse::<f64>().ok())
+            .and_then(serde_json::Number::from_f64)
+            .map_or(serde_json::Value::Null, serde_json::Value::Number),
+        Type::FLOAT8 => row
             .try_get::<_, Option<f64>>(idx)
             .ok()
             .flatten()
@@ -984,22 +993,33 @@ fn try_format_column_json(row: &tokio_postgres::Row, idx: usize) -> Result<serde
             Ok(Some(v)) => serde_json::Value::String(alloy::hex::encode_prefixed(v)),
             _ => serde_json::Value::Null,
         },
-        Type::TEXT | Type::VARCHAR | Type::NAME => match row.try_get::<_, Option<&str>>(idx) {
-            Ok(Some(v)) if v.len() > MAX_CELL_BYTES => {
-                return Err(anyhow!(
-                    "Query result cell exceeded {} bytes",
-                    MAX_CELL_BYTES
-                ));
+        Type::TEXT | Type::VARCHAR | Type::BPCHAR | Type::NAME => {
+            match row.try_get::<_, Option<&str>>(idx) {
+                Ok(Some(v)) if v.len() > MAX_CELL_BYTES => {
+                    return Err(anyhow!(
+                        "Query result cell exceeded {} bytes",
+                        MAX_CELL_BYTES
+                    ));
+                }
+                Ok(Some(v)) => serde_json::Value::String(v.to_string()),
+                _ => serde_json::Value::Null,
             }
-            Ok(Some(v)) => serde_json::Value::String(v.to_string()),
-            _ => serde_json::Value::Null,
-        },
-        Type::TIMESTAMPTZ | Type::TIMESTAMP => row
+        }
+        Type::TIMESTAMPTZ => row
             .try_get::<_, Option<DateTime<Utc>>>(idx)
             .ok()
             .flatten()
             .map_or(serde_json::Value::Null, |v| {
                 serde_json::Value::String(v.to_rfc3339())
+            }),
+        // Zoneless; read as UTC so it formats like timestamptz and ClickHouse
+        // DateTime columns (e.g. `block_timestamp AT TIME ZONE 'UTC'`).
+        Type::TIMESTAMP => row
+            .try_get::<_, Option<chrono::NaiveDateTime>>(idx)
+            .ok()
+            .flatten()
+            .map_or(serde_json::Value::Null, |v| {
+                serde_json::Value::String(v.and_utc().to_rfc3339())
             }),
         Type::BOOL => row
             .try_get::<_, Option<bool>>(idx)

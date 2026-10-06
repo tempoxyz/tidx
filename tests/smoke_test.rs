@@ -1259,6 +1259,27 @@ async fn test_query_statement_timeout_maps_to_query_timeout() {
 
 #[tokio::test]
 #[serial(db)]
+async fn test_query_float4_timestamp_bpchar_cells() {
+    let db = TestDb::empty().await;
+    let opts = default_options();
+
+    let result = execute_query_postgres(
+        &db.pool,
+        "SELECT 1.5::float4, 1.1::float4, '2024-01-02 03:04:05'::timestamp, 'ab'::char(3)",
+        &[],
+        &opts,
+    )
+    .await
+    .expect("Query failed");
+
+    assert_eq!(
+        serde_json::to_string(&result.rows).unwrap(),
+        r#"[[1.5,1.1,"2024-01-02T03:04:05+00:00","ab "]]"#
+    );
+}
+
+#[tokio::test]
+#[serial(db)]
 async fn test_query_composite_column_with_large_result() {
     let db = TestDb::empty().await;
     db.truncate_all().await;
