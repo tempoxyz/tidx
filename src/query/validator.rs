@@ -211,6 +211,8 @@ fn validate_limit_expr(expr: &Expr, context: &str) -> Result<()> {
 }
 
 const CLICKHOUSE_BLOCKED_SCHEMAS: &[&str] = &["system", "information_schema"];
+/// Functions a ClickHouse user query must not call. Entries are lowercase because
+/// the called name is lowercased before the lookup.
 const CLICKHOUSE_DANGEROUS_FUNCTIONS: &[&str] = &[
     "url",
     "urlcluster",
@@ -227,6 +229,69 @@ const CLICKHOUSE_DANGEROUS_FUNCTIONS: &[&str] = &[
     "hdfscluster",
     "mongodb",
     "redis",
+    // Object storage.
+    "gcs",
+    "cosn",
+    "oss",
+    "azureblobstorage",
+    "azureblobstoragecluster",
+    // Data lakes.
+    "iceberg",
+    "icebergs3",
+    "icebergazure",
+    "iceberghdfs",
+    "iceberglocal",
+    "icebergcluster",
+    "icebergs3cluster",
+    "icebergazurecluster",
+    "iceberghdfscluster",
+    "iceberglocalcluster",
+    "deltalake",
+    "deltalakes3",
+    "deltalakeazure",
+    "deltalakelocal",
+    "deltalakecluster",
+    "deltalakes3cluster",
+    "deltalakeazurecluster",
+    "hudi",
+    "hudicluster",
+    "paimon",
+    "paimons3",
+    "paimonazure",
+    "paimonhdfs",
+    "paimonlocal",
+    "paimoncluster",
+    "paimons3cluster",
+    "paimonazurecluster",
+    "paimonhdfscluster",
+    // Other servers and external services.
+    "cluster",
+    "clusterallreplicas",
+    "traceview",
+    "hive",
+    "ytsaurus",
+    "bigquery",
+    "arrowflight",
+    // Local files and programs.
+    "filecluster",
+    "filesystem",
+    "sqlite",
+    "executable",
+    // Runs its argument as a query, which this validator never sees.
+    "eval",
+    // Scalar functions with network or file access.
+    "hascolumnintable",
+    "catboostevaluate",
+    "generateserialid",
+    "aiclassify",
+    "aiembed",
+    "aiextract",
+    "aifilter",
+    "aigenerate",
+    "airedact",
+    "aisimilarity",
+    "aitranslate",
+    // Resource exhaustion.
     "repeat",
     "sleep",
     "sleepeachrow",
@@ -2074,6 +2139,85 @@ mod tests {
         );
         assert!(validate_clickhouse_query("SELECT sleep(2) FROM logs").is_err());
         assert!(validate_clickhouse_query("SELECT sleepEachRow(1) FROM logs").is_err());
+    }
+
+    #[test]
+    fn test_clickhouse_rejects_external_access_functions() {
+        for name in [
+            "gcs",
+            "cosn",
+            "oss",
+            "azureBlobStorage",
+            "azureBlobStorageCluster",
+            "iceberg",
+            "icebergS3",
+            "icebergAzure",
+            "icebergHDFS",
+            "icebergLocal",
+            "icebergCluster",
+            "icebergS3Cluster",
+            "icebergAzureCluster",
+            "icebergHDFSCluster",
+            "icebergLocalCluster",
+            "deltaLake",
+            "deltaLakeS3",
+            "deltaLakeAzure",
+            "deltaLakeLocal",
+            "deltaLakeCluster",
+            "deltaLakeS3Cluster",
+            "deltaLakeAzureCluster",
+            "hudi",
+            "hudiCluster",
+            "paimon",
+            "paimonS3",
+            "paimonAzure",
+            "paimonHDFS",
+            "paimonLocal",
+            "paimonCluster",
+            "paimonS3Cluster",
+            "paimonAzureCluster",
+            "paimonHDFSCluster",
+            "cluster",
+            "clusterAllReplicas",
+            "traceView",
+            "hive",
+            "ytsaurus",
+            "bigquery",
+            "arrowFlight",
+            "fileCluster",
+            "filesystem",
+            "sqlite",
+            "executable",
+            "eval",
+            "hasColumnInTable",
+            "catboostEvaluate",
+            "generateSerialID",
+            "aiClassify",
+            "aiEmbed",
+            "aiExtract",
+            "aiFilter",
+            "aiGenerate",
+            "aiRedact",
+            "aiSimilarity",
+            "aiTranslate",
+        ] {
+            let denied = format!("Function '{name}' is not allowed");
+            for sql in [
+                format!("SELECT count() FROM logs WHERE block_num IN ({name}('x'))"),
+                format!("SELECT {name}('x') FROM logs"),
+            ] {
+                let error = validate_clickhouse_query(&sql).expect_err(&sql);
+                assert_eq!(error.to_string(), denied, "{sql}");
+            }
+        }
+
+        // Ordinary functions are still accepted in the same positions.
+        assert!(
+            validate_clickhouse_query(
+                "SELECT lower(tx_hash) FROM logs WHERE block_num IN (toUInt64(1), 2)"
+            )
+            .is_ok()
+        );
     }
 
     #[test]
