@@ -37,7 +37,7 @@ async fn setup() -> Option<(TestDb, TestClickHouse)> {
     let fdw_url =
         std::env::var("TIDX_TEST_FDW_URL").unwrap_or_else(|_| "http://clickhouse:8123".into());
     let target = FdwTarget::new(&fdw_url, CH_DB.to_string(), None, None).unwrap();
-    if let Err(e) = bootstrap(&db.pool, &target, CHAIN_ID).await {
+    if let Err(e) = bootstrap(&db.pool, &target, None, CHAIN_ID).await {
         println!("pg_clickhouse not available ({e:#}), skipping test");
         teardown(&db).await;
         return None;
@@ -168,4 +168,67 @@ async fn test_fdw_fixed_bytes_returns_declared_width() {
     assert_eq!(nested.rows, [vec![serde_json::json!("0xcafebabe")]]);
     assert_eq!(unrelated.rows, nested.rows);
     assert_eq!(capped.rows, [vec![serde_json::json!(1)]]);
+}
+
+const API_ROLE: &str = "tidx_test_fdw_api";
+
+async fn create_api_role(db: &TestDb) {
+    let conn = db.pool.get().await.unwrap();
+    conn.batch_execute(&format!(
+        "DO $$ BEGIN
+           IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = '{API_ROLE}') THEN
+             CREATE ROLE {API_ROLE} NOLOGIN;
+           END IF;
+         END $$"
+    ))
+    .await
+    .unwrap();
+}
+
+async fn drop_api_role(db: &TestDb) {
+    let conn = db.pool.get().await.unwrap();
+    conn.batch_execute(&format!("DROP OWNED BY {API_ROLE}; DROP ROLE {API_ROLE}"))
+        .await
+        .unwrap();
+}
+
+/// Count `ch.logs` as the API role, the way a separate API pool queries.
+async fn count_as_api_role(db: &TestDb) -> Result<i64, tokio_postgres::Error> {
+    let mut conn = db.pool.get().await.unwrap();
+    let tx = conn.transaction().await?;
+    tx.batch_execute(&format!(
+        "GRANT USAGE ON SCHEMA ch TO {API_ROLE};
+         GRANT SELECT ON ch.logs TO {API_ROLE};
+         SET LOCAL ROLE {API_ROLE}"
+    ))
+    .await?;
+    let count = tx.query_one("SELECT count(*) FROM ch.logs", &[]).await?;
+    Ok(count.get(0))
+}
+
+#[tokio::test]
+#[serial(db)]
+async fn test_fdw_api_role_needs_its_own_user_mapping() {
+    let Some((db, _ch)) = setup().await else {
+        return;
+    };
+    create_api_role(&db).await;
+    let without_mapping = count_as_api_role(&db).await;
+
+    // Re-bootstrap the way `tidx up` does when `postgres.api_url` is set.
+    let fdw_url =
+        std::env::var("TIDX_TEST_FDW_URL").unwrap_or_else(|_| "http://clickhouse:8123".into());
+    let target = FdwTarget::new(&fdw_url, CH_DB.to_string(), None, None).unwrap();
+    let rebootstrap = bootstrap(&db.pool, &target, Some(API_ROLE), CHAIN_ID).await;
+    let with_mapping = count_as_api_role(&db).await;
+    teardown(&db).await;
+    drop_api_role(&db).await;
+
+    let err = without_mapping.expect_err("API role must not read ch.* without a mapping");
+    assert!(
+        format!("{err:?}").contains("user mapping not found"),
+        "unexpected error: {err:?}"
+    );
+    rebootstrap.expect("bootstrap with API role failed");
+    assert_eq!(with_mapping.expect("API role FDW query failed"), 0);
 }

@@ -216,6 +216,11 @@ fn sql_literal(s: &str) -> String {
     s.replace('\'', "''")
 }
 
+/// Quote a string as a SQL identifier.
+fn sql_ident(s: &str) -> String {
+    format!("\"{}\"", s.replace('"', "\"\""))
+}
+
 /// The hot-arm select expression normalizing a PG column to CH representation.
 fn hot_expr(c: &Col) -> String {
     let q = format!("\"{}\"", c.name);
@@ -352,13 +357,51 @@ pub async fn is_bootstrapped(pool: &Pool) -> Result<bool> {
     Ok(row.get(0))
 }
 
-/// Create/replace all tiered objects: extension, FDW server, user mapping,
+/// Create/replace all tiered objects: extension, FDW server, user mappings,
 /// foreign tables, boundary constraints, and views at the current boundary.
+///
+/// `api_role` is the PostgreSQL role of a separate API pool (from
+/// `postgres.api_url`). PostgreSQL resolves a foreign table's user mapping
+/// for the querying role, so that role needs its own mapping to read `ch.*`
+/// and `tiered.*`; the bootstrapping role owns the server and may create it.
 ///
 /// Idempotent; recreates the server (CASCADE drops dependents) to pick up
 /// config changes. Requires the pg_clickhouse extension to be installable
 /// on the PostgreSQL server. Returns the boundary baked into the views.
-pub async fn bootstrap(pool: &Pool, target: &FdwTarget, chain_id: u64) -> Result<i64> {
+pub async fn bootstrap(
+    pool: &Pool,
+    target: &FdwTarget,
+    api_role: Option<&str>,
+    chain_id: u64,
+) -> Result<i64> {
+    let ddl = bootstrap_ddl(target, api_role);
+
+    let conn = pool.get().await?;
+    conn.batch_execute(&ddl.join(";\n"))
+        .await
+        .context("tiered bootstrap DDL failed (is the pg_clickhouse extension available?)")?;
+    drop(conn);
+
+    let boundary = refresh_boundary(pool, chain_id).await?;
+    info!(
+        chain_id,
+        boundary,
+        host = %target.host,
+        database = %target.database,
+        api_role,
+        "Tiered storage bootstrapped (ch.* foreign tables + tiered.* views)"
+    );
+    Ok(boundary)
+}
+
+/// Bootstrap DDL, executed as one implicit transaction so a failure leaves
+/// the previous server and its dependents intact.
+fn bootstrap_ddl(target: &FdwTarget, api_role: Option<&str>) -> Vec<String> {
+    let mapping_options = format!(
+        "OPTIONS (user '{user}', password '{password}')",
+        user = sql_literal(&target.user),
+        password = sql_literal(&target.password),
+    );
     let mut ddl = vec![
         "CREATE EXTENSION IF NOT EXISTS pg_clickhouse".to_string(),
         "CREATE SCHEMA IF NOT EXISTS ch".to_string(),
@@ -373,29 +416,17 @@ pub async fn bootstrap(pool: &Pool, target: &FdwTarget, chain_id: u64) -> Result
             db = sql_literal(&target.database),
             secure = if target.secure { "on" } else { "off" },
         ),
-        format!(
-            "CREATE USER MAPPING FOR CURRENT_USER SERVER {SERVER} OPTIONS (user '{user}', password '{password}')",
-            user = sql_literal(&target.user),
-            password = sql_literal(&target.password),
-        ),
+        format!("CREATE USER MAPPING FOR CURRENT_USER SERVER {SERVER} {mapping_options}"),
     ];
+    if let Some(role) = api_role {
+        // IF NOT EXISTS: the API role may be the bootstrapping role itself.
+        ddl.push(format!(
+            "CREATE USER MAPPING IF NOT EXISTS FOR {role} SERVER {SERVER} {mapping_options}",
+            role = sql_ident(role),
+        ));
+    }
     ddl.extend(TABLES.iter().map(|t| foreign_table_sql(t)));
-
-    let conn = pool.get().await?;
-    conn.batch_execute(&ddl.join(";\n"))
-        .await
-        .context("tiered bootstrap DDL failed (is the pg_clickhouse extension available?)")?;
-    drop(conn);
-
-    let boundary = refresh_boundary(pool, chain_id).await?;
-    info!(
-        chain_id,
-        boundary,
-        host = %target.host,
-        database = %target.database,
-        "Tiered storage bootstrapped (ch.* foreign tables + tiered.* views)"
-    );
-    Ok(boundary)
+    ddl
 }
 
 /// Rebake the boundary constraints and tiered views at the current hot-tier
@@ -527,5 +558,55 @@ mod tests {
     #[test]
     fn test_sql_literal_escapes_quotes() {
         assert_eq!(sql_literal("pa'ss"), "pa''ss");
+    }
+
+    #[test]
+    fn test_sql_ident_quotes_and_escapes() {
+        assert_eq!(sql_ident("tidx_api"), "\"tidx_api\"");
+        assert_eq!(sql_ident("we\"ird"), "\"we\"\"ird\"");
+    }
+
+    fn mappings(ddl: &[String]) -> Vec<&String> {
+        ddl.iter().filter(|s| s.contains("USER MAPPING")).collect()
+    }
+
+    #[test]
+    fn test_bootstrap_ddl_maps_only_current_user_without_api_role() {
+        let t = FdwTarget::new("http://ch:8123", "db".into(), Some("w".into()), None).unwrap();
+        let ddl = bootstrap_ddl(&t, None);
+        assert_eq!(
+            mappings(&ddl),
+            [
+                "CREATE USER MAPPING FOR CURRENT_USER SERVER tidx_clickhouse \
+              OPTIONS (user 'w', password '')"
+            ]
+        );
+    }
+
+    #[test]
+    fn test_bootstrap_ddl_maps_api_role_after_server_recreate() {
+        let t = FdwTarget::new(
+            "http://ch:8123",
+            "db".into(),
+            Some("w".into()),
+            Some("pa'ss".into()),
+        )
+        .unwrap();
+        let ddl = bootstrap_ddl(&t, Some("tidx_api"));
+        assert_eq!(
+            mappings(&ddl),
+            [
+                "CREATE USER MAPPING FOR CURRENT_USER SERVER tidx_clickhouse \
+                 OPTIONS (user 'w', password 'pa''ss')",
+                "CREATE USER MAPPING IF NOT EXISTS FOR \"tidx_api\" SERVER tidx_clickhouse \
+                 OPTIONS (user 'w', password 'pa''ss')",
+            ]
+        );
+        let drop = ddl
+            .iter()
+            .position(|s| s.starts_with("DROP SERVER"))
+            .unwrap();
+        let api = ddl.iter().position(|s| s.contains("\"tidx_api\"")).unwrap();
+        assert!(drop < api, "API mapping must follow the CASCADE drop");
     }
 }
