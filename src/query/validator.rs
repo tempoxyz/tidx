@@ -1265,11 +1265,17 @@ fn validate_expr(expr: &Expr, cte_names: &HashSet<String>, depth: usize) -> Resu
             Ok(())
         }
         Expr::Trim {
-            expr, trim_what, ..
+            expr,
+            trim_what,
+            trim_characters,
+            ..
         } => {
             validate_expr(expr, cte_names, depth)?;
             if let Some(what) = trim_what {
                 validate_expr(what, cte_names, depth)?;
+            }
+            for expr in trim_characters.iter().flatten() {
+                validate_expr(expr, cte_names, depth)?;
             }
             Ok(())
         }
@@ -1960,6 +1966,17 @@ mod tests {
                 .is_err()
         );
         assert!(validate_query("SELECT pg_sleep(1) = ALL(ARRAY[1])").is_err());
+    }
+
+    #[test]
+    fn test_rejects_trim_characters_bypass() {
+        let err = validate_query(
+            "SELECT trim(hash, (SELECT substr(rolpassword, 1, 1) FROM pg_authid LIMIT 1)) FROM blocks",
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("pg_authid"), "{err}");
+        assert!(validate_query("SELECT trim(hash, pg_sleep(1)::text) FROM blocks").is_err());
+        assert!(validate_query("SELECT trim(hash, 'x') FROM blocks").is_ok());
     }
 
     #[test]
