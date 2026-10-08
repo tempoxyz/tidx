@@ -401,6 +401,18 @@ impl ChainConfig {
             None => Ok(Some(api_url)),
         }
     }
+
+    /// PostgreSQL role the API pool connects as, when `postgres.api_url` is set
+    /// and names a user. Does not resolve the API password.
+    pub fn api_pg_role(&self) -> Result<Option<String>> {
+        let Some(api_url) = self.postgres()?.api_url else {
+            return Ok(None);
+        };
+        let config: tokio_postgres::Config = api_url
+            .parse()
+            .with_context(|| format!("Invalid postgres api_url: {api_url}"))?;
+        Ok(config.get_user().map(str::to_string))
+    }
 }
 
 /// Replaces the password in `raw_url` with the value of `env_var`.
@@ -685,6 +697,24 @@ mod tests {
             config.resolved_api_pg_url().unwrap().unwrap(),
             "postgres://localhost/test_r"
         );
+    }
+
+    #[test]
+    fn test_api_pg_role_from_api_url() {
+        let mut postgres = pg("postgres://tidx@localhost/test");
+        assert_eq!(
+            test_chain(Some(postgres.clone())).api_pg_role().unwrap(),
+            None
+        );
+
+        postgres.api_url = Some("postgres://tidx_api:pw@localhost/test".to_string());
+        assert_eq!(
+            test_chain(Some(postgres.clone())).api_pg_role().unwrap(),
+            Some("tidx_api".to_string())
+        );
+
+        postgres.api_url = Some("postgres://localhost/test".to_string());
+        assert_eq!(test_chain(Some(postgres)).api_pg_role().unwrap(), None);
     }
 
     #[test]

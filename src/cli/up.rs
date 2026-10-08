@@ -395,16 +395,17 @@ fn spawn_sync_engine(
                                         ch_config.user.clone(),
                                         ch_password.clone(),
                                     );
-                                    let result = match target {
-                                        Ok(target) => {
+                                    let result = match (target, chain.api_pg_role()) {
+                                        (Ok(target), Ok(api_role)) => {
                                             db::tiered::bootstrap(
                                                 throttled_pool.inner(),
                                                 &target,
+                                                api_role.as_deref(),
                                                 chain.chain_id,
                                             )
                                             .await
                                         }
-                                        Err(e) => Err(e),
+                                        (Err(e), _) | (_, Err(e)) => Err(e),
                                     };
                                     if let Err(e) = result {
                                         warn!(
