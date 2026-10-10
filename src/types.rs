@@ -147,8 +147,15 @@ impl SyncState {
 
     /// Returns total number of indexed blocks
     pub fn total_indexed(&self) -> u64 {
+        if self.tip_num == 0 && self.backfill_num.is_none() {
+            return 0;
+        }
         let (low, high) = self.indexed_range();
-        if high >= low { high - low + 1 } else { 0 }
+        if high >= low {
+            high - low + 1
+        } else {
+            0
+        }
     }
 
     /// Get the current sync rate (blocks per second)
@@ -180,5 +187,32 @@ impl SyncState {
         } else {
             None
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_sync_state_total_indexed_zero() {
+        let state = SyncState::default();
+        assert_eq!(state.total_indexed(), 0);
+    }
+
+    #[test]
+    fn test_sync_state_total_indexed_with_tip() {
+        let state = SyncState {
+            tip_num: 100,
+            ..Default::default()
+        };
+        assert_eq!(state.total_indexed(), 1);
+
+        let state_backfill = SyncState {
+            tip_num: 100,
+            backfill_num: Some(50),
+            ..Default::default()
+        };
+        assert_eq!(state_backfill.total_indexed(), 51);
     }
 }
