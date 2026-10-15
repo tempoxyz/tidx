@@ -1,5 +1,93 @@
 # Changelog
 
+## `tidx@1.0.0`
+
+### Major Changes
+
+**Breaking:** Moved PostgreSQL chain settings into a nested `[chains.postgres]` section (`url`, `password_env`, `api_url`, `api_password_env`), removing the root-level `pg_url`, `pg_password_env`, `api_pg_url`, and `api_pg_password_env` fields.
+  ```diff
+   [[chains]]
+   name = "mainnet"
+   chain_id = 4217
+   rpc_url = "https://rpc.tempo.xyz"
+  -pg_url = "postgres://user@host:5432/tidx_mainnet"
+  -pg_password_env = "TIDX_PG_PASSWORD"
+  -api_pg_url = "postgres://user@host:5432/tidx_mainnet_r"
+  -api_pg_password_env = "TIDX_API_PG_PASSWORD"
+  +
+  +[chains.postgres]
+  +url = "postgres://user@host:5432/tidx_mainnet"
+  +password_env = "TIDX_PG_PASSWORD"
+  +api_url = "postgres://user@host:5432/tidx_mainnet_r"
+  +api_password_env = "TIDX_API_PG_PASSWORD"
+  ```
+  (by @jxom, [#254](https://github.com/tempoxyz/tidx/pull/254))
+
+### Minor Changes
+
+- Changed tiered-storage backfill to write full history directly from RPC to ClickHouse, then hydrate PostgreSQL's configured hot window from checkpointed ClickHouse archive ranges. PostgreSQL storage is now bounded during initial sync, historical RPC work is not duplicated, and increasing `pg_keep` restores the additional hot range before moving the query boundary. (by @KamilSzczygieł, [#261](https://github.com/tempoxyz/tidx/pull/261))
+- Added `dex_ohlc_1m`, a refreshable ClickHouse materialized view that rolls `dex_fills` into per-minute OHLC candles keyed by `(token, bucket)`, removing the 1000-fill in-memory bucketing cap on the OHLC endpoint and enabling multi-month windows with the work moved off the request path. (by @jxom, [#228](https://github.com/tempoxyz/tidx/pull/228))
+- Added support for the Tempo T6 network upgrade (TIP-1028 receive policies, TIP-1049 admin keys). Excluded the `ReceivePolicyGuard` precompile (`0xb10c...`) from holder/balance derivation so blocked transfers no longer credit the guard as a fake holder, while leaving raw `token_transfers`/`token_supply` movement intact. Added a one-time post-derived migration that deletes any pre-existing guard rows from `token_holder_deltas`/`address_holder_deltas` (a no-op on fresh deployments) so historical balances and refreshable holder aggregates stop counting the guard. Pinned the Tempo crates to the T6 release commit. (by @stevencartavia, [#244](https://github.com/tempoxyz/tidx/pull/244))
+- Added tiered storage: with `[chains.retention]`, PostgreSQL keeps a hot window of recent blocks and prunes the rest once durable in the ClickHouse archive.
+  ```diff
+   [[chains]]
+   name = "mainnet"
+   chain_id = 4217
+   rpc_url = "https://rpc.tempo.xyz"
+  
+   [chains.clickhouse]
+   enabled = true
+   url = "http://clickhouse:8123"
+  +
+  +[chains.retention]
+  +pg_keep = "30d"
+  ```
+  (by @jxom, [#254](https://github.com/tempoxyz/tidx/pull/254))
+
+### Patch Changes
+
+- Fixed backfill-first mode skipping the blocks above the highest stored block after a lagging restart, and the blocks realtime sync jumped over after falling more than ten blocks behind. Both ranges stayed missing until the next restart; they are now backfilled before realtime sync starts and caught up in order afterwards. (by @MatthiasSeitz, [#355](https://github.com/tempoxyz/tidx/pull/355))
+- Fixed receipts and logs being dropped or attached to the wrong block when the RPC node answers a block and its receipts inconsistently. Per-item batch errors and truncated batch responses now fail the fetch, and receipts are only written when they carry the hash and transactions of the block they are stored with. Batch responses are matched by request ID so out-of-order replies remain valid; missing, duplicate, and unexpected IDs are rejected. (by @MatthiasSeitz, [#354](https://github.com/tempoxyz/tidx/pull/354))
+- Fixed PostgreSQL `/query` validation accepting unbounded `lpad` and `rpad` lengths. The length must now be an integer literal no larger than 1024, so oversized padding is rejected before the database builds it. (by @MatthiasSeitz, [#349](https://github.com/tempoxyz/tidx/pull/349))
+- Added ClickHouse projections and bloom filters for common block, log, receipt, and transaction access paths, requiring ClickHouse 25.11 or newer. (by @jxom, [#297](https://github.com/tempoxyz/tidx/pull/297))
+- Sped up decoding of ClickHouse query results about fourfold. Queries now request `JSONCompact`, whose rows are arrays in column order, and are deserialized directly instead of through a JSON tree that was cloned cell by cell. Result bodies are also about a fifth smaller. (by @MatthiasSeitz, [#365](https://github.com/tempoxyz/tidx/pull/365))
+- Fixed ClickHouse query validation accepting calls to functions that reach external systems, other servers, local files, or programs, such as `gcs`, `azureBlobStorage`, `iceberg`, `cluster`, and `executable`. These are now rejected like `url` and `s3`. (by @MatthiasSeitz, [#352](https://github.com/tempoxyz/tidx/pull/352))
+- Capped ClickHouse working memory at 1 GiB per public API query, so array-building functions can no longer allocate up to the server profile's limit before the result caps apply. Internal queries and the indexer's own writes are unaffected. (by @MatthiasSeitz, [#350](https://github.com/tempoxyz/tidx/pull/350))
+- Added `replicated_database` option under `[chains.clickhouse]`. When enabled, the sink creates the database with `ENGINE = Replicated` and rewrites MergeTree-family table engines to their `Replicated*` counterparts, so schema and data replicate across self-hosted multi-replica clusters coordinated by Keeper. Defaults to off; ClickHouse Cloud and single-node deployments are unaffected. (by @KamilSzczygieł, [#252](https://github.com/tempoxyz/tidx/pull/252))
+- Fixed ClickHouse failover classification so client timeouts stop immediately while non-timeout transport and protocol failures try a healthy secondary. (by @jxom, [#287](https://github.com/tempoxyz/tidx/pull/287))
+- Fixed ClickHouse query validation to check functions and tables in every clause of a query. `TOP` and `IN` with a single identifier are now rejected; use `LIMIT` and `=` or a subquery instead. (by @MatthiasSeitz, [#357](https://github.com/tempoxyz/tidx/pull/357))
+- Bound the PostgreSQL, ClickHouse, Prometheus and Grafana ports in the production compose file to `127.0.0.1`, so their default credentials are no longer reachable from other hosts. (by @MatthiasSeitz, [#347](https://github.com/tempoxyz/tidx/pull/347))
+- Bounded the `dex_ohlc_1m` refresh: the join now only loads orders that were filled inside the retention window instead of every order ever placed, and the refresh carries explicit memory and thread limits. (by @MatthiasSeitz, [#348](https://github.com/tempoxyz/tidx/pull/348))
+- Fixed the Docker installer skipping `clickhouse-config.xml`, `prometheus.yml` and `alerts.yml`, which the production compose file bind-mounts and Docker otherwise creates as empty directories. Failed downloads now abort the install instead of being saved as the file. (by @MatthiasSeitz, [#358](https://github.com/tempoxyz/tidx/pull/358))
+- Fixed duplicate, stale, or missing ClickHouse rows across retries, reorgs, partial writes, and startup backfills using bounded canonical-row repair, fresh deduplication generations, and durable handoffs. (by @jxom, [#280](https://github.com/tempoxyz/tidx/pull/280))
+- Fixed the ClickHouse sink failing against ClickHouse 26.9+ with `decompression error: incorrect magic number` by requesting LZ4-framed responses via `network_compression_method=lz4`. (by @MatthiasSeitz, [#371](https://github.com/tempoxyz/tidx/pull/371))
+- Fixed `engine=clickhouse` returning timestamps without a timezone (`2026-09-11 22:38:08.000`), which JavaScript and Python parse as local time. Native ClickHouse timestamps now use the same RFC 3339 UTC format as PostgreSQL (`2026-09-11T22:38:08+00:00`). (by @EmmaJamieson-Hoare, [#342](https://github.com/tempoxyz/tidx/pull/342))
+- Fixed ClickHouse set operations with trailing ordering or limits, including case-insensitive aliases and unresolved compound outputs, by hoisting clauses into a derived-table wrapper. (by @jxom, [#285](https://github.com/tempoxyz/tidx/pull/285))
+- Fixed unquoted and repeated indexed event equality filters. Topic pushdown now edits individual WHERE predicates on a directly named event table, including safe event scans inside subqueries and CTEs. Filters on joined or derived columns and grouped expressions keep their decoded references. PostgreSQL short fixed-byte comparisons outside this path still require explicit `\x` literals. (by @MatthiasSeitz, [#373](https://github.com/tempoxyz/tidx/pull/373))
+- Fixed PostgreSQL-over-ClickHouse (`engine=postgres&source=clickhouse`) queries returning `columns: []` for an empty event result. Column names now come from the statement prepared inside the query transaction. (by @EmmaJamieson-Hoare, [#342](https://github.com/tempoxyz/tidx/pull/342))
+- Fixed `bytes1`–`bytes31` event parameters returning the whole zero-padded 32-byte ABI word instead of exactly N bytes on every query engine, so a `bytes4` value now reads `0xdeadbeef` rather than `0xdeadbeef000…000`. Signatures with a `bytesN` width outside 1–32 are now rejected.
+- Filters must now compare against the N-byte value: `WHERE "tag" = '0xdeadbeef'` matches, while the padded 32-byte literal no longer does. Equality filters on indexed `bytesN` params are pushed down to the topic column, so they match on every engine and use the topic index. On PostgreSQL, filters on non-indexed values shorter than 20 bytes need a `'\x…'` literal, since only `'0x…'` literals of 40+ hex digits are converted to bytea. ClickHouse materialized views created from a `bytesN` signature keep the padded values until they are recreated. (by @EmmaJamieson-Hoare, [#342](https://github.com/tempoxyz/tidx/pull/342))
+- Fixed PostgreSQL `/query` results returning `null` for `float4`, `timestamp` (without time zone), and `char(n)` columns. `timestamp` values are read as UTC and formatted as RFC 3339 like `timestamptz`. (by @MatthiasSeitz, [#370](https://github.com/tempoxyz/tidx/pull/370))
+- Fixed event-query predicate pushdown dropping incremental Earn deposits by turning OR-based pagination cursors into contradictory AND filters. Only required WHERE conjuncts from a single, unambiguous reference to the matching event table are pushed down; shared event sources retain their consumer-specific filters. (by @DerekCofausper, [#311](https://github.com/tempoxyz/tidx/pull/311))
+- Sped up PostgreSQL hot-window hydration in retention-enabled deployments. The first block of the hot window is now looked up once per weekly boundary instead of by a binary search over RPC on every tick, and each scan of the hot window for gaps now hydrates every gap it finds instead of stopping after one batch per worker. (by @MatthiasSeitz, [#364](https://github.com/tempoxyz/tidx/pull/364))
+- Raised the public `/query` concurrency limit from eight to 32 requests. (by @jxom, [#299](https://github.com/tempoxyz/tidx/pull/299))
+- Reduced PostgreSQL load of gap-fill on a synced chain. The check that runs every two seconds now counts only the blocks above `synced_num` instead of every block since the prune floor, and the full range is verified on start and every ten minutes. (by @MatthiasSeitz, [#361](https://github.com/tempoxyz/tidx/pull/361))
+- Live `/query` streams now rewrite and validate their per-block query once per stream instead of for every new block. The block number is bound as a query parameter, which saves about 25 µs of CPU per block and subscriber for plain queries and about 130 µs for queries with event signatures. (by @MatthiasSeitz, [#374](https://github.com/tempoxyz/tidx/pull/374))
+- Counted every statement of a live `/query` stream against the API query concurrency limit. The limit previously covered a live request only until its SSE response started, so open streams ran their statements on top of it. (by @MatthiasSeitz, [#351](https://github.com/tempoxyz/tidx/pull/351))
+- Sped up converting PostgreSQL `/query` results to JSON, most noticeably for BYTEA-heavy results such as raw logs. Response output is unchanged. (by @MatthiasSeitz, [#369](https://github.com/tempoxyz/tidx/pull/369))
+- Cut PostgreSQL write latency for small batches about fourfold. Batches are now written with one `INSERT ... SELECT FROM unnest(...)` per table instead of a temporary staging table, a COPY and an `INSERT ... SELECT`, and all statements of a batch are sent without waiting for each other, so a write takes about four round trips instead of about forty and no longer creates and drops temporary tables. (by @MatthiasSeitz, [#367](https://github.com/tempoxyz/tidx/pull/367))
+- Added PostgreSQL head-page indexes for sender, fee payer, and indexed-address lookups, built concurrently per partition with interrupted-build recovery. (by @jxom, [#288](https://github.com/tempoxyz/tidx/pull/288))
+- Added PostgreSQL log indexes for contract event history and indexed-address lookups, built concurrently per partition with interrupted-build recovery. (by @jxom, [#282](https://github.com/tempoxyz/tidx/pull/282))
+- Fixed `/query` errors flattening PostgreSQL failures to `db error`; the server message and SQLSTATE code (e.g. `division by zero (22012)`) now surface, and statement timeouts classify as timeouts. (by @jxom, [#284](https://github.com/tempoxyz/tidx/pull/284))
+- Fixed PostgreSQL `/query` validation skipping the characters argument of `trim()`, which let a subquery there read tables the validator otherwise rejects, such as `pg_authid`. The argument is now validated like the rest of the expression. (by @jxom, [#376](https://github.com/tempoxyz/tidx/pull/376))
+- Reduced PostgreSQL write latency on partitioned installs. The deletes that replace a batch's existing txs, logs and receipts are now bounded by the batch's block timestamps, so PostgreSQL plans and scans only the weekly partitions around the batch instead of every partition. (by @MatthiasSeitz, [#363](https://github.com/tempoxyz/tidx/pull/363))
+- Reduced PostgreSQL round trips per `/query` request from seven to five, and from fifteen to five for `engine=postgres-via-clickhouse`. Session settings are sent in one batch together with statement preparation, and the tiered prune-boundary lookup no longer prepares its statement. Result types are resolved before execution so composite columns cannot stall the result stream. (by @MatthiasSeitz, [#372](https://github.com/tempoxyz/tidx/pull/372))
+- Fixed reorg handling skipping the replaced blocks: the sync pointers are now rewound to the fork point and realtime sync refetches the chain from there instead of writing the batch that exposed the reorg. The parent hash of a pipelined batch is now checked after the previous batch is committed, so two consecutive batches from different forks are no longer written. (by @MatthiasSeitz, [#356](https://github.com/tempoxyz/tidx/pull/356))
+- Improved sync throughput against RPC endpoints that limit batch sizes. Oversized block and receipt batches are now split into halves that are fetched concurrently, and the accepted batch size is remembered for a minute so later ranges are requested in batches that fit instead of being rejected and split again. (by @MatthiasSeitz, [#359](https://github.com/tempoxyz/tidx/pull/359))
+- Tiered storage bootstrap now creates a `tidx_clickhouse` user mapping for the PostgreSQL role in `postgres.api_url`, alongside the indexer role's mapping. API queries that fall back to the pg_clickhouse FDW (`ch.*` / `tiered.*`) no longer fail with `user mapping not found` when a separate API role is configured. (by @KamilSzczygieł, [#378](https://github.com/tempoxyz/tidx/pull/378))
+- Fixed tiered split queries erroring on PostgreSQL availability failures; they now degrade to the full-history ClickHouse archive while preserving PostgreSQL semantic errors. (by @jxom, [#286](https://github.com/tempoxyz/tidx/pull/286))
+- Stored holder balance deltas as unsigned `UInt256` magnitude with the sign carried in `leg`. (by @jxom, [#247](https://github.com/tempoxyz/tidx/pull/247))
+
 ## `tidx@0.7.0`
 
 ### Minor Changes
