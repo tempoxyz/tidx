@@ -16,7 +16,7 @@ jobs:
       tag: ${{ steps.get-tag.outputs.tag }}
     steps:
       - name: Secure runner
-        uses: tempoxyz/gh-actions/actions/secure-runner@55fe3b63d9612623cc51e6c62d9d62fbcb175fb0 # 2026-09-29T01-25-15Z-55fe3b63
+        uses: tempoxyz/gh-actions/actions/secure-runner@947d9a3ccb2425a9c94d563fd721cc0e33c89e26 # 2026-10-15T00-15-06Z-947d9a3c
 
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
@@ -24,7 +24,7 @@ jobs:
           persist-credentials: false
       - name: Fetch GitHub token via STS
         id: app-token
-        uses: tempoxyz/gh-actions/actions/github-sts@55fe3b63d9612623cc51e6c62d9d62fbcb175fb0 # 2026-09-29T01-25-15Z-55fe3b63
+        uses: tempoxyz/gh-actions/actions/github-sts@947d9a3ccb2425a9c94d563fd721cc0e33c89e26 # 2026-10-15T00-15-06Z-947d9a3c
         with:
           policy: release
       - id: changelogs
@@ -48,7 +48,7 @@ jobs:
   binaries:
     needs: release
     if: needs.release.outputs.published == 'true' && needs.release.outputs.tag != ''
-    uses: ./.github/workflows/binary.yml
+    uses: ./.github/workflows/binary.yml # zizmor: ignore[self-repository] actionlint does not support $/ references yet.
     with:
       tag: ${{ needs.release.outputs.tag }}
     permissions:
@@ -59,7 +59,7 @@ jobs:
   docker:
     needs: release
     if: needs.release.outputs.published == 'true' && needs.release.outputs.tag != ''
-    uses: ./.github/workflows/docker.yml
+    uses: ./.github/workflows/docker.yml # zizmor: ignore[self-repository] actionlint does not support $/ references yet.
     with:
       tag: ${{ needs.release.outputs.tag }}
     permissions:
