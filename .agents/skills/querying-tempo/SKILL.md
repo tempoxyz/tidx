@@ -316,6 +316,9 @@ curl -N "http://localhost:8080/query?chainId=4217&live=true&sql=SELECT num, gas_
 ```
 
 Events:
-- `result` — Query results for each new block
+- `result` — Snapshot up to the indexed tip, then query results for each new block; `id` is the last block covered
+- `reset` — Missed blocks could not be replayed; the next `result` is a new snapshot
 - `lagged` — Client fell behind, some blocks skipped
 - `error` — Query error
+
+To resume after a disconnect, reconnect with the last `id` as the `Last-Event-ID` header (sent automatically by `EventSource`) or as `lastEventId=`. The blocks missed since then are replayed in order.

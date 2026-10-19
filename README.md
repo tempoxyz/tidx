@@ -408,12 +408,19 @@ GET  /query                                              Execute SQL query
      ?engine                string    = postgres         Query engine: postgres or clickhouse
      ?source                string    = postgres-clickhouse  Data source: postgres, clickhouse, or postgres-clickhouse
      ?live                  bool      = false            Enable SSE streaming (postgres only)
+     ?lastEventId           number                       Resume a live stream after this block
 GET  /views?chainId=                                     List materialized views
 GET  /views/{name}?chainId=                              Get view details
 POST /views                                              Create view (trusted IP only)
 DELETE /views/{name}?chainId=                            Delete view (trusted IP only)
 GET  /metrics                                            Prometheus metrics
 ```
+
+### Live Streams
+
+`live=true` streams Server-Sent Events: a `result` snapshot of the query up to the indexed tip, then a `result` with the query's rows for each new block. Each `result` has the last block it covers as its `id`, so a client that reconnects with that id receives the blocks it missed instead of a new snapshot. `EventSource` sends it automatically as the `Last-Event-ID` header; other clients can send the header or pass `lastEventId`.
+
+If PostgreSQL no longer holds the missed blocks (pruned from the hot window), or more than 1000 blocks were missed, the stream sends a `reset` event and then a new snapshot, which replaces the client's previous results. A `lagged` event with `from_block` and `to_block` reports blocks skipped because the client fell more than 10 blocks behind.
 
 ### Views API
 
