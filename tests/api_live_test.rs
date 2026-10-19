@@ -412,13 +412,11 @@ async fn test_query_live_rejects_when_stream_capacity_reached() {
     assert!(body.contains("Live stream capacity reached"), "got: {body}");
 }
 
-#[tokio::test]
-#[serial(db)]
-async fn test_query_live_streams_each_new_block() {
-    let db = TestDb::empty().await;
+/// Writes blocks `1..=count` and a sync state whose realtime tip is `tip_num`.
+async fn seed_live_blocks(db: &TestDb, count: u64, tip_num: u64, pruned_below: u64) {
     db.truncate_all().await;
     let now = chrono::Utc::now();
-    let blocks: Vec<tidx::types::BlockRow> = (1..=4)
+    let blocks: Vec<tidx::types::BlockRow> = (1..=count as i64)
         .map(|num| tidx::types::BlockRow {
             num,
             hash: vec![num as u8; 32],
@@ -439,13 +437,82 @@ async fn test_query_live_streams_each_new_block() {
         &db.pool,
         &tidx::types::SyncState {
             chain_id: 1,
-            synced_num: 2,
-            tip_num: 2,
+            synced_num: tip_num,
+            tip_num,
+            pruned_below,
             ..Default::default()
         },
     )
     .await
     .unwrap();
+}
+
+fn block_update(block_num: u64) -> BlockUpdate {
+    BlockUpdate {
+        chain_id: 1,
+        block_num,
+        block_hash: String::new(),
+        tx_count: 0,
+        log_count: 0,
+        timestamp: 0,
+    }
+}
+
+/// One SSE message: (event, id, data).
+type SseMessage = (String, Option<String>, serde_json::Value);
+
+/// Reads the next `count` SSE messages, skipping keep-alive comments.
+async fn read_events(body: &mut axum::body::BodyDataStream, count: usize) -> Vec<SseMessage> {
+    let mut buffer = String::new();
+    let mut messages = Vec::new();
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while messages.len() < count {
+            let chunk = futures::StreamExt::next(body).await.unwrap().unwrap();
+            buffer.push_str(std::str::from_utf8(&chunk).unwrap());
+            while let Some(end) = buffer.find("\n\n") {
+                let raw: String = buffer.drain(..end + 2).collect();
+                let (mut event, mut id, mut data) = (String::new(), None, None);
+                for line in raw.lines() {
+                    if let Some(v) = line.strip_prefix("event: ") {
+                        event = v.to_string();
+                    } else if let Some(v) = line.strip_prefix("id: ") {
+                        id = Some(v.to_string());
+                    } else if let Some(v) = line.strip_prefix("data: ") {
+                        data = Some(serde_json::from_str(v).unwrap());
+                    }
+                }
+                if let Some(data) = data {
+                    messages.push((event, id, data));
+                }
+            }
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("expected {count} events, got: {messages:?}"));
+    messages
+}
+
+/// (event, id, rows) for each `result` message; `rows` is null for others.
+fn summarize(messages: &[SseMessage]) -> Vec<(String, Option<String>, serde_json::Value)> {
+    messages
+        .iter()
+        .map(|(event, id, data)| (event.clone(), id.clone(), data["rows"].clone()))
+        .collect()
+}
+
+fn result(id: u64, rows: serde_json::Value) -> (String, Option<String>, serde_json::Value) {
+    ("result".to_string(), Some(id.to_string()), rows)
+}
+
+const LIVE_BLOCKS_URI: &str =
+    "/query?sql=SELECT%20num%20FROM%20blocks%20ORDER%20BY%20num&chainId=1&live=true";
+
+#[tokio::test]
+#[serial(db)]
+async fn test_query_live_streams_each_new_block() {
+    let db = TestDb::empty().await;
+    // Block 3 is already written but not yet broadcast when the stream starts.
+    seed_live_blocks(&db, 4, 2, 0).await;
 
     let broadcaster = Arc::new(Broadcaster::new());
     let (pools, chain_id) = make_pools(db.pool.clone());
@@ -454,7 +521,7 @@ async fn test_query_live_streams_each_new_block() {
         .call(
             Request::builder()
                 .method("GET")
-                .uri("/query?sql=SELECT%20num%20FROM%20blocks%20ORDER%20BY%20num&chainId=1&live=true")
+                .uri(LIVE_BLOCKS_URI)
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -462,40 +529,181 @@ async fn test_query_live_streams_each_new_block() {
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
 
-    // Blocks 3 and 4 arrive after the stream caught up to block 2.
-    broadcaster.send(BlockUpdate {
-        chain_id: 1,
-        block_num: 4,
-        block_hash: String::new(),
-        tx_count: 0,
-        log_count: 0,
-        timestamp: now.timestamp(),
-    });
+    broadcaster.send(block_update(4));
 
     let mut body = response.into_body().into_data_stream();
-    let mut events = String::new();
-    tokio::time::timeout(Duration::from_secs(10), async {
-        while events.matches("event: result").count() < 3 {
-            let chunk = futures::StreamExt::next(&mut body).await.unwrap().unwrap();
-            events.push_str(std::str::from_utf8(&chunk).unwrap());
-        }
-    })
-    .await
-    .unwrap_or_else(|_| panic!("expected three results, got: {events}"));
-
-    let rows: Vec<serde_json::Value> = events
-        .lines()
-        .filter_map(|line| line.strip_prefix("data: "))
-        .map(|data| serde_json::from_str::<serde_json::Value>(data).unwrap()["rows"].clone())
-        .collect();
+    // The snapshot stops at the tip, so blocks 3 and 4 are sent exactly once.
     assert_eq!(
-        rows,
+        summarize(&read_events(&mut body, 3).await),
         vec![
-            serde_json::json!([[1], [2], [3], [4]]),
-            serde_json::json!([[3]]),
-            serde_json::json!([[4]]),
+            result(2, serde_json::json!([[1], [2]])),
+            result(3, serde_json::json!([[3]])),
+            result(4, serde_json::json!([[4]])),
         ]
     );
+}
+
+#[tokio::test]
+#[serial(db)]
+async fn test_query_live_resumes_after_last_event_id() {
+    let db = TestDb::empty().await;
+    seed_live_blocks(&db, 7, 6, 0).await;
+
+    let broadcaster = Arc::new(Broadcaster::new());
+    let (pools, chain_id) = make_pools(db.pool.clone());
+    let mut app = make_test_service(pools, chain_id, broadcaster.clone()).await;
+    // EventSource reconnects with the URL it started with plus the last id it
+    // saw, so the header wins over the query param.
+    let response = app
+        .call(
+            Request::builder()
+                .method("GET")
+                .uri(format!("{LIVE_BLOCKS_URI}&lastEventId=1"))
+                .header("Last-Event-ID", "3")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    broadcaster.send(block_update(7));
+
+    let mut body = response.into_body().into_data_stream();
+    // No snapshot: the blocks after 3 are replayed, then the stream goes live.
+    assert_eq!(
+        summarize(&read_events(&mut body, 4).await),
+        vec![
+            result(4, serde_json::json!([[4]])),
+            result(5, serde_json::json!([[5]])),
+            result(6, serde_json::json!([[6]])),
+            result(7, serde_json::json!([[7]])),
+        ]
+    );
+
+    // A client persisting the cursor itself can resume with the query param.
+    let response = app
+        .call(
+            Request::builder()
+                .method("GET")
+                .uri(format!("{LIVE_BLOCKS_URI}&lastEventId=5"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let mut body = response.into_body().into_data_stream();
+    assert_eq!(
+        summarize(&read_events(&mut body, 1).await),
+        vec![result(6, serde_json::json!([[6]]))]
+    );
+}
+
+#[tokio::test]
+#[serial(db)]
+async fn test_query_live_resets_when_blocks_cannot_be_replayed() {
+    let db = TestDb::empty().await;
+    // Blocks at and below 3 were pruned from the hot window.
+    seed_live_blocks(&db, 6, 6, 3).await;
+
+    let broadcaster = Arc::new(Broadcaster::new());
+    let (pools, chain_id) = make_pools(db.pool.clone());
+    let mut app = make_test_service(pools, chain_id, broadcaster.clone()).await;
+
+    // Resuming after block 3 needs only blocks 4..=6, which are still there.
+    let response = app
+        .call(
+            Request::builder()
+                .uri(LIVE_BLOCKS_URI)
+                .header("Last-Event-ID", "3")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let mut body = response.into_body().into_data_stream();
+    assert_eq!(
+        summarize(&read_events(&mut body, 1).await),
+        vec![result(4, serde_json::json!([[4]]))]
+    );
+
+    // Block 3 itself is gone, so resuming after block 2 starts over.
+    let response = app
+        .call(
+            Request::builder()
+                .uri(LIVE_BLOCKS_URI)
+                .header("Last-Event-ID", "2")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let mut body = response.into_body().into_data_stream();
+    let messages = read_events(&mut body, 2).await;
+    assert_eq!(messages[0].0, "reset", "got: {messages:?}");
+    assert_eq!(messages[0].2["last_event_id"], 2);
+    assert_eq!(
+        summarize(&messages[1..]),
+        vec![result(6, serde_json::json!([[1], [2], [3], [4], [5], [6]]))]
+    );
+
+    // More than 1000 blocks behind the tip is reset instead of replayed.
+    seed_live_blocks(&db, 2, 1_006, 0).await;
+    let response = app
+        .call(
+            Request::builder()
+                .uri(LIVE_BLOCKS_URI)
+                .header("Last-Event-ID", "5")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let mut body = response.into_body().into_data_stream();
+    let messages = read_events(&mut body, 2).await;
+    assert_eq!(messages[0].0, "reset", "got: {messages:?}");
+    assert_eq!(
+        summarize(&messages[1..]),
+        vec![result(1_006, serde_json::json!([[1], [2]]))]
+    );
+
+    // Exactly 1000 blocks behind is still replayed.
+    let response = app
+        .call(
+            Request::builder()
+                .uri(LIVE_BLOCKS_URI)
+                .header("Last-Event-ID", "6")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let mut body = response.into_body().into_data_stream();
+    assert_eq!(
+        summarize(&read_events(&mut body, 1).await),
+        vec![result(7, serde_json::json!([]))]
+    );
+}
+
+#[tokio::test]
+#[serial(db)]
+async fn test_query_live_rejects_invalid_last_event_id() {
+    let db = TestDb::empty().await;
+    let broadcaster = Arc::new(Broadcaster::new());
+    let (pools, chain_id) = make_pools(db.pool.clone());
+    let mut app = make_test_service(pools, chain_id, broadcaster).await;
+
+    let response = app
+        .call(
+            Request::builder()
+                .uri(LIVE_BLOCKS_URI)
+                .header("Last-Event-ID", "not-a-block")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
 }
 
 #[test]

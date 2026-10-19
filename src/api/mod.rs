@@ -372,6 +372,10 @@ pub struct QueryParams {
     /// "clickhouse" for engine=clickhouse.
     #[serde(default)]
     source: Option<String>,
+    /// Resume a live stream after this block: the `id` of the last event the
+    /// client received. The `Last-Event-ID` header takes precedence.
+    #[serde(default, rename = "lastEventId", alias = "last_event_id")]
+    last_event_id: Option<u64>,
 }
 
 fn default_timeout() -> u64 {
@@ -401,6 +405,7 @@ struct QueryResponse {
 async fn handle_query(
     State(state): State<AppState>,
     uri: axum::http::Uri,
+    headers: axum::http::HeaderMap,
     Query(params): Query<QueryParams>,
 ) -> Response {
     let signatures = extract_signatures(uri.query());
@@ -428,7 +433,21 @@ async fn handle_query(
             ))
             .into_response();
         }
-        handle_query_live(state, params, signatures)
+        // EventSource sends the last event id it saw when it reconnects, which
+        // is newer than any lastEventId baked into the URL.
+        let resume_after = match headers.get("last-event-id") {
+            Some(value) => match value.to_str().ok().and_then(|v| v.trim().parse().ok()) {
+                Some(block_num) => Some(block_num),
+                None => {
+                    return ApiError::BadRequest(
+                        "Last-Event-ID must be a block number".to_string(),
+                    )
+                    .into_response();
+                }
+            },
+            None => params.last_event_id,
+        };
+        handle_query_live(state, params, signatures, resume_after)
             .await
             .into_response()
     } else {
@@ -525,19 +544,35 @@ type SseStream = std::pin::Pin<Box<dyn Stream<Item = Result<SseEvent, Infallible
 /// Maximum blocks to catch up in a single update (prevents query multiplication attack)
 const MAX_CATCHUP_BLOCKS: u64 = 10;
 const MAX_LIVE_CONNECTIONS: usize = 20;
+/// Maximum blocks a reconnecting stream replays before it is reset to a new
+/// snapshot instead (about 8 minutes of Tempo blocks).
+const MAX_REPLAY_BLOCKS: u64 = 1_000;
 
+fn sse_error(error: impl std::fmt::Display) -> Result<SseEvent, Infallible> {
+    Ok(SseEvent::default()
+        .event("error")
+        .json_data(serde_json::json!({ "ok": false, "error": error.to_string() }))
+        .unwrap())
+}
+
+/// Streams a query's results as SSE: a snapshot up to the indexed tip, then
+/// the query's rows for each new block.
+///
+/// Every `result` event's `id` is the last block it covers, so a client that
+/// reconnects with `Last-Event-ID` (or `resume_after`) receives the blocks it
+/// missed, in order, instead of a new snapshot. When PostgreSQL no longer has
+/// those blocks, or there are more than [`MAX_REPLAY_BLOCKS`], the stream sends
+/// a `reset` event followed by a new snapshot.
 async fn handle_query_live(
     state: AppState,
     params: QueryParams,
     signatures: Vec<String>,
+    resume_after: Option<u64>,
 ) -> Sse<KeepAliveStream<SseStream>> {
     let mut rx = state.broadcaster.subscribe();
     if state.broadcaster.receiver_count() > MAX_LIVE_CONNECTIONS {
         let stream: SseStream = Box::pin(async_stream::stream! {
-            yield Ok(SseEvent::default()
-                .event("error")
-                .json_data(serde_json::json!({ "ok": false, "error": "Live stream capacity reached" }))
-                .unwrap());
+            yield sse_error("Live stream capacity reached");
         });
         return Sse::new(stream).keep_alive(KeepAlive::default());
     }
@@ -546,10 +581,7 @@ async fn handle_query_live(
         Some(p) => p,
         None => {
             let stream: SseStream = Box::pin(async_stream::stream! {
-                yield Ok(SseEvent::default()
-                    .event("error")
-                    .json_data(serde_json::json!({ "ok": false, "error": "Unknown chain_id" }))
-                    .unwrap());
+                yield sse_error("Unknown chain_id");
             });
             return Sse::new(stream).keep_alive(KeepAlive::default());
         }
@@ -563,106 +595,117 @@ async fn handle_query_live(
     let permits = state.query_permits.clone();
 
     let stream = async_stream::stream! {
-        let mut last_block_num: u64 = 0;
         let sigs: Vec<&str> = signatures.iter().map(String::as_str).collect();
-        let mut block_query: Option<PostgresQuery> = None;
+        let prepare = |op| {
+            inject_block_predicate(&sql, op)
+                .map_err(|e| anyhow!("{e}"))
+                .and_then(|filtered| PostgresQuery::new(&filtered, &sigs, &options))
+        };
 
-        // Execute initial query (live streaming uses Postgres for realtime data)
-        match execute_live_query(&permits, &pool, &sql, &sigs, &options).await {
-            Ok(result) => {
-                yield Ok(SseEvent::default()
-                    .event("result")
-                    .json_data(QueryResponse { result, ok: true })
-                    .unwrap());
-            }
+        // The block number is a parameter, so the query is rewritten and
+        // validated once for the stream.
+        let block_query = match prepare(sqlparser::ast::BinaryOperator::Eq) {
+            Ok(query) => query,
             Err(e) => {
-                yield Ok(SseEvent::default()
-                    .event("error")
-                    .json_data(serde_json::json!({ "ok": false, "error": e.to_string() }))
-                    .unwrap());
+                yield sse_error(e);
                 return;
             }
-        }
+        };
 
-        // Get current head block
-        if let Ok(statuses) = crate::service::get_all_status(&pool).await {
-            if let Some(s) = statuses.first() {
-                last_block_num = s.synced_num as u64;
+        // Read the tip after subscribing, so every block above it is broadcast
+        // to this stream.
+        let cursor = match live_stream_cursor(&permits, &pool, params.chain_id).await {
+            Ok(cursor) => cursor,
+            Err(e) => {
+                yield sse_error(e);
+                return;
+            }
+        };
+        let tip = cursor.tip.max(0) as u64;
+        let pruned_below = cursor.boundary.max(0) as u64;
+
+        // Blocks after `last_block_num` up to `target` are sent next.
+        let mut target = tip;
+        let mut last_block_num = tip;
+        let resumed = match resume_after {
+            Some(last) if last >= pruned_below && tip.saturating_sub(last) <= MAX_REPLAY_BLOCKS => {
+                last_block_num = last;
+                true
+            }
+            Some(last) => {
+                let reason = if last < pruned_below {
+                    "blocks after last_event_id were pruned from PostgreSQL"
+                } else {
+                    "too many blocks to replay"
+                };
+                yield Ok(SseEvent::default()
+                    .event("reset")
+                    .json_data(serde_json::json!({ "last_event_id": last, "reason": reason }))
+                    .unwrap());
+                false
+            }
+            None => false,
+        };
+
+        if !resumed {
+            // Bounding the snapshot at the tip keeps its rows out of the
+            // per-block results that follow it.
+            let snapshot = match prepare(sqlparser::ast::BinaryOperator::LtEq) {
+                Ok(query) => execute_live_block_query(&permits, &pool, &query, tip as i64, &options).await,
+                Err(e) => Err(e),
+            };
+            match snapshot {
+                Ok(result) => {
+                    yield Ok(SseEvent::default()
+                        .id(tip.to_string())
+                        .event("result")
+                        .json_data(QueryResponse { result, ok: true })
+                        .unwrap());
+                }
+                Err(e) => {
+                    yield sse_error(e);
+                    return;
+                }
             }
         }
 
-        // Stream updates on each new block
         loop {
+            for block_num in last_block_num + 1..=target {
+                match execute_live_block_query(&permits, &pool, &block_query, block_num as i64, &options).await {
+                    Ok(result) => {
+                        yield Ok(SseEvent::default()
+                            .id(block_num.to_string())
+                            .event("result")
+                            .json_data(QueryResponse { result, ok: true })
+                            .unwrap());
+                    }
+                    Err(e) => yield sse_error(e),
+                }
+            }
+            last_block_num = last_block_num.max(target);
+
             match rx.recv().await {
                 Ok(update) => {
-                    if update.chain_id != params.chain_id {
+                    if update.chain_id != params.chain_id || update.block_num <= last_block_num {
                         continue;
                     }
-
-                    if update.block_num <= last_block_num {
-                        continue;
-                    }
-
-                    let start = last_block_num + 1;
-                    let end = update.block_num;
+                    target = update.block_num;
 
                     // Limit catch-up to prevent query multiplication DoS
-                    let blocks_behind = end - start + 1;
+                    let blocks_behind = target - last_block_num;
                     if blocks_behind > MAX_CATCHUP_BLOCKS {
+                        let skipped_to = target - MAX_CATCHUP_BLOCKS;
                         yield Ok(SseEvent::default()
                             .event("lagged")
                             .json_data(serde_json::json!({
                                 "skipped": blocks_behind - MAX_CATCHUP_BLOCKS,
+                                "from_block": last_block_num + 1,
+                                "to_block": skipped_to,
                                 "reason": "catch-up limit exceeded"
                             }))
                             .unwrap());
-                        last_block_num = end - MAX_CATCHUP_BLOCKS;
+                        last_block_num = skipped_to;
                     }
-
-                    // Filter by each block for per-block streaming
-                    let catch_up_start = last_block_num + 1;
-                    for block_num in catch_up_start..=end {
-                        // The block number is a parameter, so the query is
-                        // rewritten and validated once for the stream.
-                        if block_query.is_none() {
-                            let filtered_sql = match inject_block_filter(&sql) {
-                                Ok(s) => s,
-                                Err(e) => {
-                                    yield Ok(SseEvent::default()
-                                        .event("error")
-                                        .json_data(serde_json::json!({ "ok": false, "error": e.to_string() }))
-                                        .unwrap());
-                                    return;
-                                }
-                            };
-                            match PostgresQuery::new(&filtered_sql, &sigs, &options) {
-                                Ok(query) => block_query = Some(query),
-                                Err(e) => {
-                                    yield Ok(SseEvent::default()
-                                        .event("error")
-                                        .json_data(serde_json::json!({ "ok": false, "error": e.to_string() }))
-                                        .unwrap());
-                                    continue;
-                                }
-                            }
-                        }
-                        let Some(query) = &block_query else { continue };
-                        match execute_live_block_query(&permits, &pool, query, block_num as i64, &options).await {
-                            Ok(result) => {
-                                yield Ok(SseEvent::default()
-                                    .event("result")
-                                    .json_data(QueryResponse { result, ok: true })
-                                    .unwrap());
-                            }
-                            Err(e) => {
-                                yield Ok(SseEvent::default()
-                                    .event("error")
-                                    .json_data(serde_json::json!({ "ok": false, "error": e.to_string() }))
-                                    .unwrap());
-                            }
-                        }
-                    }
-                    last_block_num = end;
                 }
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
                     yield Ok(SseEvent::default()
@@ -681,20 +724,19 @@ async fn handle_query_live(
     Sse::new(stream).keep_alive(KeepAlive::default())
 }
 
-/// Runs one statement of a live stream under an API query permit.
+/// Reads where a live stream starts: the realtime tip, and the prune floor at
+/// and below which PostgreSQL has no blocks to replay.
 ///
 /// The route's concurrency limit is released as soon as the SSE response
-/// starts, so each statement the stream runs afterwards takes a permit from
-/// the same budget for as long as it executes.
-async fn execute_live_query(
+/// starts, so each statement the stream runs takes a permit from the API
+/// query budget for as long as it executes.
+async fn live_stream_cursor(
     permits: &Semaphore,
     pool: &Pool,
-    sql: &str,
-    signatures: &[&str],
-    options: &QueryOptions,
-) -> AnyhowResult<QueryResult> {
+    chain_id: u64,
+) -> AnyhowResult<crate::db::tiered::PruneBoundary> {
     let _permit = permits.acquire().await?;
-    crate::service::execute_query_postgres(pool, sql, signatures, options).await
+    crate::db::tiered::fetch_prune_boundary(pool, chain_id).await
 }
 
 /// Runs a prepared block query under the same API query permit budget.
@@ -719,6 +761,14 @@ async fn execute_live_block_query(
 /// avoiding SQL injection risks from string-based splicing.
 #[doc(hidden)]
 pub fn inject_block_filter(sql: &str) -> Result<String, ApiError> {
+    inject_block_predicate(sql, sqlparser::ast::BinaryOperator::Eq)
+}
+
+/// Like [`inject_block_filter`], comparing the block column to `$1` with `op`.
+fn inject_block_predicate(
+    sql: &str,
+    op: sqlparser::ast::BinaryOperator,
+) -> Result<String, ApiError> {
     use sqlparser::ast::{BinaryOperator, Expr, Ident, SetExpr, Statement, Value};
     use sqlparser::dialect::GenericDialect;
     use sqlparser::parser::Parser;
@@ -778,7 +828,7 @@ pub fn inject_block_filter(sql: &str) -> Result<String, ApiError> {
 
     let block_filter = Expr::BinaryOp {
         left: Box::new(col_expr),
-        op: BinaryOperator::Eq,
+        op,
         right: Box::new(Expr::Value(Value::Placeholder("$1".to_string()).into())),
     };
 
@@ -982,8 +1032,9 @@ mod tests {
             limit: 1,
             engine: None,
             source: None,
+            last_event_id: None,
         };
-        let mut events = handle_query_live(state, params, vec![])
+        let mut events = handle_query_live(state, params, vec![], None)
             .await
             .into_response()
             .into_body()
