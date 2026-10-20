@@ -375,6 +375,12 @@ tidx upgrade
 
 tidx exposes a HTTP API for querying the indexer.
 
+The PostgreSQL query validator rejects `replace()` (including nested calls) because
+it can allocate large intermediate strings even when the final result is small.
+Perform replacement in the client after fetching bounded results. Existing result
+limits, timeouts, and concurrency limits remain additional safeguards; this restriction
+does not provide a general memory budget for every allowed SQL expression.
+
 Hosted endpoints:
 
 - Mainnet: `https://indexer.tempo.xyz` (`chainId=4217`)
