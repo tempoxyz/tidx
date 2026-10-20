@@ -1378,7 +1378,7 @@ const ALLOWED_FUNCTIONS: &[&str] = &[
     "trim",
     "ltrim",
     "rtrim",
-    "replace",
+    // replace can multiply nested intermediate allocations despite a small final result.
     "concat",
     "concat_ws",
     "left",
@@ -1803,7 +1803,19 @@ mod tests {
 
     #[test]
     fn test_rejects_string_amplification_functions() {
-        assert!(validate_query("SELECT repeat('x', 1000000) FROM blocks").is_err());
+        for sql in [
+            "SELECT repeat('x', 1000000) FROM blocks",
+            "SELECT length(replace(replace(rpad('x',64,'x'),'x',rpad('x',1024,'x')),'x',rpad('x',1024,'x')))",
+            "SELECT length(REPLACE('x', 'x', rpad('x',1024,'x')))",
+            "SELECT pg_catalog.replace('x', 'x', 'xx')",
+            "SELECT replace(hash, 'a', 'aa') FROM blocks",
+            "SELECT num FROM blocks WHERE length(replace('x', 'x', 'xx')) > 0",
+        ] {
+            assert!(
+                validate_query(sql).is_err(),
+                "accepted unbounded expansion: {sql}"
+            );
+        }
     }
 
     #[test]
