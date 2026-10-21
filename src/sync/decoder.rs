@@ -56,6 +56,7 @@ pub fn decode_transaction(tx: &Transaction, block: &Block, idx: u32) -> TxRow {
                     SignatureType::Secp256k1 => 0,
                     SignatureType::P256 => 1,
                     SignatureType::WebAuthn => 2,
+                    SignatureType::Multisig => 3,
                 }),
             )
         } else {
