@@ -3,7 +3,7 @@ use alloy::consensus::{BlockHeader as _, Transaction as TransactionTrait, Typed2
 use alloy::network::{ReceiptResponse, TransactionResponse};
 use alloy::primitives::B256;
 use chrono::{DateTime, TimeZone, Utc};
-use tempo_alloy::primitives::transaction::SignatureType;
+use tempo_alloy::primitives::transaction::{SignatureType, TempoSignature};
 
 use crate::tempo::{Block, Log, Receipt, TempoTxEnvelope, Transaction};
 use crate::types::{BlockRow, LogRow, ReceiptRow, TxRow};
@@ -52,11 +52,7 @@ pub fn decode_transaction(tx: &Transaction, block: &Block, idx: u32) -> TxRow {
                 tempo_tx.calls.len() as i16,
                 tempo_tx.valid_before.map(|v| v.get() as i64),
                 tempo_tx.valid_after.map(|v| v.get() as i64),
-                Some(match aa_signed.signature().signature_type() {
-                    SignatureType::Secp256k1 => 0,
-                    SignatureType::P256 => 1,
-                    SignatureType::WebAuthn => 2,
-                }),
+                Some(signature_type_code(aa_signed.signature())),
             )
         } else {
             (vec![0u8; 32], None, None, 1, None, None, Some(0))
@@ -87,6 +83,24 @@ pub fn decode_transaction(tx: &Transaction, block: &Block, idx: u32) -> TxRow {
         valid_before,
         valid_after,
         signature_type,
+    }
+}
+
+/// Map a Tempo transaction signature to the stored `signature_type` code.
+///
+/// Keychain signatures are recorded by the access key's signature type. Configurable
+/// accounts (TIP-1107), signing directly or as an access key, are recorded as `3`.
+fn signature_type_code(signature: &TempoSignature) -> i16 {
+    let signature_type = match signature {
+        TempoSignature::Primitive(primitive) => primitive.signature_type(),
+        TempoSignature::Keychain(keychain) => keychain.signature.signature_type(),
+        TempoSignature::ConfigurableAccount(_) => SignatureType::ConfigurableAccount,
+    };
+    match signature_type {
+        SignatureType::Secp256k1 => 0,
+        SignatureType::P256 => 1,
+        SignatureType::WebAuthn => 2,
+        SignatureType::ConfigurableAccount => 3,
     }
 }
 
@@ -458,5 +472,64 @@ mod tests {
 
         let err = validate_receipts(&[block], &[]).unwrap_err();
         assert_eq!(err.to_string(), "Fetched 1 blocks but 0 receipt lists");
+    }
+
+    /// Block 218 of a local `ghcr.io/tempoxyz/tempo:sha-b6d1615` dev node (T14 active),
+    /// holding one configurable-account (TIP-1107) `updateConfig` transaction.
+    const CONFIGURABLE_ACCOUNT_BLOCK: &str =
+        include_str!("../../tests/fixtures/configurable_account_block.json");
+    const CONFIGURABLE_ACCOUNT_RECEIPTS: &str =
+        include_str!("../../tests/fixtures/configurable_account_receipts.json");
+
+    #[test]
+    fn decodes_configurable_account_block() {
+        use alloy::sol_types::SolEvent;
+        use tempo_alloy::contracts::precompiles::IConfigurableAccount::ConfigurableAccountConfigUpdated;
+
+        let account: Address = "0x00a786b5dee39362feab935c9b9bcac7d6b36850"
+            .parse()
+            .unwrap();
+
+        let block: Block = serde_json::from_str(CONFIGURABLE_ACCOUNT_BLOCK).unwrap();
+        let receipts: Vec<Receipt> = serde_json::from_str(CONFIGURABLE_ACCOUNT_RECEIPTS).unwrap();
+        validate_receipts(
+            std::slice::from_ref(&block),
+            std::slice::from_ref(&receipts),
+        )
+        .unwrap();
+
+        let block_row = decode_block(&block);
+        assert_eq!(block_row.num, 218);
+
+        let txs = block.transactions.as_transactions().unwrap();
+        assert_eq!(txs.len(), 1);
+        let TempoTxEnvelope::AA(aa_signed) = txs[0].inner.as_ref() else {
+            panic!("expected a Tempo transaction");
+        };
+        assert!(aa_signed.signature().is_configurable_account());
+
+        let tx = decode_transaction(&txs[0], &block, 0);
+        assert_eq!(tx.tx_type, 0x76);
+        assert_eq!(tx.from, account.as_slice());
+        assert_eq!(tx.signature_type, Some(3));
+
+        let receipt = decode_receipt(&receipts[0], block_row.timestamp);
+        assert_eq!(receipt.status, Some(1));
+        assert_eq!(receipt.fee_payer, Some(account.to_vec()));
+
+        let logs: Vec<LogRow> = receipts[0]
+            .logs()
+            .iter()
+            .map(|log| decode_log(log, block_row.timestamp))
+            .collect();
+        let updated = logs
+            .iter()
+            .find(|log| {
+                log.topic0.as_deref()
+                    == Some(ConfigurableAccountConfigUpdated::SIGNATURE_HASH.as_slice())
+            })
+            .expect("ConfigurableAccountConfigUpdated log");
+        assert_eq!(updated.topic1, Some(account.into_word().to_vec()));
+        assert_eq!(updated.tx_hash, tx.hash);
     }
 }
