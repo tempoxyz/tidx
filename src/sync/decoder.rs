@@ -3,7 +3,7 @@ use alloy::consensus::{BlockHeader as _, Transaction as TransactionTrait, Typed2
 use alloy::network::{ReceiptResponse, TransactionResponse};
 use alloy::primitives::B256;
 use chrono::{DateTime, TimeZone, Utc};
-use tempo_alloy::primitives::transaction::SignatureType;
+use tempo_alloy::primitives::transaction::{SignatureType, TempoSignature};
 
 use crate::tempo::{Block, Log, Receipt, TempoTxEnvelope, Transaction};
 use crate::types::{BlockRow, LogRow, ReceiptRow, TxRow};
@@ -52,11 +52,7 @@ pub fn decode_transaction(tx: &Transaction, block: &Block, idx: u32) -> TxRow {
                 tempo_tx.calls.len() as i16,
                 tempo_tx.valid_before.map(|v| v.get() as i64),
                 tempo_tx.valid_after.map(|v| v.get() as i64),
-                Some(match aa_signed.signature().signature_type() {
-                    SignatureType::Secp256k1 => 0,
-                    SignatureType::P256 => 1,
-                    SignatureType::WebAuthn => 2,
-                }),
+                Some(signature_type_code(aa_signed.signature())),
             )
         } else {
             (vec![0u8; 32], None, None, 1, None, None, Some(0))
@@ -87,6 +83,24 @@ pub fn decode_transaction(tx: &Transaction, block: &Block, idx: u32) -> TxRow {
         valid_before,
         valid_after,
         signature_type,
+    }
+}
+
+/// Map a Tempo transaction signature to the stored `signature_type` code.
+///
+/// Keychain signatures are recorded by the access key's signature type. Configurable
+/// accounts (TIP-1107), signing directly or as an access key, are recorded as `3`.
+fn signature_type_code(signature: &TempoSignature) -> i16 {
+    let signature_type = match signature {
+        TempoSignature::Primitive(primitive) => primitive.signature_type(),
+        TempoSignature::Keychain(keychain) => keychain.signature.signature_type(),
+        TempoSignature::ConfigurableAccount(_) => SignatureType::ConfigurableAccount,
+    };
+    match signature_type {
+        SignatureType::Secp256k1 => 0,
+        SignatureType::P256 => 1,
+        SignatureType::WebAuthn => 2,
+        SignatureType::ConfigurableAccount => 3,
     }
 }
 

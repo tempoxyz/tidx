@@ -565,7 +565,7 @@ Written by the sync engine to both PostgreSQL and ClickHouse. Schemas are identi
 | `call_count` | `INT2` | Number of calls |
 | `valid_before` | `INT8` | Validity window start |
 | `valid_after` | `INT8` | Validity window end |
-| `signature_type` | `INT2` | Signature type |
+| `signature_type` | `INT2` | Signature type: 0 = secp256k1, 1 = P256, 2 = WebAuthn, 3 = configurable account (keychain transactions use the access key's type) |
 
 #### logs
 
