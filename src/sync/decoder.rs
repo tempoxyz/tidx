@@ -473,4 +473,63 @@ mod tests {
         let err = validate_receipts(&[block], &[]).unwrap_err();
         assert_eq!(err.to_string(), "Fetched 1 blocks but 0 receipt lists");
     }
+
+    /// Block 218 of a local `ghcr.io/tempoxyz/tempo:sha-b6d1615` dev node (T14 active),
+    /// holding one configurable-account (TIP-1107) `updateConfig` transaction.
+    const CONFIGURABLE_ACCOUNT_BLOCK: &str =
+        include_str!("../../tests/fixtures/configurable_account_block.json");
+    const CONFIGURABLE_ACCOUNT_RECEIPTS: &str =
+        include_str!("../../tests/fixtures/configurable_account_receipts.json");
+
+    #[test]
+    fn decodes_configurable_account_block() {
+        use alloy::sol_types::SolEvent;
+        use tempo_alloy::contracts::precompiles::IConfigurableAccount::ConfigurableAccountConfigUpdated;
+
+        let account: Address = "0x00a786b5dee39362feab935c9b9bcac7d6b36850"
+            .parse()
+            .unwrap();
+
+        let block: Block = serde_json::from_str(CONFIGURABLE_ACCOUNT_BLOCK).unwrap();
+        let receipts: Vec<Receipt> = serde_json::from_str(CONFIGURABLE_ACCOUNT_RECEIPTS).unwrap();
+        validate_receipts(
+            std::slice::from_ref(&block),
+            std::slice::from_ref(&receipts),
+        )
+        .unwrap();
+
+        let block_row = decode_block(&block);
+        assert_eq!(block_row.num, 218);
+
+        let txs = block.transactions.as_transactions().unwrap();
+        assert_eq!(txs.len(), 1);
+        let TempoTxEnvelope::AA(aa_signed) = txs[0].inner.as_ref() else {
+            panic!("expected a Tempo transaction");
+        };
+        assert!(aa_signed.signature().is_configurable_account());
+
+        let tx = decode_transaction(&txs[0], &block, 0);
+        assert_eq!(tx.tx_type, 0x76);
+        assert_eq!(tx.from, account.as_slice());
+        assert_eq!(tx.signature_type, Some(3));
+
+        let receipt = decode_receipt(&receipts[0], block_row.timestamp);
+        assert_eq!(receipt.status, Some(1));
+        assert_eq!(receipt.fee_payer, Some(account.to_vec()));
+
+        let logs: Vec<LogRow> = receipts[0]
+            .logs()
+            .iter()
+            .map(|log| decode_log(log, block_row.timestamp))
+            .collect();
+        let updated = logs
+            .iter()
+            .find(|log| {
+                log.topic0.as_deref()
+                    == Some(ConfigurableAccountConfigUpdated::SIGNATURE_HASH.as_slice())
+            })
+            .expect("ConfigurableAccountConfigUpdated log");
+        assert_eq!(updated.topic1, Some(account.into_word().to_vec()));
+        assert_eq!(updated.tx_hash, tx.hash);
+    }
 }
