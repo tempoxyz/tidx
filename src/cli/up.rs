@@ -131,7 +131,7 @@ async fn run_with_role(args: Args, role: Role) -> Result<()> {
         let api_pool = match chain.resolved_api_pg_url()? {
             Some(api_url) => {
                 info!(chain = %chain.name, "Creating separate API pool with dedicated credentials");
-                db::create_pool(&api_url).await?
+                db::create_pool_with_size(&api_url, chain.api_pool_size()?).await?
             }
             None => throttled_pool.pool.clone(),
         };
@@ -164,6 +164,7 @@ async fn run_with_role(args: Args, role: Role) -> Result<()> {
                 Arc::clone(&clickhouse_engines),
                 trusted_cidrs,
                 api_mode,
+                api::ApiLimits::from(&config.http),
             );
 
             info!(addr = %addr, ?api_mode, "Starting HTTP API server (hot-reload enabled)");
@@ -197,7 +198,12 @@ async fn run_with_role(args: Args, role: Role) -> Result<()> {
                 {
                     Ok(throttled_pool) => {
                         let api_pool = match event.chain.resolved_api_pg_url() {
-                            Ok(Some(api_url)) => match db::create_pool(&api_url).await {
+                            Ok(Some(api_url)) => match db::create_pool_with_size(
+                                &api_url,
+                                event.chain.api_pool_size().unwrap_or(16),
+                            )
+                            .await
+                            {
                                 Ok(pool) => pool,
                                 Err(_) => throttled_pool.pool.clone(),
                             },
@@ -239,6 +245,7 @@ async fn run_with_role(args: Args, role: Role) -> Result<()> {
             Arc::clone(&clickhouse_engines),
             trusted_cidrs,
             api_mode,
+            api::ApiLimits::from(&config.http),
         );
 
         info!(addr = %addr, ?api_mode, "Starting HTTP API server");

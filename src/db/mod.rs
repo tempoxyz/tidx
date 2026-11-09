@@ -4,7 +4,8 @@ mod schema;
 pub mod tiered;
 
 pub use pool::{
-    BackfillConnection, ThrottledPool, connect_pool, create_pool, create_pool_with_size,
+    BackfillConnection, ThrottledPool, connect_pool, connect_pool_with_wait, create_pool,
+    create_pool_with_size,
 };
 pub use schema::{run_migrations, run_post_startup_migrations};
 

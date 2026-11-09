@@ -172,6 +172,7 @@ async fn service(
         Arc::new(RwLock::new(HashMap::new())),
         Arc::new(std::sync::RwLock::new(Vec::new())),
         mode,
+        api::ApiLimits::default(),
     );
     let mut svc: IntoMakeServiceWithConnectInfo<Router, SocketAddr> =
         router.into_make_service_with_connect_info::<SocketAddr>();

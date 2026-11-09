@@ -47,6 +47,34 @@ pub struct ChainClickHouseConfig {
 pub type SharedClickHouseConfigs = Arc<RwLock<HashMap<u64, ChainClickHouseConfig>>>;
 pub type SharedTrustedCidrs = Arc<StdRwLock<Vec<(IpAddr, u8)>>>;
 const MAX_CONCURRENT_API_QUERIES: usize = 32;
+const MAX_LIVE_CONNECTIONS: usize = 20;
+
+/// Per-process API limits, from `[http]`.
+#[derive(Clone, Copy, Debug)]
+pub struct ApiLimits {
+    /// API statements that may run at once.
+    pub max_concurrent_queries: usize,
+    /// Live query streams accepted at once.
+    pub max_live_connections: usize,
+}
+
+impl Default for ApiLimits {
+    fn default() -> Self {
+        Self {
+            max_concurrent_queries: MAX_CONCURRENT_API_QUERIES,
+            max_live_connections: MAX_LIVE_CONNECTIONS,
+        }
+    }
+}
+
+impl From<&HttpConfig> for ApiLimits {
+    fn from(http: &HttpConfig) -> Self {
+        Self {
+            max_concurrent_queries: http.max_concurrent_queries.max(1),
+            max_live_connections: http.max_live_connections,
+        }
+    }
+}
 
 #[derive(Clone)]
 pub struct AppState {
@@ -64,6 +92,8 @@ pub struct AppState {
     /// Permits for the API statements that may run at once. One-shot queries
     /// and every statement of a live stream draw from the same permits.
     pub query_permits: Arc<Semaphore>,
+    /// Live query streams accepted at once.
+    pub max_live_connections: usize,
 }
 
 impl AppState {
@@ -178,7 +208,8 @@ pub fn router_with_options(
         clickhouse_configs: Arc::new(RwLock::new(clickhouse_configs)),
         clickhouse_engines: Arc::new(RwLock::new(HashMap::new())),
         trusted_cidrs,
-        query_permits: Arc::new(Semaphore::new(MAX_CONCURRENT_API_QUERIES)),
+        query_permits: Arc::new(Semaphore::new(http_config.max_concurrent_queries.max(1))),
+        max_live_connections: http_config.max_live_connections,
     };
 
     Ok(build_router(state, ApiMode::Full))
@@ -214,9 +245,11 @@ pub fn router_shared(
         clickhouse_engines,
         trusted_cidrs,
         ApiMode::Full,
+        ApiLimits::default(),
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn router_shared_with_mode(
     pools: SharedPools,
     default_chain_id: u64,
@@ -225,6 +258,7 @@ pub fn router_shared_with_mode(
     clickhouse_engines: SharedClickHouseEngines,
     trusted_cidrs: SharedTrustedCidrs,
     mode: ApiMode,
+    limits: ApiLimits,
 ) -> Router<()> {
     let state = AppState {
         pools,
@@ -233,7 +267,8 @@ pub fn router_shared_with_mode(
         clickhouse_configs,
         clickhouse_engines,
         trusted_cidrs,
-        query_permits: Arc::new(Semaphore::new(MAX_CONCURRENT_API_QUERIES)),
+        query_permits: Arc::new(Semaphore::new(limits.max_concurrent_queries.max(1))),
+        max_live_connections: limits.max_live_connections,
     };
 
     build_router(state, mode)
@@ -571,7 +606,6 @@ type SseStream = std::pin::Pin<Box<dyn Stream<Item = Result<SseEvent, Infallible
 
 /// Maximum blocks to catch up in a single update (prevents query multiplication attack)
 const MAX_CATCHUP_BLOCKS: u64 = 10;
-const MAX_LIVE_CONNECTIONS: usize = 20;
 
 async fn handle_query_live(
     state: AppState,
@@ -579,7 +613,7 @@ async fn handle_query_live(
     signatures: Vec<String>,
 ) -> Sse<KeepAliveStream<SseStream>> {
     let mut rx = state.broadcaster.subscribe();
-    if state.broadcaster.receiver_count() > MAX_LIVE_CONNECTIONS {
+    if state.broadcaster.receiver_count() > state.max_live_connections {
         let stream: SseStream = Box::pin(async_stream::stream! {
             yield Ok(SseEvent::default()
                 .event("error")
@@ -945,6 +979,7 @@ mod tests {
             clickhouse_engines: Arc::new(RwLock::new(HashMap::new())),
             trusted_cidrs: Arc::new(std::sync::RwLock::new(Vec::new())),
             query_permits: Arc::new(Semaphore::new(MAX_CONCURRENT_API_QUERIES)),
+            max_live_connections: MAX_LIVE_CONNECTIONS,
         };
         assert!(!state.is_trusted_ip(&"127.0.0.1".parse().unwrap()));
     }
@@ -1019,6 +1054,7 @@ mod tests {
             clickhouse_engines: Arc::new(RwLock::new(HashMap::new())),
             trusted_cidrs: Arc::new(std::sync::RwLock::new(Vec::new())),
             query_permits: Arc::new(Semaphore::new(0)),
+            max_live_connections: MAX_LIVE_CONNECTIONS,
         };
         let permits = state.query_permits.clone();
         let params = QueryParams {

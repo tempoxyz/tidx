@@ -286,6 +286,18 @@ Options:
 
 Both read the same `config.toml`, and `tidx up` is unchanged. Each binds `http.port` and `prometheus.port`, so when they share a host give `serve` its own ports with `--port` and `--metrics-port`. `/status` on `serve` reports what `sync_state` holds; the per-store watermarks, row counts and write rates come from the writer's process, so read them from `sync`.
 
+These optional settings tune the API per process. They default to tidx's previous fixed values, so existing configs behave the same:
+
+| Setting | Default | Meaning |
+|---|---|---|
+| `http.max_concurrent_queries` | 32 | API statements that may run at once in one process |
+| `http.max_live_connections` | 20 | Live query streams one process accepts |
+| `chains.postgres.api_pool_size` | 16 | Connections in the API's own pool (`api_url` and `serve`) |
+| `chains.postgres.api_pool_wait_ms` | none | `serve` only: fail a request that waits this long for a connection |
+| `chains.clickhouse.api_user` / `api_password_env` | `user` / `password_env` | `serve` only: ClickHouse user for queries, such as a read-only one |
+
+With several `serve` copies, the database sees copies x `api_pool_size` connections, so size it under the replica's connection limit.
+
 ```
 Usage: tidx serve [OPTIONS]
 

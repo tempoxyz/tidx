@@ -10,16 +10,13 @@ use std::future::IntoFuture;
 use tokio::sync::RwLock;
 use tracing::{info, warn};
 
-use tidx::api::{self, ApiMode, ChainClickHouseConfig, SharedTrustedCidrs, head_poller};
+use tidx::api::{self, ApiLimits, ApiMode, ChainClickHouseConfig, SharedTrustedCidrs, head_poller};
 use tidx::broadcast::Broadcaster;
 use tidx::clickhouse::ClickHouseEngine;
 use tidx::config::{ChainConfig, Config};
 use tidx::db::{self, Pool};
 
 use super::up::{shutdown_channel, start_prometheus};
-
-/// Connections per chain in a serve process's Postgres pool.
-const API_POOL_SIZE: usize = 16;
 
 /// How long shutdown waits for open connections before exiting.
 const SHUTDOWN_DRAIN: Duration = Duration::from_secs(5);
@@ -95,9 +92,10 @@ pub async fn run(args: Args) -> Result<()> {
                     failover_urls: ch_config.failover_urls.clone(),
                 },
             );
-            let engine = ClickHouseEngine::new(ch_config, chain.chain_id).with_context(|| {
-                format!("failed to configure ClickHouse for chain {}", chain.name)
-            })?;
+            let engine =
+                ClickHouseEngine::for_api(ch_config, chain.chain_id).with_context(|| {
+                    format!("failed to configure ClickHouse for chain {}", chain.name)
+                })?;
             clickhouse_engines.insert(chain.chain_id, Arc::new(engine));
             info!(chain = %chain.name, "ClickHouse OLAP engine configured");
         }
@@ -123,6 +121,7 @@ pub async fn run(args: Args) -> Result<()> {
         Arc::new(RwLock::new(clickhouse_engines)),
         trusted_cidrs,
         ApiMode::Serve,
+        ApiLimits::from(&config.http),
     );
 
     let addr: SocketAddr = format!("{}:{}", config.http.bind, config.http.port).parse()?;
@@ -164,8 +163,10 @@ async fn connect_api_pool(chain: &ChainConfig) -> Result<Pool> {
         Some(url) => (url, "api_url"),
         None => (chain.resolved_pg_url()?, "url"),
     };
-    info!(chain = %chain.name, source = kind, "Connecting API pool");
-    db::connect_pool(&url, API_POOL_SIZE)
+    let size = chain.api_pool_size()?;
+    let wait = chain.api_pool_wait()?;
+    info!(chain = %chain.name, source = kind, size, wait_ms = ?wait.map(|w| w.as_millis()), "Connecting API pool");
+    db::connect_pool_with_wait(&url, size, wait)
         .await
         .with_context(|| format!("failed to connect to PostgreSQL for chain {}", chain.name))
 }

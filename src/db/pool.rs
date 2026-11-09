@@ -19,6 +19,16 @@ pub async fn create_pool_with_size(database_url: &str, max_size: usize) -> Resul
 /// Used by `tidx serve`, which may connect with read-only credentials to a
 /// read replica where `CREATE DATABASE` is neither allowed nor wanted.
 pub async fn connect_pool(database_url: &str, max_size: usize) -> Result<Pool> {
+    connect_pool_with_wait(database_url, max_size, None).await
+}
+
+/// Like [`connect_pool`], failing a checkout that waits longer than `wait`
+/// for a free connection instead of queueing until the query timeout.
+pub async fn connect_pool_with_wait(
+    database_url: &str,
+    max_size: usize,
+    wait: Option<std::time::Duration>,
+) -> Result<Pool> {
     // Kill idle or active long-running statements in transactions after 60s to prevent
     // lock contention. API queries still use stricter SET LOCAL timeouts when requested,
     // and Clean recycling clears leaked session state.
@@ -36,10 +46,12 @@ pub async fn connect_pool(database_url: &str, max_size: usize) -> Result<Pool> {
 
     let mut config = Config::new();
     config.url = Some(url_with_timeout);
-    config.pool = Some(deadpool_postgres::PoolConfig {
+    let mut pool_config = deadpool_postgres::PoolConfig {
         max_size,
         ..Default::default()
-    });
+    };
+    pool_config.timeouts.wait = wait;
+    config.pool = Some(pool_config);
     config.manager = Some(deadpool_postgres::ManagerConfig {
         recycling_method: deadpool_postgres::RecyclingMethod::Clean,
     });
