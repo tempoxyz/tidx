@@ -472,8 +472,6 @@ impl ChainConfig {
         }
     }
 
-    /// PostgreSQL role the API pool connects as, when `postgres.api_url` is set
-    /// and names a user. Does not resolve the API password.
     /// Size of the HTTP API's own Postgres pool (default 16).
     pub fn api_pool_size(&self) -> Result<usize> {
         Ok(self.postgres()?.api_pool_size.unwrap_or(16).max(1))
@@ -487,6 +485,8 @@ impl ChainConfig {
             .map(std::time::Duration::from_millis))
     }
 
+    /// PostgreSQL role the API pool connects as, when `postgres.api_url` is set
+    /// and names a user. Does not resolve the API password.
     pub fn api_pg_role(&self) -> Result<Option<String>> {
         let Some(api_url) = self.postgres()?.api_url else {
             return Ok(None);
