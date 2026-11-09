@@ -294,7 +294,7 @@ These optional settings tune the API per process. They default to tidx's previou
 | `http.max_live_connections` | 20 | Live query streams one process accepts |
 | `chains.postgres.api_pool_size` | 16 | Connections in the API's own pool (`api_url` and `serve`) |
 | `chains.postgres.api_pool_wait_ms` | none | `serve` only: fail a request that waits this long for a connection |
-| `chains.clickhouse.api_user` / `api_password_env` | `user` / `password_env` | `serve` only: ClickHouse user for queries, such as a read-only one |
+| `chains.clickhouse.api_user` / `api_password_env` | `user` / `password_env` | `serve` only: ClickHouse user for queries. Use `readonly = 2` or SELECT-only grants: tidx sets query settings on every request, which `readonly = 1` refuses |
 
 With several `serve` copies, the database sees copies x `api_pool_size` connections, so size it under the replica's connection limit.
 

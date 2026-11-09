@@ -71,7 +71,7 @@ impl From<&HttpConfig> for ApiLimits {
     fn from(http: &HttpConfig) -> Self {
         Self {
             max_concurrent_queries: http.max_concurrent_queries.max(1),
-            max_live_connections: http.max_live_connections,
+            max_live_connections: http.max_live_connections.max(1),
         }
     }
 }
@@ -209,7 +209,7 @@ pub fn router_with_options(
         clickhouse_engines: Arc::new(RwLock::new(HashMap::new())),
         trusted_cidrs,
         query_permits: Arc::new(Semaphore::new(http_config.max_concurrent_queries.max(1))),
-        max_live_connections: http_config.max_live_connections,
+        max_live_connections: http_config.max_live_connections.max(1),
     };
 
     Ok(build_router(state, ApiMode::Full))
@@ -268,7 +268,7 @@ pub fn router_shared_with_mode(
         clickhouse_engines,
         trusted_cidrs,
         query_permits: Arc::new(Semaphore::new(limits.max_concurrent_queries.max(1))),
-        max_live_connections: limits.max_live_connections,
+        max_live_connections: limits.max_live_connections.max(1),
     };
 
     build_router(state, mode)

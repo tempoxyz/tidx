@@ -293,7 +293,10 @@ pub struct ClickHouseConfig {
     pub password_env: Option<String>,
 
     /// ClickHouse user for `tidx serve`'s API queries, such as a read-only
-    /// user. Falls back to `user` and `password_env` when unset. `tidx up`
+    /// user. It must be allowed to set query settings (tidx sends
+    /// `max_execution_time`, `max_result_bytes` and others on every
+    /// request), so use `readonly = 2` or SELECT-only grants, not
+    /// `readonly = 1`. Falls back to `user` and `password_env` when unset. `tidx up`
     /// and `tidx sync` keep using `user`, which view management needs.
     #[serde(default)]
     pub api_user: Option<String>,
@@ -338,6 +341,12 @@ impl ClickHouseConfig {
     /// `password_env`.
     pub fn api_credentials(&self) -> Result<(Option<String>, Option<String>)> {
         let Some(user) = &self.api_user else {
+            if self.api_password_env.is_some() {
+                anyhow::bail!(
+                    "clickhouse api_password_env is set without api_user; set api_user too, \
+                     or serve would silently query as the writer user"
+                );
+            }
             return Ok((self.user.clone(), self.resolved_password()?));
         };
         let password = match &self.api_password_env {
@@ -890,5 +899,11 @@ mod tests {
         let ch: ClickHouseConfig =
             toml::from_str("user = \"writer\"\napi_user = \"reader\"").unwrap();
         assert_eq!(ch.api_credentials().unwrap(), (Some("reader".into()), None));
+
+        // A password without its user is a config error, not a silent
+        // fallback to the writer.
+        let ch: ClickHouseConfig =
+            toml::from_str("user = \"writer\"\napi_password_env = \"X\"").unwrap();
+        assert!(ch.api_credentials().is_err());
     }
 }
