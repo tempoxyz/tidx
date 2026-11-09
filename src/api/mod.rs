@@ -1,3 +1,4 @@
+pub mod head_poller;
 mod views;
 
 use std::collections::HashMap;
@@ -180,7 +181,21 @@ pub fn router_with_options(
         query_permits: Arc::new(Semaphore::new(MAX_CONCURRENT_API_QUERIES)),
     };
 
-    Ok(build_router(state))
+    Ok(build_router(state, ApiMode::Full))
+}
+
+/// Which routes a process serves.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ApiMode {
+    /// Every route: what `tidx up` serves.
+    Full,
+    /// Read-only routes for `tidx serve`: queries, status and listing
+    /// views. ClickHouse view creation and deletion are left out, so the
+    /// horizontally scaled tier runs no DDL.
+    Serve,
+    /// Routes for `tidx sync`: health, status and view management. Queries
+    /// are served by `tidx serve`.
+    Sync,
 }
 
 pub fn router_shared(
@@ -190,6 +205,26 @@ pub fn router_shared(
     clickhouse_configs: SharedClickHouseConfigs,
     clickhouse_engines: SharedClickHouseEngines,
     trusted_cidrs: SharedTrustedCidrs,
+) -> Router<()> {
+    router_shared_with_mode(
+        pools,
+        default_chain_id,
+        broadcaster,
+        clickhouse_configs,
+        clickhouse_engines,
+        trusted_cidrs,
+        ApiMode::Full,
+    )
+}
+
+pub fn router_shared_with_mode(
+    pools: SharedPools,
+    default_chain_id: u64,
+    broadcaster: Arc<Broadcaster>,
+    clickhouse_configs: SharedClickHouseConfigs,
+    clickhouse_engines: SharedClickHouseEngines,
+    trusted_cidrs: SharedTrustedCidrs,
+    mode: ApiMode,
 ) -> Router<()> {
     let state = AppState {
         pools,
@@ -201,29 +236,41 @@ pub fn router_shared(
         query_permits: Arc::new(Semaphore::new(MAX_CONCURRENT_API_QUERIES)),
     };
 
-    build_router(state)
+    build_router(state, mode)
 }
 
-fn build_router(state: AppState) -> Router<()> {
+fn build_router(state: AppState, mode: ApiMode) -> Router<()> {
     let cors = CorsLayer::new()
         .allow_methods([Method::GET, Method::OPTIONS])
         .allow_headers([header::CONTENT_TYPE, header::AUTHORIZATION])
         .allow_origin(tower_http::cors::Any);
 
-    Router::new()
+    let mut router = Router::new()
         .route("/health", get(handle_health))
-        .route("/status", get(handle_status))
-        .route(
+        .route("/status", get(handle_status));
+
+    if mode != ApiMode::Sync {
+        router = router.route(
             "/query",
             get(handle_query).layer(GlobalConcurrencyLimitLayer::with_semaphore(
                 state.query_permits.clone(),
             )),
-        )
-        .route("/views", get(views::list_views).post(views::create_view))
-        .route(
-            "/views/{name}",
-            get(views::get_view).delete(views::delete_view),
-        )
+        );
+    }
+
+    router = match mode {
+        ApiMode::Serve => router
+            .route("/views", get(views::list_views))
+            .route("/views/{name}", get(views::get_view)),
+        ApiMode::Full | ApiMode::Sync => router
+            .route("/views", get(views::list_views).post(views::create_view))
+            .route(
+                "/views/{name}",
+                get(views::get_view).delete(views::delete_view),
+            ),
+    };
+
+    router
         .layer(cors)
         .layer(TraceLayer::new_for_http())
         .with_state(state)

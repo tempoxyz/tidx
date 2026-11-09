@@ -1,0 +1,165 @@
+use std::collections::HashMap;
+use std::net::SocketAddr;
+use std::path::PathBuf;
+use std::sync::Arc;
+use std::time::Duration;
+
+use anyhow::{Context, Result, bail};
+use clap::Args as ClapArgs;
+use tokio::sync::RwLock;
+use tracing::info;
+
+use tidx::api::{self, ApiMode, ChainClickHouseConfig, SharedTrustedCidrs, head_poller};
+use tidx::broadcast::Broadcaster;
+use tidx::clickhouse::ClickHouseEngine;
+use tidx::config::{ChainConfig, Config};
+use tidx::db::{self, Pool};
+
+use super::up::{shutdown_channel, start_prometheus};
+
+/// Connections per chain in a serve process's Postgres pool.
+const API_POOL_SIZE: usize = 16;
+
+#[derive(ClapArgs)]
+pub struct Args {
+    /// Path to config file
+    #[arg(short, long, default_value = "config.toml")]
+    pub config: PathBuf,
+
+    /// HTTP port, overriding http.port
+    #[arg(long)]
+    pub port: Option<u16>,
+
+    /// Prometheus port, overriding prometheus.port
+    #[arg(long)]
+    pub metrics_port: Option<u16>,
+
+    /// How often to poll sync_state for new blocks to drive live streams, in milliseconds
+    #[arg(long, default_value_t = 250)]
+    pub live_poll_ms: u64,
+}
+
+/// Runs the HTTP API without indexing (`tidx serve`).
+///
+/// Serve is stateless: it reads the data and the sync progress that a
+/// separate `tidx sync` (or `tidx up`) process writes, so any number of
+/// copies can run behind a load balancer. It never runs migrations, creates
+/// databases or issues ClickHouse DDL, and it connects with the API
+/// credentials (`postgres.api_url`) when they are configured.
+pub async fn run(args: Args) -> Result<()> {
+    let mut config = Config::load(&args.config)?;
+    // Overrides let serve share a config file and host with tidx sync,
+    // which binds the configured ports.
+    if let Some(port) = args.port {
+        config.http.port = port;
+    }
+    if let Some(port) = args.metrics_port {
+        config.prometheus.port = port;
+    }
+    if !config.http.enabled {
+        bail!("tidx serve needs [http] enabled = true");
+    }
+    let Some(default_chain_id) = config.chains.first().map(|c| c.chain_id) else {
+        bail!("tidx serve needs at least one [[chains]] entry");
+    };
+
+    info!(
+        chains = config.chains.len(),
+        "Loaded config (serve: API only, no indexing)"
+    );
+
+    start_prometheus(&config)?;
+
+    let broadcaster = Arc::new(Broadcaster::new());
+    let shutdown_tx = shutdown_channel();
+    let live_poll = Duration::from_millis(args.live_poll_ms.max(50));
+
+    let mut pools = HashMap::new();
+    let mut clickhouse_configs = HashMap::new();
+    let mut clickhouse_engines = HashMap::new();
+
+    for chain in &config.chains {
+        let pool = connect_api_pool(chain).await?;
+        check_schema(&pool, chain).await?;
+
+        if let Some(ch_config) = chain.clickhouse.as_ref().filter(|c| c.enabled) {
+            clickhouse_configs.insert(
+                chain.chain_id,
+                ChainClickHouseConfig {
+                    enabled: true,
+                    url: ch_config.url.clone(),
+                    failover_urls: ch_config.failover_urls.clone(),
+                },
+            );
+            let engine = ClickHouseEngine::new(ch_config, chain.chain_id).with_context(|| {
+                format!("failed to configure ClickHouse for chain {}", chain.name)
+            })?;
+            clickhouse_engines.insert(chain.chain_id, Arc::new(engine));
+            info!(chain = %chain.name, "ClickHouse OLAP engine configured");
+        }
+
+        head_poller::spawn(
+            pool.clone(),
+            chain.chain_id,
+            broadcaster.clone(),
+            live_poll,
+            shutdown_tx.subscribe(),
+        );
+        pools.insert(chain.chain_id, pool);
+    }
+
+    let trusted_cidrs: SharedTrustedCidrs = Arc::new(std::sync::RwLock::new(api::parse_cidrs(
+        &config.http.trusted_cidrs,
+    )?));
+    let router = api::router_shared_with_mode(
+        Arc::new(RwLock::new(pools)),
+        default_chain_id,
+        broadcaster,
+        Arc::new(RwLock::new(clickhouse_configs)),
+        Arc::new(RwLock::new(clickhouse_engines)),
+        trusted_cidrs,
+        ApiMode::Serve,
+    );
+
+    let addr: SocketAddr = format!("{}:{}", config.http.bind, config.http.port).parse()?;
+    info!(addr = %addr, "Starting HTTP API server (serve mode)");
+    let listener = tokio::net::TcpListener::bind(addr).await?;
+    let mut shutdown_rx = shutdown_tx.subscribe();
+    axum::serve(
+        listener,
+        router.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .with_graceful_shutdown(async move {
+        let _ = shutdown_rx.recv().await;
+    })
+    .await?;
+
+    Ok(())
+}
+
+/// Connects to the chain's API database: `postgres.api_url` when set, else
+/// the main URL. Never creates the database.
+async fn connect_api_pool(chain: &ChainConfig) -> Result<Pool> {
+    let (url, kind) = match chain.resolved_api_pg_url()? {
+        Some(url) => (url, "api_url"),
+        None => (chain.resolved_pg_url()?, "url"),
+    };
+    info!(chain = %chain.name, source = kind, "Connecting API pool");
+    db::connect_pool(&url, API_POOL_SIZE)
+        .await
+        .with_context(|| format!("failed to connect to PostgreSQL for chain {}", chain.name))
+}
+
+/// Fails fast when the database has not been set up by a sync process.
+async fn check_schema(pool: &Pool, chain: &ChainConfig) -> Result<()> {
+    let conn = pool.get().await?;
+    conn.query_opt("SELECT tip_num FROM sync_state LIMIT 1", &[])
+        .await
+        .with_context(|| {
+            format!(
+                "chain {}: sync_state is missing; run tidx sync (or tidx up) against this database first",
+                chain.name
+            )
+        })?;
+    Ok(())
+}

@@ -1,6 +1,7 @@
 pub mod backfill_receipt_data;
 pub mod init;
 pub mod query;
+pub mod serve;
 pub mod status;
 pub mod up;
 pub mod upgrade;
@@ -23,6 +24,10 @@ pub enum Commands {
     Init(init::Args),
     /// Start syncing blocks from the chain (continuous) and serve HTTP API
     Up(up::Args),
+    /// Start syncing blocks without the query API (pair with `tidx serve`)
+    Sync(up::Args),
+    /// Serve the HTTP API without syncing (stateless; run any number of copies)
+    Serve(serve::Args),
     /// Show sync status
     Status(status::Args),
     /// Run a SQL query (use --signature to decode event logs)

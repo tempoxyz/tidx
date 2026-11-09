@@ -240,6 +240,8 @@ Usage: tidx <COMMAND>
 Commands:
   init         Initialize a new config.toml
   up           Start syncing blocks from the chain (continuous) and serve HTTP API
+  sync         Start syncing blocks without the query API (pair with `tidx serve`)
+  serve        Serve the HTTP API without syncing (stateless; run any number of copies)
   status       Show sync status
   query        Run a SQL query (use --signature to decode event logs)
   views        Manage ClickHouse materialized views
@@ -273,6 +275,26 @@ Usage: tidx up [OPTIONS]
 Options:
   -c, --config <CONFIG>  Path to config file [default: config.toml]
   -h, --help             Print help
+```
+
+### `tidx sync` and `tidx serve`
+
+`tidx up` runs the indexer and the HTTP API in one process. To scale the API on its own, run them separately:
+
+- `tidx sync` runs the indexer: fetching, writing, migrations, pruning and the tiered-storage bootstrap. Run one per database. Its HTTP port serves `/health`, `/status` and view management (`POST`/`DELETE /views`), but not `/query`.
+- `tidx serve` runs the read-only HTTP API. It is stateless, so any number of copies can run behind a load balancer. It never runs migrations, creates databases or issues ClickHouse DDL; it connects with `postgres.api_url` (a read replica with a read-only role) when set, and refuses to start until `sync` has set up the database. Live query streams are driven by polling `sync_state` on the database serve reads from, capped at the highest block in `blocks`, so a replica only announces blocks it already has.
+
+Both read the same `config.toml`, and `tidx up` is unchanged. Each binds `http.port` and `prometheus.port`, so when they share a host give `serve` its own ports with `--port` and `--metrics-port`. `/status` on `serve` reports what `sync_state` holds; the per-store watermarks, row counts and write rates come from the writer's process, so read them from `sync`.
+
+```
+Usage: tidx serve [OPTIONS]
+
+Options:
+  -c, --config <CONFIG>              Path to config file [default: config.toml]
+      --port <PORT>                  HTTP port, overriding http.port
+      --metrics-port <METRICS_PORT>  Prometheus port, overriding prometheus.port
+      --live-poll-ms <LIVE_POLL_MS>  How often to poll sync_state for new blocks to drive live streams, in milliseconds [default: 250]
+  -h, --help                         Print help
 ```
 
 ### `tidx status`

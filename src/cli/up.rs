@@ -38,11 +38,28 @@ pub struct Args {
 
 use std::path::PathBuf;
 
+/// Which parts of tidx a process runs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Role {
+    /// Indexer and the full HTTP API in one process (`tidx up`).
+    Up,
+    /// Indexer only (`tidx sync`). Its HTTP port serves health, status and
+    /// view management; queries are served by `tidx serve`.
+    Sync,
+}
+
+/// Runs the indexer and the full HTTP API (`tidx up`).
 pub async fn run(args: Args) -> Result<()> {
-    let config = Config::load(&args.config)?;
+    run_with_role(args, Role::Up).await
+}
 
-    info!(chains = config.chains.len(), "Loaded config");
+/// Runs the indexer without the query API (`tidx sync`).
+pub async fn run_sync(args: Args) -> Result<()> {
+    run_with_role(args, Role::Sync).await
+}
 
+/// Starts the Prometheus exporter when it is enabled.
+pub(crate) fn start_prometheus(config: &Config) -> Result<()> {
     if config.prometheus.enabled {
         let metrics_addr: SocketAddr =
             format!("{}:{}", config.http.bind, config.prometheus.port).parse()?;
@@ -51,8 +68,11 @@ pub async fn run(args: Args) -> Result<()> {
             .with_http_listener(metrics_addr)
             .install()?;
     }
+    Ok(())
+}
 
-    let broadcaster = Arc::new(Broadcaster::new());
+/// A shutdown channel that fires on SIGTERM or SIGINT.
+pub(crate) fn shutdown_channel() -> tokio::sync::broadcast::Sender<()> {
     let (shutdown_tx, _shutdown_rx) = tokio::sync::broadcast::channel::<()>(1);
 
     #[cfg(unix)]
@@ -76,6 +96,23 @@ pub async fn run(args: Args) -> Result<()> {
             let _ = shutdown_tx.send(());
         }
     });
+
+    shutdown_tx
+}
+
+async fn run_with_role(args: Args, role: Role) -> Result<()> {
+    let config = Config::load(&args.config)?;
+
+    info!(chains = config.chains.len(), ?role, "Loaded config");
+
+    start_prometheus(&config)?;
+
+    let broadcaster = Arc::new(Broadcaster::new());
+    let shutdown_tx = shutdown_channel();
+    let api_mode = match role {
+        Role::Up => api::ApiMode::Full,
+        Role::Sync => api::ApiMode::Sync,
+    };
 
     let pools: SharedPools = Arc::new(RwLock::new(HashMap::new()));
     let clickhouse_configs: SharedClickHouseConfigs = Arc::new(RwLock::new(HashMap::new()));
@@ -119,16 +156,17 @@ pub async fn run(args: Args) -> Result<()> {
         if config.http.enabled && default_chain_id != 0 {
             let addr: SocketAddr = format!("{}:{}", config.http.bind, config.http.port).parse()?;
 
-            let router = api::router_shared(
+            let router = api::router_shared_with_mode(
                 Arc::clone(&pools),
                 default_chain_id,
                 broadcaster.clone(),
                 Arc::clone(&clickhouse_configs),
                 Arc::clone(&clickhouse_engines),
                 trusted_cidrs,
+                api_mode,
             );
 
-            info!(addr = %addr, "Starting HTTP API server (hot-reload enabled)");
+            info!(addr = %addr, ?api_mode, "Starting HTTP API server (hot-reload enabled)");
 
             let listener = tokio::net::TcpListener::bind(addr).await?;
             let mut shutdown_rx_api = shutdown_tx.subscribe();
@@ -186,15 +224,24 @@ pub async fn run(args: Args) -> Result<()> {
         });
     } else if config.http.enabled && default_chain_id != 0 {
         let addr: SocketAddr = format!("{}:{}", config.http.bind, config.http.port).parse()?;
-        let router = api::router_with_options(
-            pools.read().await.clone(),
+        // Share the live pool and engine maps with the router, as the
+        // hot-reload path does: ClickHouse engines are registered by each
+        // sync task after its schema setup, so a snapshot taken here would
+        // leave engine=clickhouse unavailable.
+        let trusted_cidrs: api::SharedTrustedCidrs = Arc::new(std::sync::RwLock::new(
+            api::parse_cidrs(&config.http.trusted_cidrs)?,
+        ));
+        let router = api::router_shared_with_mode(
+            Arc::clone(&pools),
             default_chain_id,
             broadcaster.clone(),
-            clickhouse_configs.read().await.clone(),
-            &config.http,
-        )?;
+            Arc::clone(&clickhouse_configs),
+            Arc::clone(&clickhouse_engines),
+            trusted_cidrs,
+            api_mode,
+        );
 
-        info!(addr = %addr, "Starting HTTP API server");
+        info!(addr = %addr, ?api_mode, "Starting HTTP API server");
 
         let listener = tokio::net::TcpListener::bind(addr).await?;
         let mut shutdown_rx_api = shutdown_tx.subscribe();
