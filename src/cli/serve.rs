@@ -6,8 +6,9 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use clap::Args as ClapArgs;
+use std::future::IntoFuture;
 use tokio::sync::RwLock;
-use tracing::info;
+use tracing::{info, warn};
 
 use tidx::api::{self, ApiMode, ChainClickHouseConfig, SharedTrustedCidrs, head_poller};
 use tidx::broadcast::Broadcaster;
@@ -19,6 +20,9 @@ use super::up::{shutdown_channel, start_prometheus};
 
 /// Connections per chain in a serve process's Postgres pool.
 const API_POOL_SIZE: usize = 16;
+
+/// How long shutdown waits for open connections before exiting.
+const SHUTDOWN_DRAIN: Duration = Duration::from_secs(5);
 
 #[derive(ClapArgs)]
 pub struct Args {
@@ -124,15 +128,31 @@ pub async fn run(args: Args) -> Result<()> {
     let addr: SocketAddr = format!("{}:{}", config.http.bind, config.http.port).parse()?;
     info!(addr = %addr, "Starting HTTP API server (serve mode)");
     let listener = tokio::net::TcpListener::bind(addr).await?;
+    let mut drain_rx = shutdown_tx.subscribe();
+    let server = tokio::spawn(
+        axum::serve(
+            listener,
+            router.into_make_service_with_connect_info::<SocketAddr>(),
+        )
+        .with_graceful_shutdown(async move {
+            let _ = drain_rx.recv().await;
+        })
+        .into_future(),
+    );
+
     let mut shutdown_rx = shutdown_tx.subscribe();
-    axum::serve(
-        listener,
-        router.into_make_service_with_connect_info::<SocketAddr>(),
-    )
-    .with_graceful_shutdown(async move {
-        let _ = shutdown_rx.recv().await;
-    })
-    .await?;
+    let _ = shutdown_rx.recv().await;
+
+    // Graceful shutdown waits for every open connection, and live streams
+    // stay open until the client leaves. Give in-flight requests a bounded
+    // drain, then exit so rolling deploys are not held up by SSE clients.
+    match tokio::time::timeout(SHUTDOWN_DRAIN, server).await {
+        Ok(result) => result??,
+        Err(_) => warn!(
+            drain_secs = SHUTDOWN_DRAIN.as_secs(),
+            "Connections still open after the shutdown drain (live streams); exiting"
+        ),
+    }
 
     Ok(())
 }

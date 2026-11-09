@@ -24,10 +24,6 @@ use crate::broadcast::{BlockUpdate, Broadcaster};
 /// Default interval between `sync_state` polls.
 pub const DEFAULT_POLL_INTERVAL: Duration = Duration::from_millis(250);
 
-/// Most block updates published from one poll. Live streams cap their own
-/// catch-up at 10 blocks, so a larger jump only needs its last blocks.
-const MAX_BLOCKS_PER_POLL: u64 = 64;
-
 /// Reads the chain's announced head: `sync_state.tip_num` capped at the
 /// highest block stored in `blocks`.
 pub async fn fetch_tip(pool: &Pool, chain_id: u64) -> Result<Option<u64>> {
@@ -42,34 +38,27 @@ pub async fn fetch_tip(pool: &Pool, chain_id: u64) -> Result<Option<u64>> {
     Ok(row.map(|r| r.get::<_, i64>(0).max(0) as u64))
 }
 
-/// Publishes the block updates between two observed tips.
+/// Publishes the new head when it moved past `previous`.
 ///
-/// Returns the updates sent, oldest first. Only the last
-/// [`MAX_BLOCKS_PER_POLL`] blocks of a large jump are published.
-pub fn publish_range(
-    broadcaster: &Broadcaster,
-    chain_id: u64,
-    previous: u64,
-    current: u64,
-) -> Vec<u64> {
+/// Only the newest block is sent. Each live stream catches up from its own
+/// last block to the announced one, capped at 10 blocks with a `lagged`
+/// event, so one update per poll keeps that cap in force after a jump.
+/// Returns whether an update was sent.
+pub fn publish_head(broadcaster: &Broadcaster, chain_id: u64, previous: u64, current: u64) -> bool {
     if current <= previous {
-        return Vec::new();
+        return false;
     }
-    let start = (previous + 1).max(current.saturating_sub(MAX_BLOCKS_PER_POLL - 1));
-    let blocks: Vec<u64> = (start..=current).collect();
-    for &block_num in &blocks {
-        broadcaster.send(BlockUpdate {
-            chain_id,
-            block_num,
-            // Only chain_id and block_num drive live streams; the poller
-            // does not read block contents.
-            block_hash: String::new(),
-            tx_count: 0,
-            log_count: 0,
-            timestamp: 0,
-        });
-    }
-    blocks
+    broadcaster.send(BlockUpdate {
+        chain_id,
+        block_num: current,
+        // Only chain_id and block_num drive live streams; the poller does
+        // not read block contents.
+        block_hash: String::new(),
+        tx_count: 0,
+        log_count: 0,
+        timestamp: 0,
+    });
+    true
 }
 
 /// Spawns a task that polls `sync_state` for `chain_id` every `interval`
@@ -97,14 +86,8 @@ pub fn spawn(
                         // from their own initial query, not from history.
                         None => last = Some(tip),
                         Some(prev) if tip > prev => {
-                            let sent = publish_range(&broadcaster, chain_id, prev, tip);
-                            debug!(
-                                chain_id,
-                                from = prev,
-                                to = tip,
-                                published = sent.len(),
-                                "head poller advanced"
-                            );
+                            publish_head(&broadcaster, chain_id, prev, tip);
+                            debug!(chain_id, from = prev, to = tip, "head poller advanced");
                             last = Some(tip);
                         }
                         // A reorg can rewind the head; follow it down so the

@@ -93,19 +93,19 @@ async fn head_poller_announces_blocks_from_sync_state() {
 
     let t = |d: i64| (top - d) as u64;
     set_tip(&db.pool, top - 2).await;
-    assert_eq!(recv_blocks(&mut rx, 3).await, vec![t(4), t(3), t(2)]);
+    assert_eq!(recv_blocks(&mut rx, 1).await, vec![t(2)]);
 
     // A reorg rewinds tip_num; the replacement blocks are announced again.
     set_tip(&db.pool, top - 4).await;
     tokio::time::sleep(Duration::from_millis(150)).await;
     assert!(rx.try_recv().is_err(), "a rewind announces nothing");
     set_tip(&db.pool, top - 2).await;
-    assert_eq!(recv_blocks(&mut rx, 2).await, vec![t(3), t(2)]);
+    assert_eq!(recv_blocks(&mut rx, 1).await, vec![t(2)]);
 
     // tip_num can run ahead of the stored blocks (backfill-first sets it to
     // the chain head first); only blocks that exist are announced.
     set_tip(&db.pool, top + 1_000).await;
-    assert_eq!(recv_blocks(&mut rx, 2).await, vec![t(1), t(0)]);
+    assert_eq!(recv_blocks(&mut rx, 1).await, vec![t(0)]);
     tokio::time::sleep(Duration::from_millis(150)).await;
     assert!(
         rx.try_recv().is_err(),
@@ -121,18 +121,16 @@ async fn head_poller_announces_blocks_from_sync_state() {
 }
 
 #[test]
-fn head_poller_caps_large_jumps() {
+fn head_poller_announces_only_the_newest_block() {
+    // Streams catch up on their own and cap catch-up at 10 blocks, so a
+    // jump must arrive as a single update for that cap to apply.
     let broadcaster = Broadcaster::new();
     let mut rx = broadcaster.subscribe();
-    let sent = head_poller::publish_range(&broadcaster, CHAIN_ID, 10, 1_000);
-    assert_eq!(sent.len(), 64);
-    assert_eq!(sent.first(), Some(&937));
-    assert_eq!(sent.last(), Some(&1_000));
-    assert_eq!(rx.try_recv().unwrap().block_num, 937);
-    assert_eq!(
-        head_poller::publish_range(&broadcaster, CHAIN_ID, 5, 5),
-        Vec::<u64>::new()
-    );
+    assert!(head_poller::publish_head(&broadcaster, CHAIN_ID, 10, 1_000));
+    assert_eq!(rx.try_recv().unwrap().block_num, 1_000);
+    assert!(rx.try_recv().is_err());
+    assert!(!head_poller::publish_head(&broadcaster, CHAIN_ID, 5, 5));
+    assert!(rx.try_recv().is_err());
 }
 
 #[tokio::test]
