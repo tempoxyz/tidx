@@ -18,6 +18,7 @@ jobs:
     name: Build Docker
     runs-on: ubuntu-latest
     permissions:
+      attestations: write
       contents: read
       id-token: write
       packages: write
@@ -66,12 +67,9 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
-      - name: Install cosign
-        uses: tempoxyz/gh-actions/vendor/sigstore/cosign-installer@35019557465e3c38ee3468be171771fd73577584 # 2026-10-20T06-22-38Z-35019557
-
-      - name: Sign the published image
-        env:
-          IMAGES: ghcr.io/${{ github.repository }}@${{ steps.build.outputs.digest }}
-        run: |
-          set -euo pipefail
-          while IFS= read -r ref; do if [ -n "$ref" ]; then cosign sign --yes --recursive "$ref"; fi; done <<< "$IMAGES"
+      - name: Attest the tidx image
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-name: ghcr.io/${{ github.repository }}
+          subject-digest: ${{ steps.build.outputs.digest }}
+          push-to-registry: true
