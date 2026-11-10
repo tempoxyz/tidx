@@ -193,6 +193,7 @@ async fn postgres_section(chain: &ChainConfig, limit: u32) -> Result<Value> {
                     left(regexp_replace(query, '\\s+', ' ', 'g'), 300) AS example \
              FROM pg_stat_statements \
              WHERE queryid IS NOT NULL \
+               AND dbid = (SELECT oid FROM pg_database WHERE datname = current_database()) \
                AND ($1::text IS NULL OR userid = (SELECT oid FROM pg_roles WHERE rolname = $1)) \
              ORDER BY total_exec_time DESC \
              LIMIT $2",
