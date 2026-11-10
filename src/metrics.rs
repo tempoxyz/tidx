@@ -166,6 +166,13 @@ pub fn record_query_duration(duration: std::time::Duration) {
     histogram!("tidx_query_duration_seconds").record(duration.as_secs_f64());
 }
 
+/// One public API query by route (such as `query.tiered`) and HTTP status.
+pub fn record_api_query(route: &str, status: u16, duration: std::time::Duration) {
+    let labels = [("route", route.to_string()), ("status", status.to_string())];
+    counter!("tidx_api_queries_total", &labels).increment(1);
+    histogram!("tidx_api_query_duration_seconds", &labels).record(duration.as_secs_f64());
+}
+
 pub fn record_query_rows(count: u64) {
     histogram!("tidx_query_rows").record(count as f64);
 }

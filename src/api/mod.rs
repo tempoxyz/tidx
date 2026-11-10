@@ -12,7 +12,7 @@ use anyhow::{Result as AnyhowResult, anyhow};
 use axum::{
     Json, Router,
     extract::{Query, State},
-    http::{Method, StatusCode, header},
+    http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode, header},
     response::{
         IntoResponse, Response, Sse,
         sse::{Event as SseEvent, KeepAlive, KeepAliveStream},
@@ -30,6 +30,7 @@ use crate::broadcast::Broadcaster;
 use crate::clickhouse::ClickHouseEngine;
 use crate::config::HttpConfig;
 use crate::db::Pool;
+use crate::query::QueryTag;
 use crate::service::{PostgresQuery, QueryOptions, QueryResult, SyncStatus};
 use tokio_postgres::types::Type;
 
@@ -277,7 +278,15 @@ pub fn router_shared_with_mode(
 fn build_router(state: AppState, mode: ApiMode) -> Router<()> {
     let cors = CorsLayer::new()
         .allow_methods([Method::GET, Method::OPTIONS])
-        .allow_headers([header::CONTENT_TYPE, header::AUTHORIZATION])
+        .allow_headers([
+            header::CONTENT_TYPE,
+            header::AUTHORIZATION,
+            HeaderName::from_static(crate::query::tag::CALLER_HEADER),
+            HeaderName::from_static(crate::query::tag::REQUEST_ID_HEADER),
+        ])
+        .expose_headers([HeaderName::from_static(
+            crate::query::tag::REQUEST_ID_HEADER,
+        )])
         .allow_origin(tower_http::cors::Any);
 
     let mut router = Router::new()
@@ -518,8 +527,33 @@ struct QueryResponse {
 
 async fn handle_query(
     State(state): State<AppState>,
+    headers: HeaderMap,
     uri: axum::http::Uri,
     Query(params): Query<QueryParams>,
+) -> Response {
+    let header = |name: &str| headers.get(name).and_then(|v| v.to_str().ok());
+    let caller = header(QueryTag::CALLER_HEADER_NAME).map(str::to_owned);
+    // Reuse the gateway's request ID (or make one) for every query this
+    // request runs, and echo it so callers can quote it.
+    let request_id = QueryTag::new("query", None, header(QueryTag::REQUEST_ID_HEADER_NAME))
+        .request_id()
+        .to_owned();
+    let mut response = Box::pin(route_query(state, uri, params, caller, request_id.clone())).await;
+    if let Ok(value) = HeaderValue::from_str(&request_id) {
+        response.headers_mut().insert(
+            HeaderName::from_static(crate::query::tag::REQUEST_ID_HEADER),
+            value,
+        );
+    }
+    response
+}
+
+async fn route_query(
+    state: AppState,
+    uri: axum::http::Uri,
+    params: QueryParams,
+    caller: Option<String>,
+    request_id: String,
 ) -> Response {
     let signatures = extract_signatures(uri.query());
 
@@ -553,13 +587,22 @@ async fn handle_query(
             ))
             .into_response();
         }
-        handle_query_live(state, params, signatures)
+        let tag = QueryTag::new("query.live", caller.as_deref(), Some(&request_id));
+        handle_query_live(state, params, signatures, tag)
             .await
             .into_response()
     } else {
-        handle_query_once(state, params, signatures, route)
+        let route_name = format!("query.{route}");
+        let tag = QueryTag::new(&route_name, caller.as_deref(), Some(&request_id));
+        let start = std::time::Instant::now();
+        let response = tag
+            .scope(Box::pin(handle_query_once(
+                state, params, signatures, route,
+            )))
             .await
-            .into_response()
+            .into_response();
+        crate::metrics::record_api_query(&route_name, response.status().as_u16(), start.elapsed());
+        response
     }
 }
 
@@ -688,6 +731,7 @@ async fn handle_query_live(
     state: AppState,
     params: QueryParams,
     signatures: Vec<String>,
+    tag: QueryTag,
 ) -> Sse<KeepAliveStream<SseStream>> {
     let mut rx = state.broadcaster.subscribe();
     if state.broadcaster.receiver_count() > state.max_live_connections {
@@ -726,7 +770,7 @@ async fn handle_query_live(
         let mut block_query: Option<PostgresQuery> = None;
 
         // Execute initial query (live streaming uses Postgres for realtime data)
-        match execute_live_query(&permits, &pool, &sql, &sigs, &options).await {
+        match tag.clone().scope(execute_live_query(&permits, &pool, &sql, &sigs, &options)).await {
             Ok(result) => {
                 yield Ok(SseEvent::default()
                     .event("result")
@@ -805,7 +849,8 @@ async fn handle_query_live(
                             }
                         }
                         let Some(query) = &block_query else { continue };
-                        match execute_live_block_query(&permits, &pool, query, block_num as i64, &options).await {
+                        let block_query_run = execute_live_block_query(&permits, &pool, query, block_num as i64, &options);
+                        match tag.clone().scope(block_query_run).await {
                             Ok(result) => {
                                 yield Ok(SseEvent::default()
                                     .event("result")
@@ -1143,11 +1188,16 @@ mod tests {
             engine: None,
             source: None,
         };
-        let mut events = handle_query_live(state, params, vec![])
-            .await
-            .into_response()
-            .into_body()
-            .into_data_stream();
+        let mut events = handle_query_live(
+            state,
+            params,
+            vec![],
+            QueryTag::new("query.live", None, None),
+        )
+        .await
+        .into_response()
+        .into_body()
+        .into_data_stream();
 
         // Every permit is taken, so the stream must not run its first statement.
         assert!(

@@ -255,7 +255,7 @@ impl PostgresQuery {
         params: &[(&(dyn ToSql + Sync), Type)],
         options: &QueryOptions,
     ) -> Result<QueryResult> {
-        run_pg_query(pool, &self.sql, params, options, &[], "postgres").await
+        run_pg_query(pool, &self.sql, params, options, &[], &[], "postgres").await
     }
 }
 
@@ -779,9 +779,16 @@ pub async fn execute_query_postgres_via_clickhouse(
     // restarts the server (upstream 0.3.x bug), so the FDW must never be
     // what PostgreSQL cancels.
     let ch_deadline_secs = (options.timeout_ms / 1000).max(1);
+    // The request's tag reaches ClickHouse's query_log through the FDW; its
+    // characters need no quoting in the settings list. Bound as a parameter
+    // (set_config below) so the per-request value never enters statement
+    // text, which would give pg_stat_statements an entry per request.
+    let log_comment = crate::query::QueryTag::current()
+        .map(|tag| format!(", log_comment {}", tag.comment()))
+        .unwrap_or_default();
     let session_settings = format!(
-        "SET LOCAL pg_clickhouse.session_settings = 'join_use_nulls 1, \
-         group_by_use_nulls 1, final 0, max_execution_time {ch_deadline_secs}'"
+        "join_use_nulls 1, group_by_use_nulls 1, final 0, \
+         max_execution_time {ch_deadline_secs}{log_comment}"
     );
     let statement_timeout = format!(
         "SET LOCAL statement_timeout = {}",
@@ -798,15 +805,26 @@ pub async fn execute_query_postgres_via_clickhouse(
             // ch.* carries prune-boundary CHECKs for the tiered views; the
             // archive holds full history, so never let them prune scans here.
             "SET LOCAL constraint_exclusion = off",
-            // `final 0` drops pg_clickhouse's default FINAL merge (costly
-            // reads; native ClickHouse engine semantics instead).
-            &session_settings,
             // Overrides run_pg_query's base statement_timeout (margin above).
             &statement_timeout,
         ],
+        // `final 0` drops pg_clickhouse's default FINAL merge (costly
+        // reads; native ClickHouse engine semantics instead).
+        &[("pg_clickhouse.session_settings", &session_settings)],
         "postgres-via-clickhouse",
     )
     .await
+}
+
+/// `SELECT set_config('<name>', $1, true), …` for transaction-local settings
+/// whose values are bound. Names come from code, never from requests.
+fn set_config_statement(settings: &[(&str, &str)]) -> String {
+    let calls: Vec<String> = settings
+        .iter()
+        .enumerate()
+        .map(|(i, (name, _))| format!("set_config('{name}', ${}, true)", i + 1))
+        .collect();
+    format!("SELECT {}", calls.join(", "))
 }
 
 /// Run prepared SQL on PostgreSQL and stream the result rows into a
@@ -819,6 +837,7 @@ async fn run_pg_query(
     params: &[(&(dyn ToSql + Sync), Type)],
     options: &QueryOptions,
     session_setup: &[&str],
+    bound_settings: &[(&str, &str)],
     engine: &str,
 ) -> Result<QueryResult> {
     let mut conn = pool
@@ -844,6 +863,21 @@ async fn run_pg_query(
         .map_err(classify_postgres_error)?;
 
     let mut setup = format!("SET LOCAL statement_timeout = {}", options.timeout_ms);
+    // Transaction-local settings whose values vary per request, such as the
+    // request's tag (application_name, shown in pg_stat_activity and logs as
+    // %a). Their values are bound parameters of one set_config statement, so
+    // its text stays the same and pg_stat_statements keeps one entry for it.
+    let application_name = crate::query::QueryTag::current().map(|tag| tag.application_name());
+    let mut bound: Vec<(&str, &str)> = Vec::with_capacity(bound_settings.len() + 1);
+    if let Some(name) = &application_name {
+        bound.push(("application_name", name));
+    }
+    bound.extend_from_slice(bound_settings);
+    let set_config_sql = (!bound.is_empty()).then(|| set_config_statement(&bound));
+    let set_config_params: Vec<(&(dyn ToSql + Sync), Type)> = bound
+        .iter()
+        .map(|(_, value)| (value as &(dyn ToSql + Sync), Type::TEXT))
+        .collect();
     for stmt in session_setup {
         setup.push_str(";\n");
         setup.push_str(stmt);
@@ -859,14 +893,25 @@ async fn run_pg_query(
         // is parsed. Resolve result types before executing: query_typed_raw
         // can deadlock discovering a composite type behind unread data rows.
         let setup = tx.batch_execute(&setup);
+        let set_config = async {
+            match &set_config_sql {
+                Some(sql) => tx.query_typed(sql, &set_config_params).await.map(drop),
+                None => Ok(()),
+            }
+        };
         let param_types: Vec<Type> = params.iter().map(|(_, ty)| ty.clone()).collect();
         let prepare = tx.prepare_typed(sql, &param_types);
-        futures::pin_mut!(setup, prepare);
+        futures::pin_mut!(setup, set_config, prepare);
         let setup_sent = futures::poll!(setup.as_mut());
+        let set_config_sent = futures::poll!(set_config.as_mut());
         let prepare_sent = futures::poll!(prepare.as_mut());
         match setup_sent {
             Poll::Ready(result) => result?,
             Poll::Pending => setup.await?,
+        }
+        match set_config_sent {
+            Poll::Ready(result) => result?,
+            Poll::Pending => set_config.await?,
         }
         let statement = match prepare_sent {
             Poll::Ready(result) => result?,
