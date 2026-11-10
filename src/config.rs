@@ -305,6 +305,20 @@ pub struct ClickHouseConfig {
     #[serde(default)]
     pub api_password_env: Option<String>,
 
+    /// ClickHouse URL for `tidx serve`'s native ClickHouse queries, such as a
+    /// replica that serves only reads, so that load stays off the replicas
+    /// `tidx sync` writes to. Falls back to `url` and `failover_urls` when
+    /// unset. Queries that PostgreSQL runs through pg_clickhouse (tiered
+    /// storage) use `fdw_url` instead; point that at the replica too to move
+    /// them.
+    #[serde(default)]
+    pub api_url: Option<String>,
+
+    /// Failover URLs for `api_url`, tried in order when it is unreachable,
+    /// such as the writer replicas. Needs `api_url`.
+    #[serde(default)]
+    pub api_failover_urls: Vec<String>,
+
     /// Scan and repair historical derived-table gaps on startup (default: true).
     #[serde(default = "default_true")]
     pub repair_derived_on_startup: bool,
@@ -334,6 +348,22 @@ impl ClickHouseConfig {
         let mut urls = vec![self.url.as_str()];
         urls.extend(self.failover_urls.iter().map(|u| u.as_str()));
         urls
+    }
+
+    /// URLs for API-only queries (`tidx serve`): `api_url` then
+    /// `api_failover_urls` when `api_url` is set, else [`Self::all_urls`].
+    pub fn api_urls(&self) -> Result<Vec<&str>> {
+        let Some(api_url) = &self.api_url else {
+            if !self.api_failover_urls.is_empty() {
+                anyhow::bail!(
+                    "clickhouse api_failover_urls is set without api_url; set api_url too"
+                );
+            }
+            return Ok(self.all_urls());
+        };
+        let mut urls = vec![api_url.as_str()];
+        urls.extend(self.api_failover_urls.iter().map(String::as_str));
+        Ok(urls)
     }
 
     /// The user and password for API-only queries: `api_user` and
@@ -387,6 +417,8 @@ impl Default for ClickHouseConfig {
             password_env: None,
             api_user: None,
             api_password_env: None,
+            api_url: None,
+            api_failover_urls: Vec::new(),
             repair_derived_on_startup: true,
             fdw_url: None,
             replicated_database: false,
@@ -878,6 +910,27 @@ mod tests {
             redact_url_credentials("https://rpc.example.com/path"),
             "https://rpc.example.com/path"
         );
+    }
+
+    #[test]
+    fn clickhouse_api_urls_fall_back_to_writer_urls() {
+        let mut ch = ClickHouseConfig {
+            url: "http://w0:8123".to_string(),
+            failover_urls: vec!["http://w1:8123".to_string()],
+            ..Default::default()
+        };
+        assert_eq!(ch.api_urls().unwrap(), ["http://w0:8123", "http://w1:8123"]);
+
+        ch.api_url = Some("http://reader:8123".to_string());
+        ch.api_failover_urls = vec!["http://w0:8123".to_string()];
+        assert_eq!(
+            ch.api_urls().unwrap(),
+            ["http://reader:8123", "http://w0:8123"]
+        );
+        assert_eq!(ch.all_urls(), ["http://w0:8123", "http://w1:8123"]);
+
+        ch.api_url = None;
+        assert!(ch.api_urls().is_err());
     }
 
     #[test]
