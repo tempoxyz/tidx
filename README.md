@@ -241,7 +241,7 @@ OTEL_EXPORTER_OTLP_ENDPOINT=http://otel-collector:4318 tidx up   # OTLP/HTTP; /v
 ```
 
 - The HTTP API continues the caller's W3C `traceparent`: a `GET /query` server span with child spans `tidx.route`, `tidx.query`, `tidx.parse`, `tidx.route.prune_boundary` (tiered), `tidx.postgres.acquire`, `tidx.postgres.execute`, `tidx.clickhouse.execute` and `tidx.serialize`. The SQL is not recorded.
-- Sampling follows the caller's `traceparent` flag; requests without one are sampled at 1%. Override with `OTEL_TRACES_SAMPLER` / `OTEL_TRACES_SAMPLER_ARG`. `OTEL_SERVICE_NAME` defaults to `tidx`; `OTEL_SDK_DISABLED=true` turns export off.
+- Sampling is by trace ID at 1% by default, ignoring the caller's sampled flag (some callers always set it); the parent link is kept either way. Override with `OTEL_TRACES_SAMPLER` / `OTEL_TRACES_SAMPLER_ARG`, e.g. `traceidratio` with `0.1`, or `parentbased_always_on` to follow trusted callers. `OTEL_SERVICE_NAME` defaults to `tidx`; `OTEL_SDK_DISABLED=true` turns export off.
 
 Freshness, in time rather than blocks:
 

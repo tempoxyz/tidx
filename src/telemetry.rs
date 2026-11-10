@@ -7,9 +7,12 @@
 //!
 //! When enabled, incoming W3C `traceparent` headers on the HTTP API become
 //! the parent of the request span, so a caller's trace continues into tidx.
-//! Sampling follows the caller's decision; requests without a parent are
-//! sampled at [`DEFAULT_ROOT_SAMPLE_RATIO`] unless `OTEL_TRACES_SAMPLER`
-//! (and `OTEL_TRACES_SAMPLER_ARG`) choose otherwise. `OTEL_SERVICE_NAME`
+//! Sampling is decided here, by trace ID at [`DEFAULT_SAMPLE_RATIO`], not by
+//! the caller's sampled flag: some callers (such as Cloudflare Workers) always
+//! send `01`, which would trace every request. The same trace ID gets the same
+//! decision on every instance. `OTEL_TRACES_SAMPLER` (and
+//! `OTEL_TRACES_SAMPLER_ARG`) override it, e.g. `parentbased_always_on` to
+//! follow trusted callers. `OTEL_SERVICE_NAME`
 //! defaults to `tidx`.
 
 use anyhow::Result;
@@ -23,8 +26,8 @@ use tracing_subscriber::filter::Targets;
 use tracing_subscriber::prelude::*;
 use tracing_subscriber::{EnvFilter, Layer, Registry};
 
-/// Share of parentless (root) requests traced when `OTEL_TRACES_SAMPLER` is unset.
-pub const DEFAULT_ROOT_SAMPLE_RATIO: f64 = 0.01;
+/// Share of traces (by trace ID) sampled when `OTEL_TRACES_SAMPLER` is unset.
+pub const DEFAULT_SAMPLE_RATIO: f64 = 0.01;
 
 /// Flushes and shuts down the trace exporter when dropped.
 #[must_use = "dropping the guard shuts down trace export"]
@@ -126,9 +129,7 @@ fn build_provider() -> Result<SdkTracerProvider> {
         .with_batch_exporter(exporter)
         .with_resource(resource);
     if std::env::var("OTEL_TRACES_SAMPLER").is_err() {
-        builder = builder.with_sampler(Sampler::ParentBased(Box::new(Sampler::TraceIdRatioBased(
-            DEFAULT_ROOT_SAMPLE_RATIO,
-        ))));
+        builder = builder.with_sampler(Sampler::TraceIdRatioBased(DEFAULT_SAMPLE_RATIO));
     }
     Ok(builder.build())
 }
