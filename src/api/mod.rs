@@ -282,6 +282,7 @@ fn build_router(state: AppState, mode: ApiMode) -> Router<()> {
             header::CONTENT_TYPE,
             header::AUTHORIZATION,
             HeaderName::from_static(crate::query::tag::CALLER_HEADER),
+            HeaderName::from_static(crate::query::tag::REQUEST_ID_HEADER),
         ])
         .expose_headers([HeaderName::from_static(
             crate::query::tag::REQUEST_ID_HEADER,
@@ -552,7 +553,9 @@ async fn route_query(
         let tag = QueryTag::new(&route_name, caller.as_deref(), Some(&request_id));
         let start = std::time::Instant::now();
         let response = tag
-            .scope(handle_query_once(state, params, signatures, route))
+            .scope(Box::pin(handle_query_once(
+                state, params, signatures, route,
+            )))
             .await
             .into_response();
         crate::metrics::record_api_query(&route_name, response.status().as_u16(), start.elapsed());

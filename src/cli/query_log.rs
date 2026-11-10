@@ -192,13 +192,22 @@ async fn postgres_section(chain: &ChainConfig, limit: u32) -> Result<Value> {
                     rows, shared_blks_read + temp_blks_read AS blocks_read, \
                     left(regexp_replace(query, '\\s+', ' ', 'g'), 300) AS example \
              FROM pg_stat_statements \
-             WHERE $1::text IS NULL OR userid = (SELECT oid FROM pg_roles WHERE rolname = $1) \
+             WHERE queryid IS NOT NULL \
+               AND ($1::text IS NULL OR userid = (SELECT oid FROM pg_roles WHERE rolname = $1)) \
              ORDER BY total_exec_time DESC \
              LIMIT $2",
             &[&role, &i64::from(limit)],
         )
         .await
         .context("reading pg_stat_statements")?;
+    if rows.is_empty() {
+        // Other roles' statements have a NULL queryid unless this user is a
+        // superuser or has pg_read_all_stats.
+        return Ok(json!({
+            "skipped": "no visible pg_stat_statements rows for the API role (the config's PostgreSQL user needs pg_read_all_stats to see other roles' statements)",
+            "role": role,
+        }));
+    }
     let columns: Vec<String> = rows
         .first()
         .map(|r| r.columns().iter().map(|c| c.name().to_string()).collect())
@@ -207,14 +216,14 @@ async fn postgres_section(chain: &ChainConfig, limit: u32) -> Result<Value> {
         .iter()
         .map(|row| {
             vec![
-                json!(row.get::<_, String>(0)),
-                json!(row.get::<_, i64>(1)),
-                json!(row.get::<_, f64>(2)),
-                json!(row.get::<_, f64>(3)),
-                json!(row.get::<_, f64>(4)),
-                json!(row.get::<_, i64>(5)),
-                json!(row.get::<_, i64>(6)),
-                json!(row.get::<_, String>(7)),
+                json!(row.get::<_, Option<String>>(0)),
+                json!(row.get::<_, Option<i64>>(1)),
+                json!(row.get::<_, Option<f64>>(2)),
+                json!(row.get::<_, Option<f64>>(3)),
+                json!(row.get::<_, Option<f64>>(4)),
+                json!(row.get::<_, Option<i64>>(5)),
+                json!(row.get::<_, Option<i64>>(6)),
+                json!(row.get::<_, Option<String>>(7)),
             ]
         })
         .collect();
