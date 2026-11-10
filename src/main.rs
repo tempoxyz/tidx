@@ -7,18 +7,8 @@ use cli::{Cli, Commands};
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let filter = tracing_subscriber::EnvFilter::from_default_env()
-        .add_directive("tidx=info".parse().unwrap());
-
-    // Use JSON format if RUST_LOG_FORMAT=json
-    if std::env::var("RUST_LOG_FORMAT").as_deref() == Ok("json") {
-        tracing_subscriber::fmt()
-            .with_env_filter(filter)
-            .json()
-            .init();
-    } else {
-        tracing_subscriber::fmt().with_env_filter(filter).init();
-    }
+    // Logs, plus OTLP trace export when OTEL_EXPORTER_OTLP_*ENDPOINT is set.
+    let _telemetry = tidx::telemetry::init()?;
 
     let cli = Cli::parse();
 

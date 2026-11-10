@@ -232,6 +232,22 @@ password_env = "TIDX_PG_PASSWORD"
     └── require_clickhouse  bool      = true         Only prune rows durably archived in ClickHouse
 ```
 
+### Tracing and freshness metrics
+
+Trace export is off unless a standard OpenTelemetry endpoint is set:
+
+```bash
+OTEL_EXPORTER_OTLP_ENDPOINT=http://otel-collector:4318 tidx up   # OTLP/HTTP; /v1/traces is appended
+```
+
+- The HTTP API continues the caller's W3C `traceparent`: a `GET /query` server span with child spans `tidx.route`, `tidx.query`, `tidx.parse`, `tidx.route.prune_boundary` (tiered), `tidx.postgres.acquire`, `tidx.postgres.execute`, `tidx.clickhouse.execute` and `tidx.serialize`. The SQL is not recorded.
+- Sampling follows the caller's `traceparent` flag; requests without one are sampled at 1%. Override with `OTEL_TRACES_SAMPLER` / `OTEL_TRACES_SAMPLER_ARG`. `OTEL_SERVICE_NAME` defaults to `tidx`; `OTEL_SDK_DISABLED=true` turns export off.
+
+Freshness, in time rather than blocks:
+
+- `tidx_index_latency_seconds{chain_id,sink}`: histogram of now minus the block's (millisecond) timestamp when realtime sync commits the block's rows to each sink, i.e. block to queryable.
+- `tidx_sync_head_timestamp_seconds{chain_id}`: timestamp of the newest block committed by realtime sync; `time() - tidx_sync_head_timestamp_seconds` is how stale the index is.
+
 ## CLI
 
 ```

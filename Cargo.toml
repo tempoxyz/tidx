@@ -54,6 +54,11 @@ clap = { version = "4", features = ["derive", "env"] }
 # Observability
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+# OpenTelemetry trace export: off unless OTEL_EXPORTER_OTLP_(TRACES_)ENDPOINT is set
+opentelemetry = "0.33"
+opentelemetry_sdk = { version = "0.33", features = ["trace"] }
+opentelemetry-otlp = { version = "0.33", default-features = false, features = ["trace", "http-proto", "reqwest-blocking-client"] }
+tracing-opentelemetry = "0.34"
 metrics = "0.24"
 metrics-exporter-prometheus = { version = "0.16", default-features = false, features = ["http-listener"] }
 

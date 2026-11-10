@@ -24,7 +24,7 @@ use futures::Stream;
 use serde::{Deserialize, Serialize};
 use tower::limit::GlobalConcurrencyLimitLayer;
 use tower_http::cors::CorsLayer;
-use tower_http::trace::TraceLayer;
+use tower_http::trace::{DefaultOnResponse, OnResponse, TraceLayer};
 
 use crate::broadcast::Broadcaster;
 use crate::clickhouse::ClickHouseEngine;
@@ -307,8 +307,44 @@ fn build_router(state: AppState, mode: ApiMode) -> Router<()> {
 
     router
         .layer(cors)
-        .layer(TraceLayer::new_for_http())
+        .layer(
+            TraceLayer::new_for_http()
+                .make_span_with(make_request_span)
+                .on_response(on_request_response),
+        )
         .with_state(state)
+}
+
+/// The server span of each API request. Its parent is the caller's W3C
+/// `traceparent` when OpenTelemetry export is on (see [`crate::telemetry`]).
+/// The query string (which carries the SQL) is left out.
+fn make_request_span<B>(req: &axum::http::Request<B>) -> tracing::Span {
+    let method = req.method();
+    let path = req.uri().path();
+    let span = tracing::info_span!(
+        "http.request",
+        otel.name = %format_args!("{method} {path}"),
+        otel.kind = "server",
+        http.request.method = %method,
+        url.path = %path,
+        http.response.status_code = tracing::field::Empty,
+        otel.status_code = tracing::field::Empty,
+    );
+    crate::telemetry::set_parent_from_headers(&span, req.headers());
+    span
+}
+
+fn on_request_response<B>(
+    res: &axum::http::Response<B>,
+    latency: std::time::Duration,
+    span: &tracing::Span,
+) {
+    let status = res.status();
+    span.record("http.response.status_code", status.as_u16());
+    if status.is_server_error() {
+        span.record("otel.status_code", "ERROR");
+    }
+    DefaultOnResponse::default().on_response(res, latency, span);
 }
 
 async fn handle_health() -> &'static str {
@@ -498,9 +534,16 @@ async fn handle_query(
         params.source.as_deref()
     };
 
-    let route = match crate::query::QueryRoute::resolve(params.engine.as_deref(), source) {
-        Ok(route) => route,
-        Err(e) => return ApiError::BadRequest(e).into_response(),
+    let route = {
+        let span = tracing::info_span!("tidx.route", route = tracing::field::Empty);
+        let _guard = span.enter();
+        match crate::query::QueryRoute::resolve(params.engine.as_deref(), source) {
+            Ok(route) => {
+                span.record("route", tracing::field::display(route));
+                route
+            }
+            Err(e) => return ApiError::BadRequest(e).into_response(),
+        }
     };
 
     if params.live {
@@ -520,12 +563,22 @@ async fn handle_query(
     }
 }
 
+#[tracing::instrument(
+    name = "tidx.query",
+    skip_all,
+    fields(
+        chain_id = params.chain_id,
+        route = %route,
+        engine = tracing::field::Empty,
+        rows = tracing::field::Empty,
+    )
+)]
 async fn handle_query_once(
     state: AppState,
     params: QueryParams,
     signatures: Vec<String>,
     route: crate::query::QueryRoute,
-) -> Result<Json<QueryResponse>, ApiError> {
+) -> Result<Response, ApiError> {
     let pool = state
         .get_pool(Some(params.chain_id))
         .await
@@ -599,7 +652,31 @@ async fn handle_query_once(
         }
     };
 
-    Ok(Json(QueryResponse { result, ok: true }))
+    let span = tracing::Span::current();
+    span.record("rows", result.row_count);
+    if let Some(engine) = &result.engine {
+        span.record("engine", engine.as_str());
+    }
+
+    serialize_query_response(&QueryResponse { result, ok: true })
+}
+
+/// Serialize the response body here rather than in `Json`'s `IntoResponse`,
+/// so its cost shows up as its own span.
+fn serialize_query_response(response: &QueryResponse) -> Result<Response, ApiError> {
+    let span = tracing::info_span!("tidx.serialize", bytes = tracing::field::Empty);
+    let _guard = span.enter();
+    let body = serde_json::to_vec(response)
+        .map_err(|e| ApiError::Internal(format!("Failed to serialize response: {e}")))?;
+    span.record("bytes", body.len());
+    Ok((
+        [(
+            header::CONTENT_TYPE,
+            axum::http::HeaderValue::from_static("application/json"),
+        )],
+        body,
+    )
+        .into_response())
 }
 
 type SseStream = std::pin::Pin<Box<dyn Stream<Item = Result<SseEvent, Infallible>> + Send>>;

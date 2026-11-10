@@ -402,10 +402,23 @@ impl SyncEngine {
             };
 
             let sinks = self.sinks.clone();
+            let chain_id = self.chain_id;
+            let block_ts_ms: Vec<i64> = blocks
+                .iter()
+                .map(|b| b.header.inner.timestamp_millis() as i64)
+                .collect();
+            let newest_block_ts_ms = block_ts_ms.iter().copied().max();
             let write_future = async move {
                 let write_start = std::time::Instant::now();
                 sinks
-                    .write_all(&block_rows, &all_txs, &all_logs, &all_receipts)
+                    .write_all_realtime(
+                        chain_id,
+                        &block_ts_ms,
+                        &block_rows,
+                        &all_txs,
+                        &all_logs,
+                        &all_receipts,
+                    )
                     .await?;
                 let write_ms = write_start.elapsed().as_millis();
                 Ok::<_, anyhow::Error>(write_ms)
@@ -425,6 +438,9 @@ impl SyncEngine {
             }
 
             update_tip_num(self.pool(), self.chain_id, current_to, remote_head).await?;
+            if let Some(ts_ms) = newest_block_ts_ms {
+                metrics::set_sync_head_timestamp(self.chain_id, ts_ms);
+            }
 
             let batch_ms = batch_start.elapsed().as_millis();
             let block_count = blocks.len();

@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use anyhow::Result;
 use clap::Args as ClapArgs;
-use metrics_exporter_prometheus::PrometheusBuilder;
+use metrics_exporter_prometheus::{Matcher, PrometheusBuilder};
 use tokio::sync::RwLock;
 use tracing::{error, info, warn};
 
@@ -66,6 +66,16 @@ pub(crate) fn start_prometheus(config: &Config) -> Result<()> {
         info!(addr = %metrics_addr, "Starting Prometheus metrics server");
         PrometheusBuilder::new()
             .with_http_listener(metrics_addr)
+            // Real histograms (buckets) for these, so they aggregate across
+            // instances; other histograms stay summaries.
+            .set_buckets_for_metric(
+                Matcher::Full("tidx_index_latency_seconds".to_string()),
+                tidx::metrics::INDEX_LATENCY_BUCKETS,
+            )?
+            .set_buckets_for_metric(
+                Matcher::Full("tidx_clickhouse_query_duration_seconds".to_string()),
+                tidx::metrics::CLICKHOUSE_QUERY_BUCKETS,
+            )?
             .install()?;
     }
     Ok(())

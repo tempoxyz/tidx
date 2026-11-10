@@ -6,6 +6,7 @@ use std::task::Poll;
 use std::time::Instant;
 use tokio_postgres::error::SqlState;
 use tokio_postgres::types::{ToSql, Type};
+use tracing::Instrument;
 
 use crate::db::Pool;
 use crate::metrics;
@@ -226,6 +227,7 @@ pub struct PostgresQuery {
 
 impl PostgresQuery {
     pub fn new(sql: &str, signatures: &[&str], options: &QueryOptions) -> Result<Self> {
+        let _span = tracing::info_span!("tidx.parse", engine = "postgres").entered();
         let sql = apply_event_signature_ctes_postgres(sql, signatures)?;
 
         // Validate query (after CTE wrapping so signature-derived table names are valid)
@@ -430,7 +432,9 @@ pub async fn execute_query_tiered(
         boundary,
         boundary_ts,
         tip,
-    } = crate::db::tiered::fetch_prune_boundary(pool, chain_id).await?;
+    } = crate::db::tiered::fetch_prune_boundary(pool, chain_id)
+        .instrument(tracing::info_span!("tidx.route.prune_boundary"))
+        .await?;
     if boundary <= 0 {
         // Nothing pruned yet: full history is hot in PostgreSQL.
         let mut result = execute_query_postgres(pool, sql, signatures, options).await?;
@@ -440,7 +444,10 @@ pub async fn execute_query_tiered(
     match try_execute_tiered_split(pool, clickhouse, boundary, sql, signatures, options).await? {
         Some(result) => Ok(result),
         None => {
-            let hot = crate::query::hot_window_confinement(sql, boundary, boundary_ts);
+            let hot = {
+                let _span = tracing::info_span!("tidx.route", planner = "hot_window").entered();
+                crate::query::hot_window_confinement(sql, boundary, boundary_ts)
+            };
             let hot_on_pg = match &hot {
                 Some(hw) => clickhouse.is_none() || !hot_query_prefers_clickhouse(hw, tip),
                 None => false,
@@ -526,6 +533,8 @@ async fn try_execute_tiered_split(
     options: &QueryOptions,
 ) -> Result<Option<QueryResult>> {
     let start = Instant::now();
+    // Planning is synchronous; the span closes on every early return.
+    let route_span = tracing::info_span!("tidx.route", planner = "split").entered();
 
     let mut events = Vec::with_capacity(signatures.len());
     for sig in signatures {
@@ -551,6 +560,7 @@ async fn try_execute_tiered_split(
     if plan.sql_limit.is_some_and(|l| l > options.limit) {
         return Ok(None);
     }
+    drop(route_span);
 
     let eff_limit = plan
         .sql_limit
@@ -811,12 +821,27 @@ async fn run_pg_query(
     session_setup: &[&str],
     engine: &str,
 ) -> Result<QueryResult> {
-    let mut conn = pool.get().await.map_err(|e| {
-        anyhow::Error::new(PostgresQueryFailure::Unavailable {
-            message: e.to_string(),
-        })
-    })?;
-    let tx = conn.transaction().await.map_err(classify_postgres_error)?;
+    let mut conn = pool
+        .get()
+        .instrument(tracing::info_span!("tidx.postgres.acquire"))
+        .await
+        .map_err(|e| {
+            anyhow::Error::new(PostgresQueryFailure::Unavailable {
+                message: e.to_string(),
+            })
+        })?;
+    let exec_span = tracing::info_span!(
+        "tidx.postgres.execute",
+        otel.kind = "client",
+        db.system.name = "postgresql",
+        engine,
+        rows = tracing::field::Empty,
+    );
+    let tx = conn
+        .transaction()
+        .instrument(exec_span.clone())
+        .await
+        .map_err(classify_postgres_error)?;
 
     let mut setup = format!("SET LOCAL statement_timeout = {}", options.timeout_ms);
     for stmt in session_setup {
@@ -883,6 +908,7 @@ async fn run_pg_query(
 
         Ok::<_, anyhow::Error>((columns, rows))
     })
+    .instrument(exec_span.clone())
     .await;
 
     let (columns, result_rows) = match result {
@@ -896,10 +922,14 @@ async fn run_pg_query(
         Err(_) => return Err(PostgresQueryFailure::Timeout.into()),
     };
 
-    tx.commit().await.map_err(classify_postgres_error)?;
+    tx.commit()
+        .instrument(exec_span.clone())
+        .await
+        .map_err(classify_postgres_error)?;
 
     let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
     let row_count = result_rows.len();
+    exec_span.record("rows", row_count);
     metrics::record_query_rows(row_count as u64);
 
     Ok(QueryResult {
