@@ -9,7 +9,7 @@
 
 use anyhow::{Result, anyhow};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use tracing::{error, warn};
+use tracing::{error, info, warn};
 
 use crate::config::ClickHouseConfig;
 use crate::query::{
@@ -30,6 +30,10 @@ const MAX_QUERY_RESULT_BYTES: usize = 10 * 1024 * 1024;
 /// legitimate queries without bounding memory any further.
 const MAX_USER_QUERY_MEMORY_BYTES: u64 = 1 << 30;
 
+/// How long the engine stays on a failover instance before trying the
+/// primary again.
+const PRIMARY_RETRY_AFTER: std::time::Duration = std::time::Duration::from_secs(30);
+
 /// A single ClickHouse instance (connection + URL).
 struct Instance {
     http_client: reqwest::Client,
@@ -47,6 +51,11 @@ pub struct ClickHouseEngine {
     instances: Vec<Instance>,
     /// Index of the currently active instance (0 = primary).
     active: AtomicUsize,
+    /// When the engine last moved off the primary or last retried it; while
+    /// on a failover instance, the primary is tried again every
+    /// `primary_retry_after` so traffic returns once it recovers.
+    failed_over_at: std::sync::Mutex<Option<std::time::Instant>>,
+    primary_retry_after: std::time::Duration,
     /// Database name for this chain (e.g., "tidx_4217" for chain 4217)
     database: String,
 }
@@ -57,18 +66,26 @@ impl ClickHouseEngine {
     /// come from `config.failover_urls`.
     pub fn new(config: &ClickHouseConfig, chain_id: u64) -> Result<Self> {
         let password = config.resolved_password()?;
-        Self::with_credentials(config, chain_id, config.user.clone(), password)
+        Self::with_credentials(
+            config,
+            &config.all_urls(),
+            chain_id,
+            config.user.clone(),
+            password,
+        )
     }
 
-    /// An engine for API-only processes (`tidx serve`), connecting as
-    /// `api_user` when it is configured, such as a read-only user.
+    /// An engine for API-only processes (`tidx serve`), connecting to
+    /// `api_url` and as `api_user` when they are configured, such as a
+    /// read-only replica and user.
     pub fn for_api(config: &ClickHouseConfig, chain_id: u64) -> Result<Self> {
         let (user, password) = config.api_credentials()?;
-        Self::with_credentials(config, chain_id, user, password)
+        Self::with_credentials(config, &config.api_urls()?, chain_id, user, password)
     }
 
     fn with_credentials(
         config: &ClickHouseConfig,
+        urls: &[&str],
         chain_id: u64,
         user: Option<String>,
         password: Option<String>,
@@ -79,13 +96,15 @@ impl ClickHouseEngine {
             .unwrap_or_else(|| format!("tidx_{chain_id}"));
 
         let mut instances = Vec::new();
-        for url in config.all_urls() {
+        for url in urls {
             instances.push(Self::make_instance(url, user.clone(), password.clone())?);
         }
 
         Ok(Self {
             instances,
             active: AtomicUsize::new(0),
+            failed_over_at: std::sync::Mutex::new(None),
+            primary_retry_after: PRIMARY_RETRY_AFTER,
             database,
         })
     }
@@ -197,7 +216,12 @@ impl ClickHouseEngine {
     ) -> Result<QueryResult> {
         let start = std::time::Instant::now();
         let n = self.instances.len();
-        let starting = self.active.load(Ordering::Relaxed);
+        let active = self.active.load(Ordering::Relaxed);
+        let starting = if active != 0 && self.primary_retry_due() {
+            0
+        } else {
+            active
+        };
 
         for attempt in 0..n {
             let idx = (starting + attempt) % n;
@@ -205,14 +229,23 @@ impl ClickHouseEngine {
 
             match self.try_query(inst, sql, start, timeout_ms, settings).await {
                 Ok(result) => {
-                    if attempt > 0 {
+                    if idx != active {
                         self.active.store(idx, Ordering::Relaxed);
-                        warn!(
-                            url = %inst.url,
-                            database = %self.database,
-                            "ClickHouse failed over to instance {}",
-                            idx
-                        );
+                        if idx == 0 {
+                            info!(
+                                url = %inst.url,
+                                database = %self.database,
+                                "ClickHouse back on the primary instance"
+                            );
+                        } else {
+                            self.mark_failed_over();
+                            warn!(
+                                url = %inst.url,
+                                database = %self.database,
+                                "ClickHouse failed over to instance {}",
+                                idx
+                            );
+                        }
                     }
                     return Ok(result);
                 }
@@ -229,6 +262,26 @@ impl ClickHouseEngine {
         }
 
         Err(anyhow!("All ClickHouse instances unreachable"))
+    }
+
+    fn mark_failed_over(&self) {
+        if let Ok(mut at) = self.failed_over_at.lock() {
+            *at = Some(std::time::Instant::now());
+        }
+    }
+
+    /// Whether a query should try the primary again: once per
+    /// `primary_retry_after`, so only one query at a time pays for a primary
+    /// that is still down.
+    fn primary_retry_due(&self) -> bool {
+        let Ok(mut at) = self.failed_over_at.lock() else {
+            return false;
+        };
+        let due = at.is_none_or(|t| t.elapsed() >= self.primary_retry_after);
+        if due {
+            *at = Some(std::time::Instant::now());
+        }
+        due
     }
 
     fn query_url(
@@ -555,6 +608,58 @@ mod tests {
 
         assert_eq!(result.rows, vec![vec![serde_json::json!(1)]]);
         assert_eq!(engine.active_url(), secondary_url);
+        primary_task.await.unwrap();
+        secondary_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_fails_back_to_recovered_primary() {
+        let body = r#"{"meta":[{"name":"n","type":"UInt8"}],"data":[[1]],"rows":1}"#;
+        let ok = format!(
+            "HTTP/1.1 200 OK
+Content-Type: application/json
+Content-Length: {}
+Connection: close
+
+{body}",
+            body.len()
+        );
+        // The primary fails the first query, then recovers.
+        let primary = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let primary_url = format!("http://{}", primary.local_addr().unwrap());
+        let primary_ok = ok.clone();
+        let primary_task = tokio::spawn(async move {
+            for response in [
+                b"HTTP/1.1 nope
+
+"
+                .to_vec(),
+                primary_ok.into_bytes(),
+            ] {
+                let (mut stream, _) = primary.accept().await.unwrap();
+                read_request(&mut stream).await;
+                stream.write_all(&response).await.unwrap();
+                stream.shutdown().await.unwrap();
+            }
+        });
+        let secondary = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let secondary_url = format!("http://{}", secondary.local_addr().unwrap());
+        let secondary_task = tokio::spawn(serve_once(secondary, ok.into_bytes()));
+
+        let config = ClickHouseConfig {
+            enabled: true,
+            url: primary_url.clone(),
+            failover_urls: vec![secondary_url.clone()],
+            database: Some("default".to_string()),
+            ..Default::default()
+        };
+        let mut engine = ClickHouseEngine::new(&config, 4217).unwrap();
+        engine.primary_retry_after = std::time::Duration::ZERO;
+
+        engine.query("SELECT 1 AS n", &[]).await.unwrap();
+        assert_eq!(engine.active_url(), secondary_url);
+        engine.query("SELECT 1 AS n", &[]).await.unwrap();
+        assert_eq!(engine.active_url(), primary_url);
         primary_task.await.unwrap();
         secondary_task.await.unwrap();
     }

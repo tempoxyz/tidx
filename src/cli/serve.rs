@@ -84,12 +84,13 @@ pub async fn run(args: Args) -> Result<()> {
         check_schema(&pool, chain).await?;
 
         if let Some(ch_config) = chain.clickhouse.as_ref().filter(|c| c.enabled) {
+            let mut api_urls = ch_config.api_urls()?.into_iter().map(str::to_string);
             clickhouse_configs.insert(
                 chain.chain_id,
                 ChainClickHouseConfig {
                     enabled: true,
-                    url: ch_config.url.clone(),
-                    failover_urls: ch_config.failover_urls.clone(),
+                    url: api_urls.next().unwrap_or_default(),
+                    failover_urls: api_urls.collect(),
                 },
             );
             let engine =
