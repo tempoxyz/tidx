@@ -56,19 +56,31 @@ impl ClickHouseEngine {
     /// The primary URL comes from `config.url`; additional failover URLs
     /// come from `config.failover_urls`.
     pub fn new(config: &ClickHouseConfig, chain_id: u64) -> Result<Self> {
+        let password = config.resolved_password()?;
+        Self::with_credentials(config, chain_id, config.user.clone(), password)
+    }
+
+    /// An engine for API-only processes (`tidx serve`), connecting as
+    /// `api_user` when it is configured, such as a read-only user.
+    pub fn for_api(config: &ClickHouseConfig, chain_id: u64) -> Result<Self> {
+        let (user, password) = config.api_credentials()?;
+        Self::with_credentials(config, chain_id, user, password)
+    }
+
+    fn with_credentials(
+        config: &ClickHouseConfig,
+        chain_id: u64,
+        user: Option<String>,
+        password: Option<String>,
+    ) -> Result<Self> {
         let database = config
             .database
             .clone()
             .unwrap_or_else(|| format!("tidx_{chain_id}"));
 
-        let password = config.resolved_password()?;
         let mut instances = Vec::new();
         for url in config.all_urls() {
-            instances.push(Self::make_instance(
-                url,
-                config.user.clone(),
-                password.clone(),
-            )?);
+            instances.push(Self::make_instance(url, user.clone(), password.clone())?);
         }
 
         Ok(Self {
