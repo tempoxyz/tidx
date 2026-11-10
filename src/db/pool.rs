@@ -11,7 +11,14 @@ pub async fn create_pool(database_url: &str) -> Result<Pool> {
 /// Creates a pool with custom max connections
 pub async fn create_pool_with_size(database_url: &str, max_size: usize) -> Result<Pool> {
     ensure_database_exists(database_url).await?;
+    connect_pool(database_url, max_size).await
+}
 
+/// Creates a pool against an existing database without trying to create it.
+///
+/// Used by `tidx serve`, which may connect with read-only credentials to a
+/// read replica where `CREATE DATABASE` is neither allowed nor wanted.
+pub async fn connect_pool(database_url: &str, max_size: usize) -> Result<Pool> {
     // Kill idle or active long-running statements in transactions after 60s to prevent
     // lock contention. API queries still use stricter SET LOCAL timeouts when requested,
     // and Clean recycling clears leaked session state.
