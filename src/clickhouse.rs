@@ -8,7 +8,8 @@
 //! to secondary instances if the primary is unavailable.
 
 use anyhow::{Result, anyhow};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use tracing::{error, info, warn};
 
 use crate::config::ClickHouseConfig;
@@ -34,7 +35,14 @@ const MAX_USER_QUERY_MEMORY_BYTES: u64 = 1 << 30;
 /// primary again.
 const PRIMARY_RETRY_AFTER: std::time::Duration = std::time::Duration::from_secs(30);
 
+/// How long a primary health probe may take.
+const PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// How long connecting to a ClickHouse instance may take.
+const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// A single ClickHouse instance (connection + URL).
+#[derive(Clone)]
 struct Instance {
     http_client: reqwest::Client,
     url: String,
@@ -50,11 +58,13 @@ struct Instance {
 pub struct ClickHouseEngine {
     instances: Vec<Instance>,
     /// Index of the currently active instance (0 = primary).
-    active: AtomicUsize,
-    /// When the engine last moved off the primary or last retried it; while
-    /// on a failover instance, the primary is tried again every
-    /// `primary_retry_after` so traffic returns once it recovers.
+    active: Arc<AtomicUsize>,
+    /// When the engine last moved off the primary or last probed it. While on
+    /// a failover instance, a background probe checks the primary's health
+    /// every `primary_retry_after`, and traffic returns once it passes.
     failed_over_at: std::sync::Mutex<Option<std::time::Instant>>,
+    /// Whether a primary health probe is running.
+    probing: Arc<AtomicBool>,
     primary_retry_after: std::time::Duration,
     /// Database name for this chain (e.g., "tidx_4217" for chain 4217)
     database: String,
@@ -102,8 +112,9 @@ impl ClickHouseEngine {
 
         Ok(Self {
             instances,
-            active: AtomicUsize::new(0),
+            active: Arc::new(AtomicUsize::new(0)),
             failed_over_at: std::sync::Mutex::new(None),
+            probing: Arc::new(AtomicBool::new(false)),
             primary_retry_after: PRIMARY_RETRY_AFTER,
             database,
         })
@@ -116,6 +127,9 @@ impl ClickHouseEngine {
     ) -> Result<Instance> {
         let http_client = reqwest::Client::builder()
             .pool_max_idle_per_host(4)
+            // A host that drops packets fails over in seconds, not after the
+            // kernel's connect timeout.
+            .connect_timeout(CONNECT_TIMEOUT)
             .build()
             .map_err(|e| anyhow!("Failed to create HTTP client: {e}"))?;
         Ok(Instance {
@@ -217,11 +231,10 @@ impl ClickHouseEngine {
         let start = std::time::Instant::now();
         let n = self.instances.len();
         let active = self.active.load(Ordering::Relaxed);
-        let starting = if active != 0 && self.primary_retry_due() {
-            0
-        } else {
-            active
-        };
+        if active != 0 && self.primary_retry_due() {
+            self.spawn_primary_probe();
+        }
+        let starting = active;
 
         for attempt in 0..n {
             let idx = (starting + attempt) % n;
@@ -270,9 +283,62 @@ impl ClickHouseEngine {
         }
     }
 
-    /// Whether a query should try the primary again: once per
-    /// `primary_retry_after`, so only one query at a time pays for a primary
-    /// that is still down.
+    /// Check the primary in the background and switch back to it once it is
+    /// healthy: ClickHouse's `/replicas_status` answers 200 only when the
+    /// server is up and its replicated tables have caught up, so a replica
+    /// that just restarted keeps serving nothing until it has the data. User
+    /// queries keep going to the active instance meanwhile.
+    fn spawn_primary_probe(&self) {
+        if self.probing.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            self.probing.store(false, Ordering::Release);
+            return;
+        };
+        let primary = self.instances[0].clone();
+        let active = Arc::clone(&self.active);
+        let probing = Arc::clone(&self.probing);
+        let database = self.database.clone();
+        runtime.spawn(async move {
+            let url = format!("{}/replicas_status", primary.url.trim_end_matches('/'));
+            let mut req = primary.http_client.get(&url).timeout(PROBE_TIMEOUT);
+            if let Some(user) = &primary.user {
+                req = req.header("X-ClickHouse-User", user);
+            }
+            if let Some(password) = &primary.password {
+                req = req.header("X-ClickHouse-Key", password);
+            }
+            match req.send().await {
+                Ok(resp) if resp.status().is_success() => {
+                    if active.swap(0, Ordering::Relaxed) != 0 {
+                        info!(
+                            url = %primary.url,
+                            database = %database,
+                            "ClickHouse back on the primary instance"
+                        );
+                    }
+                }
+                Ok(resp) => {
+                    warn!(
+                        url = %primary.url,
+                        status = %resp.status(),
+                        "ClickHouse primary not ready (replicas_status), staying on failover"
+                    );
+                }
+                Err(e) => {
+                    warn!(
+                        url = %primary.url,
+                        error = %e,
+                        "ClickHouse primary still unreachable, staying on failover"
+                    );
+                }
+            }
+            probing.store(false, Ordering::Release);
+        });
+    }
+
+    /// Whether to probe the primary again: once per `primary_retry_after`.
     fn primary_retry_due(&self) -> bool {
         let Ok(mut at) = self.failed_over_at.lock() else {
             return false;
@@ -612,39 +678,61 @@ mod tests {
         secondary_task.await.unwrap();
     }
 
-    #[tokio::test]
-    async fn test_fails_back_to_recovered_primary() {
+    fn ok_response() -> Vec<u8> {
         let body = r#"{"meta":[{"name":"n","type":"UInt8"}],"data":[[1]],"rows":1}"#;
-        let ok = format!(
-            "HTTP/1.1 200 OK
-Content-Type: application/json
-Content-Length: {}
-Connection: close
-
-{body}",
+        format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
             body.len()
-        );
-        // The primary fails the first query, then recovers.
-        let primary = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let primary_url = format!("http://{}", primary.local_addr().unwrap());
-        let primary_ok = ok.clone();
-        let primary_task = tokio::spawn(async move {
-            for response in [
-                b"HTTP/1.1 nope
+        )
+        .into_bytes()
+    }
 
-"
-                .to_vec(),
-                primary_ok.into_bytes(),
-            ] {
-                let (mut stream, _) = primary.accept().await.unwrap();
-                read_request(&mut stream).await;
+    /// Serves one response per connection, in order, returning the request
+    /// lines it saw.
+    fn serve_each(
+        listener: tokio::net::TcpListener,
+        responses: Vec<Vec<u8>>,
+    ) -> tokio::task::JoinHandle<Vec<String>> {
+        tokio::spawn(async move {
+            let mut seen = Vec::new();
+            for response in responses {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let request = read_request(&mut stream).await;
+                seen.push(request.lines().next().unwrap_or_default().to_string());
                 stream.write_all(&response).await.unwrap();
                 stream.shutdown().await.unwrap();
             }
-        });
+            seen
+        })
+    }
+
+    async fn wait_for_active(engine: &ClickHouseEngine, url: &str) -> bool {
+        for _ in 0..100 {
+            if engine.active_url() == url {
+                return true;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        false
+    }
+
+    #[tokio::test]
+    async fn test_fails_back_once_primary_reports_healthy() {
+        // The primary fails the first query, then passes /replicas_status and
+        // serves the next query. User queries never probe the primary.
+        let primary = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let primary_url = format!("http://{}", primary.local_addr().unwrap());
+        let primary_task = serve_each(
+            primary,
+            vec![
+                b"HTTP/1.1 nope\r\n\r\n".to_vec(),
+                b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\nConnection: close\r\n\r\nOk.\n".to_vec(),
+                ok_response(),
+            ],
+        );
         let secondary = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let secondary_url = format!("http://{}", secondary.local_addr().unwrap());
-        let secondary_task = tokio::spawn(serve_once(secondary, ok.into_bytes()));
+        let secondary_task = serve_each(secondary, vec![ok_response(), ok_response()]);
 
         let config = ClickHouseConfig {
             enabled: true,
@@ -658,9 +746,51 @@ Connection: close
 
         engine.query("SELECT 1 AS n", &[]).await.unwrap();
         assert_eq!(engine.active_url(), secondary_url);
+        // Due for a probe: it runs in the background while this query stays
+        // on the failover instance.
         engine.query("SELECT 1 AS n", &[]).await.unwrap();
-        assert_eq!(engine.active_url(), primary_url);
+        assert!(wait_for_active(&engine, &primary_url).await);
+        engine.query("SELECT 1 AS n", &[]).await.unwrap();
+
+        let primary_requests = primary_task.await.unwrap();
+        assert!(primary_requests[1].starts_with("GET /replicas_status"));
+        assert_eq!(secondary_task.await.unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_stays_on_failover_while_primary_lags() {
+        let primary = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let primary_url = format!("http://{}", primary.local_addr().unwrap());
+        let primary_task = serve_each(
+            primary,
+            vec![
+                b"HTTP/1.1 nope\r\n\r\n".to_vec(),
+                b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                    .to_vec(),
+            ],
+        );
+        let secondary = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let secondary_url = format!("http://{}", secondary.local_addr().unwrap());
+        let secondary_task =
+            serve_each(secondary, vec![ok_response(), ok_response(), ok_response()]);
+
+        let config = ClickHouseConfig {
+            enabled: true,
+            url: primary_url,
+            failover_urls: vec![secondary_url.clone()],
+            database: Some("default".to_string()),
+            ..Default::default()
+        };
+        let mut engine = ClickHouseEngine::new(&config, 4217).unwrap();
+        engine.primary_retry_after = std::time::Duration::ZERO;
+
+        engine.query("SELECT 1 AS n", &[]).await.unwrap();
+        engine.query("SELECT 1 AS n", &[]).await.unwrap();
+        // The lagging primary's probe has answered by the time it closes.
         primary_task.await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        engine.query("SELECT 1 AS n", &[]).await.unwrap();
+        assert_eq!(engine.active_url(), secondary_url);
         secondary_task.await.unwrap();
     }
 

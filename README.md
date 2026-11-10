@@ -295,7 +295,7 @@ These optional settings tune the API per process. They default to tidx's previou
 | `chains.postgres.api_pool_size` | 16 | Connections in the API's own pool (`api_url` and `serve`) |
 | `chains.postgres.api_pool_wait_ms` | none | `serve` only: fail a request that waits this long for a connection |
 | `chains.clickhouse.api_user` / `api_password_env` | `user` / `password_env` | `serve` only: ClickHouse user for queries. Use `readonly = 2` or SELECT-only grants: tidx sets query settings on every request, which `readonly = 1` refuses |
-| `chains.clickhouse.api_url` / `api_failover_urls` | `url` / `failover_urls` | `serve` only: ClickHouse URL for queries, such as a replica that serves only API reads, and the URLs to fail over to (such as the writers). Serve returns to `api_url` within 30 seconds of it recovering |
+| `chains.clickhouse.api_url` / `api_failover_urls` | `url` / `failover_urls` | `serve` only: ClickHouse URL for queries, such as a replica that serves only API reads, and the URLs to fail over to (such as the writers). Serve returns to `api_url` within 30 seconds of its `/replicas_status` reporting healthy (up and caught up). Tiered-storage queries that PostgreSQL runs through pg_clickhouse use `fdw_url` instead |
 
 With several `serve` copies, the database sees copies x `api_pool_size` connections, so size it under the replica's connection limit.
 

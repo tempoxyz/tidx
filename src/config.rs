@@ -305,9 +305,12 @@ pub struct ClickHouseConfig {
     #[serde(default)]
     pub api_password_env: Option<String>,
 
-    /// ClickHouse URL for `tidx serve`'s API queries, such as a replica that
-    /// serves only reads, so API load stays off the replicas `tidx sync`
-    /// writes to. Falls back to `url` and `failover_urls` when unset.
+    /// ClickHouse URL for `tidx serve`'s native ClickHouse queries, such as a
+    /// replica that serves only reads, so that load stays off the replicas
+    /// `tidx sync` writes to. Falls back to `url` and `failover_urls` when
+    /// unset. Queries that PostgreSQL runs through pg_clickhouse (tiered
+    /// storage) use `fdw_url` instead; point that at the replica too to move
+    /// them.
     #[serde(default)]
     pub api_url: Option<String>,
 
