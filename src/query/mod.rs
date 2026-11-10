@@ -1,6 +1,7 @@
 mod filters;
 mod parser;
 mod router;
+pub mod tag;
 mod tiered_split;
 mod validator;
 
@@ -11,6 +12,7 @@ pub use parser::{
     extract_order_by_columns, extract_raw_column_predicates,
 };
 pub use router::QueryRoute;
+pub use tag::QueryTag;
 pub use tiered_split::{
     HotWindow, TieredSplit, hot_window_confined, hot_window_confinement, plan_tiered_split,
 };

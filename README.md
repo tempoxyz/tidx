@@ -244,6 +244,8 @@ Commands:
   serve        Serve the HTTP API without syncing (stateless; run any number of copies)
   status       Show sync status
   query        Run a SQL query (use --signature to decode event logs)
+  query-log    Show the most expensive API queries (ClickHouse query_log, pg_stat_statements)
+  replay       Replay captured API traffic against a tidx endpoint and record a latency baseline
   views        Manage ClickHouse materialized views
   upgrade      Update tidx to the latest version
   help         Print this message or the help of the given subcommand(s)
@@ -344,6 +346,24 @@ Options:
   -t, --timeout <TIMEOUT>      Query timeout in milliseconds [default: 30000]
   -c, --config <CONFIG>        Path to config file [default: config.toml]
   -h, --help                   Print help
+```
+
+### `tidx query-log`
+
+Ranks the API's queries over the last `--since-minutes` by total time, from ClickHouse's `system.query_log` (grouped by query shape, route or caller with `--by`) and, when the extension is installed, PostgreSQL's `pg_stat_statements` for the API role. It connects with the chain's sync credentials, which need `SELECT` on `system.query_log`; pass `--cluster` to read every replica.
+
+Every database query an API request runs is tagged `tidx/<route>/<caller>/<request_id>`: ClickHouse's `log_comment` (directly or through pg_clickhouse) and PostgreSQL's `application_name`. The route is `query.<engine route>` or `query.live`; the caller is the request's `x-tidx-caller` header (`-` without one); the request ID is its `x-request-id` header or a generated one, echoed on the response.
+
+```bash
+tidx query-log --config config.toml --since-minutes 60 --by shape --limit 20
+```
+
+### `tidx replay`
+
+Replays captured requests (JSON lines with a `path` such as `/query?sql=…&chainId=…` and an optional RFC 3339 `t`, or raw Envoy access-log entries) against a tidx API, at the captured pace (`--pace recorded --speed 2` for twice as fast), a fixed rate (`--pace rate --speed 200`) or as fast as `--concurrency` allows (`--pace max`). It reports status codes and latency percentiles per route and the costliest query shapes, and tags every request with `x-tidx-caller: replay` so `tidx query-log --by caller` shows its server-side cost. `--chain-id` rewrites the chain, and live requests are skipped unless `--live-seconds` is given.
+
+```bash
+tidx replay --input capture.jsonl --url http://localhost:8080 --pace rate --speed 200 --report replay.json
 ```
 
 ### `tidx views`
@@ -448,6 +468,8 @@ GET  /query                                              Execute SQL query
      ?engine                string    = postgres         Query engine: postgres or clickhouse
      ?source                string    = postgres-clickhouse  Data source: postgres, clickhouse, or postgres-clickhouse
      ?live                  bool      = false            Enable SSE streaming (postgres only)
+     x-tidx-caller          header                       Calling service, recorded in query tags
+     x-request-id           header                       Request ID for query tags (generated if absent; echoed)
 GET  /views?chainId=                                     List materialized views
 GET  /views/{name}?chainId=                              Get view details
 POST /views                                              Create view (trusted IP only)

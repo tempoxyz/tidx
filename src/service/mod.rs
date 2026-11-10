@@ -769,9 +769,14 @@ pub async fn execute_query_postgres_via_clickhouse(
     // restarts the server (upstream 0.3.x bug), so the FDW must never be
     // what PostgreSQL cancels.
     let ch_deadline_secs = (options.timeout_ms / 1000).max(1);
+    // The request's tag reaches ClickHouse's query_log through the FDW; its
+    // characters need no quoting in the settings list.
+    let log_comment = crate::query::QueryTag::current()
+        .map(|tag| format!(", log_comment {}", tag.comment()))
+        .unwrap_or_default();
     let session_settings = format!(
         "SET LOCAL pg_clickhouse.session_settings = 'join_use_nulls 1, \
-         group_by_use_nulls 1, final 0, max_execution_time {ch_deadline_secs}'"
+         group_by_use_nulls 1, final 0, max_execution_time {ch_deadline_secs}{log_comment}'"
     );
     let statement_timeout = format!(
         "SET LOCAL statement_timeout = {}",
@@ -819,6 +824,15 @@ async fn run_pg_query(
     let tx = conn.transaction().await.map_err(classify_postgres_error)?;
 
     let mut setup = format!("SET LOCAL statement_timeout = {}", options.timeout_ms);
+    if let Some(tag) = crate::query::QueryTag::current() {
+        // Shows the request in pg_stat_activity and logs (%a); the tag is
+        // safe inside a string literal.
+        setup.push_str(";\n");
+        setup.push_str(&format!(
+            "SET LOCAL application_name = '{}'",
+            tag.application_name()
+        ));
+    }
     for stmt in session_setup {
         setup.push_str(";\n");
         setup.push_str(stmt);

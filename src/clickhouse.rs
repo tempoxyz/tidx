@@ -252,6 +252,10 @@ impl ClickHouseEngine {
         for (key, value) in settings {
             url.push_str(&format!("&{key}={value}"));
         }
+        // Tags the query in system.query_log; the tag is URL-safe.
+        if let Some(tag) = crate::query::QueryTag::current() {
+            url.push_str(&format!("&log_comment={}", tag.comment()));
+        }
         url
     }
 
