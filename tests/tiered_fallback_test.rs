@@ -56,7 +56,7 @@ fn make_block(num: i64, ts: chrono::DateTime<Utc>) -> BlockRow {
 async fn setup_tiered_store() -> Option<(TestClickHouse, TestDb, ClickHouseEngine)> {
     let ch = TestClickHouse::new(CH_DB).expect("CH client");
     if ch.wait_for_ready().await.is_err() {
-        println!("ClickHouse not available, skipping test");
+        common::skip("ClickHouse not available");
         return None;
     }
     ch.reset_database().await.expect("Failed to reset CH db");
