@@ -124,6 +124,12 @@ jobs:
       DATABASE_URL: postgres://tidx:tidx@localhost:5433/tidx_test
       TEMPO_RPC_URL: http://localhost:8545
       CLICKHOUSE_URL: http://localhost:8123
+      # A missing or broken service fails the test instead of skipping it.
+      TIDX_TEST_REQUIRE_SERVICES: "1"
+      # Pinned so a republished upstream image cannot break unrelated PRs; bump
+      # these deliberately. docker/local/docker-compose.yml defaults to latest.
+      TEMPO_IMAGE: ghcr.io/tempoxyz/tempo@sha256:3af0f1e591b8693f30ba873c16d76d31ca4271393916cb778d9dd9cd65d1948c
+      CLICKHOUSE_IMAGE: clickhouse/clickhouse-server@sha256:739e099abd1157390960a59e4532d21781d8fde57e6e4151cb920ea02c30b1ce
     steps:
       - name: Secure runner
         uses: tempoxyz/gh-actions/actions/secure-runner@35019557465e3c38ee3468be171771fd73577584 # 2026-10-20T06-22-38Z-35019557
