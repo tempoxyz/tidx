@@ -36,7 +36,7 @@ services:
 
   tempo:
     platform: linux/amd64
-    image: ghcr.io/tempoxyz/tempo:latest
+    image: ${TEMPO_IMAGE:-ghcr.io/tempoxyz/tempo:latest}
     command:
       - node
       - --dev
@@ -110,7 +110,7 @@ services:
     restart: always
 
   clickhouse:
-    image: clickhouse/clickhouse-server:latest
+    image: ${CLICKHOUSE_IMAGE:-clickhouse/clickhouse-server:latest}
     ports:
       - "8123:8123"   # HTTP interface
       - "9000:9000"   # Native interface

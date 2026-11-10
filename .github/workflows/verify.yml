@@ -113,10 +113,55 @@ jobs:
       - name: Run unit tests
         run: cargo test --lib --bins --locked
 
+  integration-test:
+    name: integration tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      DATABASE_URL: postgres://tidx:tidx@localhost:5433/tidx_test
+      TEMPO_RPC_URL: http://localhost:8545
+      CLICKHOUSE_URL: http://localhost:8123
+      # A missing or broken service fails the test instead of skipping it.
+      TIDX_TEST_REQUIRE_SERVICES: "1"
+      # Pinned so a republished upstream image cannot break unrelated PRs; bump
+      # these deliberately. docker/local/docker-compose.yml defaults to latest.
+      TEMPO_IMAGE: ghcr.io/tempoxyz/tempo@sha256:3af0f1e591b8693f30ba873c16d76d31ca4271393916cb778d9dd9cd65d1948c
+      CLICKHOUSE_IMAGE: clickhouse/clickhouse-server@sha256:739e099abd1157390960a59e4532d21781d8fde57e6e4151cb920ea02c30b1ce
+    steps:
+      - name: Secure runner
+        uses: tempoxyz/gh-actions/actions/secure-runner@35019557465e3c38ee3468be171771fd73577584 # 2026-10-20T06-22-38Z-35019557
+
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+
+      - name: Start PostgreSQL, ClickHouse and a Tempo dev node
+        run: |
+          docker compose -f docker/local/docker-compose.yml up -d --wait postgres clickhouse
+          docker compose -f docker/local/docker-compose.yml up -d tempo
+          docker compose -f docker/local/docker-compose.yml exec -T postgres \
+            psql -U tidx -d postgres -c "CREATE DATABASE tidx_test"
+
+      - name: Install Rust
+        uses: tempoxyz/gh-actions/vendor/dtolnay/rust-toolchain@35019557465e3c38ee3468be171771fd73577584 # 2026-10-20T06-22-38Z-35019557
+
+      - name: Cache cargo
+        uses: tempoxyz/gh-actions/vendor/Swatinem/rust-cache@35019557465e3c38ee3468be171771fd73577584 # 2026-10-20T06-22-38Z-35019557
+
+      - name: Run integration tests
+        run: cargo test --tests --locked --no-fail-fast
+
+      - name: Service logs on failure
+        if: failure()
+        run: docker compose -f docker/local/docker-compose.yml logs --tail 200 postgres clickhouse tempo
+
   ci-gate:
     name: CI Gate
     if: always()
-    needs: [fmt, cargo-check, clippy, unit-test]
+    needs: [fmt, cargo-check, clippy, unit-test, integration-test]
     runs-on: ubuntu-latest
     permissions:
       id-token: write

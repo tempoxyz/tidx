@@ -146,7 +146,7 @@ fn retention(require_clickhouse: bool) -> RetentionConfig {
 async fn setup_clickhouse() -> Option<(ClickHouseSink, TestClickHouse)> {
     let ch = TestClickHouse::new(CH_DB).expect("Failed to create CH client");
     if ch.wait_for_ready().await.is_err() {
-        println!("ClickHouse not available, skipping test");
+        common::skip("ClickHouse not available");
         return None;
     }
     ch.reset_database().await.expect("Failed to reset CH db");
