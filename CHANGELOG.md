@@ -1,5 +1,11 @@
 # Changelog
 
+## `tidx@1.0.1`
+
+### Patch Changes
+
+- Realtime sync now recovers when PostgreSQL stops answering, such as after a failover: database connections time out instead of hanging, and `/health` returns 503 while a realtime sync tick has been stuck for more than 120 seconds, so the orchestrator restarts the indexer. (by Kartik, [#407](https://github.com/tempoxyz/tidx/pull/407))
+
 ## `tidx@1.0.0`
 
 ### Major Changes
