@@ -269,6 +269,7 @@ impl SyncProgress {
 
     pub fn report_forward(&mut self, synced_block: u64, head_block: u64, blocks_synced: u64) {
         self.blocks_since_report += blocks_synced;
+        crate::sync::liveness::record_progress(self.chain_id);
         set_synced_block(self.chain_id, synced_block);
         set_sync_head(self.chain_id, head_block);
         set_sync_lag(self.chain_id, head_block.saturating_sub(synced_block));
