@@ -18,8 +18,10 @@ const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(10);
 const KEEPALIVE_RETRIES: u32 = 3;
 /// libpq's keepalive idle default, which a URL that sets none leaves in place.
 const DEFAULT_KEEPALIVE_IDLE: Duration = Duration::from_secs(2 * 60 * 60);
-/// How long the pool may spend creating or recycling one connection.
-const POOL_CREATE_TIMEOUT: Duration = Duration::from_secs(15);
+/// How long the pool may spend recycling (health-checking) one connection.
+/// Creation has no overall timeout: `CONNECT_TIMEOUT` already bounds each
+/// address tokio-postgres tries, and a URL with several hosts or a name with
+/// several addresses needs that budget per address.
 const POOL_RECYCLE_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Default pool for general use (16 connections)
@@ -78,7 +80,6 @@ pub async fn connect_pool_with_wait(
         .max_size(max_size)
         .runtime(Runtime::Tokio1)
         .wait_timeout(wait)
-        .create_timeout(Some(POOL_CREATE_TIMEOUT))
         .recycle_timeout(Some(POOL_RECYCLE_TIMEOUT))
         .build()?;
     let _ = pool.get().await?;
@@ -89,7 +90,9 @@ pub async fn connect_pool_with_wait(
 /// Makes connections to a server that stopped answering fail in seconds
 /// instead of hanging, so callers see an error and retry on a fresh
 /// connection. `statement_timeout` cannot help there: the server enforces it.
-/// Options the database URL sets explicitly are kept.
+/// Options the database URL sets explicitly are kept, except an explicit
+/// `keepalives_idle=7200`: tokio-postgres reports it exactly like the unset
+/// default, so it becomes 30s too.
 fn apply_dead_server_timeouts(config: &mut tokio_postgres::Config) {
     if config.get_connect_timeout().is_none() {
         config.connect_timeout(CONNECT_TIMEOUT);

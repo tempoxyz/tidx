@@ -1,12 +1,13 @@
 //! Realtime sync liveness, for the `/health` probe.
 //!
-//! The realtime loop records progress every time a tick returns, with or
-//! without an error, and every time it commits a batch inside a long tick.
-//! Ticks that find no new block or fail fast (an RPC outage, a rejected
-//! write) therefore count as live: restarting would not fix them, and alerts
-//! cover them. When a chain records nothing for [`STALL_AFTER`], a tick is stuck
-//! in place (for example on a database connection that will never answer)
-//! and `/health` fails so the orchestrator restarts the process.
+//! The realtime loop records progress when it starts, every time a tick
+//! returns (with or without an error), and every time it commits a batch
+//! inside a long tick. Ticks that find no new block or fail fast (an RPC
+//! outage, a rejected write) therefore count as live: restarting would not
+//! fix them, and alerts cover them. When a chain records nothing for
+//! [`STALL_AFTER`], a tick is stuck in place (for example on a database
+//! connection that will never answer) and `/health` fails so the
+//! orchestrator restarts the process.
 //!
 //! A process that never runs realtime sync (`tidx serve`, or `tidx up` still
 //! in its backfill-first phase) records nothing and always reports healthy.

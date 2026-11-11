@@ -213,6 +213,8 @@ impl SyncEngine {
         // Phase 2: Run realtime sync (no gap-fill needed)
         let mut realtime_progress = SyncProgress::new(self.chain_id, state.tip_num);
         info!(chain_id = self.chain_id, "Starting realtime sync");
+        // Measure silence from loop start, so a first tick that hangs is caught.
+        super::liveness::record_progress(self.chain_id);
 
         loop {
             tokio::select! {
@@ -290,6 +292,9 @@ impl SyncEngine {
             )
             .await
         });
+
+        // Measure silence from loop start, so a first tick that hangs is caught.
+        super::liveness::record_progress(self.chain_id);
 
         // Run realtime loop in foreground
         loop {
