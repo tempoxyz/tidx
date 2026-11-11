@@ -356,8 +356,25 @@ fn on_request_response<B>(
     DefaultOnResponse::default().on_response(res, latency, span);
 }
 
-async fn handle_health() -> &'static str {
-    "OK"
+/// Fails while a realtime sync tick in this process has been stuck for
+/// [`crate::sync::liveness::STALL_AFTER`], so a stuck indexer gets restarted.
+/// Processes without realtime sync (`tidx serve`) always answer OK.
+async fn handle_health() -> Response {
+    let stalled = crate::sync::liveness::global().stalled();
+    if stalled.is_empty() {
+        return (StatusCode::OK, "OK").into_response();
+    }
+    let detail = stalled
+        .iter()
+        .map(|(chain_id, silent)| format!("chain {chain_id} silent {}s", silent.as_secs()))
+        .collect::<Vec<_>>()
+        .join(", ");
+    tracing::warn!(%detail, "Health check failing: realtime sync stalled");
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        format!("realtime sync stalled: {detail}"),
+    )
+        .into_response()
 }
 
 #[derive(Serialize)]

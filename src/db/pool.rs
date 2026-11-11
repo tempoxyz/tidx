@@ -1,7 +1,28 @@
+use std::time::Duration;
+
 use anyhow::{Context, Result};
-use deadpool_postgres::{Config, Pool, Runtime};
+use deadpool_postgres::{Manager, ManagerConfig, Pool, RecyclingMethod, Runtime};
 use tokio_postgres::NoTls;
 use url::Url;
+
+/// How long opening a connection may take, TCP and startup included.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+/// How long sent data may stay unacknowledged before the kernel drops the
+/// connection. Without it, a write to a server that vanished (node lost,
+/// failover) retransmits for about 15 minutes before the query fails.
+const TCP_USER_TIMEOUT: Duration = Duration::from_secs(30);
+/// Keepalive probes find a dead server on an idle connection: first probe
+/// after 30s idle, then every 10s, dropping the connection after 3 misses.
+const KEEPALIVE_IDLE: Duration = Duration::from_secs(30);
+const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(10);
+const KEEPALIVE_RETRIES: u32 = 3;
+/// libpq's keepalive idle default, which a URL that sets none leaves in place.
+const DEFAULT_KEEPALIVE_IDLE: Duration = Duration::from_secs(2 * 60 * 60);
+/// How long the pool may spend recycling (health-checking) one connection.
+/// Creation has no overall timeout: `CONNECT_TIMEOUT` already bounds each
+/// address tokio-postgres tries, and a URL with several hosts or a name with
+/// several addresses needs that budget per address.
+const POOL_RECYCLE_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Default pool for general use (16 connections)
 pub async fn create_pool(database_url: &str) -> Result<Pool> {
@@ -44,22 +65,52 @@ pub async fn connect_pool_with_wait(
         )
     };
 
-    let mut config = Config::new();
-    config.url = Some(url_with_timeout);
-    let mut pool_config = deadpool_postgres::PoolConfig {
-        max_size,
-        ..Default::default()
-    };
-    pool_config.timeouts.wait = wait;
-    config.pool = Some(pool_config);
-    config.manager = Some(deadpool_postgres::ManagerConfig {
-        recycling_method: deadpool_postgres::RecyclingMethod::Clean,
-    });
+    let mut pg_config: tokio_postgres::Config =
+        url_with_timeout.parse().context("Invalid database URL")?;
+    apply_dead_server_timeouts(&mut pg_config);
 
-    let pool = config.create_pool(Some(Runtime::Tokio1), NoTls)?;
+    let manager = Manager::from_config(
+        pg_config,
+        NoTls,
+        ManagerConfig {
+            recycling_method: RecyclingMethod::Clean,
+        },
+    );
+    let pool = Pool::builder(manager)
+        .max_size(max_size)
+        .runtime(Runtime::Tokio1)
+        .wait_timeout(wait)
+        .recycle_timeout(Some(POOL_RECYCLE_TIMEOUT))
+        .build()?;
     let _ = pool.get().await?;
 
     Ok(pool)
+}
+
+/// Makes connections to a server that stopped answering fail in seconds
+/// instead of hanging, so callers see an error and retry on a fresh
+/// connection. `statement_timeout` cannot help there: the server enforces it.
+/// Options the database URL sets explicitly are kept, except an explicit
+/// `keepalives_idle=7200`: tokio-postgres reports it exactly like the unset
+/// default, so it becomes 30s too.
+fn apply_dead_server_timeouts(config: &mut tokio_postgres::Config) {
+    if config.get_connect_timeout().is_none() {
+        config.connect_timeout(CONNECT_TIMEOUT);
+    }
+    if config.get_tcp_user_timeout().is_none() {
+        config.tcp_user_timeout(TCP_USER_TIMEOUT);
+    }
+    if config.get_keepalives() {
+        if config.get_keepalives_idle() == DEFAULT_KEEPALIVE_IDLE {
+            config.keepalives_idle(KEEPALIVE_IDLE);
+        }
+        if config.get_keepalives_interval().is_none() {
+            config.keepalives_interval(KEEPALIVE_INTERVAL);
+        }
+        if config.get_keepalives_retries().is_none() {
+            config.keepalives_retries(KEEPALIVE_RETRIES);
+        }
+    }
 }
 
 use std::sync::Arc;
@@ -192,7 +243,12 @@ async fn ensure_database_exists(database_url: &str) -> Result<()> {
     url.set_path("/postgres");
     let postgres_url = url.as_str();
 
-    let (client, connection) = match tokio_postgres::connect(postgres_url, NoTls).await {
+    let mut admin_config: tokio_postgres::Config = match postgres_url.parse() {
+        Ok(config) => config,
+        Err(_) => return Ok(()), // Let the main connection fail with a better error
+    };
+    apply_dead_server_timeouts(&mut admin_config);
+    let (client, connection) = match admin_config.connect(NoTls).await {
         Ok(c) => c,
         Err(_) => return Ok(()), // Can't connect to postgres db, let the main connection fail with a better error
     };
@@ -221,4 +277,42 @@ async fn ensure_database_exists(database_url: &str) -> Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_dead_server_timeouts_fill_unset_options() {
+        let mut config: tokio_postgres::Config = "postgres://tidx@localhost/tidx".parse().unwrap();
+        apply_dead_server_timeouts(&mut config);
+        assert_eq!(config.get_connect_timeout(), Some(&CONNECT_TIMEOUT));
+        assert_eq!(config.get_tcp_user_timeout(), Some(&TCP_USER_TIMEOUT));
+        assert!(config.get_keepalives());
+        assert_eq!(config.get_keepalives_idle(), KEEPALIVE_IDLE);
+        assert_eq!(config.get_keepalives_interval(), Some(KEEPALIVE_INTERVAL));
+        assert_eq!(config.get_keepalives_retries(), Some(KEEPALIVE_RETRIES));
+    }
+
+    #[test]
+    fn test_dead_server_timeouts_keep_url_options() {
+        let mut config: tokio_postgres::Config = "postgres://tidx@localhost/tidx?connect_timeout=3&tcp_user_timeout=7&keepalives_idle=60"
+            .parse()
+            .unwrap();
+        apply_dead_server_timeouts(&mut config);
+        assert_eq!(config.get_connect_timeout(), Some(&Duration::from_secs(3)));
+        assert_eq!(config.get_tcp_user_timeout(), Some(&Duration::from_secs(7)));
+        assert_eq!(config.get_keepalives_idle(), Duration::from_secs(60));
+    }
+
+    #[test]
+    fn test_dead_server_timeouts_respect_disabled_keepalives() {
+        let mut config: tokio_postgres::Config = "postgres://tidx@localhost/tidx?keepalives=0"
+            .parse()
+            .unwrap();
+        apply_dead_server_timeouts(&mut config);
+        assert!(!config.get_keepalives());
+        assert_eq!(config.get_keepalives_interval(), None);
+    }
 }

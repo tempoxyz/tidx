@@ -213,6 +213,8 @@ impl SyncEngine {
         // Phase 2: Run realtime sync (no gap-fill needed)
         let mut realtime_progress = SyncProgress::new(self.chain_id, state.tip_num);
         info!(chain_id = self.chain_id, "Starting realtime sync");
+        // Measure silence from loop start, so a first tick that hangs is caught.
+        super::liveness::record_progress(self.chain_id);
 
         loop {
             tokio::select! {
@@ -221,6 +223,9 @@ impl SyncEngine {
                     break;
                 }
                 result = self.tick_realtime(&mut realtime_progress) => {
+                    // A tick that returns, even with an error, means the loop
+                    // is turning; /health only fails for a tick stuck in place.
+                    super::liveness::record_progress(self.chain_id);
                     if let Err(e) = result {
                         error!(error = %e, "Realtime sync tick failed");
                         tokio::time::sleep(Duration::from_secs(1)).await;
@@ -288,6 +293,9 @@ impl SyncEngine {
             .await
         });
 
+        // Measure silence from loop start, so a first tick that hangs is caught.
+        super::liveness::record_progress(self.chain_id);
+
         // Run realtime loop in foreground
         loop {
             tokio::select! {
@@ -296,6 +304,9 @@ impl SyncEngine {
                     break;
                 }
                 result = self.tick_realtime(&mut realtime_progress) => {
+                    // A tick that returns, even with an error, means the loop
+                    // is turning; /health only fails for a tick stuck in place.
+                    super::liveness::record_progress(self.chain_id);
                     if let Err(e) = result {
                         error!(error = %e, "Realtime sync tick failed");
                         tokio::time::sleep(Duration::from_secs(1)).await;
