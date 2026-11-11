@@ -221,6 +221,9 @@ impl SyncEngine {
                     break;
                 }
                 result = self.tick_realtime(&mut realtime_progress) => {
+                    // A tick that returns, even with an error, means the loop
+                    // is turning; /health only fails for a tick stuck in place.
+                    super::liveness::record_progress(self.chain_id);
                     if let Err(e) = result {
                         error!(error = %e, "Realtime sync tick failed");
                         tokio::time::sleep(Duration::from_secs(1)).await;
@@ -296,6 +299,9 @@ impl SyncEngine {
                     break;
                 }
                 result = self.tick_realtime(&mut realtime_progress) => {
+                    // A tick that returns, even with an error, means the loop
+                    // is turning; /health only fails for a tick stuck in place.
+                    super::liveness::record_progress(self.chain_id);
                     if let Err(e) = result {
                         error!(error = %e, "Realtime sync tick failed");
                         tokio::time::sleep(Duration::from_secs(1)).await;

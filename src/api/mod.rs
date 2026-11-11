@@ -320,7 +320,7 @@ fn build_router(state: AppState, mode: ApiMode) -> Router<()> {
         .with_state(state)
 }
 
-/// Fails while realtime sync in this process has made no progress for
+/// Fails while a realtime sync tick in this process has been stuck for
 /// [`crate::sync::liveness::STALL_AFTER`], so a stuck indexer gets restarted.
 /// Processes without realtime sync (`tidx serve`) always answer OK.
 async fn handle_health() -> Response {
