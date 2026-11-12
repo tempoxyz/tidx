@@ -40,8 +40,4 @@ deny = [{ name = "openssl" }]
 
 [sources]
 unknown-registry = "warn"
-unknown-git = "deny"
-allow-git = [
-    "https://github.com/tempoxyz/tempo",
-    "https://github.com/paradigmxyz/reth",
-]
+unknown-git = "allow"
