@@ -18,6 +18,7 @@ jobs:
     name: Build Docker
     runs-on: ubuntu-latest
     permissions:
+      attestations: write
       contents: read
       id-token: write
       packages: write
@@ -53,6 +54,7 @@ jobs:
             type=raw,value=${{ inputs.tag }},enable=${{ inputs.tag != '' }}
 
       - name: Build and push
+        id: build
         uses: tempoxyz/gh-actions/vendor/docker/build-push-action@35019557465e3c38ee3468be171771fd73577584 # 2026-10-20T06-22-38Z-35019557
         with:
           context: .
@@ -64,3 +66,10 @@ jobs:
             GIT_REV=${{ github.sha }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
+
+      - name: Attest the tidx image
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-name: ghcr.io/${{ github.repository }}
+          subject-digest: ${{ steps.build.outputs.digest }}
+          push-to-registry: true

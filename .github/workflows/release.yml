@@ -63,6 +63,7 @@ jobs:
     with:
       tag: ${{ needs.release.outputs.tag }}
     permissions:
+      attestations: write
       contents: read
       id-token: write
       packages: write
