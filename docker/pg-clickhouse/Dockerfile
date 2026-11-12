@@ -1,14 +1,28 @@
 # syntax=docker/dockerfile:1
 
-ARG CNPG_BASE=ghcr.io/cloudnative-pg/postgresql:18.3-minimal-trixie
+ARG CNPG_BASE=ghcr.io/cloudnative-pg/postgresql:18.6-minimal-trixie
 ARG PG_MAJOR=18
+# PostgreSQL minor release installed from PGDG on top of CNPG_BASE, so the
+# image can move to a new minor release before CloudNativePG publishes it.
+ARG PG_VERSION=18.7
 
 FROM ${CNPG_BASE} AS build
 
 ARG PG_MAJOR
+ARG PG_VERSION
 
 USER root
 WORKDIR /work
+
+# PGDG's main repository keeps only the newest minor release; its archive
+# keeps every release, so PG_VERSION stays installable after the next one.
+# The archive also carries prereleases, so it gets a low pin priority: only
+# packages pinned to an exact version below come from it.
+RUN . /etc/os-release \
+    && printf 'Types: deb\nURIs: https://apt-archive.postgresql.org/pub/repos/apt\nSuites: %s-pgdg-archive\nComponents: main\nSigned-By: /usr/share/postgresql-common/pgdg/apt.postgresql.org.gpg\n' \
+        "${VERSION_CODENAME}" > /etc/apt/sources.list.d/pgdg-archive.sources \
+    && printf 'Package: *\nPin: origin apt-archive.postgresql.org\nPin-Priority: 100\n' \
+        > /etc/apt/preferences.d/pgdg-archive
 
 COPY src/ .
 
@@ -22,7 +36,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         libzstd-dev \
         make \
         pgxnclient \
-        postgresql-server-dev-${PG_MAJOR} \
+        "postgresql-${PG_MAJOR}=${PG_VERSION}-*" \
+        "postgresql-client-${PG_MAJOR}=${PG_VERSION}-*" \
+        libpq-dev \
+        "postgresql-server-dev-${PG_MAJOR}=${PG_VERSION}-*" \
         unzip \
         uuid-dev \
     && rm -rf /var/lib/apt/lists/*
@@ -41,10 +58,24 @@ RUN cd /tmp \
 FROM ${CNPG_BASE}
 
 ARG PG_MAJOR
+ARG PG_VERSION
 
 USER root
 
+# PGDG's main repository keeps only the newest minor release; its archive
+# keeps every release, so PG_VERSION stays installable after the next one.
+# The archive also carries prereleases, so it gets a low pin priority: only
+# packages pinned to an exact version below come from it.
+RUN . /etc/os-release \
+    && printf 'Types: deb\nURIs: https://apt-archive.postgresql.org/pub/repos/apt\nSuites: %s-pgdg-archive\nComponents: main\nSigned-By: /usr/share/postgresql-common/pgdg/apt.postgresql.org.gpg\n' \
+        "${VERSION_CODENAME}" > /etc/apt/sources.list.d/pgdg-archive.sources \
+    && printf 'Package: *\nPin: origin apt-archive.postgresql.org\nPin-Priority: 100\n' \
+        > /etc/apt/preferences.d/pgdg-archive
+
 RUN apt-get update && apt-get install -y --no-install-recommends \
+        "postgresql-${PG_MAJOR}=${PG_VERSION}-*" \
+        "postgresql-client-${PG_MAJOR}=${PG_VERSION}-*" \
+        libpq5 \
         ca-certificates \
         libcurl4t64 \
         liblz4-1 \
@@ -69,7 +100,8 @@ COPY --chmod=644 --from=build \
     /dest/usr/lib/postgresql/${PG_MAJOR}/lib/bitcode/pg_clickhouse/src/*.bc \
     /usr/lib/postgresql/${PG_MAJOR}/lib/bitcode/pg_clickhouse/src/
 
-RUN test -f /usr/lib/postgresql/${PG_MAJOR}/lib/pg_clickhouse.so \
+RUN /usr/lib/postgresql/${PG_MAJOR}/bin/postgres --version | grep -Fq " ${PG_VERSION} " \
+    && test -f /usr/lib/postgresql/${PG_MAJOR}/lib/pg_clickhouse.so \
     && test -f /usr/lib/postgresql/${PG_MAJOR}/lib/re2.so \
     && test -f /usr/share/postgresql/${PG_MAJOR}/extension/pg_clickhouse.control \
     && test -f /usr/share/postgresql/${PG_MAJOR}/extension/re2.control \

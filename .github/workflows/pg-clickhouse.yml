@@ -1,7 +1,8 @@
 name: Publish pg_clickhouse for CloudNativePG
 
-# Adds ClickHouse/pg_clickhouse to the CloudNativePG PostgreSQL 18.3 minimal
-# Trixie operand image and publishes the result as ghcr.io/tempoxyz/pg_clickhouse.
+# Adds ClickHouse/pg_clickhouse to the CloudNativePG PostgreSQL 18 minimal
+# Trixie operand image, upgraded to PG_VERSION from PGDG, and publishes the
+# result as ghcr.io/tempoxyz/pg_clickhouse.
 # The extension is pinned because the fix for LATERAL / correlated-subquery
 # crashes over foreign tables (ClickHouse/pg_clickhouse#296) is only on main
 # (unreleased 0.4).
@@ -20,10 +21,10 @@ on:
       - 'docker/pg-clickhouse/**'
 
 env:
-  CNPG_BASE: ghcr.io/cloudnative-pg/postgresql:18.3-minimal-trixie
+  CNPG_BASE: ghcr.io/cloudnative-pg/postgresql:18.6-minimal-trixie
   UPSTREAM_REF: ${{ inputs.ref || '02505c48130e3fd7d13bf4ffb2de6bfeca76a84b' }}
   PG_MAJOR: '18'
-  PG_VERSION: '18.3'
+  PG_VERSION: '18.7'
 
 jobs:
   docker:
@@ -83,6 +84,7 @@ jobs:
           build-args: |
             CNPG_BASE=${{ env.CNPG_BASE }}
             PG_MAJOR=${{ env.PG_MAJOR }}
+            PG_VERSION=${{ env.PG_VERSION }}
           labels: |
             org.opencontainers.image.source=https://github.com/${{ github.repository }}
             org.opencontainers.image.base.name=${{ env.CNPG_BASE }}
