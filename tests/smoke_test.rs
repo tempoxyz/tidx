@@ -1399,6 +1399,27 @@ async fn test_query_float4_timestamp_bpchar_cells() {
 
 #[tokio::test]
 #[serial(db)]
+async fn test_query_json_cells() {
+    let db = TestDb::empty().await;
+    let opts = default_options();
+
+    let result = execute_query_postgres(
+        &db.pool,
+        r#"SELECT '{"a":1,"b":[true,null]}'::jsonb, '[1,"x"]'::json, NULL::jsonb"#,
+        &[],
+        &opts,
+    )
+    .await
+    .expect("Query failed");
+
+    assert_eq!(
+        serde_json::to_string(&result.rows).unwrap(),
+        r#"[[{"a":1,"b":[true,null]},[1,"x"],null]]"#
+    );
+}
+
+#[tokio::test]
+#[serial(db)]
 async fn test_query_composite_column_with_large_result() {
     let db = TestDb::empty().await;
     db.truncate_all().await;

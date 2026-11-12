@@ -1071,6 +1071,16 @@ fn try_format_column_json(row: &tokio_postgres::Row, idx: usize) -> Result<serde
             .ok()
             .flatten()
             .map_or(serde_json::Value::Null, serde_json::Value::Bool),
+        Type::JSON | Type::JSONB => match row.try_get::<_, Option<serde_json::Value>>(idx) {
+            Ok(Some(v)) if estimated_json_value_bytes(&v) > MAX_CELL_BYTES => {
+                return Err(anyhow!(
+                    "Query result cell exceeded {} bytes",
+                    MAX_CELL_BYTES
+                ));
+            }
+            Ok(Some(v)) => v,
+            _ => serde_json::Value::Null,
+        },
         _ => serde_json::Value::Null,
     };
 
