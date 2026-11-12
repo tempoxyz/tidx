@@ -14,6 +14,16 @@ ARG PG_VERSION
 USER root
 WORKDIR /work
 
+# PGDG's main repository keeps only the newest minor release; its archive
+# keeps every release, so PG_VERSION stays installable after the next one.
+# The archive also carries prereleases, so it gets a low pin priority: only
+# packages pinned to an exact version below come from it.
+RUN . /etc/os-release \
+    && printf 'Types: deb\nURIs: https://apt-archive.postgresql.org/pub/repos/apt\nSuites: %s-pgdg-archive\nComponents: main\nSigned-By: /usr/share/postgresql-common/pgdg/apt.postgresql.org.gpg\n' \
+        "${VERSION_CODENAME}" > /etc/apt/sources.list.d/pgdg-archive.sources \
+    && printf 'Package: *\nPin: origin apt-archive.postgresql.org\nPin-Priority: 100\n' \
+        > /etc/apt/preferences.d/pgdg-archive
+
 COPY src/ .
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -28,8 +38,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         pgxnclient \
         "postgresql-${PG_MAJOR}=${PG_VERSION}-*" \
         "postgresql-client-${PG_MAJOR}=${PG_VERSION}-*" \
-        "libpq5=${PG_VERSION}-*" \
-        "libpq-dev=${PG_VERSION}-*" \
+        libpq-dev \
         "postgresql-server-dev-${PG_MAJOR}=${PG_VERSION}-*" \
         unzip \
         uuid-dev \
@@ -53,10 +62,20 @@ ARG PG_VERSION
 
 USER root
 
+# PGDG's main repository keeps only the newest minor release; its archive
+# keeps every release, so PG_VERSION stays installable after the next one.
+# The archive also carries prereleases, so it gets a low pin priority: only
+# packages pinned to an exact version below come from it.
+RUN . /etc/os-release \
+    && printf 'Types: deb\nURIs: https://apt-archive.postgresql.org/pub/repos/apt\nSuites: %s-pgdg-archive\nComponents: main\nSigned-By: /usr/share/postgresql-common/pgdg/apt.postgresql.org.gpg\n' \
+        "${VERSION_CODENAME}" > /etc/apt/sources.list.d/pgdg-archive.sources \
+    && printf 'Package: *\nPin: origin apt-archive.postgresql.org\nPin-Priority: 100\n' \
+        > /etc/apt/preferences.d/pgdg-archive
+
 RUN apt-get update && apt-get install -y --no-install-recommends \
         "postgresql-${PG_MAJOR}=${PG_VERSION}-*" \
         "postgresql-client-${PG_MAJOR}=${PG_VERSION}-*" \
-        "libpq5=${PG_VERSION}-*" \
+        libpq5 \
         ca-certificates \
         libcurl4t64 \
         liblz4-1 \
