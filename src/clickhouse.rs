@@ -244,7 +244,10 @@ impl ClickHouseEngine {
             .execute_with_failover(sql, timeout_ms, settings, start)
             .instrument(span.clone())
             .await;
-        crate::metrics::record_clickhouse_query(start.elapsed(), result.is_ok());
+        // Only an unreachable ClickHouse counts as a failure: user query errors
+        // (SQL, timeouts, memory cap, planned tiered fallbacks) are not.
+        let unreachable = result.as_ref().is_err_and(is_connection_error);
+        crate::metrics::record_clickhouse_query(start.elapsed(), !unreachable);
         match &result {
             Ok(result) => {
                 crate::metrics::record_clickhouse_rows(result.row_count as u64);
