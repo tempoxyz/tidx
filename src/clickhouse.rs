@@ -10,7 +10,7 @@
 use anyhow::{Result, anyhow};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use tracing::{error, info, warn};
+use tracing::{Instrument, error, info, warn};
 
 use crate::config::ClickHouseConfig;
 use crate::query::{
@@ -180,10 +180,13 @@ impl ClickHouseEngine {
         limit: i64,
         settings: &[(&str, &str)],
     ) -> Result<QueryResult> {
-        let sql = Self::prepare_query(sql, signatures)?;
-        validate_clickhouse_query(&sql)?;
-        let sql = hoist_set_operation_order_by_clickhouse(&sql);
-        let sql = Self::wrap_user_query_with_limit(&sql, limit.clamp(1, HARD_LIMIT_MAX));
+        let sql = {
+            let _span = tracing::info_span!("tidx.parse", engine = "clickhouse").entered();
+            let sql = Self::prepare_query(sql, signatures)?;
+            validate_clickhouse_query(&sql)?;
+            let sql = hoist_set_operation_order_by_clickhouse(&sql);
+            Self::wrap_user_query_with_limit(&sql, limit.clamp(1, HARD_LIMIT_MAX))
+        };
         // The memory cap goes last so no caller setting can override it.
         let max_memory_usage = MAX_USER_QUERY_MEMORY_BYTES.to_string();
         let mut settings = settings.to_vec();
@@ -228,7 +231,42 @@ impl ClickHouseEngine {
         timeout_ms: Option<u64>,
         settings: &[(&str, &str)],
     ) -> Result<QueryResult> {
+        let span = tracing::info_span!(
+            "tidx.clickhouse.execute",
+            otel.kind = "client",
+            db.system.name = "clickhouse",
+            db.namespace = %self.database,
+            rows = tracing::field::Empty,
+            otel.status_code = tracing::field::Empty,
+        );
         let start = std::time::Instant::now();
+        let result = self
+            .execute_with_failover(sql, timeout_ms, settings, start)
+            .instrument(span.clone())
+            .await;
+        // Only an unreachable ClickHouse counts as a failure: user query errors
+        // (SQL, timeouts, memory cap, planned tiered fallbacks) are not.
+        let unreachable = result.as_ref().is_err_and(is_connection_error);
+        crate::metrics::record_clickhouse_query(start.elapsed(), !unreachable);
+        match &result {
+            Ok(result) => {
+                crate::metrics::record_clickhouse_rows(result.row_count as u64);
+                span.record("rows", result.row_count);
+            }
+            Err(_) => {
+                span.record("otel.status_code", "ERROR");
+            }
+        }
+        result
+    }
+
+    async fn execute_with_failover(
+        &self,
+        sql: &str,
+        timeout_ms: Option<u64>,
+        settings: &[(&str, &str)],
+        start: std::time::Instant,
+    ) -> Result<QueryResult> {
         let n = self.instances.len();
         let active = self.active.load(Ordering::Relaxed);
         if active != 0 && self.primary_retry_due() {
