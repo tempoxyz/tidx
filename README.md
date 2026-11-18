@@ -228,7 +228,6 @@ password_env = "TIDX_PG_PASSWORD"
 │   ├── replicated_database bool      = false        Create the database as ENGINE = Replicated with Replicated* table engines
 │   └── [earn_prices]                                Hourly Earn vault share price sampler (earn_vault_price_hours)
 │       ├── enabled         bool      = true         Sample vault prices over RPC (needs archive state for backfill)
-│       ├── factories       string[]  = []           Only sample vaults from these factories (default: every vault)
 │       ├── interval_secs   u64       = 60           Seconds between sampling rounds
 │       ├── batch           usize     = 2000         Most samples per round, newest hours first
 │       └── concurrency     usize     = 4            Concurrent eth_call requests
@@ -718,9 +717,9 @@ For self-hosted multi-replica ClickHouse (coordinated by Keeper/ZooKeeper), set 
 | [`dex_orders`](#dex_orders) | Decoded stablecoin-DEX `OrderPlaced` events. |
 | [`dex_pair_liquidity`](#dex_pair_liquidity) | Pairs joined to their on-DEX base liquidity. |
 | [`dex_pairs`](#dex_pairs) | Decoded stablecoin-DEX `PairCreated` events. |
-| [`earn_flows`](#earn_flows) | Decoded Earn vault deposit and redemption events. |
-| [`earn_vault_price_hours`](#earn_vault_price_hours) | Hourly Earn vault share price, sampled over RPC. |
-| [`earn_vaults`](#earn_vaults) | Earn vaults discovered from their deployment events. |
+| [`earn_flows`](#earn_flows) | Deposit and redemption events for approved vaults (internal). |
+| [`earn_vault_price_hours`](#earn_vault_price_hours) | Hourly price samples for approved vaults (internal). |
+| [`earn_vaults`](#earn_vaults) | Approved vaults and token bindings from the current chain registry (internal). |
 | [`token_balances`](#token_balances) | Current positive balance per `(token, holder)`. |
 | [`token_balances_snapshot`](#token_balances_snapshot) | Pre-aggregated `token_balances`, refreshed on a schedule. |
 | [`token_holder_counts`](#token_holder_counts) | Holder count per token, refreshed on a schedule. |
@@ -962,32 +961,15 @@ curl -G "https://indexer.testnet.tempo.xyz/query" \
 
 #### earn_vaults
 
-> [!NOTE]
-> Materialized view over `logs`, kept in sync on reorg.
+An Earn vault issues a share token against deposited assets. This ClickHouse view lists the vaults that an operator has approved for the current chain. A separate publisher reads the verified vault registry and replaces the contents of `earn_verified_vaults` in this chain's database in one operation. A row binds a vault address to its share token, asset token, first block, block timestamp and expiry time (`valid_until`, UTC). The view returns only unexpired rows. Neither a new contract nor a deployment event adds a vault.
 
-Earn vaults decoded from their deployment events: `EarnStackDeployed(address indexed earnVault, address indexed earnShare, address indexed earnFees, address engine, address asset, address owner, …)` (topic0 `0x420632dc…`) and the later deployment event layout with the same indexed fields and leading data words (topic0 `0x950acdb9…`). Any contract can emit these logs, so `factory` records the emitter: filter on the factories you trust. `ReplacingMergeTree` ordered by `(vault, deployed_block, log_idx)`; read it with `FINAL`.
-
-| Column | Type | Description |
-|--------|------|-------------|
-| `deployed_block` | `Int64` | Block of the deployment event |
-| `deployed_at` | `DateTime64(3, 'UTC')` | Block timestamp |
-| `tx_hash` | `String` | Transaction hash |
-| `log_idx` | `Int32` | Log index |
-| `factory` | `String` | Contract that emitted the deployment event |
-| `selector` | `LowCardinality(String)` | Deployment event topic0 |
-| `vault` | `String` | Earn vault address |
-| `share_token` | `String` | Vault share token |
-| `fees` | `String` | Fees contract |
-| `engine` | `String` | Engine contract |
-| `asset` | `String` | Underlying asset token |
-| `owner` | `String` | Initial owner |
+Internal services can submit ClickHouse SELECT queries to `GET /internal/earn/query` using the dedicated bearer credential configured through `TIDX_EARN_READ_TOKEN`. Without it, the route is off. Public `/query` cannot read these Earn objects, and neither route exposes the publisher's source table.
 
 #### earn_flows
 
-> [!NOTE]
-> Materialized view over `logs`, kept in sync on reorg.
+This view decodes deposit and redemption events from the `logs` table for approved vault addresses. It stores no separate copy. Adding a vault makes earlier events available; removing it excludes its events. A chain reorganization changes the result when the underlying logs change.
 
-One row per Earn vault deposit or redemption event. Amounts are the raw unsigned event values; readers apply signs by `kind`. `vault` is the emitting contract and any contract can emit these signatures, so join on `earn_vaults` (or your own vault list). `ReplacingMergeTree` ordered by `(vault, account, block_num, log_idx)`; read it with `FINAL`.
+The table maps each event to an account and quantities in the event's original units. A redeem request reserves shares; finalization pays assets and cancellation releases shares. A venue is the underlying strategy or pool where the vault invests. If a user deposits shares of that pool directly, `assets` counts the pool shares received and `shares` counts the new Earn vault shares issued to the user.
 
 | `kind` | Event | `account` | `caller` | `request_id` | `assets` | `shares` |
 |--------|-------|-----------|----------|--------------|----------|----------|
@@ -1007,18 +989,20 @@ One row per Earn vault deposit or redemption event. Amounts are the raw unsigned
 | `log_idx` | `Int32` | Log index |
 | `vault` | `String` | Emitting vault |
 | `account` | `String` | Receiver, or requester for `redeem_requested` |
-| `caller` | `String` | Caller, or `''` for request events |
+| `caller` | `String` | Caller, or `''` for request, finalize and cancel events |
 | `request_id` | `String` | Redeem request ID (32-byte hex), or `''` |
 | `kind` | `LowCardinality(String)` | Event kind (see above) |
-| `assets` | `Int256` | Raw unsigned asset amount |
-| `shares` | `Int256` | Raw unsigned vault share amount |
+| `assets` | `UInt256` | Quantity in the units shown for the event above |
+| `shares` | `UInt256` | Raw unsigned vault share amount |
 
 #### earn_vault_price_hours
 
 > [!NOTE]
 > Written by the tidx Earn price sampler over RPC, not from logs. Rows at or above a reorged block are pruned and written again.
 
-For every vault in `earn_vaults` and every completed UTC hour since its deployment, `previewRedeem(1e18)` read with `eth_call` at the last block of that hour. The sampler writes the hour that just completed within one interval and backfills older hours with historical calls, so the RPC must serve archive state. It only writes values it read: a failed or reverted call leaves the hour missing and is retried with backoff. `ReplacingMergeTree` keyed on `(vault, hour)`; read it with `FINAL`. Configure it under `[chains.clickhouse.earn_prices]`; `tidx_earn_price_lag_seconds` and `tidx_earn_price_missing_hours` report how far it is behind.
+For each approved vault, the sampler reads `previewRedeem(1e18)` at the last indexed block of each completed hour since deployment. It needs archive RPC access for earlier hours. It checks the registry before dispatching calls and before writing their results. Removal stops new sampling; previously recorded prices remain in storage. A failed call leaves the price missing.
+
+Enable or disable the sampler, set its interval, or limit batch size and concurrency under `[chains.clickhouse.earn_prices]`. Read with `FINAL` for one price per vault and hour. The metrics `tidx_earn_price_lag_seconds` and `tidx_earn_price_missing_hours` describe pricing coverage, not registry freshness.
 
 | Column | Type | Description |
 |--------|------|-------------|
@@ -1028,17 +1012,7 @@ For every vault in `earn_vaults` and every completed UTC hour since its deployme
 | `assets_per_1e18_shares` | `UInt256` | `previewRedeem(1e18)` at `block_num` |
 | `sampled_at` | `DateTime('UTC')` | When the sampler wrote the row |
 
-```bash
-# A position's value at the end of each hour: shares × price / 1e18
-curl -G "https://indexer.testnet.tempo.xyz/query" \
-  --data-urlencode "chainId=42431" \
-  --data-urlencode "engine=clickhouse" \
-  --data-urlencode "sql=SELECT hour, toString(assets_per_1e18_shares) AS price
-    FROM earn_vault_price_hours FINAL
-    WHERE vault = '0x…'
-    ORDER BY hour DESC
-    LIMIT 24"
-```
+Upgrading a staging database that ran the earlier event-based Earn schema removes its derived vault rows, flow rows and price samples. It preserves logs and holder balances. Keep applications that depend on price history disabled until the sampler has rebuilt the required hours.
 
 #### token_balances
 

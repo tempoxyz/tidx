@@ -437,25 +437,14 @@ fn spawn_sync_engine(
                                 }
                                 seed_metrics_from_clickhouse(&ch_sink).await;
                                 if ch_config.earn_prices.enabled {
-                                    match EarnPriceSampler::new(
+                                    let sampler = EarnPriceSampler::new(
                                         ch_sink.clone(),
                                         RpcClient::new(&rpc_url),
                                         chain.chain_id,
                                         ch_config.earn_prices.clone(),
-                                    ) {
-                                        Ok(sampler) => {
-                                            info!(
-                                                chain = %chain.name,
-                                                "Earn vault price sampler enabled"
-                                            );
-                                            tokio::spawn(sampler.run(shutdown_rx.resubscribe()));
-                                        }
-                                        Err(e) => error!(
-                                            error = %e,
-                                            chain = %chain.name,
-                                            "Invalid earn_prices config; sampler disabled"
-                                        ),
-                                    }
+                                    );
+                                    info!(chain = %chain.name, "Earn vault price sampler enabled");
+                                    tokio::spawn(sampler.run(shutdown_rx.resubscribe()));
                                 }
                                 sinks = sinks.with_clickhouse(ch_sink);
 

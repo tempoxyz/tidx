@@ -59,6 +59,7 @@ metrics-exporter-prometheus = { version = "0.16", default-features = false, feat
 
 # Crypto
 sha3 = "0.10"
+subtle = "2.6"
 
 # Error handling
 thiserror = "2"

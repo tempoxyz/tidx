@@ -17,6 +17,7 @@ use tidx::sync::ch_sink::ClickHouseSink;
 use tidx::sync::earn_prices::{EarnPriceSampler, SampleReport};
 use tidx::sync::fetcher::RpcClient;
 use tidx::types::{BlockRow, LogRow};
+use tokio::sync::Notify;
 
 const DB: &str = "tidx_earn_test";
 
@@ -135,6 +136,30 @@ fn stack_deployed(block_num: i64, topic0: &str, vault: &str, data_words: usize) 
         ],
         data,
     )
+}
+
+async fn replace_registry(ch: &TestClickHouse, vaults: &[(&str, i64, bool)]) {
+    ch.query("CREATE TABLE earn_stage AS earn_verified_vaults")
+        .await
+        .unwrap();
+    for (vault, block, live) in vaults {
+        let expiry = if *live {
+            "now() + INTERVAL 1 HOUR"
+        } else {
+            "now()"
+        };
+        ch.query(&format!(
+            "INSERT INTO earn_stage SELECT '{vault}', '{SHARE}', '{TOKEN}', {block}, toDateTime({}, 'UTC'), {expiry}",
+            block_time(*block).timestamp()
+        )).await.unwrap();
+    }
+    let swap = if vaults.is_empty() {
+        "ALTER TABLE earn_verified_vaults DROP PARTITION tuple()"
+    } else {
+        "ALTER TABLE earn_verified_vaults REPLACE PARTITION tuple() FROM earn_stage"
+    };
+    ch.query(swap).await.unwrap();
+    ch.query("DROP TABLE earn_stage SYNC").await.unwrap();
 }
 
 async fn setup() -> Option<(ClickHouseSink, TestClickHouse)> {
@@ -287,39 +312,121 @@ async fn balance_hours_follow_reorg_pruning() {
     assert_eq!(balance_at_end_of_hour(&ch, ALICE, 5).await, "850");
 }
 
+#[test]
+fn earn_tables_are_not_exposed_through_public_sql() {
+    use tidx::query::validate_clickhouse_query;
+    for table in [
+        "earn_verified_vaults",
+        "earn_vaults",
+        "earn_flows",
+        "earn_vault_price_hours",
+        "earn_vaults_mv",
+        "earn_flows_mv",
+    ] {
+        assert!(
+            validate_clickhouse_query(&format!("SELECT * FROM {table}")).is_err(),
+            "{table}"
+        );
+    }
+    assert!(validate_clickhouse_query("SELECT * FROM address_balance_hours").is_ok());
+}
+
 #[tokio::test]
 #[serial(clickhouse)]
-async fn earn_vaults_decode_both_deployment_layouts() {
+async fn earn_schema_upgrade_drops_unverified_state_once() {
+    let ch = TestClickHouse::new(DB).expect("ClickHouse client");
+    if ch.wait_for_ready().await.is_err() {
+        common::skip("ClickHouse not available");
+        return;
+    }
+    ch.reset_database().await.unwrap();
+    ch.query(include_str!("../db/clickhouse/logs.sql"))
+        .await
+        .unwrap();
+    // Previous staging objects are caches of untrusted deployments, not a
+    // source for migration. The original logs are the authoritative history.
+    for name in ["earn_vaults", "earn_flows", "earn_vault_price_hours"] {
+        ch.query(&format!(
+            "CREATE TABLE {name} (address String) ENGINE=MergeTree ORDER BY address"
+        ))
+        .await
+        .unwrap();
+        ch.query(&format!("INSERT INTO {name} VALUES ('staging')"))
+            .await
+            .unwrap();
+    }
+    for name in ["earn_vaults", "earn_flows"] {
+        ch.query(&format!(
+            "CREATE MATERIALIZED VIEW {name}_mv TO {name} AS SELECT address FROM logs"
+        ))
+        .await
+        .unwrap();
+    }
+    let sink = ClickHouseSink::new(&ch.url, DB, None, None).unwrap();
+    sink.ensure_schema_only().await.unwrap();
+    for name in ["earn_vaults_mv", "earn_flows_mv"] {
+        assert_eq!(
+            ch.query(&format!("EXISTS TABLE {name}"))
+                .await
+                .unwrap()
+                .trim(),
+            "0"
+        );
+    }
+    for name in ["earn_vaults", "earn_flows", "earn_vault_price_hours"] {
+        assert_eq!(ch.table_count(name).await.unwrap(), 0);
+    }
+    replace_registry(&ch, &[(VAULT, 3, true)]).await;
+    ch.query(&format!("INSERT INTO earn_vault_price_hours (vault, hour, block_num, assets_per_1e18_shares) VALUES ('{VAULT}', now(), 9, 1)")).await.unwrap();
+    sink.ensure_schema_only().await.unwrap();
+    assert_eq!(ch.table_count("earn_vaults").await.unwrap(), 1);
+    assert_eq!(ch.table_count("earn_vault_price_hours").await.unwrap(), 1);
+}
+
+#[tokio::test]
+#[serial(clickhouse)]
+async fn earn_registry_controls_canonical_history_at_read_time() {
     let Some((sink, ch)) = setup().await else {
         return;
     };
-    sink.write_logs(&[
+    let deposit = |vault| {
+        log(
+            10,
+            0,
+            vault,
+            &[bytes(DEPOSITED), word_address(BOB), word_address(ALICE)],
+            [word_u128(12), word_u128(10)].concat(),
+        )
+    };
+    let logs = vec![
         stack_deployed(3, STACK_DEPLOYED, VAULT, 11),
         stack_deployed(9, STACK_DEPLOYED_V2, BROKEN_VAULT, 13),
-    ])
-    .await
-    .expect("write logs");
+        deposit(VAULT),
+        deposit(BROKEN_VAULT),
+    ];
+    sink.write_logs(&logs).await.expect("write logs");
+    let flows = "SELECT vault FROM earn_flows ORDER BY vault";
+    assert_eq!(tsv(&ch, "SELECT vault FROM earn_vaults").await, "");
+    assert_eq!(tsv(&ch, flows).await, "");
 
+    // Historical rows appear immediately after approval. An expired row
+    // cannot admit even a matching deposit from its own vault address.
+    replace_registry(&ch, &[(VAULT, 3, true), (BROKEN_VAULT, 9, false)]).await;
+    let columns = "SELECT vault, share_token, asset, deployed_block, toUnixTimestamp(deployed_at) FROM earn_vaults";
     assert_eq!(
-        tsv(
-            &ch,
-            "SELECT vault, share_token, fees, engine, asset, owner, factory, deployed_block, \
-                 toUnixTimestamp(deployed_at) FROM earn_vaults FINAL ORDER BY deployed_block",
-        )
-        .await,
+        tsv(&ch, columns).await,
         format!(
-            "{VAULT}\t{SHARE}\t{FEES}\t{ENGINE}\t{TOKEN}\t{OWNER}\t{FACTORY}\t3\t{}\n\
-             {BROKEN_VAULT}\t{SHARE}\t{FEES}\t{ENGINE}\t{TOKEN}\t{OWNER}\t{FACTORY}\t9\t{}\n",
-            block_time(3).timestamp(),
-            block_time(9).timestamp()
+            "{VAULT}\t{SHARE}\t{TOKEN}\t3\t{}\n",
+            block_time(3).timestamp()
         )
     );
+    assert_eq!(tsv(&ch, flows).await, format!("{VAULT}\n"));
 
-    sink.delete_from(9).await.expect("delete_from");
-    assert_eq!(
-        tsv(&ch, "SELECT vault FROM earn_vaults FINAL").await,
-        format!("{VAULT}\n")
-    );
+    // No new log or replay: one vault is revoked, the other is approved.
+    replace_registry(&ch, &[(BROKEN_VAULT, 9, true)]).await;
+    assert_eq!(tsv(&ch, flows).await, format!("{BROKEN_VAULT}\n"));
+    replace_registry(&ch, &[]).await;
+    assert_eq!(tsv(&ch, flows).await, "");
 }
 
 #[tokio::test]
@@ -328,6 +435,7 @@ async fn earn_flows_decode_each_event_and_follow_reorgs() {
     let Some((sink, ch)) = setup().await else {
         return;
     };
+    replace_registry(&ch, &[(VAULT, 3, true)]).await;
     let request_id = format!("0x{}", "ab".repeat(32));
     let caller = word_address(BOB);
     let receiver = word_address(ALICE);
@@ -412,12 +520,16 @@ async fn earn_flows_decode_each_event_and_follow_reorgs() {
             data(&[1]),
         ),
     ];
+    assert_eq!(
+        tsv(&ch, "SELECT name, type FROM system.columns WHERE database = currentDatabase() AND table = 'earn_flows' AND name IN ('assets','shares') ORDER BY name").await,
+        "assets\tUInt256\nshares\tUInt256\n"
+    );
     sink.write_logs(&logs).await.expect("write logs");
     sink.write_logs(&logs).await.expect("replay logs");
 
     let rows = "SELECT block_num, log_idx, vault, account, caller, request_id, kind, \
                     toString(assets), toString(shares) \
-                FROM earn_flows FINAL ORDER BY block_num, log_idx";
+                FROM earn_flows ORDER BY block_num, log_idx";
     let r = &request_id;
     assert_eq!(
         tsv(&ch, rows).await,
@@ -438,7 +550,7 @@ async fn earn_flows_decode_each_event_and_follow_reorgs() {
     assert_eq!(
         tsv(
             &ch,
-            "SELECT kind FROM earn_flows FINAL ORDER BY block_num, log_idx"
+            "SELECT kind FROM earn_flows ORDER BY block_num, log_idx"
         )
         .await,
         "deposited\nredeemed\nwithdrew_exact\nredeem_requested\n"
@@ -451,6 +563,10 @@ async fn earn_flows_decode_each_event_and_follow_reorgs() {
 struct StubRpc {
     calls: Arc<Mutex<Vec<(String, u64)>>>,
     fail_all: Arc<Mutex<bool>>,
+    // When enabled, let the test replace the registry while an RPC is in flight.
+    pause: Arc<Mutex<bool>>,
+    entered: Arc<Notify>,
+    release: Arc<Notify>,
 }
 
 async fn stub_rpc(State(stub): State<StubRpc>, Json(req): Json<Value>) -> Json<Value> {
@@ -469,6 +585,11 @@ async fn stub_rpc(State(stub): State<StubRpc>, Json(req): Json<Value>) -> Json<V
         "0x4cdad5060000000000000000000000000000000000000000000000000de0b6b3a7640000"
     );
     stub.calls.lock().unwrap().push((vault.clone(), block));
+    let pause = *stub.pause.lock().unwrap();
+    if pause {
+        stub.entered.notify_one();
+        stub.release.notified().await;
+    }
     if *stub.fail_all.lock().unwrap() || vault == BROKEN_VAULT {
         return Json(
             json!({"jsonrpc": "2.0", "id": id, "error": {"code": 3, "message": "execution reverted"}}),
@@ -489,17 +610,13 @@ async fn start_stub() -> (StubRpc, String) {
     (stub, url)
 }
 
-fn sampler(sink: &ClickHouseSink, url: &str, factories: Vec<String>) -> EarnPriceSampler {
+fn sampler(sink: &ClickHouseSink, url: &str) -> EarnPriceSampler {
     EarnPriceSampler::new(
         sink.clone(),
         RpcClient::new(url),
         4217,
-        EarnPricesConfig {
-            factories,
-            ..EarnPricesConfig::default()
-        },
+        EarnPricesConfig::default(),
     )
-    .unwrap()
 }
 
 async fn price_rows(ch: &TestClickHouse) -> String {
@@ -540,14 +657,9 @@ async fn price_sampler_writes_each_completed_hour_once_and_skips_failures() {
     sink.write_blocks(&(0..=20).map(block).collect::<Vec<_>>())
         .await
         .expect("blocks");
-    sink.write_logs(&[
-        stack_deployed(5, STACK_DEPLOYED, VAULT, 11),
-        stack_deployed(9, STACK_DEPLOYED_V2, BROKEN_VAULT, 13),
-    ])
-    .await
-    .expect("deployments");
+    replace_registry(&ch, &[(VAULT, 5, true), (BROKEN_VAULT, 9, true)]).await;
 
-    let first = sampler(&sink, &url, vec![]);
+    let first = sampler(&sink, &url);
     let report = first.run_once().await.expect("first round");
     assert_eq!(
         report,
@@ -588,7 +700,7 @@ async fn price_sampler_writes_each_completed_hour_once_and_skips_failures() {
     sink.write_blocks(&(21..=24).map(block).collect::<Vec<_>>())
         .await
         .expect("blocks");
-    let report = sampler(&sink, &url, vec![])
+    let report = sampler(&sink, &url)
         .run_once()
         .await
         .expect("failing round");
@@ -596,7 +708,7 @@ async fn price_sampler_writes_each_completed_hour_once_and_skips_failures() {
     assert_eq!(price_rows(&ch).await, expected_price_rows(VAULT, 1..=4));
 
     *stub.fail_all.lock().unwrap() = false;
-    let report = sampler(&sink, &url, vec![])
+    let report = sampler(&sink, &url)
         .run_once()
         .await
         .expect("recovery round");
@@ -612,17 +724,40 @@ async fn price_sampler_writes_each_completed_hour_once_and_skips_failures() {
         .await
         .expect("reorged blocks");
     assert_eq!(price_rows(&ch).await, expected_price_rows(VAULT, 1..=3));
-    let report = sampler(&sink, &url, vec![])
-        .run_once()
-        .await
-        .expect("after reorg");
+    let report = sampler(&sink, &url).run_once().await.expect("after reorg");
     assert_eq!(report.written, 2);
     assert_eq!(price_rows(&ch).await, expected_price_rows(VAULT, 1..=5));
 }
 
 #[tokio::test]
 #[serial(clickhouse)]
-async fn price_sampler_waits_for_the_last_block_of_an_hour_and_honours_factories() {
+async fn price_sampler_discards_results_revoked_during_rpc() {
+    let Some((sink, ch)) = setup().await else {
+        return;
+    };
+    let (stub, url) = start_stub().await;
+    replace_registry(&ch, &[(VAULT, 1, true), (BROKEN_VAULT, 1, false)]).await;
+    sink.write_blocks(&(0..=4).map(block).collect::<Vec<_>>())
+        .await
+        .expect("one completed hour");
+
+    *stub.pause.lock().unwrap() = true;
+    let round = sampler(&sink, &url);
+    let task = tokio::spawn(async move { round.run_once().await });
+    tokio::time::timeout(std::time::Duration::from_secs(15), stub.entered.notified())
+        .await
+        .expect("RPC dispatched");
+    replace_registry(&ch, &[]).await;
+    stub.release.notify_one();
+    let result = task.await.unwrap().unwrap();
+    assert_eq!(result.written, 0);
+    assert_eq!(price_rows(&ch).await, "");
+    assert_eq!(*stub.calls.lock().unwrap(), vec![(VAULT.to_string(), 3)]);
+}
+
+#[tokio::test]
+#[serial(clickhouse)]
+async fn price_sampler_waits_for_the_last_block_of_an_hour_and_requires_live_vaults() {
     let Some((sink, ch)) = setup().await else {
         return;
     };
@@ -632,22 +767,13 @@ async fn price_sampler_waits_for_the_last_block_of_an_hour_and_honours_factories
     // at block 10.
     let blocks: Vec<_> = (0..=16).filter(|n| *n != 11).map(block).collect();
     sink.write_blocks(&blocks).await.expect("blocks");
-    sink.write_logs(&[stack_deployed(5, STACK_DEPLOYED, VAULT, 11)])
-        .await
-        .expect("deployment");
-
-    let other_factory = "0xfac0000000000000000000000000000000000002".to_string();
-    let report = sampler(&sink, &url, vec![other_factory])
-        .run_once()
-        .await
-        .unwrap();
+    replace_registry(&ch, &[(VAULT, 5, false)]).await;
+    let report = sampler(&sink, &url).run_once().await.unwrap();
     assert_eq!(report, SampleReport::default());
     assert_eq!(price_rows(&ch).await, "");
 
-    let report = sampler(&sink, &url, vec![FACTORY.to_string()])
-        .run_once()
-        .await
-        .unwrap();
+    replace_registry(&ch, &[(VAULT, 5, true)]).await;
+    let report = sampler(&sink, &url).run_once().await.unwrap();
     assert_eq!(
         report,
         SampleReport {
@@ -661,7 +787,7 @@ async fn price_sampler_waits_for_the_last_block_of_an_hour_and_honours_factories
     assert_eq!(price_rows(&ch).await, expected);
 
     sink.write_blocks(&[block(11)]).await.expect("gap filled");
-    let report = sampler(&sink, &url, vec![]).run_once().await.unwrap();
+    let report = sampler(&sink, &url).run_once().await.unwrap();
     assert_eq!(report.written, 1);
     assert_eq!(price_rows(&ch).await, expected_price_rows(VAULT, 1..=3));
 }

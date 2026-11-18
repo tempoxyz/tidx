@@ -213,6 +213,20 @@ pub const TABLES: &[ClickHouseObject] = &[
     },
 ];
 
+// One-shot, before the new views are installed: these objects contain
+// reconstructible data from the former, unverified staging index. Retire
+// the writers first. Never drop canonical logs, balances, or the registry.
+const fn retire_earn_stage(name: &'static str, ddl: &'static str) -> ClickHouseObject {
+    ClickHouseObject {
+        name,
+        kind: ClickHouseObjectKind::Migration(ddl),
+        depends_on: &[],
+        public_query: false,
+        block_column: None,
+        backfill: None,
+    }
+}
+
 pub const MIGRATIONS: &[ClickHouseObject] = &[
     ClickHouseObject {
         name: "logs_20260416_is_virtual_forward",
@@ -505,6 +519,26 @@ pub const MIGRATIONS: &[ClickHouseObject] = &[
         block_column: None,
         backfill: None,
     },
+    retire_earn_stage(
+        "earn_20261118_retire_vaults_mv",
+        "DROP VIEW IF EXISTS earn_vaults_mv SYNC",
+    ),
+    retire_earn_stage(
+        "earn_20261118_retire_flows_mv",
+        "DROP VIEW IF EXISTS earn_flows_mv SYNC",
+    ),
+    retire_earn_stage(
+        "earn_20261118_retire_vaults",
+        "DROP TABLE IF EXISTS earn_vaults SYNC",
+    ),
+    retire_earn_stage(
+        "earn_20261118_retire_flows",
+        "DROP TABLE IF EXISTS earn_flows SYNC",
+    ),
+    retire_earn_stage(
+        "earn_20261118_retire_prices",
+        "DROP TABLE IF EXISTS earn_vault_price_hours SYNC",
+    ),
 ];
 
 /// One-shot migrations that mutate derived tables, so they run after those

@@ -16,6 +16,7 @@ pub use tag::QueryTag;
 pub use tiered_split::{
     HotWindow, TieredSplit, hot_window_confined, hot_window_confinement, plan_tiered_split,
 };
+pub(crate) use validator::{ClickHouseReadAccess, validate_scoped_clickhouse_query};
 pub use validator::{HARD_LIMIT_MAX, validate_clickhouse_query, validate_query};
 
 use regex_lite::Regex;

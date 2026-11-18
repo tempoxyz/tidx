@@ -6520,6 +6520,7 @@ dependencies = [
  "serial_test",
  "sha3 0.10.8",
  "sqlparser",
+ "subtle",
  "tempfile",
  "tempo-alloy",
  "tempo-primitives",

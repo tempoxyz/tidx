@@ -1,56 +1,34 @@
-use super::{BackfillPolicy, ClickHouseObject, ClickHouseObjectKind};
+use super::{ClickHouseObject, ClickHouseObjectKind};
 
 const EARN_VAULTS_SCHEMA: &str = include_str!("../../db/clickhouse/earn_vaults.sql");
-const EARN_VAULTS_SELECT: &str = include_str!("../../db/clickhouse/earn_vaults_select.sql");
+const EARN_VERIFIED_VAULTS_SCHEMA: &str =
+    include_str!("../../db/clickhouse/earn_verified_vaults.sql");
 const EARN_FLOWS_SCHEMA: &str = include_str!("../../db/clickhouse/earn_flows.sql");
-const EARN_FLOWS_SELECT: &str = include_str!("../../db/clickhouse/earn_flows_select.sql");
 const EARN_VAULT_PRICE_HOURS_SCHEMA: &str =
     include_str!("../../db/clickhouse/earn_vault_price_hours.sql");
 
-/// Earn vault deployments, deposit and redemption flows, and the hourly share
-/// price written by the Earn price sampler (`crate::service::earn_prices`).
-///
-/// With `address_balance_hours` these let a reader compute a position's value
-/// and earnings over any range from indexed data alone.
+/// Named Earn objects are private. Generic holder balances remain public.
 pub const OBJECTS: &[ClickHouseObject] = &[
     ClickHouseObject {
-        name: "earn_vaults",
-        kind: ClickHouseObjectKind::Table(EARN_VAULTS_SCHEMA),
-        depends_on: &["logs"],
-        public_query: true,
-        block_column: Some("deployed_block"),
-        backfill: Some(BackfillPolicy::Ranged {
-            select_sql: EARN_VAULTS_SELECT,
-        }),
+        name: "earn_verified_vaults",
+        kind: ClickHouseObjectKind::Table(EARN_VERIFIED_VAULTS_SCHEMA),
+        depends_on: &[],
+        public_query: false,
+        block_column: None,
+        backfill: None,
     },
     ClickHouseObject {
-        name: "earn_vaults_mv",
-        kind: ClickHouseObjectKind::MaterializedView {
-            target_table: "earn_vaults",
-            select_sql: EARN_VAULTS_SELECT,
-        },
-        depends_on: &["logs", "earn_vaults"],
+        name: "earn_vaults",
+        kind: ClickHouseObjectKind::View(EARN_VAULTS_SCHEMA),
+        depends_on: &["earn_verified_vaults"],
         public_query: false,
         block_column: None,
         backfill: None,
     },
     ClickHouseObject {
         name: "earn_flows",
-        kind: ClickHouseObjectKind::Table(EARN_FLOWS_SCHEMA),
-        depends_on: &["logs"],
-        public_query: true,
-        block_column: Some("block_num"),
-        backfill: Some(BackfillPolicy::Ranged {
-            select_sql: EARN_FLOWS_SELECT,
-        }),
-    },
-    ClickHouseObject {
-        name: "earn_flows_mv",
-        kind: ClickHouseObjectKind::MaterializedView {
-            target_table: "earn_flows",
-            select_sql: EARN_FLOWS_SELECT,
-        },
-        depends_on: &["logs", "earn_flows"],
+        kind: ClickHouseObjectKind::View(EARN_FLOWS_SCHEMA),
+        depends_on: &["logs", "earn_vaults"],
         public_query: false,
         block_column: None,
         backfill: None,
@@ -59,7 +37,7 @@ pub const OBJECTS: &[ClickHouseObject] = &[
         name: "earn_vault_price_hours",
         kind: ClickHouseObjectKind::Table(EARN_VAULT_PRICE_HOURS_SCHEMA),
         depends_on: &["earn_vaults"],
-        public_query: true,
+        public_query: false,
         // Written by the sampler, not from logs: reorg cleanup prunes rows at
         // or above the fork block and the sampler writes them again.
         block_column: Some("block_num"),
@@ -76,16 +54,24 @@ mod tests {
     }
 
     #[test]
-    fn earn_vaults_decode_both_deployment_layouts() {
-        let ddl = object("earn_vaults_mv").ddl();
-        assert!(ddl.contains("TO earn_vaults AS"));
-        assert!(ddl.contains("0x420632dca5c7b108ec3fe8f96f06644917f70c8682f8f66cadc3b03e1fe9301d"));
-        assert!(ddl.contains("0x950acdb981ae9ee0189b7bba6d347b4fb9b24f0e4f630a1b9a388bc5702fd67b"));
+    fn registry_is_private_and_views_require_no_reorg_cleanup_or_backfill() {
+        for descriptor in OBJECTS {
+            assert!(!descriptor.public_query, "{}", descriptor.name);
+            assert!(descriptor.backfill.is_none());
+        }
+        assert!(object("earn_verified_vaults").block_column.is_none());
+        for name in ["earn_vaults", "earn_flows"] {
+            assert!(object(name).is_view());
+            // The API reader can SELECT these views without direct access
+            // to the underlying registry table.
+            assert!(object(name).ddl().contains("SQL SECURITY DEFINER"));
+            assert!(object(name).block_column.is_none());
+        }
     }
 
     #[test]
     fn earn_flows_decode_every_event() {
-        let ddl = object("earn_flows_mv").ddl();
+        let ddl = object("earn_flows").ddl();
         for (kind, topic0) in [
             (
                 "deposited",
@@ -125,10 +111,6 @@ mod tests {
     fn earn_event_topics_match_signatures() {
         use alloy::primitives::keccak256;
         for (signature, topic0) in [
-            (
-                "EarnStackDeployed(address,address,address,address,address,address,bytes32,address,address,uint8,bytes32,bytes32,bytes32,bytes32)",
-                "420632dca5c7b108ec3fe8f96f06644917f70c8682f8f66cadc3b03e1fe9301d",
-            ),
             (
                 "Deposited(address,address,uint256,uint256)",
                 "f5681f9d0db1b911ac18ee83d515a1cf1051853a9eae418316a2fdf7dea427c5",

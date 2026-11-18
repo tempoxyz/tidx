@@ -352,14 +352,9 @@ pub struct ClickHouseConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EarnPricesConfig {
     /// Run the sampler when ClickHouse is enabled (default: true). It does
-    /// nothing on chains without Earn vault deployments.
+    /// nothing without live, verified vaults for this chain.
     #[serde(default = "default_true")]
     pub enabled: bool,
-
-    /// Only sample vaults deployed by these factory addresses (default: every
-    /// vault in `earn_vaults`).
-    #[serde(default)]
-    pub factories: Vec<String>,
 
     /// Seconds between sampling rounds (default: 60).
     #[serde(default = "default_earn_prices_interval_secs")]
@@ -378,7 +373,6 @@ impl Default for EarnPricesConfig {
     fn default() -> Self {
         Self {
             enabled: true,
-            factories: Vec::new(),
             interval_secs: default_earn_prices_interval_secs(),
             batch: default_earn_prices_batch(),
             concurrency: default_earn_prices_concurrency(),

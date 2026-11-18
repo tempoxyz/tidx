@@ -12,14 +12,13 @@
 //! `(vault, hour)`. Reorg cleanup prunes rows whose block was replaced, and
 //! the next round writes them again.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use alloy::primitives::U256;
 use anyhow::{Result, anyhow};
 use clickhouse::Row;
-use futures::StreamExt;
 use serde::Deserialize;
 use tokio::sync::broadcast;
 use tracing::{debug, info, warn};
@@ -54,7 +53,6 @@ pub struct EarnPriceSampler {
     rpc: RpcClient,
     chain_id: u64,
     config: EarnPricesConfig,
-    factories: Vec<String>,
     failures: Mutex<HashMap<(String, u32), (u32, Instant)>>,
 }
 
@@ -82,23 +80,14 @@ impl EarnPriceSampler {
         rpc: RpcClient,
         chain_id: u64,
         config: EarnPricesConfig,
-    ) -> Result<Self> {
-        let mut factories = Vec::with_capacity(config.factories.len());
-        for factory in &config.factories {
-            let factory = factory.to_ascii_lowercase();
-            if !is_address(&factory) {
-                return Err(anyhow!("invalid earn_prices factory address: {factory}"));
-            }
-            factories.push(factory);
-        }
-        Ok(Self {
+    ) -> Self {
+        Self {
             sink,
             rpc,
             chain_id,
             config,
-            factories,
             failures: Mutex::default(),
-        })
+        }
     }
 
     pub async fn run(self, mut shutdown: broadcast::Receiver<()>) {
@@ -161,7 +150,7 @@ impl EarnPriceSampler {
             let hours: BTreeSet<u32> = due.iter().map(|row| row.hour).collect();
             let blocks = self.hour_last_blocks(&hours).await?;
 
-            let calls = due
+            let calls: Vec<_> = due
                 .into_iter()
                 .filter_map(|row| match blocks.get(&row.hour) {
                     Some(&block_num) => Some((row, block_num)),
@@ -169,42 +158,69 @@ impl EarnPriceSampler {
                         report.deferred += 1;
                         None
                     }
-                });
-            let results: Vec<_> = futures::stream::iter(calls)
-                .map(|(row, block_num)| async move {
-                    let price = self.preview_redeem(&row.vault, block_num).await;
-                    (row, block_num, price)
                 })
-                .buffer_unordered(self.config.concurrency.max(1))
-                .collect()
-                .await;
-
+                .collect();
             let mut values = Vec::new();
-            for (row, block_num, price) in results {
-                let key = (row.vault, row.hour);
-                match price {
-                    Ok(price) => {
-                        self.failures
-                            .lock()
-                            .unwrap_or_else(|e| e.into_inner())
-                            .remove(&key);
-                        values.push(format!(
-                            "('{}', toDateTime({}, 'UTC'), {}, toUInt256('{}'))",
-                            key.0, key.1, block_num, price
-                        ));
-                    }
-                    Err(e) => {
-                        debug!(vault = %key.0, hour = key.1, block_num, error = %e, "previewRedeem failed");
-                        report.failed += 1;
-                        self.record_failure(key);
+            let mut keys = Vec::new();
+            // A backfill round may outlive its registry snapshot. Recheck the
+            // small live set before dispatching each wave of archive reads.
+            for wave in calls.chunks(self.config.concurrency.max(1)) {
+                let active: HashSet<String> = self
+                    .sink
+                    .client()
+                    .query("SELECT vault FROM earn_vaults")
+                    .fetch_all::<String>()
+                    .await?
+                    .into_iter()
+                    .collect();
+                if active.is_empty() {
+                    break;
+                }
+                let results = futures::future::join_all(
+                    wave.iter()
+                        .filter(|(row, _)| active.contains(&row.vault))
+                        .map(|(row, block_num)| async move {
+                            (
+                                row,
+                                *block_num,
+                                self.preview_redeem(&row.vault, *block_num).await,
+                            )
+                        }),
+                )
+                .await;
+                for (row, block_num, price) in results {
+                    let key = (row.vault.clone(), row.hour);
+                    match price {
+                        Ok(price) => {
+                            self.failures
+                                .lock()
+                                .unwrap_or_else(|e| e.into_inner())
+                                .remove(&key);
+                            // missing_pairs validates the address; the remaining literals
+                            // are typed integers or a decoded uint256 in decimal.
+                            values.push(format!(
+                                "('{}', {}, {}, '{}')",
+                                key.0, key.1, block_num, price
+                            ));
+                            keys.push(format!("('{}', toDateTime({}, 'UTC'))", key.0, key.1));
+                        }
+                        Err(e) => {
+                            debug!(vault = %key.0, hour = key.1, block_num, error = %e, "previewRedeem failed");
+                            report.failed += 1;
+                            self.record_failure(key);
+                        }
                     }
                 }
             }
 
             if !values.is_empty() {
+                // An RPC result may arrive after removal or lease expiry.
+                // Apply membership in the insert itself, not only in Rust.
                 let sql = format!(
-                    "INSERT INTO earn_vault_price_hours \
-                     (vault, hour, block_num, assets_per_1e18_shares) VALUES {}",
+                    "INSERT INTO earn_vault_price_hours (vault, hour, block_num, assets_per_1e18_shares) \
+                     SELECT vault, toDateTime(h, 'UTC'), n, toUInt256(p) \
+                     FROM values('vault String, h UInt32, n Int64, p String', {}) \
+                     WHERE vault IN (SELECT vault FROM earn_vaults)",
                     values.join(", ")
                 );
                 self.sink
@@ -213,7 +229,11 @@ impl EarnPriceSampler {
                     .execute()
                     .await
                     .map_err(|e| anyhow!("insert earn_vault_price_hours: {e}"))?;
-                report.written = values.len();
+                let count: u64 = self.sink.client().query(&format!(
+                    "SELECT count() FROM earn_vault_price_hours FINAL WHERE (vault, hour) IN ({})",
+                    keys.join(", ")
+                )).fetch_one().await?;
+                report.written = usize::try_from(count)?;
             }
         }
 
@@ -234,20 +254,6 @@ impl EarnPriceSampler {
         failures.insert(key, (attempts, Instant::now() + backoff));
     }
 
-    fn vault_filter(&self) -> String {
-        if self.factories.is_empty() {
-            String::new()
-        } else {
-            let list = self
-                .factories
-                .iter()
-                .map(|factory| format!("'{factory}'"))
-                .collect::<Vec<_>>()
-                .join(", ");
-            format!("WHERE factory IN ({list})")
-        }
-    }
-
     /// The newest UTC hour whose last block is indexed: a block from a later
     /// hour exists.
     async fn last_complete_hour(&self) -> Result<Option<u32>> {
@@ -261,15 +267,14 @@ impl EarnPriceSampler {
         Ok(tip.checked_sub(HOUR_SECS).filter(|hour| *hour > 0))
     }
 
-    fn vault_hours_sql(&self, last_complete: u32) -> String {
+    fn vault_hours_sql(last_complete: u32) -> String {
         format!(
             "SELECT vault, arrayJoin(arrayMap(i -> first_hour + toIntervalHour(i), \
                  range(toUInt64(greatest(dateDiff('hour', first_hour, toDateTime({last_complete}, 'UTC')) + 1, 0))))) AS hour \
              FROM ( \
                  SELECT vault, toStartOfHour(toDateTime(min(deployed_at), 'UTC')) AS first_hour \
-                 FROM earn_vaults FINAL {filter} GROUP BY vault \
-             )",
-            filter = self.vault_filter()
+                 FROM earn_vaults GROUP BY vault \
+             )"
         )
     }
 
@@ -278,7 +283,7 @@ impl EarnPriceSampler {
             "SELECT vault, toUInt32(hour) AS hour FROM ({}) \
              WHERE (vault, hour) NOT IN (SELECT vault, hour FROM earn_vault_price_hours FINAL) \
              ORDER BY hour DESC, vault LIMIT {limit}",
-            self.vault_hours_sql(last_complete)
+            Self::vault_hours_sql(last_complete)
         );
         let rows: Vec<MissingRow> = self
             .sink
@@ -348,7 +353,7 @@ impl EarnPriceSampler {
                      SELECT vault, \
                          toStartOfHour(toDateTime(min(deployed_at), 'UTC')) AS first_hour, \
                          toUInt64(greatest(dateDiff('hour', first_hour, toDateTime({last_complete}, 'UTC')) + 1, 0)) AS expected \
-                     FROM earn_vaults FINAL {filter} GROUP BY vault \
+                     FROM earn_vaults GROUP BY vault \
                  ) AS v \
                  LEFT JOIN ( \
                      SELECT vault, count() AS have, max(hour) AS newest \
@@ -357,8 +362,7 @@ impl EarnPriceSampler {
                      GROUP BY vault \
                  ) AS p ON v.vault = p.vault \
              ) \
-             SETTINGS join_use_nulls = 0",
-            filter = self.vault_filter()
+             SETTINGS join_use_nulls = 0"
         );
         let status: StatusRow = self
             .sink

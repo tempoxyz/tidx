@@ -84,6 +84,12 @@ pub fn is_known_table(table: &str) -> bool {
     all_objects().any(|object| object.name == table)
 }
 
+/// Reserve the Earn namespace, including retired objects, from public reads and metadata.
+pub(crate) fn is_reserved_earn_name(name: &str) -> bool {
+    name.get(..5)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("earn_"))
+}
+
 /// True for tables/views in the public query allowlist.
 pub fn is_public_query_table(table: &str) -> bool {
     public_query_objects().any(|object| object.name == table)
