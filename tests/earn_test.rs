@@ -155,15 +155,6 @@ async fn tsv(ch: &TestClickHouse, sql: &str) -> String {
         .unwrap_or_else(|e| panic!("{sql}: {e}"))
 }
 
-async fn refresh_balance_hours(ch: &TestClickHouse) {
-    ch.query("SYSTEM REFRESH VIEW address_balance_hours_snapshot")
-        .await
-        .expect("refresh");
-    ch.query("SYSTEM WAIT VIEW address_balance_hours_snapshot")
-        .await
-        .expect("wait");
-}
-
 /// address_balance_hours, read back as "holder token hour delta" lines.
 async fn balance_hours(ch: &TestClickHouse) -> String {
     tsv(
@@ -190,7 +181,8 @@ async fn balance_at_end_of_hour(ch: &TestClickHouse, holder: &str, hour: i64) ->
         ch,
         &format!(
             "SELECT toString(sum(delta)) FROM address_balance_hours \
-             WHERE holder = '{holder}' AND token = '{TOKEN}' AND hour <= toDateTime({}, 'UTC')",
+             WHERE holder = '{holder}' AND token = '{TOKEN}' AND hour <= toDateTime({}, 'UTC') \
+             SETTINGS force_primary_key = 1",
             hour_start(hour)
         ),
     )
@@ -214,7 +206,7 @@ fn balance_history_logs() -> Vec<LogRow> {
 
 #[tokio::test]
 #[serial(clickhouse)]
-async fn balance_hours_sum_to_holder_deltas_across_snapshot_and_live_tail() {
+async fn balance_hours_sum_to_canonical_holder_deltas() {
     let Some((sink, ch)) = setup().await else {
         return;
     };
@@ -222,30 +214,18 @@ async fn balance_hours_sum_to_holder_deltas_across_snapshot_and_live_tail() {
         .await
         .expect("write logs");
 
-    // Before any refresh everything comes from the live tail.
     let expected = holder_delta_hours(&ch).await;
     assert_eq!(balance_hours(&ch).await, expected);
 
-    // After a refresh, hours before the cutoff (hour 4 here: one hour before
-    // the newest delta's hour) come from the snapshot, the rest live.
-    refresh_balance_hours(&ch).await;
-    assert_eq!(
-        tsv(&ch, "SELECT toUnixTimestamp(max(hour)) FROM address_balance_hours_snapshot WHERE holder = ''")
-            .await
-            .trim(),
-        hour_start(4).to_string()
-    );
-    assert_eq!(balance_hours(&ch).await, expected);
     assert!(
         !balance_hours(&ch).await.contains(ZERO),
         "zero address is not a holder"
     );
 
-    // Replayed inserts are deduplicated by FINAL in both halves.
+    // Replayed inserts must not double-count movements.
     sink.write_logs(&balance_history_logs())
         .await
         .expect("replay logs");
-    refresh_balance_hours(&ch).await;
     assert_eq!(balance_hours(&ch).await, expected);
 
     // Balances at the end of each hour.
@@ -287,9 +267,8 @@ async fn balance_hours_follow_reorg_pruning() {
     sink.write_logs(&balance_history_logs())
         .await
         .expect("write logs");
-    refresh_balance_hours(&ch).await;
 
-    // A reorg at the tip (hour 5, in the live tail) shows up immediately.
+    // A reorg at the tip shows up immediately.
     sink.delete_from(22).await.expect("delete_from");
     assert_eq!(balance_at_end_of_hour(&ch, ALICE, 5).await, "665");
     assert_eq!(balance_hours(&ch).await, holder_delta_hours(&ch).await);
@@ -302,10 +281,8 @@ async fn balance_hours_follow_reorg_pruning() {
     assert_eq!(balance_at_end_of_hour(&ch, ALICE, 6).await, "600");
     assert_eq!(balance_hours(&ch).await, holder_delta_hours(&ch).await);
 
-    // Pruning below the snapshot cutoff (a deep repair) is picked up by the
-    // next refresh.
+    // A deeper repair also takes effect without a refresh.
     sink.delete_from(6).await.expect("deep delete_from");
-    refresh_balance_hours(&ch).await;
     assert_eq!(balance_hours(&ch).await, holder_delta_hours(&ch).await);
     assert_eq!(balance_at_end_of_hour(&ch, ALICE, 5).await, "850");
 }

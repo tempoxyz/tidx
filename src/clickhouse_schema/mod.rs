@@ -182,6 +182,7 @@ mod tests {
     #[test]
     fn removed_objects_are_not_registered() {
         for name in [
+            "address_balance_hours_snapshot",
             "address_transfers",
             "address_transfers_mv",
             "address_txs",
@@ -230,6 +231,7 @@ mod tests {
                 "DROP TABLE IF EXISTS balance_dirty_keys SYNC",
                 "ALTER TABLE tidx_schema_objects\n    DELETE WHERE name = \
                  'balance_state_20260714_bootstrap'\n    SETTINGS mutations_sync = 1",
+                "DROP VIEW IF EXISTS address_balance_hours_snapshot SYNC",
             ]
         );
     }

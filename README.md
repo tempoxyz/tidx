@@ -734,10 +734,9 @@ User-defined views registered through the [`/views` API](#views-api) live alongs
 
 #### address_balance_hours
 
-> [!NOTE]
-> View over `address_balance_hours_snapshot` (a refreshable materialized view, recomputed every 30 minutes) for completed history plus a live aggregate of `address_holder_deltas FINAL` for the most recent hours.
+One row per active `(holder, token, UTC hour)`, read from `address_holder_deltas FINAL`. Filter by holder (and optionally token) to use the ledger's primary key. The view needs no snapshot or separate backfill: replayed rows count once, and changes to the ledger are visible on the next read.
 
-Net balance change of each holder for each token in each UTC hour, one row per `(holder, token, hour)` with any activity. The balance at the end of hour `H` is `sum(delta)` over `hour <= H`, so a whole balance history is one sort-key range read, carried forward between active hours. Like `address_holder_deltas`, holders exclude the zero address. The live part makes the view current and reflects reorg pruning of recent blocks immediately; historical repairs reach the snapshot on its next refresh.
+The balance at the end of hour `H` is `sum(delta)` over `hour <= H`; between active hours it stays unchanged. For holders with unusually many transfers, measure filtered queries first. If they miss the latency target, materialize only the affected history in replaceable partitions rather than refreshing the entire ledger.
 
 | Column | Type | Description |
 |--------|------|-------------|
@@ -747,7 +746,7 @@ Net balance change of each holder for each token in each UTC hour, one row per `
 | `delta` | `Int256` | Signed net balance change of `(holder, token)` in that hour |
 
 ```bash
-# Balance at the end of each active hour, plus the opening balance before the range
+# Balance at the end of each active hour
 curl -G "https://indexer.testnet.tempo.xyz/query" \
   --data-urlencode "chainId=42431" \
   --data-urlencode "engine=clickhouse" \

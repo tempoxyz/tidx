@@ -1226,6 +1226,7 @@ async fn test_case_insensitive_table_reference() {
 const SINK_DB: &str = "tidx_sink_test";
 const TEST_CHAIN_ID: u64 = 99999;
 const RETIRED_CLICKHOUSE_OBJECTS: &[&str] = &[
+    "address_balance_hours_snapshot",
     "address_transfers",
     "address_transfers_mv",
     "address_txs",
@@ -1244,6 +1245,13 @@ const RETIRED_CLICKHOUSE_OBJECTS: &[&str] = &[
 ];
 
 async fn seed_retired_clickhouse_objects(ch: &TestClickHouse) {
+    ch.query(
+        "CREATE MATERIALIZED VIEW address_balance_hours_snapshot REFRESH EVERY 30 MINUTE \
+         ENGINE = MergeTree ORDER BY () AS SELECT 1 AS marker \
+         SETTINGS allow_experimental_refreshable_materialized_view = 1",
+    )
+    .await
+    .expect("failed to seed the retired hourly balance snapshot");
     for table in [
         "address_transfers",
         "address_txs",
