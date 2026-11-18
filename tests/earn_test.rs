@@ -563,8 +563,8 @@ async fn earn_flows_decode_each_event_and_follow_reorgs() {
 struct StubRpc {
     calls: Arc<Mutex<Vec<(String, u64)>>>,
     fail_all: Arc<Mutex<bool>>,
-    // When enabled, let the test replace the registry while an RPC is in flight.
-    pause: Arc<Mutex<bool>>,
+    // Hold just this archive read in flight; other block reads can finish.
+    pause_block: Arc<Mutex<Option<u64>>>,
     entered: Arc<Notify>,
     release: Arc<Notify>,
 }
@@ -585,8 +585,8 @@ async fn stub_rpc(State(stub): State<StubRpc>, Json(req): Json<Value>) -> Json<V
         "0x4cdad5060000000000000000000000000000000000000000000000000de0b6b3a7640000"
     );
     stub.calls.lock().unwrap().push((vault.clone(), block));
-    let pause = *stub.pause.lock().unwrap();
-    if pause {
+    let pause_block = *stub.pause_block.lock().unwrap();
+    if Some(block) == pause_block {
         stub.entered.notify_one();
         stub.release.notified().await;
     }
@@ -629,10 +629,16 @@ async fn price_rows(ch: &TestClickHouse) -> String {
 }
 
 fn expected_price_rows(vault: &str, hours: std::ops::RangeInclusive<i64>) -> String {
+    expected_price_rows_at(vault, hours.map(|h| (h, 4 * h + 3)))
+}
+
+fn expected_price_rows_at(
+    vault: &str,
+    hour_blocks: impl IntoIterator<Item = (i64, i64)>,
+) -> String {
     use std::fmt::Write;
     let mut rows = String::new();
-    for h in hours {
-        let last_block = 4 * h + 3;
+    for (h, last_block) in hour_blocks {
         writeln!(
             rows,
             "{vault}\t{}\t{last_block}\t{}",
@@ -731,6 +737,149 @@ async fn price_sampler_writes_each_completed_hour_once_and_skips_failures() {
 
 #[tokio::test]
 #[serial(clickhouse)]
+async fn price_sampler_publishes_latest_before_a_blocked_archive_read() {
+    let Some((sink, ch)) = setup().await else {
+        return;
+    };
+    let (stub, url) = start_stub().await;
+    sink.write_blocks(&(0..=8).map(block).collect::<Vec<_>>())
+        .await
+        .unwrap();
+    replace_registry(&ch, &[(VAULT, 1, true)]).await;
+
+    // Hours 0 and 1 fit in one RPC wave under the default config. A reader
+    // must be able to see hour 1 without waiting for hour 0's RPC to return.
+    *stub.pause_block.lock().unwrap() = Some(3);
+    let round = sampler(&sink, &url);
+    let task = tokio::spawn(async move { round.run_once().await });
+    tokio::time::timeout(std::time::Duration::from_secs(15), stub.entered.notified())
+        .await
+        .expect("historical read dispatched");
+    assert_eq!(price_rows(&ch).await, expected_price_rows(VAULT, 1..=1));
+
+    // Publication of fresh samples doesn't authorize outstanding archive
+    // reads to write after revocation. Check the underlying table, not a view
+    // that would merely hide the revoked vault's results.
+    replace_registry(&ch, &[]).await;
+    stub.release.notify_one();
+    assert_eq!(task.await.unwrap().unwrap().written, 1);
+    assert_eq!(price_rows(&ch).await, expected_price_rows(VAULT, 1..=1));
+}
+
+#[tokio::test]
+#[serial(clickhouse)]
+async fn price_sampler_publishes_newly_completed_hours_while_archive_rpc_is_blocked() {
+    use std::time::Duration;
+    use tokio::time::{sleep, timeout};
+
+    let Some((sink, ch)) = setup().await else {
+        return;
+    };
+    let (stub, url) = start_stub().await;
+    sink.write_blocks(&(0..=8).map(block).collect::<Vec<_>>())
+        .await
+        .unwrap();
+    replace_registry(&ch, &[(VAULT, 1, true)]).await;
+    *stub.pause_block.lock().unwrap() = Some(3);
+    let sampler = EarnPriceSampler::new(
+        sink.clone(),
+        RpcClient::new(&url),
+        4217,
+        EarnPricesConfig {
+            interval_secs: 1,
+            concurrency: 2,
+            ..Default::default()
+        },
+    );
+    let (shutdown, rx) = tokio::sync::broadcast::channel(1);
+    let worker = tokio::spawn(sampler.run(rx));
+    timeout(Duration::from_secs(15), stub.entered.notified())
+        .await
+        .expect("archive RPC dispatched");
+
+    // Only now does hour 2 complete. Merely committing fresh prices first
+    // within each round cannot pass: the old round would still be blocked.
+    sink.write_blocks(&(9..=12).map(block).collect::<Vec<_>>())
+        .await
+        .unwrap();
+    let reader = &ch;
+    let wait_for_rows = |expected: String| async move {
+        timeout(Duration::from_secs(8), async {
+            while !price_rows(reader).await.contains(&expected) {
+                sleep(Duration::from_millis(100)).await;
+            }
+        })
+        .await
+    };
+    wait_for_rows(expected_price_rows(VAULT, 2..=2))
+        .await
+        .expect("hour 2 visible before releasing the archive RPC");
+
+    stub.release.notify_one();
+    wait_for_rows(expected_price_rows(VAULT, 0..=2))
+        .await
+        .expect("archive repair finishes after release");
+    shutdown.send(()).unwrap();
+    timeout(Duration::from_secs(8), worker)
+        .await
+        .expect("sampler shuts down")
+        .unwrap();
+    assert_eq!(price_rows(&ch).await, expected_price_rows(VAULT, 0..=2));
+}
+
+#[tokio::test]
+#[serial(clickhouse)]
+async fn price_sampler_backfills_across_a_blockless_hour_and_restarts_without_rpc() {
+    let Some((sink, ch)) = setup().await else {
+        return;
+    };
+    let (stub, url) = start_stub().await;
+
+    // Consecutive heights across a clock gap: block 7 is in hour 1 and its
+    // immediate successor 8 is in hour 4. Hours 2 and 3 never had blocks.
+    let blocks: Vec<_> = (0..=16)
+        .map(|num| {
+            let mut b = block(num);
+            if num >= 8 {
+                b.timestamp += chrono::Duration::hours(2);
+                b.timestamp_ms = b.timestamp.timestamp_millis();
+            }
+            b
+        })
+        .collect();
+    sink.write_blocks(&blocks).await.unwrap();
+    replace_registry(&ch, &[(VAULT, 1, true)]).await;
+    let new_sampler = || {
+        EarnPriceSampler::new(
+            sink.clone(),
+            RpcClient::new(&url),
+            4217,
+            EarnPricesConfig {
+                batch: 1,
+                ..Default::default()
+            },
+        )
+    };
+    let sampler = new_sampler();
+    let expected = expected_price_rows_at(VAULT, [(0, 3), (1, 7), (4, 11), (5, 15)]);
+    for _ in 0..10 {
+        sampler.run_once().await.unwrap();
+        if price_rows(&ch).await == expected {
+            break;
+        }
+    }
+    assert_eq!(price_rows(&ch).await, expected);
+    drop(sampler);
+
+    assert_eq!(new_sampler().run_once().await.unwrap().written, 0);
+    let mut calls = stub.calls.lock().unwrap().clone();
+    calls.sort_unstable();
+    assert_eq!(calls, [3, 7, 11, 15].map(|n| (VAULT.to_string(), n)));
+    assert_eq!(price_rows(&ch).await, expected);
+}
+
+#[tokio::test]
+#[serial(clickhouse)]
 async fn price_sampler_discards_results_revoked_during_rpc() {
     let Some((sink, ch)) = setup().await else {
         return;
@@ -741,7 +890,7 @@ async fn price_sampler_discards_results_revoked_during_rpc() {
         .await
         .expect("one completed hour");
 
-    *stub.pause.lock().unwrap() = true;
+    *stub.pause_block.lock().unwrap() = Some(3);
     let round = sampler(&sink, &url);
     let task = tokio::spawn(async move { round.run_once().await });
     tokio::time::timeout(std::time::Duration::from_secs(15), stub.entered.notified())
@@ -761,19 +910,20 @@ async fn price_sampler_waits_for_the_last_block_of_an_hour_and_requires_live_vau
     let Some((sink, ch)) = setup().await else {
         return;
     };
-    let (_stub, url) = start_stub().await;
+    let (stub, url) = start_stub().await;
+    let sampler = sampler(&sink, &url);
 
     // Block 11 (the last of hour 2) is missing, so hour 2 must not be sampled
     // at block 10.
     let blocks: Vec<_> = (0..=16).filter(|n| *n != 11).map(block).collect();
     sink.write_blocks(&blocks).await.expect("blocks");
     replace_registry(&ch, &[(VAULT, 5, false)]).await;
-    let report = sampler(&sink, &url).run_once().await.unwrap();
+    let report = sampler.run_once().await.unwrap();
     assert_eq!(report, SampleReport::default());
     assert_eq!(price_rows(&ch).await, "");
 
     replace_registry(&ch, &[(VAULT, 5, true)]).await;
-    let report = sampler(&sink, &url).run_once().await.unwrap();
+    let report = sampler.run_once().await.unwrap();
     assert_eq!(
         report,
         SampleReport {
@@ -787,9 +937,12 @@ async fn price_sampler_waits_for_the_last_block_of_an_hour_and_requires_live_vau
     assert_eq!(price_rows(&ch).await, expected);
 
     sink.write_blocks(&[block(11)]).await.expect("gap filled");
-    let report = sampler(&sink, &url).run_once().await.unwrap();
+    let report = sampler.run_once().await.unwrap();
     assert_eq!(report.written, 1);
     assert_eq!(price_rows(&ch).await, expected_price_rows(VAULT, 1..=3));
+    let mut calls = stub.calls.lock().unwrap().clone();
+    calls.sort_unstable();
+    assert_eq!(calls, [7, 11, 15].map(|n| (VAULT.to_string(), n)));
 }
 
 #[test]

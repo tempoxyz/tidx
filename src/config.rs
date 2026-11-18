@@ -356,15 +356,15 @@ pub struct EarnPricesConfig {
     #[serde(default = "default_true")]
     pub enabled: bool,
 
-    /// Seconds between sampling rounds (default: 60).
+    /// Seconds between polls of each sampling lane (default: 60).
     #[serde(default = "default_earn_prices_interval_secs")]
     pub interval_secs: u64,
 
-    /// Most (vault, hour) samples read per round, newest hours first (default: 2000).
+    /// Maximum vault-hour pairs examined per page in each lane (default: 2000).
     #[serde(default = "default_earn_prices_batch")]
     pub batch: usize,
 
-    /// Concurrent `eth_call` requests (default: 4).
+    /// Maximum concurrent `eth_call` requests across head and repair (default: 4).
     #[serde(default = "default_earn_prices_concurrency")]
     pub concurrency: usize,
 }

@@ -228,9 +228,9 @@ password_env = "TIDX_PG_PASSWORD"
 │   ├── replicated_database bool      = false        Create the database as ENGINE = Replicated with Replicated* table engines
 │   └── [earn_prices]                                Hourly Earn vault share price sampler (earn_vault_price_hours)
 │       ├── enabled         bool      = true         Sample vault prices over RPC (needs archive state for backfill)
-│       ├── interval_secs   u64       = 60           Seconds between sampling rounds
-│       ├── batch           usize     = 2000         Most samples per round, newest hours first
-│       └── concurrency     usize     = 4            Concurrent eth_call requests
+│       ├── interval_secs   u64       = 60           Seconds between polls of each sampling lane
+│       ├── batch           usize     = 2000         Maximum vault-hour pairs per page in each lane
+│       └── concurrency     usize     = 4            Concurrent eth_call requests across both lanes
 └── [retention]                                      Tiered storage (PostgreSQL hot window)
     ├── pg_keep             string    (required)     Recent data kept in PostgreSQL, e.g. "30d" or "36h"
     ├── prune_interval      string    = "1h"         How often the pruner runs
@@ -1002,7 +1002,9 @@ The table maps each event to an account and quantities in the event's original u
 
 For each approved vault, the sampler reads `previewRedeem(1e18)` at the last indexed block of each completed hour since deployment. It needs archive RPC access for earlier hours. It checks the registry before dispatching calls and before writing their results. Removal stops new sampling; previously recorded prices remain in storage. A failed call leaves the price missing.
 
-Enable or disable the sampler, set its interval, or limit batch size and concurrency under `[chains.clickhouse.earn_prices]`. Read with `FINAL` for one price per vault and hour. The metrics `tidx_earn_price_lag_seconds` and `tidx_earn_price_missing_hours` describe pricing coverage, not registry freshness.
+The latest completed hour has its own polling loop. A second loop checks older hours in 24-hour windows, skipping prices already stored. Each loop commits small groups of prices as it goes. Restarting resets the scan position, not the prices. An hour with no blocks has no quote; if indexing fills a gap later, repair picks it up on another pass.
+
+Set the polling interval, page size and shared RPC concurrency under `[chains.clickhouse.earn_prices]`. With concurrency set to one, a new hour may wait for one in-flight archive request, not an entire page. Read prices with `FINAL` for one row per vault and hour. The `tidx_earn_price_page_missing` gauge counts failed or deferred pairs on the last processed page of each lane, not all outstanding history. The `tidx_earn_price_head_hour_timestamp_seconds` gauge reports the latest completed hour seen by the head loop; it does not certify price coverage or registry freshness.
 
 | Column | Type | Description |
 |--------|------|-------------|

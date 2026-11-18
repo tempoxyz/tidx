@@ -20,17 +20,19 @@ pub fn record_logs_indexed(chain_id: u64, count: u64) {
     counter!("tidx_logs_indexed_total", &labels).increment(count);
 }
 
-/// Seconds between the end of the oldest vault's newest sampled hour and now,
-/// or 0 when every vault is sampled through the last completed hour.
-pub fn set_earn_price_lag(chain_id: u64, seconds: u64) {
-    let labels = [("chain_id", chain_id.to_string())];
-    gauge!("tidx_earn_price_lag_seconds", &labels).set(seconds as f64);
+/// Unsampled pairs on the last processed page, not a chain-wide backlog.
+pub fn set_earn_price_page_missing(chain_id: u64, lane: &'static str, count: u64) {
+    let labels = [
+        ("chain_id", chain_id.to_string()),
+        ("lane", lane.to_string()),
+    ];
+    gauge!("tidx_earn_price_page_missing", &labels).set(count as f64);
 }
 
-/// (vault, hour) price samples still missing since each vault's deployment.
-pub fn set_earn_price_missing_hours(chain_id: u64, count: u64) {
+/// Start of the head hour the sampler is inspecting (not a coverage watermark).
+pub fn set_earn_price_head_hour(chain_id: u64, timestamp: u32) {
     let labels = [("chain_id", chain_id.to_string())];
-    gauge!("tidx_earn_price_missing_hours", &labels).set(count as f64);
+    gauge!("tidx_earn_price_head_hour_timestamp_seconds", &labels).set(f64::from(timestamp));
 }
 
 pub fn record_earn_price_samples(chain_id: u64, result: &'static str, count: u64) {
