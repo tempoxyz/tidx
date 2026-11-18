@@ -20,6 +20,27 @@ pub fn record_logs_indexed(chain_id: u64, count: u64) {
     counter!("tidx_logs_indexed_total", &labels).increment(count);
 }
 
+/// Seconds between the end of the oldest vault's newest sampled hour and now,
+/// or 0 when every vault is sampled through the last completed hour.
+pub fn set_earn_price_lag(chain_id: u64, seconds: u64) {
+    let labels = [("chain_id", chain_id.to_string())];
+    gauge!("tidx_earn_price_lag_seconds", &labels).set(seconds as f64);
+}
+
+/// (vault, hour) price samples still missing since each vault's deployment.
+pub fn set_earn_price_missing_hours(chain_id: u64, count: u64) {
+    let labels = [("chain_id", chain_id.to_string())];
+    gauge!("tidx_earn_price_missing_hours", &labels).set(count as f64);
+}
+
+pub fn record_earn_price_samples(chain_id: u64, result: &'static str, count: u64) {
+    let labels = [
+        ("chain_id", chain_id.to_string()),
+        ("result", result.to_string()),
+    ];
+    counter!("tidx_earn_price_samples_total", &labels).increment(count);
+}
+
 pub fn set_sync_head(chain_id: u64, block_num: u64) {
     let labels = [("chain_id", chain_id.to_string())];
     gauge!("tidx_sync_head_block", &labels).set(block_num as f64);

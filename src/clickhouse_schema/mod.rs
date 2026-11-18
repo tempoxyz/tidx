@@ -2,6 +2,7 @@ mod address_balances;
 mod base;
 mod catalog;
 mod dex;
+mod earn;
 mod token_balances;
 mod token_metadata;
 mod token_supply;
@@ -40,6 +41,7 @@ pub fn derived_objects() -> impl DoubleEndedIterator<Item = &'static ClickHouseO
         .chain(token_transfer_stats::OBJECTS.iter())
         .chain(address_balances::OBJECTS.iter())
         .chain(dex::OBJECTS.iter())
+        .chain(earn::OBJECTS.iter())
 }
 
 /// Tables and views that the public `/query` HTTP surface may reference.

@@ -225,7 +225,13 @@ password_env = "TIDX_PG_PASSWORD"
 │   ├── url                 string    = "http://clickhouse:8123"  ClickHouse HTTP URL
 │   ├── fdw_url             string    = url          ClickHouse URL as reachable from PostgreSQL (pg_clickhouse FDW)
 │   ├── repair_derived_on_startup bool = true        Repair historical derived-table gaps on startup
-│   └── replicated_database bool      = false        Create the database as ENGINE = Replicated with Replicated* table engines
+│   ├── replicated_database bool      = false        Create the database as ENGINE = Replicated with Replicated* table engines
+│   └── [earn_prices]                                Hourly Earn vault share price sampler (earn_vault_price_hours)
+│       ├── enabled         bool      = true         Sample vault prices over RPC (needs archive state for backfill)
+│       ├── factories       string[]  = []           Only sample vaults from these factories (default: every vault)
+│       ├── interval_secs   u64       = 60           Seconds between sampling rounds
+│       ├── batch           usize     = 2000         Most samples per round, newest hours first
+│       └── concurrency     usize     = 4            Concurrent eth_call requests
 └── [retention]                                      Tiered storage (PostgreSQL hot window)
     ├── pg_keep             string    (required)     Recent data kept in PostgreSQL, e.g. "30d" or "36h"
     ├── prune_interval      string    = "1h"         How often the pruner runs
@@ -703,6 +709,7 @@ For self-hosted multi-replica ClickHouse (coordinated by Keeper/ZooKeeper), set 
 
 | Name | Purpose |
 |------|---------|
+| [`address_balance_hours`](#address_balance_hours) | Net balance change per `(holder, token, UTC hour)` for balance history. |
 | [`address_balances`](#address_balances) | Current positive balance per `(holder, token)`. |
 | [`address_balances_snapshot`](#address_balances_snapshot) | Pre-aggregated `address_balances`, refreshed on a schedule. |
 | [`address_holder_deltas`](#address_holder_deltas) | Holder-first mirror of `token_holder_deltas`. |
@@ -711,6 +718,9 @@ For self-hosted multi-replica ClickHouse (coordinated by Keeper/ZooKeeper), set 
 | [`dex_orders`](#dex_orders) | Decoded stablecoin-DEX `OrderPlaced` events. |
 | [`dex_pair_liquidity`](#dex_pair_liquidity) | Pairs joined to their on-DEX base liquidity. |
 | [`dex_pairs`](#dex_pairs) | Decoded stablecoin-DEX `PairCreated` events. |
+| [`earn_flows`](#earn_flows) | Decoded Earn vault deposit and redemption events. |
+| [`earn_vault_price_hours`](#earn_vault_price_hours) | Hourly Earn vault share price, sampled over RPC. |
+| [`earn_vaults`](#earn_vaults) | Earn vaults discovered from their deployment events. |
 | [`token_balances`](#token_balances) | Current positive balance per `(token, holder)`. |
 | [`token_balances_snapshot`](#token_balances_snapshot) | Pre-aggregated `token_balances`, refreshed on a schedule. |
 | [`token_holder_counts`](#token_holder_counts) | Holder count per token, refreshed on a schedule. |
@@ -721,6 +731,32 @@ For self-hosted multi-replica ClickHouse (coordinated by Keeper/ZooKeeper), set 
 | [`token_transfers`](#token_transfers) | Decoded `Transfer` events. |
 
 User-defined views registered through the [`/views` API](#views-api) live alongside these in `analytics_{chainId}` and are queryable the same way.
+
+#### address_balance_hours
+
+> [!NOTE]
+> View over `address_balance_hours_snapshot` (a refreshable materialized view, recomputed every 30 minutes) for completed history plus a live aggregate of `address_holder_deltas FINAL` for the most recent hours.
+
+Net balance change of each holder for each token in each UTC hour, one row per `(holder, token, hour)` with any activity. The balance at the end of hour `H` is `sum(delta)` over `hour <= H`, so a whole balance history is one sort-key range read, carried forward between active hours. Like `address_holder_deltas`, holders exclude the zero address. The live part makes the view current and reflects reorg pruning of recent blocks immediately; historical repairs reach the snapshot on its next refresh.
+
+| Column | Type | Description |
+|--------|------|-------------|
+| `holder` | `String` | Holder address |
+| `token` | `String` | Token contract |
+| `hour` | `DateTime('UTC')` | Start of the UTC hour |
+| `delta` | `Int256` | Signed net balance change of `(holder, token)` in that hour |
+
+```bash
+# Balance at the end of each active hour, plus the opening balance before the range
+curl -G "https://indexer.testnet.tempo.xyz/query" \
+  --data-urlencode "chainId=42431" \
+  --data-urlencode "engine=clickhouse" \
+  --data-urlencode "sql=SELECT hour, toString(sum(delta) OVER (ORDER BY hour)) AS balance
+    FROM address_balance_hours
+    WHERE holder = '0x70997970c51812dc3a010c7d01b50e0d17dc79c8'
+      AND token = '0x20c0000000000000000000000000000000000000'
+    ORDER BY hour"
+```
 
 #### address_balances
 
@@ -924,6 +960,86 @@ curl -G "https://indexer.testnet.tempo.xyz/query" \
     LIMIT 20"
 ```
 
+
+#### earn_vaults
+
+> [!NOTE]
+> Materialized view over `logs`, kept in sync on reorg.
+
+Earn vaults decoded from their deployment events: `EarnStackDeployed(address indexed earnVault, address indexed earnShare, address indexed earnFees, address engine, address asset, address owner, …)` (topic0 `0x420632dc…`) and the later deployment event layout with the same indexed fields and leading data words (topic0 `0x950acdb9…`). Any contract can emit these logs, so `factory` records the emitter: filter on the factories you trust. `ReplacingMergeTree` ordered by `(vault, deployed_block, log_idx)`; read it with `FINAL`.
+
+| Column | Type | Description |
+|--------|------|-------------|
+| `deployed_block` | `Int64` | Block of the deployment event |
+| `deployed_at` | `DateTime64(3, 'UTC')` | Block timestamp |
+| `tx_hash` | `String` | Transaction hash |
+| `log_idx` | `Int32` | Log index |
+| `factory` | `String` | Contract that emitted the deployment event |
+| `selector` | `LowCardinality(String)` | Deployment event topic0 |
+| `vault` | `String` | Earn vault address |
+| `share_token` | `String` | Vault share token |
+| `fees` | `String` | Fees contract |
+| `engine` | `String` | Engine contract |
+| `asset` | `String` | Underlying asset token |
+| `owner` | `String` | Initial owner |
+
+#### earn_flows
+
+> [!NOTE]
+> Materialized view over `logs`, kept in sync on reorg.
+
+One row per Earn vault deposit or redemption event. Amounts are the raw unsigned event values; readers apply signs by `kind`. `vault` is the emitting contract and any contract can emit these signatures, so join on `earn_vaults` (or your own vault list). `ReplacingMergeTree` ordered by `(vault, account, block_num, log_idx)`; read it with `FINAL`.
+
+| `kind` | Event | `account` | `caller` | `request_id` | `assets` | `shares` |
+|--------|-------|-----------|----------|--------------|----------|----------|
+| `deposited` | `Deposited(address indexed caller, address indexed receiver, uint256 assets, uint256 earnShares)` | receiver | caller | | `assets` | `earnShares` |
+| `redeemed` | `Redeemed(address indexed caller, address indexed receiver, uint256 earnShares, uint256 assets)` | receiver | caller | | `assets` | `earnShares` |
+| `withdrew_exact` | `WithdrewExact(address indexed caller, address indexed receiver, uint256 assets, uint256 earnSharesBurned)` | receiver | caller | | `assets` | `earnSharesBurned` |
+| `redeem_requested` | `RedeemRequested(bytes32 indexed requestId, address indexed requester, address indexed receiver, uint256 earnShares)` | requester | | `requestId` | 0 | `earnShares` |
+| `redeem_finalized` | `RedeemFinalized(bytes32 indexed requestId, address indexed receiver, uint256 earnShares, address asset, uint256 assets)` | receiver | | `requestId` | `assets` | `earnShares` |
+| `redeem_cancelled` | `RedeemCancelled(bytes32 indexed requestId, address indexed receiver, uint256 earnShares)` | receiver | | `requestId` | 0 | `earnShares` |
+| `venue_shares_deposited` | `VenueSharesDeposited(address indexed caller, address indexed receiver, uint256 requestedVenueShares, uint256 receivedVenueShares, uint256 earnShares)` | receiver | caller | | `receivedVenueShares` (venue share units) | `earnShares` |
+
+| Column | Type | Description |
+|--------|------|-------------|
+| `block_num` | `Int64` | Block number |
+| `block_timestamp` | `DateTime64(3, 'UTC')` | Block timestamp |
+| `tx_hash` | `String` | Transaction hash |
+| `log_idx` | `Int32` | Log index |
+| `vault` | `String` | Emitting vault |
+| `account` | `String` | Receiver, or requester for `redeem_requested` |
+| `caller` | `String` | Caller, or `''` for request events |
+| `request_id` | `String` | Redeem request ID (32-byte hex), or `''` |
+| `kind` | `LowCardinality(String)` | Event kind (see above) |
+| `assets` | `Int256` | Raw unsigned asset amount |
+| `shares` | `Int256` | Raw unsigned vault share amount |
+
+#### earn_vault_price_hours
+
+> [!NOTE]
+> Written by the tidx Earn price sampler over RPC, not from logs. Rows at or above a reorged block are pruned and written again.
+
+For every vault in `earn_vaults` and every completed UTC hour since its deployment, `previewRedeem(1e18)` read with `eth_call` at the last block of that hour. The sampler writes the hour that just completed within one interval and backfills older hours with historical calls, so the RPC must serve archive state. It only writes values it read: a failed or reverted call leaves the hour missing and is retried with backoff. `ReplacingMergeTree` keyed on `(vault, hour)`; read it with `FINAL`. Configure it under `[chains.clickhouse.earn_prices]`; `tidx_earn_price_lag_seconds` and `tidx_earn_price_missing_hours` report how far it is behind.
+
+| Column | Type | Description |
+|--------|------|-------------|
+| `vault` | `String` | Earn vault |
+| `hour` | `DateTime('UTC')` | Start of the UTC hour |
+| `block_num` | `Int64` | Last block whose timestamp falls inside `hour` |
+| `assets_per_1e18_shares` | `UInt256` | `previewRedeem(1e18)` at `block_num` |
+| `sampled_at` | `DateTime('UTC')` | When the sampler wrote the row |
+
+```bash
+# A position's value at the end of each hour: shares × price / 1e18
+curl -G "https://indexer.testnet.tempo.xyz/query" \
+  --data-urlencode "chainId=42431" \
+  --data-urlencode "engine=clickhouse" \
+  --data-urlencode "sql=SELECT hour, toString(assets_per_1e18_shares) AS price
+    FROM earn_vault_price_hours FINAL
+    WHERE vault = '0x…'
+    ORDER BY hour DESC
+    LIMIT 24"
+```
 
 #### token_balances
 

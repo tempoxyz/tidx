@@ -462,6 +462,26 @@ impl RpcClient {
     }
 
     #[allow(dead_code)]
+    /// `eth_call` against `to` at `block`, returning the raw return data.
+    ///
+    /// Fails on transport errors, RPC errors (including reverts) and missing
+    /// results, so callers never mistake a failed call for empty data.
+    pub async fn eth_call(&self, to: &str, data: &str, block: u64) -> Result<Vec<u8>> {
+        let resp: RpcResponse<String> = self
+            .call(
+                "eth_call",
+                serde_json::json!([{ "to": to, "data": data }, format!("0x{block:x}")]),
+            )
+            .await?;
+        if let Some(error) = resp.error {
+            return Err(anyhow!("eth_call failed: {}", error.message));
+        }
+        let result = resp
+            .result
+            .ok_or_else(|| anyhow!("No result for eth_call"))?;
+        Ok(hex::decode(result.trim_start_matches("0x"))?)
+    }
+
     pub async fn get_logs(&self, from: u64, to: u64) -> Result<Vec<Log>> {
         let estimated_logs = ((to - from + 1) * 100) as usize;
         let mut all_logs = Vec::with_capacity(estimated_logs.min(10_000));

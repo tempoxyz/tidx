@@ -16,7 +16,9 @@ use tidx::clickhouse::ClickHouseEngine;
 use tidx::config::{ChainConfig, Config, ConfigWatcher, NewChainEvent};
 use tidx::db::{self, ThrottledPool};
 use tidx::sync::ch_sink::ClickHouseSink;
+use tidx::sync::earn_prices::EarnPriceSampler;
 use tidx::sync::engine::SyncEngine;
+use tidx::sync::fetcher::RpcClient;
 use tidx::sync::pruner::Pruner;
 use tidx::sync::sink::{ClickHouseBackfillPlan, SinkSet};
 use tidx::sync::tiered_sync::TieredSync;
@@ -434,6 +436,27 @@ fn spawn_sync_engine(
                                     );
                                 }
                                 seed_metrics_from_clickhouse(&ch_sink).await;
+                                if ch_config.earn_prices.enabled {
+                                    match EarnPriceSampler::new(
+                                        ch_sink.clone(),
+                                        RpcClient::new(&rpc_url),
+                                        chain.chain_id,
+                                        ch_config.earn_prices.clone(),
+                                    ) {
+                                        Ok(sampler) => {
+                                            info!(
+                                                chain = %chain.name,
+                                                "Earn vault price sampler enabled"
+                                            );
+                                            tokio::spawn(sampler.run(shutdown_rx.resubscribe()));
+                                        }
+                                        Err(e) => error!(
+                                            error = %e,
+                                            chain = %chain.name,
+                                            "Invalid earn_prices config; sampler disabled"
+                                        ),
+                                    }
+                                }
                                 sinks = sinks.with_clickhouse(ch_sink);
 
                                 // Tiered storage: pg_clickhouse foreign tables
