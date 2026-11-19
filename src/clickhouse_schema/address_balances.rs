@@ -7,6 +7,8 @@ const ADDRESS_HOLDER_DELTAS_SELECT: &str =
 const ADDRESS_BALANCES_VIEW: &str = include_str!("../../db/clickhouse/address_balances.sql");
 const ADDRESS_BALANCES_SNAPSHOT: &str =
     include_str!("../../db/clickhouse/address_balances_snapshot.sql");
+const ADDRESS_BALANCE_HOURS_VIEW: &str =
+    include_str!("../../db/clickhouse/address_balance_hours.sql");
 
 pub const OBJECTS: &[ClickHouseObject] = &[
     ClickHouseObject {
@@ -45,6 +47,14 @@ pub const OBJECTS: &[ClickHouseObject] = &[
         public_query: true,
         // Self-storing refreshable MV: fully replaced each refresh, so it isn't
         // block-scoped and reorg cleanup skips it.
+        block_column: None,
+        backfill: None,
+    },
+    ClickHouseObject {
+        name: "address_balance_hours",
+        kind: ClickHouseObjectKind::View(ADDRESS_BALANCE_HOURS_VIEW),
+        depends_on: &["address_holder_deltas"],
+        public_query: true,
         block_column: None,
         backfill: None,
     },
@@ -96,6 +106,17 @@ mod tests {
         assert!(ddl.contains("FROM address_holder_deltas FINAL"));
         assert!(ddl.contains("GROUP BY holder, token"));
         assert!(ddl.contains("HAVING balance > 0"));
+    }
+
+    #[test]
+    fn hourly_history_is_a_plain_view_of_the_canonical_ledger() {
+        let view = OBJECTS
+            .iter()
+            .find(|object| object.name == "address_balance_hours")
+            .unwrap();
+        assert!(view.public_query && view.is_view());
+        assert_eq!(view.depends_on, &["address_holder_deltas"]);
+        assert!(view.ddl().contains("FROM address_holder_deltas FINAL"));
     }
 
     #[test]

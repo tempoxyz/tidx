@@ -2,6 +2,7 @@ mod address_balances;
 mod base;
 mod catalog;
 mod dex;
+mod earn;
 mod token_balances;
 mod token_metadata;
 mod token_supply;
@@ -40,6 +41,7 @@ pub fn derived_objects() -> impl DoubleEndedIterator<Item = &'static ClickHouseO
         .chain(token_transfer_stats::OBJECTS.iter())
         .chain(address_balances::OBJECTS.iter())
         .chain(dex::OBJECTS.iter())
+        .chain(earn::OBJECTS.iter())
 }
 
 /// Tables and views that the public `/query` HTTP surface may reference.
@@ -80,6 +82,12 @@ pub fn block_column(table: &str) -> Option<&'static str> {
 /// Used by the sink to validate names it interpolates into DDL/queries.
 pub fn is_known_table(table: &str) -> bool {
     all_objects().any(|object| object.name == table)
+}
+
+/// Reserve the Earn namespace, including retired objects, from public reads and metadata.
+pub(crate) fn is_reserved_earn_name(name: &str) -> bool {
+    name.get(..5)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("earn_"))
 }
 
 /// True for tables/views in the public query allowlist.
@@ -180,6 +188,7 @@ mod tests {
     #[test]
     fn removed_objects_are_not_registered() {
         for name in [
+            "address_balance_hours_snapshot",
             "address_transfers",
             "address_transfers_mv",
             "address_txs",
@@ -228,6 +237,7 @@ mod tests {
                 "DROP TABLE IF EXISTS balance_dirty_keys SYNC",
                 "ALTER TABLE tidx_schema_objects\n    DELETE WHERE name = \
                  'balance_state_20260714_bootstrap'\n    SETTINGS mutations_sync = 1",
+                "DROP VIEW IF EXISTS address_balance_hours_snapshot SYNC",
             ]
         );
     }

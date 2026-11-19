@@ -14,8 +14,9 @@ use tracing::{error, info, warn};
 
 use crate::config::ClickHouseConfig;
 use crate::query::{
-    HARD_LIMIT_MAX, apply_event_signature_ctes_clickhouse, convert_timestamp_literals_clickhouse,
-    hoist_set_operation_order_by_clickhouse, validate_clickhouse_query,
+    ClickHouseReadAccess, HARD_LIMIT_MAX, apply_event_signature_ctes_clickhouse,
+    convert_timestamp_literals_clickhouse, hoist_set_operation_order_by_clickhouse,
+    validate_scoped_clickhouse_query,
 };
 
 const MAX_QUERY_RESULT_BYTES: usize = 10 * 1024 * 1024;
@@ -180,8 +181,28 @@ impl ClickHouseEngine {
         limit: i64,
         settings: &[(&str, &str)],
     ) -> Result<QueryResult> {
+        self.query_with_access(
+            sql,
+            signatures,
+            timeout_ms,
+            limit,
+            settings,
+            ClickHouseReadAccess::Public,
+        )
+        .await
+    }
+
+    pub(crate) async fn query_with_access(
+        &self,
+        sql: &str,
+        signatures: &[&str],
+        timeout_ms: u64,
+        limit: i64,
+        settings: &[(&str, &str)],
+        access: ClickHouseReadAccess,
+    ) -> Result<QueryResult> {
         let sql = Self::prepare_query(sql, signatures)?;
-        validate_clickhouse_query(&sql)?;
+        validate_scoped_clickhouse_query(&sql, access)?;
         let sql = hoist_set_operation_order_by_clickhouse(&sql);
         let sql = Self::wrap_user_query_with_limit(&sql, limit.clamp(1, HARD_LIMIT_MAX));
         // The memory cap goes last so no caller setting can override it.
@@ -921,7 +942,10 @@ mod tests {
         assert!(sql.starts_with("WITH Transfer AS ("));
         assert!(sql.contains("), recent AS ("));
         assert_eq!(sql.matches("WITH ").count(), 1);
-        assert!(validate_clickhouse_query(&sql).is_ok(), "got: {sql}");
+        assert!(
+            crate::query::validate_clickhouse_query(&sql).is_ok(),
+            "got: {sql}"
+        );
     }
 
     #[test]

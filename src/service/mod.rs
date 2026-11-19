@@ -276,13 +276,41 @@ pub async fn execute_query_clickhouse(
     signatures: &[&str],
     options: &QueryOptions,
 ) -> Result<QueryResult> {
+    execute_query_clickhouse_with_access(
+        clickhouse,
+        sql,
+        signatures,
+        options,
+        crate::query::ClickHouseReadAccess::Public,
+    )
+    .await
+}
+
+pub(crate) async fn execute_query_clickhouse_with_access(
+    clickhouse: &crate::clickhouse::ClickHouseEngine,
+    sql: &str,
+    signatures: &[&str],
+    options: &QueryOptions,
+    access: crate::query::ClickHouseReadAccess,
+) -> Result<QueryResult> {
+    // Membership and flow rows in a single Earn query must see the same
+    // registry snapshot; cached results must not survive its expiry.
+    let settings: &[(&str, &str)] = match access {
+        crate::query::ClickHouseReadAccess::Public => CH_QUERY_SETTINGS,
+        crate::query::ClickHouseReadAccess::Earn => &[
+            ("date_time_output_format", "iso"),
+            ("enable_shared_storage_snapshot_in_query", "1"),
+            ("use_query_cache", "0"),
+        ],
+    };
     let mut result = clickhouse
-        .query_user_with_settings(
+        .query_with_access(
             sql,
             signatures,
             options.timeout_ms,
             options.limit,
-            CH_QUERY_SETTINGS,
+            settings,
+            access,
         )
         .await?;
     normalize_datetime_columns(&mut result);

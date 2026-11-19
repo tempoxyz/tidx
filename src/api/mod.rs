@@ -1,3 +1,4 @@
+mod earn_reader;
 pub mod head_poller;
 mod views;
 
@@ -10,7 +11,7 @@ use tokio::sync::{RwLock, Semaphore};
 
 use anyhow::{Result as AnyhowResult, anyhow};
 use axum::{
-    Json, Router,
+    Extension, Json, Router,
     extract::{Query, State},
     http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode, header},
     response::{
@@ -30,7 +31,7 @@ use crate::broadcast::Broadcaster;
 use crate::clickhouse::ClickHouseEngine;
 use crate::config::HttpConfig;
 use crate::db::Pool;
-use crate::query::QueryTag;
+use crate::query::{ClickHouseReadAccess, QueryTag};
 use crate::service::{PostgresQuery, QueryOptions, QueryResult, SyncStatus};
 use tokio_postgres::types::Type;
 
@@ -276,6 +277,17 @@ pub fn router_shared_with_mode(
 }
 
 fn build_router(state: AppState, mode: ApiMode) -> Router<()> {
+    let reader = std::env::var("TIDX_EARN_READ_TOKEN")
+        .ok()
+        .and_then(|token| earn_reader::Credential::new(&token));
+    build_router_with_reader(state, mode, reader)
+}
+
+fn build_router_with_reader(
+    state: AppState,
+    mode: ApiMode,
+    reader: Option<earn_reader::Credential>,
+) -> Router<()> {
     let cors = CorsLayer::new()
         .allow_methods([Method::GET, Method::OPTIONS])
         .allow_headers([
@@ -294,12 +306,14 @@ fn build_router(state: AppState, mode: ApiMode) -> Router<()> {
         .route("/status", get(handle_status));
 
     if mode != ApiMode::Sync {
-        router = router.route(
-            "/query",
-            get(handle_query).layer(GlobalConcurrencyLimitLayer::with_semaphore(
-                state.query_permits.clone(),
-            )),
-        );
+        let concurrency = GlobalConcurrencyLimitLayer::with_semaphore(state.query_permits.clone());
+        router = router.route("/query", get(handle_query).layer(concurrency.clone()));
+        if let Some(reader) = reader {
+            router = router.route(
+                "/internal/earn/query",
+                earn_reader::route(reader, concurrency),
+            );
+        }
     }
 
     router = match mode {
@@ -508,6 +522,7 @@ struct QueryResponse {
 
 async fn handle_query(
     State(state): State<AppState>,
+    scope: Option<Extension<ClickHouseReadAccess>>,
     headers: HeaderMap,
     uri: axum::http::Uri,
     Query(params): Query<QueryParams>,
@@ -519,7 +534,16 @@ async fn handle_query(
     let request_id = QueryTag::new("query", None, header(QueryTag::REQUEST_ID_HEADER_NAME))
         .request_id()
         .to_owned();
-    let mut response = Box::pin(route_query(state, uri, params, caller, request_id.clone())).await;
+    let access = scope.map(|Extension(access)| access).unwrap_or_default();
+    let mut response = Box::pin(route_query(
+        state,
+        uri,
+        params,
+        caller,
+        request_id.clone(),
+        access,
+    ))
+    .await;
     if let Ok(value) = HeaderValue::from_str(&request_id) {
         response.headers_mut().insert(
             HeaderName::from_static(crate::query::tag::REQUEST_ID_HEADER),
@@ -535,6 +559,7 @@ async fn route_query(
     params: QueryParams,
     caller: Option<String>,
     request_id: String,
+    access: ClickHouseReadAccess,
 ) -> Response {
     let signatures = extract_signatures(uri.query());
 
@@ -554,6 +579,15 @@ async fn route_query(
         Err(e) => return ApiError::BadRequest(e).into_response(),
     };
 
+    if access == ClickHouseReadAccess::Earn
+        && (params.live || route != crate::query::QueryRoute::ClickHouse)
+    {
+        return ApiError::BadRequest(
+            "Earn reads require engine=clickhouse without live streaming".to_string(),
+        )
+        .into_response();
+    }
+
     if params.live {
         if route != crate::query::QueryRoute::Postgres {
             return ApiError::BadRequest(format!(
@@ -571,7 +605,7 @@ async fn route_query(
         let start = std::time::Instant::now();
         let response = tag
             .scope(Box::pin(handle_query_once(
-                state, params, signatures, route,
+                state, params, signatures, route, access,
             )))
             .await
             .into_response();
@@ -585,6 +619,7 @@ async fn handle_query_once(
     params: QueryParams,
     signatures: Vec<String>,
     route: crate::query::QueryRoute,
+    access: ClickHouseReadAccess,
 ) -> Result<Json<QueryResponse>, ApiError> {
     let pool = state
         .get_pool(Some(params.chain_id))
@@ -621,9 +656,15 @@ async fn handle_query_once(
                     ))
                 })?;
 
-            crate::service::execute_query_clickhouse(&clickhouse, &params.sql, &sigs, &options)
-                .await
-                .map_err(|e| ApiError::QueryError(e.to_string()))?
+            crate::service::execute_query_clickhouse_with_access(
+                &clickhouse,
+                &params.sql,
+                &sigs,
+                &options,
+                access,
+            )
+            .await
+            .map_err(|e| ApiError::QueryError(e.to_string()))?
         }
         crate::query::QueryRoute::Tiered => {
             // Split hot/cold at the prune boundary when possible; otherwise

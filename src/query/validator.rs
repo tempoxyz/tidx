@@ -15,6 +15,20 @@ const MAX_QUERY_LENGTH: usize = 65_536;
 const MAX_SUBQUERY_DEPTH: usize = 4;
 pub const HARD_LIMIT_MAX: i64 = 10_000;
 
+/// Native ClickHouse query scopes. Neither scope admits the registry snapshot table.
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) enum ClickHouseReadAccess {
+    #[default]
+    Public,
+    Earn,
+}
+
+#[derive(Clone, Default)]
+struct ClickHouseNames {
+    access: ClickHouseReadAccess,
+    ctes: HashSet<String>,
+}
+
 /// Validates that a SQL query is safe to execute.
 ///
 /// Uses a reject-by-default approach: only explicitly allowed tables,
@@ -63,6 +77,13 @@ pub fn validate_query(sql: &str) -> Result<()> {
 /// engine-specific scalar functions, but table functions, system catalogs, and
 /// multi-statement/non-SELECT queries are never needed for public queries.
 pub fn validate_clickhouse_query(sql: &str) -> Result<()> {
+    validate_scoped_clickhouse_query(sql, ClickHouseReadAccess::Public)
+}
+
+pub(crate) fn validate_scoped_clickhouse_query(
+    sql: &str,
+    access: ClickHouseReadAccess,
+) -> Result<()> {
     if sql.len() > MAX_QUERY_LENGTH {
         return Err(anyhow!(
             "Query too large ({} bytes, max {})",
@@ -90,9 +111,12 @@ pub fn validate_clickhouse_query(sql: &str) -> Result<()> {
 
     match &statements[0] {
         Statement::Query(query) => {
-            let cte_names = HashSet::new();
+            let cte_names = ClickHouseNames {
+                access,
+                ..Default::default()
+            };
             validate_clickhouse_query_ast(query, &cte_names, 0)?;
-            validate_clickhouse_query_nodes(query)
+            validate_clickhouse_query_nodes(query, access)
         }
         _ => Err(anyhow!("Only SELECT queries are allowed")),
     }
@@ -364,7 +388,7 @@ const CLICKHOUSE_DANGEROUS_FUNCTIONS: &[&str] = &[
 
 fn validate_clickhouse_query_ast(
     query: &Query,
-    cte_names: &HashSet<String>,
+    cte_names: &ClickHouseNames,
     depth: usize,
 ) -> Result<()> {
     if depth > MAX_SUBQUERY_DEPTH {
@@ -389,7 +413,9 @@ fn validate_clickhouse_query_ast(
                 return Err(anyhow!("FROM before SELECT is not allowed after WITH"));
             }
             validate_clickhouse_query_ast(&cte.query, &all_cte_names, depth + 1)?;
-            all_cte_names.insert(cte.alias.name.value.to_lowercase());
+            all_cte_names
+                .ctes
+                .insert(cte.alias.name.value.to_lowercase());
         }
     }
 
@@ -422,7 +448,7 @@ fn validate_clickhouse_query_ast(
 
 fn validate_clickhouse_set_expr(
     set_expr: &SetExpr,
-    cte_names: &HashSet<String>,
+    cte_names: &ClickHouseNames,
     depth: usize,
 ) -> Result<()> {
     match set_expr {
@@ -535,7 +561,7 @@ fn validate_clickhouse_wildcard_options(
 
 fn validate_clickhouse_table_with_joins(
     table: &TableWithJoins,
-    cte_names: &HashSet<String>,
+    cte_names: &ClickHouseNames,
     depth: usize,
 ) -> Result<()> {
     validate_clickhouse_table_factor(&table.relation, cte_names, depth)?;
@@ -583,7 +609,7 @@ fn validate_clickhouse_table_with_joins(
 
 fn validate_clickhouse_table_factor(
     factor: &TableFactor,
-    cte_names: &HashSet<String>,
+    cte_names: &ClickHouseNames,
     depth: usize,
 ) -> Result<()> {
     match factor {
@@ -625,7 +651,7 @@ fn validate_clickhouse_table_factor(
     }
 }
 
-fn validate_clickhouse_table_name(name: &ObjectName, cte_names: &HashSet<String>) -> Result<()> {
+fn validate_clickhouse_table_name(name: &ObjectName, cte_names: &ClickHouseNames) -> Result<()> {
     let parts: Vec<String> = name
         .0
         .iter()
@@ -644,17 +670,32 @@ fn validate_clickhouse_table_name(name: &ObjectName, cte_names: &HashSet<String>
     }
 
     let bare_name = parts.last().cloned().unwrap_or_default();
+    // Resolve reserved names before CTEs: aliases must not mask a private object.
+    if crate::clickhouse_schema::is_reserved_earn_name(&bare_name) {
+        return if parts.len() == 1
+            && cte_names.access == ClickHouseReadAccess::Earn
+            && name.0[0].as_ident().is_some_and(|ident| {
+                matches!(
+                    ident.value.as_str(),
+                    "earn_vaults" | "earn_flows" | "earn_vault_price_hours"
+                )
+            }) {
+            Ok(())
+        } else {
+            Err(anyhow!("Access to table '{bare_name}' is not allowed"))
+        };
+    }
     if parts.len() == 1 && crate::clickhouse_schema::is_public_query_table(&bare_name) {
         return Ok(());
     }
-    if parts.len() == 1 && cte_names.contains(&bare_name) {
+    if parts.len() == 1 && cte_names.ctes.contains(&bare_name) {
         return Ok(());
     }
 
     Err(anyhow!("Access to table '{bare_name}' is not allowed"))
 }
 
-fn validate_clickhouse_expr(expr: &Expr, cte_names: &HashSet<String>, depth: usize) -> Result<()> {
+fn validate_clickhouse_expr(expr: &Expr, cte_names: &ClickHouseNames, depth: usize) -> Result<()> {
     match expr {
         Expr::Identifier(_)
         | Expr::CompoundIdentifier(_)
@@ -786,7 +827,7 @@ fn validate_clickhouse_expr(expr: &Expr, cte_names: &HashSet<String>, depth: usi
 
 fn validate_clickhouse_function(
     func: &Function,
-    cte_names: &HashSet<String>,
+    cte_names: &ClickHouseNames,
     depth: usize,
 ) -> Result<()> {
     validate_clickhouse_function_name(func)?;
@@ -866,7 +907,7 @@ fn validate_clickhouse_function_name(func: &Function) -> Result<()> {
 
 fn validate_clickhouse_named_window(
     window: &sqlparser::ast::NamedWindowDefinition,
-    cte_names: &HashSet<String>,
+    cte_names: &ClickHouseNames,
     depth: usize,
 ) -> Result<()> {
     match &window.1 {
@@ -879,7 +920,7 @@ fn validate_clickhouse_named_window(
 
 fn validate_clickhouse_window_spec(
     spec: &sqlparser::ast::WindowSpec,
-    cte_names: &HashSet<String>,
+    cte_names: &ClickHouseNames,
     depth: usize,
 ) -> Result<()> {
     for expr in &spec.partition_by {
@@ -899,7 +940,7 @@ fn validate_clickhouse_window_spec(
 
 fn validate_clickhouse_window_frame_bound(
     bound: &sqlparser::ast::WindowFrameBound,
-    cte_names: &HashSet<String>,
+    cte_names: &ClickHouseNames,
     depth: usize,
 ) -> Result<()> {
     match bound {
@@ -915,7 +956,7 @@ fn validate_clickhouse_window_frame_bound(
 
 fn validate_clickhouse_order_by_expr(
     order_expr: &sqlparser::ast::OrderByExpr,
-    cte_names: &HashSet<String>,
+    cte_names: &ClickHouseNames,
     depth: usize,
 ) -> Result<()> {
     validate_clickhouse_expr(&order_expr.expr, cte_names, depth)?;
@@ -930,9 +971,12 @@ fn validate_clickhouse_order_by_expr(
 /// Second pass over every node of the statement. The walk above enforces the
 /// detailed rules; this pass guarantees that a field the walk does not know
 /// about cannot hide a denied function or a table outside the allowlist.
-fn validate_clickhouse_query_nodes(query: &Query) -> Result<()> {
+fn validate_clickhouse_query_nodes(query: &Query, access: ClickHouseReadAccess) -> Result<()> {
     let mut visitor = ClickHouseNodeValidator {
-        cte_names: HashSet::new(),
+        cte_names: ClickHouseNames {
+            access,
+            ..Default::default()
+        },
     };
     match query.visit(&mut visitor) {
         ControlFlow::Continue(()) => Ok(()),
@@ -942,7 +986,7 @@ fn validate_clickhouse_query_nodes(query: &Query) -> Result<()> {
 
 struct ClickHouseNodeValidator {
     /// CTE names of the whole statement. The scoped check stays in the walk.
-    cte_names: HashSet<String>,
+    cte_names: ClickHouseNames,
 }
 
 impl Visitor for ClickHouseNodeValidator {
@@ -957,7 +1001,9 @@ impl Visitor for ClickHouseNodeValidator {
                         "FROM before SELECT is not allowed after WITH"
                     ));
                 }
-                self.cte_names.insert(cte.alias.name.value.to_lowercase());
+                self.cte_names
+                    .ctes
+                    .insert(cte.alias.name.value.to_lowercase());
             }
         }
         ControlFlow::Continue(())
@@ -1179,6 +1225,9 @@ fn validate_table_name(name: &ObjectName, cte_names: &HashSet<String>) -> Result
 
     let bare_name = name_parts.last().cloned().unwrap_or_default();
 
+    if crate::clickhouse_schema::is_reserved_earn_name(&bare_name) {
+        return Err(anyhow!("Access to table '{bare_name}' is not allowed"));
+    }
     if POSTGRES_ALLOWED_TABLES.contains(&bare_name.as_str()) {
         return Ok(());
     }
@@ -1654,6 +1703,34 @@ fn validate_window_frame_bound(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn earn_reader_table_scope() {
+        for name in ["earn_vaults", "earn_flows", "earn_vault_price_hours"] {
+            let sql = format!("SELECT * FROM {name}");
+            assert!(validate_scoped_clickhouse_query(&sql, ClickHouseReadAccess::Earn).is_ok());
+            assert!(validate_clickhouse_query(&sql).is_err());
+            assert!(validate_query(&sql).is_err());
+        }
+        for sql in [
+            "SELECT vault FROM earn_verified_vaults",
+            "SELECT vault FROM other_db.earn_vaults",
+            "SELECT * FROM system.tables",
+            "SELECT * FROM EARN_VAULTS",
+            "SELECT * FROM earn_vaults_mv",
+            "SELECT * FROM logs WHERE address IN (SELECT vault FROM earn_verified_vaults)",
+        ] {
+            assert!(
+                validate_scoped_clickhouse_query(sql, ClickHouseReadAccess::Earn).is_err(),
+                "{sql}"
+            );
+            assert!(validate_clickhouse_query(sql).is_err(), "{sql}");
+        }
+        let history = "WITH held AS (SELECT token FROM address_balance_hours) SELECT vault FROM earn_vaults WHERE share_token IN (SELECT token FROM held)";
+        assert!(validate_scoped_clickhouse_query(history, ClickHouseReadAccess::Earn).is_ok());
+        assert!(validate_clickhouse_query(history).is_err());
+        assert!(validate_clickhouse_query("SELECT token FROM address_balance_hours").is_ok());
+    }
 
     #[test]
     fn test_simple_select() {
@@ -2438,9 +2515,11 @@ mod tests {
     /// so that neither pass can hide a gap in the other.
     fn assert_clickhouse_rejects(sql: &str, walk_error: &str, visitor_error: &str) {
         let query = parse_query(&sqlparser::dialect::ClickHouseDialect {}, sql);
-        let walk = validate_clickhouse_query_ast(&query, &HashSet::new(), 0).expect_err(sql);
+        let walk =
+            validate_clickhouse_query_ast(&query, &ClickHouseNames::default(), 0).expect_err(sql);
         assert_eq!(walk.to_string(), walk_error, "walk: {sql}");
-        let visitor = validate_clickhouse_query_nodes(&query).expect_err(sql);
+        let visitor =
+            validate_clickhouse_query_nodes(&query, ClickHouseReadAccess::Public).expect_err(sql);
         assert_eq!(visitor.to_string(), visitor_error, "visitor: {sql}");
         let error = validate_clickhouse_query(sql).expect_err(sql);
         assert_eq!(error.to_string(), walk_error, "{sql}");
@@ -2547,7 +2626,7 @@ mod tests {
         // if that ever changes.
         let walk_error = |dialect: &dyn sqlparser::dialect::Dialect, sql: &str| {
             let query = parse_query(dialect, sql);
-            let walk = validate_clickhouse_query_ast(&query, &HashSet::new(), 0);
+            let walk = validate_clickhouse_query_ast(&query, &ClickHouseNames::default(), 0);
             walk.expect_err(sql).to_string()
         };
 
@@ -2693,7 +2772,7 @@ mod tests {
         ] {
             // The walk does not look at these positions, only the visitor pass does.
             let query = parse_query(&sqlparser::dialect::ClickHouseDialect {}, sql);
-            let walk = validate_clickhouse_query_ast(&query, &HashSet::new(), 0);
+            let walk = validate_clickhouse_query_ast(&query, &ClickHouseNames::default(), 0);
             assert!(walk.is_ok(), "{sql}: {walk:?}");
             let result = validate_clickhouse_query(sql);
             assert_eq!(result.expect_err(sql).to_string(), error, "{sql}");

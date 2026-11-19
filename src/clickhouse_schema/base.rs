@@ -152,6 +152,8 @@ const DROP_BALANCE_REORG_KEYS_20260715: &str =
     include_str!("../../db/clickhouse/migrations/20260715_drop_balance_reorg_keys.sql");
 const DROP_BALANCE_DIRTY_KEYS_20260715: &str =
     include_str!("../../db/clickhouse/migrations/20260715_drop_balance_dirty_keys.sql");
+const DROP_ADDRESS_BALANCE_HOURS_SNAPSHOT_20261118: &str =
+    include_str!("../../db/clickhouse/migrations/20261118_drop_address_balance_hours_snapshot.sql");
 const FORGET_BALANCE_STATE_BOOTSTRAP_20260715: &str =
     include_str!("../../db/clickhouse/migrations/20260715_forget_balance_state_bootstrap.sql");
 
@@ -173,6 +175,7 @@ pub(super) const RETIRED_OBJECT_DROPS: &[&str] = &[
     DROP_BALANCE_REORG_KEYS_20260715,
     DROP_BALANCE_DIRTY_KEYS_20260715,
     FORGET_BALANCE_STATE_BOOTSTRAP_20260715,
+    DROP_ADDRESS_BALANCE_HOURS_SNAPSHOT_20261118,
 ];
 
 pub const TABLES: &[ClickHouseObject] = &[
@@ -209,6 +212,20 @@ pub const TABLES: &[ClickHouseObject] = &[
         backfill: None,
     },
 ];
+
+// One-shot, before the new views are installed: these objects contain
+// reconstructible data from the former, unverified staging index. Retire
+// the writers first. Never drop canonical logs, balances, or the registry.
+const fn retire_earn_stage(name: &'static str, ddl: &'static str) -> ClickHouseObject {
+    ClickHouseObject {
+        name,
+        kind: ClickHouseObjectKind::Migration(ddl),
+        depends_on: &[],
+        public_query: false,
+        block_column: None,
+        backfill: None,
+    }
+}
 
 pub const MIGRATIONS: &[ClickHouseObject] = &[
     ClickHouseObject {
@@ -502,6 +519,26 @@ pub const MIGRATIONS: &[ClickHouseObject] = &[
         block_column: None,
         backfill: None,
     },
+    retire_earn_stage(
+        "earn_20261118_retire_vaults_mv",
+        "DROP VIEW IF EXISTS earn_vaults_mv SYNC",
+    ),
+    retire_earn_stage(
+        "earn_20261118_retire_flows_mv",
+        "DROP VIEW IF EXISTS earn_flows_mv SYNC",
+    ),
+    retire_earn_stage(
+        "earn_20261118_retire_vaults",
+        "DROP TABLE IF EXISTS earn_vaults SYNC",
+    ),
+    retire_earn_stage(
+        "earn_20261118_retire_flows",
+        "DROP TABLE IF EXISTS earn_flows SYNC",
+    ),
+    retire_earn_stage(
+        "earn_20261118_retire_prices",
+        "DROP TABLE IF EXISTS earn_vault_price_hours SYNC",
+    ),
 ];
 
 /// One-shot migrations that mutate derived tables, so they run after those

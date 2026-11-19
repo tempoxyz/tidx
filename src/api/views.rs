@@ -90,7 +90,7 @@ fn forwarded_client_ip(headers: &HeaderMap, state: &AppState) -> Option<IpAddr> 
 
 /// Validate view name (alphanumeric + underscore only)
 fn is_valid_view_name(name: &str) -> bool {
-    is_valid_identifier(name)
+    is_valid_identifier(name) && !crate::clickhouse_schema::is_reserved_earn_name(name)
 }
 
 /// Validate that a string is a safe SQL identifier.
@@ -173,6 +173,9 @@ pub async fn list_views(
             .and_then(|v| v.as_str())
             .unwrap_or("")
             .to_string();
+        if crate::clickhouse_schema::is_reserved_earn_name(&name) {
+            continue;
+        }
         let engine = row
             .get(1)
             .and_then(|v| v.as_str())
@@ -518,6 +521,8 @@ mod tests {
 
     #[test]
     fn test_valid_view_name() {
+        assert!(!is_valid_view_name("earn_vaults"));
+        assert!(!is_valid_view_name("earn_verified_vaults"));
         assert!(is_valid_view_name("token_balances"));
         assert!(is_valid_view_name("my_view_123"));
         assert!(is_valid_view_name("View1"));

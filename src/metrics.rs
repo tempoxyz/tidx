@@ -20,6 +20,29 @@ pub fn record_logs_indexed(chain_id: u64, count: u64) {
     counter!("tidx_logs_indexed_total", &labels).increment(count);
 }
 
+/// Unsampled pairs on the last processed page, not a chain-wide backlog.
+pub fn set_earn_price_page_missing(chain_id: u64, lane: &'static str, count: u64) {
+    let labels = [
+        ("chain_id", chain_id.to_string()),
+        ("lane", lane.to_string()),
+    ];
+    gauge!("tidx_earn_price_page_missing", &labels).set(count as f64);
+}
+
+/// Start of the head hour the sampler is inspecting (not a coverage watermark).
+pub fn set_earn_price_head_hour(chain_id: u64, timestamp: u32) {
+    let labels = [("chain_id", chain_id.to_string())];
+    gauge!("tidx_earn_price_head_hour_timestamp_seconds", &labels).set(f64::from(timestamp));
+}
+
+pub fn record_earn_price_samples(chain_id: u64, result: &'static str, count: u64) {
+    let labels = [
+        ("chain_id", chain_id.to_string()),
+        ("result", result.to_string()),
+    ];
+    counter!("tidx_earn_price_samples_total", &labels).increment(count);
+}
+
 pub fn set_sync_head(chain_id: u64, block_num: u64) {
     let labels = [("chain_id", chain_id.to_string())];
     gauge!("tidx_sync_head_block", &labels).set(block_num as f64);

@@ -340,6 +340,56 @@ pub struct ClickHouseConfig {
     /// and tables are never converted.
     #[serde(default)]
     pub replicated_database: bool,
+
+    /// Hourly Earn vault share price sampler (`earn_vault_price_hours`).
+    #[serde(default)]
+    pub earn_prices: EarnPricesConfig,
+}
+
+/// Samples `previewRedeem(1e18)` of every vault in `earn_vaults` at the last
+/// block of each completed UTC hour, and backfills earlier hours with
+/// historical `eth_call`s (the RPC must serve archive state).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EarnPricesConfig {
+    /// Run the sampler when ClickHouse is enabled (default: true). It does
+    /// nothing without live, verified vaults for this chain.
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+
+    /// Seconds between polls of each sampling lane (default: 60).
+    #[serde(default = "default_earn_prices_interval_secs")]
+    pub interval_secs: u64,
+
+    /// Maximum vault-hour pairs examined per page in each lane (default: 2000).
+    #[serde(default = "default_earn_prices_batch")]
+    pub batch: usize,
+
+    /// Maximum concurrent `eth_call` requests across head and repair (default: 4).
+    #[serde(default = "default_earn_prices_concurrency")]
+    pub concurrency: usize,
+}
+
+impl Default for EarnPricesConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            interval_secs: default_earn_prices_interval_secs(),
+            batch: default_earn_prices_batch(),
+            concurrency: default_earn_prices_concurrency(),
+        }
+    }
+}
+
+fn default_earn_prices_interval_secs() -> u64 {
+    60
+}
+
+fn default_earn_prices_batch() -> usize {
+    2000
+}
+
+fn default_earn_prices_concurrency() -> usize {
+    4
 }
 
 impl ClickHouseConfig {
@@ -422,6 +472,7 @@ impl Default for ClickHouseConfig {
             repair_derived_on_startup: true,
             fdw_url: None,
             replicated_database: false,
+            earn_prices: EarnPricesConfig::default(),
         }
     }
 }

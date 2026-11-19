@@ -573,6 +573,12 @@ impl ClickHouseSink {
         &self.database
     }
 
+    /// The database-scoped client, for workers that own their own tables
+    /// such as the Earn price sampler.
+    pub fn client(&self) -> &clickhouse::Client {
+        &self.client
+    }
+
     pub async fn write_blocks(&self, blocks: &[BlockRow]) -> Result<()> {
         self.write_blocks_with_deduplication_seed(blocks, None)
             .await

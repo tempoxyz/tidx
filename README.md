@@ -225,7 +225,12 @@ password_env = "TIDX_PG_PASSWORD"
 │   ├── url                 string    = "http://clickhouse:8123"  ClickHouse HTTP URL
 │   ├── fdw_url             string    = url          ClickHouse URL as reachable from PostgreSQL (pg_clickhouse FDW)
 │   ├── repair_derived_on_startup bool = true        Repair historical derived-table gaps on startup
-│   └── replicated_database bool      = false        Create the database as ENGINE = Replicated with Replicated* table engines
+│   ├── replicated_database bool      = false        Create the database as ENGINE = Replicated with Replicated* table engines
+│   └── [earn_prices]                                Hourly Earn vault share price sampler (earn_vault_price_hours)
+│       ├── enabled         bool      = true         Sample vault prices over RPC (needs archive state for backfill)
+│       ├── interval_secs   u64       = 60           Seconds between polls of each sampling lane
+│       ├── batch           usize     = 2000         Maximum vault-hour pairs per page in each lane
+│       └── concurrency     usize     = 4            Concurrent eth_call requests across both lanes
 └── [retention]                                      Tiered storage (PostgreSQL hot window)
     ├── pg_keep             string    (required)     Recent data kept in PostgreSQL, e.g. "30d" or "36h"
     ├── prune_interval      string    = "1h"         How often the pruner runs
@@ -703,6 +708,7 @@ For self-hosted multi-replica ClickHouse (coordinated by Keeper/ZooKeeper), set 
 
 | Name | Purpose |
 |------|---------|
+| [`address_balance_hours`](#address_balance_hours) | Net balance change per `(holder, token, UTC hour)` for balance history. |
 | [`address_balances`](#address_balances) | Current positive balance per `(holder, token)`. |
 | [`address_balances_snapshot`](#address_balances_snapshot) | Pre-aggregated `address_balances`, refreshed on a schedule. |
 | [`address_holder_deltas`](#address_holder_deltas) | Holder-first mirror of `token_holder_deltas`. |
@@ -711,6 +717,9 @@ For self-hosted multi-replica ClickHouse (coordinated by Keeper/ZooKeeper), set 
 | [`dex_orders`](#dex_orders) | Decoded stablecoin-DEX `OrderPlaced` events. |
 | [`dex_pair_liquidity`](#dex_pair_liquidity) | Pairs joined to their on-DEX base liquidity. |
 | [`dex_pairs`](#dex_pairs) | Decoded stablecoin-DEX `PairCreated` events. |
+| [`earn_flows`](#earn_flows) | Deposit and redemption events for approved vaults (internal). |
+| [`earn_vault_price_hours`](#earn_vault_price_hours) | Hourly price samples for approved vaults (internal). |
+| [`earn_vaults`](#earn_vaults) | Approved vaults and token bindings from the current chain registry (internal). |
 | [`token_balances`](#token_balances) | Current positive balance per `(token, holder)`. |
 | [`token_balances_snapshot`](#token_balances_snapshot) | Pre-aggregated `token_balances`, refreshed on a schedule. |
 | [`token_holder_counts`](#token_holder_counts) | Holder count per token, refreshed on a schedule. |
@@ -721,6 +730,31 @@ For self-hosted multi-replica ClickHouse (coordinated by Keeper/ZooKeeper), set 
 | [`token_transfers`](#token_transfers) | Decoded `Transfer` events. |
 
 User-defined views registered through the [`/views` API](#views-api) live alongside these in `analytics_{chainId}` and are queryable the same way.
+
+#### address_balance_hours
+
+One row per active `(holder, token, UTC hour)`, read from `address_holder_deltas FINAL`. Filter by holder (and optionally token) to use the ledger's primary key. The view needs no snapshot or separate backfill: replayed rows count once, and changes to the ledger are visible on the next read.
+
+The balance at the end of hour `H` is `sum(delta)` over `hour <= H`; between active hours it stays unchanged. For holders with unusually many transfers, measure filtered queries first. If they miss the latency target, materialize only the affected history in replaceable partitions rather than refreshing the entire ledger.
+
+| Column | Type | Description |
+|--------|------|-------------|
+| `holder` | `String` | Holder address |
+| `token` | `String` | Token contract |
+| `hour` | `DateTime('UTC')` | Start of the UTC hour |
+| `delta` | `Int256` | Signed net balance change of `(holder, token)` in that hour |
+
+```bash
+# Balance at the end of each active hour
+curl -G "https://indexer.testnet.tempo.xyz/query" \
+  --data-urlencode "chainId=42431" \
+  --data-urlencode "engine=clickhouse" \
+  --data-urlencode "sql=SELECT hour, toString(sum(delta) OVER (ORDER BY hour)) AS balance
+    FROM address_balance_hours
+    WHERE holder = '0x70997970c51812dc3a010c7d01b50e0d17dc79c8'
+      AND token = '0x20c0000000000000000000000000000000000000'
+    ORDER BY hour"
+```
 
 #### address_balances
 
@@ -924,6 +958,63 @@ curl -G "https://indexer.testnet.tempo.xyz/query" \
     LIMIT 20"
 ```
 
+
+#### earn_vaults
+
+An Earn vault issues a share token against deposited assets. This ClickHouse view lists the vaults that an operator has approved for the current chain. A separate publisher reads the verified vault registry and replaces the contents of `earn_verified_vaults` in this chain's database in one operation. A row binds a vault address to its share token, asset token, first block, block timestamp and expiry time (`valid_until`, UTC). The view returns only unexpired rows. Neither a new contract nor a deployment event adds a vault.
+
+Internal services can submit ClickHouse SELECT queries to `GET /internal/earn/query` using the dedicated bearer credential configured through `TIDX_EARN_READ_TOKEN`. Without it, the route is off. Public `/query` cannot read these Earn objects, and neither route exposes the publisher's source table.
+
+#### earn_flows
+
+This view decodes deposit and redemption events from the `logs` table for approved vault addresses. It stores no separate copy. Adding a vault makes earlier events available; removing it excludes its events. A chain reorganization changes the result when the underlying logs change.
+
+The table maps each event to an account and quantities in the event's original units. A redeem request reserves shares; finalization pays assets and cancellation releases shares. A venue is the underlying strategy or pool where the vault invests. If a user deposits shares of that pool directly, `assets` counts the pool shares received and `shares` counts the new Earn vault shares issued to the user.
+
+| `kind` | Event | `account` | `caller` | `request_id` | `assets` | `shares` |
+|--------|-------|-----------|----------|--------------|----------|----------|
+| `deposited` | `Deposited(address indexed caller, address indexed receiver, uint256 assets, uint256 earnShares)` | receiver | caller | | `assets` | `earnShares` |
+| `redeemed` | `Redeemed(address indexed caller, address indexed receiver, uint256 earnShares, uint256 assets)` | receiver | caller | | `assets` | `earnShares` |
+| `withdrew_exact` | `WithdrewExact(address indexed caller, address indexed receiver, uint256 assets, uint256 earnSharesBurned)` | receiver | caller | | `assets` | `earnSharesBurned` |
+| `redeem_requested` | `RedeemRequested(bytes32 indexed requestId, address indexed requester, address indexed receiver, uint256 earnShares)` | requester | | `requestId` | 0 | `earnShares` |
+| `redeem_finalized` | `RedeemFinalized(bytes32 indexed requestId, address indexed receiver, uint256 earnShares, address asset, uint256 assets)` | receiver | | `requestId` | `assets` | `earnShares` |
+| `redeem_cancelled` | `RedeemCancelled(bytes32 indexed requestId, address indexed receiver, uint256 earnShares)` | receiver | | `requestId` | 0 | `earnShares` |
+| `venue_shares_deposited` | `VenueSharesDeposited(address indexed caller, address indexed receiver, uint256 requestedVenueShares, uint256 receivedVenueShares, uint256 earnShares)` | receiver | caller | | `receivedVenueShares` (venue share units) | `earnShares` |
+
+| Column | Type | Description |
+|--------|------|-------------|
+| `block_num` | `Int64` | Block number |
+| `block_timestamp` | `DateTime64(3, 'UTC')` | Block timestamp |
+| `tx_hash` | `String` | Transaction hash |
+| `log_idx` | `Int32` | Log index |
+| `vault` | `String` | Emitting vault |
+| `account` | `String` | Receiver, or requester for `redeem_requested` |
+| `caller` | `String` | Caller, or `''` for request, finalize and cancel events |
+| `request_id` | `String` | Redeem request ID (32-byte hex), or `''` |
+| `kind` | `LowCardinality(String)` | Event kind (see above) |
+| `assets` | `UInt256` | Quantity in the units shown for the event above |
+| `shares` | `UInt256` | Raw unsigned vault share amount |
+
+#### earn_vault_price_hours
+
+> [!NOTE]
+> Written by the tidx Earn price sampler over RPC, not from logs. Rows at or above a reorged block are pruned and written again.
+
+For each approved vault, the sampler reads `previewRedeem(1e18)` at the last indexed block of each completed hour since deployment. It needs archive RPC access for earlier hours. It checks the registry before dispatching calls and before writing their results. Removal stops new sampling; previously recorded prices remain in storage. A failed call leaves the price missing.
+
+The latest completed hour has its own polling loop. A second loop checks older hours in 24-hour windows, skipping prices already stored. Each loop commits small groups of prices as it goes. Restarting resets the scan position, not the prices. An hour with no blocks has no quote; if indexing fills a gap later, repair picks it up on another pass.
+
+Set the polling interval, page size and shared RPC concurrency under `[chains.clickhouse.earn_prices]`. With concurrency set to one, a new hour may wait for one in-flight archive request, not an entire page. Read prices with `FINAL` for one row per vault and hour. The `tidx_earn_price_page_missing` gauge counts failed or deferred pairs on the last processed page of each lane, not all outstanding history. The `tidx_earn_price_head_hour_timestamp_seconds` gauge reports the latest completed hour seen by the head loop; it does not certify price coverage or registry freshness.
+
+| Column | Type | Description |
+|--------|------|-------------|
+| `vault` | `String` | Earn vault |
+| `hour` | `DateTime('UTC')` | Start of the UTC hour |
+| `block_num` | `Int64` | Last block whose timestamp falls inside `hour` |
+| `assets_per_1e18_shares` | `UInt256` | `previewRedeem(1e18)` at `block_num` |
+| `sampled_at` | `DateTime('UTC')` | When the sampler wrote the row |
+
+Upgrading a staging database that ran the earlier event-based Earn schema removes its derived vault rows, flow rows and price samples. It preserves logs and holder balances. Keep applications that depend on price history disabled until the sampler has rebuilt the required hours.
 
 #### token_balances
 
