@@ -1151,12 +1151,13 @@ fn validate_table_name(name: &ObjectName, cte_names: &HashSet<String>) -> Result
 }
 
 /// The name PostgreSQL resolves an identifier to: unquoted identifiers fold to
-/// lowercase, quoted ones keep their exact case.
+/// ASCII lowercase, quoted ones keep their exact case.
 fn postgres_relation_key(ident: &sqlparser::ast::Ident) -> String {
     if ident.quote_style.is_some() {
         ident.value.clone()
     } else {
-        ident.value.to_lowercase()
+        // PostgreSQL folds only ASCII A-Z in unquoted identifiers.
+        ident.value.to_ascii_lowercase()
     }
 }
 
@@ -2676,6 +2677,15 @@ mod tests {
         ] {
             assert!(validate_query(sql).is_err(), "{sql}");
         }
+    }
+
+    #[test]
+    fn test_rejects_non_ascii_folded_cte_shadowing() {
+        // PostgreSQL does not fold U+212A KELVIN SIGN to ASCII k.
+        assert!(
+            validate_query("WITH pg_loc\u{212A}s AS (SELECT 1) SELECT * FROM pg_locks").is_err()
+        );
+        assert!(validate_query("WITH SYNC_\u{212A} AS (SELECT 1) SELECT * FROM sync_k").is_err());
     }
 
     #[test]
