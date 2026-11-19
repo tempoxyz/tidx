@@ -304,6 +304,62 @@ const CLICKHOUSE_DANGEROUS_FUNCTIONS: &[&str] = &[
     "notnullin",
     "globalnullin",
     "globalnotnullin",
+    // Server, session and deployment introspection.
+    "hostname",
+    "fqdn",
+    "fullhostname",
+    "serveruuid",
+    "version",
+    "revision",
+    "buildid",
+    "uptime",
+    "displayname",
+    "getoskernelversion",
+    "tcpport",
+    "getserverport",
+    "getmacro",
+    "getsetting",
+    "getsettingordefault",
+    "getserversetting",
+    "getmergetreesetting",
+    "currentuser",
+    "current_user",
+    "user",
+    "session_user",
+    "authenticateduser",
+    "authenticated_user",
+    "currentdatabase",
+    "current_database",
+    "database",
+    "schema",
+    "currentschemas",
+    "current_schemas",
+    "currentroles",
+    "enabledroles",
+    "defaultroles",
+    "currentprofiles",
+    "enabledprofiles",
+    "defaultprofiles",
+    "queryid",
+    "query_id",
+    "initialqueryid",
+    "initial_query_id",
+    "initialquerystarttime",
+    "initial_query_start_time",
+    "servertimezone",
+    "server_timezone",
+    "connectionid",
+    "connection_id",
+    "getclienthttpheader",
+    "shardnum",
+    "shardcount",
+    "zookeepersessionuptime",
+    "filesystemavailable",
+    "filesystemcapacity",
+    "filesystemunreserved",
+    "transactionid",
+    "transactionlatestsnapshot",
+    "transactionoldestsnapshot",
 ];
 
 fn validate_clickhouse_query_ast(
@@ -1149,6 +1205,17 @@ fn object_name_parts(name: &ObjectName) -> Result<Vec<String>> {
 /// Only explicitly allowed expression types are permitted.
 fn validate_expr(expr: &Expr, cte_names: &HashSet<String>, depth: usize) -> Result<()> {
     match expr {
+        // An unquoted keyword such as current_role is a session value in
+        // PostgreSQL, not a column, even though it parses as an identifier.
+        Expr::Identifier(ident)
+            if ident.quote_style.is_none()
+                && POSTGRES_SESSION_KEYWORDS.contains(&ident.value.to_lowercase().as_str()) =>
+        {
+            Err(anyhow!(
+                "Function '{}' is not allowed",
+                ident.value.to_lowercase()
+            ))
+        }
         // Safe leaf nodes
         Expr::Identifier(_) | Expr::CompoundIdentifier(_) => Ok(()),
         Expr::Value(_) => Ok(()),
@@ -1332,6 +1399,17 @@ fn validate_expr(expr: &Expr, cte_names: &HashSet<String>, depth: usize) -> Resu
         _ => Err(anyhow!("Unsupported expression type")),
     }
 }
+
+/// Keywords PostgreSQL evaluates to a session value when written unquoted.
+const POSTGRES_SESSION_KEYWORDS: &[&str] = &[
+    "current_catalog",
+    "current_role",
+    "current_schema",
+    "current_user",
+    "session_user",
+    "system_user",
+    "user",
+];
 
 const ALLOWED_FUNCTIONS: &[&str] = &[
     // ABI decode helpers (custom PostgreSQL functions)
@@ -2247,6 +2325,70 @@ mod tests {
             )
             .is_ok()
         );
+    }
+
+    #[test]
+    fn test_clickhouse_rejects_introspection_functions() {
+        for call in [
+            "hostname()",
+            "hostName()",
+            "fqdn()",
+            "FQDN()",
+            "serverUUID()",
+            "version()",
+            "uptime()",
+            "getServerPort('tcp_port')",
+            "getMacro('replica')",
+            "getSetting('max_memory_usage')",
+            "getSettingOrDefault('max_memory_usage', 0)",
+            "currentUser()",
+            "authenticatedUser()",
+            "authenticated_user()",
+            "serverTimeZone()",
+            "initial_query_start_time()",
+            "user()",
+            "currentDatabase()",
+            "current_database()",
+            "database()",
+            "currentRoles()",
+            "currentProfiles()",
+            "queryID()",
+            "initialQueryID()",
+            "shardNum()",
+            "filesystemAvailable()",
+        ] {
+            let sql = format!("SELECT {call} AS x");
+            let error = validate_clickhouse_query(&sql).expect_err(&sql);
+            assert!(
+                error.to_string().ends_with("is not allowed"),
+                "{sql}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_postgres_rejects_session_keywords() {
+        for keyword in [
+            "current_role",
+            "CURRENT_ROLE",
+            "current_schema",
+            "current_catalog",
+            "current_user",
+            "session_user",
+            "system_user",
+            "user",
+        ] {
+            let sql = format!("SELECT {keyword} AS x");
+            let error = validate_query(&sql).expect_err(&sql);
+            assert!(
+                error.to_string().ends_with("is not allowed"),
+                "{sql}: {error}"
+            );
+            let sql = format!("SELECT block_num FROM logs WHERE {keyword} IS NOT NULL");
+            assert!(validate_query(&sql).is_err(), "{sql}");
+        }
+        // A quoted name is a column reference, not the keyword.
+        assert!(validate_query(r#"SELECT "user" FROM logs"#).is_ok());
     }
 
     #[test]
