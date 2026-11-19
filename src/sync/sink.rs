@@ -160,6 +160,32 @@ impl SinkSet {
             .await
     }
 
+    /// [`Self::write_all`] for realtime sync: as each sink commits, records
+    /// `tidx_index_latency_seconds` for every block in the batch.
+    /// `block_timestamps_ms` are the blocks' header timestamps in
+    /// milliseconds (Tempo blocks are sub-second; `BlockRow::timestamp_ms` keeps
+    /// whole seconds).
+    pub async fn write_all_realtime(
+        &self,
+        chain_id: u64,
+        block_timestamps_ms: &[i64],
+        blocks: &[BlockRow],
+        txs: &[TxRow],
+        logs: &[LogRow],
+        receipts: &[ReceiptRow],
+    ) -> Result<()> {
+        self.write_all_observed(
+            blocks,
+            txs,
+            logs,
+            receipts,
+            None,
+            WriteTarget::All,
+            Some((chain_id, block_timestamps_ms)),
+        )
+        .await
+    }
+
     pub(crate) async fn write_all_postgres(
         &self,
         blocks: &[BlockRow],
@@ -250,6 +276,30 @@ impl SinkSet {
         application_name: Option<&str>,
         target: WriteTarget,
     ) -> Result<()> {
+        self.write_all_observed(blocks, txs, logs, receipts, application_name, target, None)
+            .await
+    }
+
+    /// Writes the batch; with `latency` (chain ID, block timestamps in ms),
+    /// records each sink's index latency as soon as that sink commits.
+    #[allow(clippy::too_many_arguments)]
+    async fn write_all_observed(
+        &self,
+        blocks: &[BlockRow],
+        txs: &[TxRow],
+        logs: &[LogRow],
+        receipts: &[ReceiptRow],
+        application_name: Option<&str>,
+        target: WriteTarget,
+        latency: Option<(u64, &[i64])>,
+    ) -> Result<()> {
+        let observe = |sink: &str| {
+            if let Some((chain_id, timestamps_ms)) = latency {
+                for &ts_ms in timestamps_ms {
+                    metrics::record_index_latency(chain_id, sink, ts_ms);
+                }
+            }
+        };
         if target != WriteTarget::ClickHouse {
             self.ensure_partitions(
                 blocks
@@ -272,19 +322,23 @@ impl SinkSet {
                     receipts,
                     application_name,
                 )
-                .await
+                .await?;
             } else {
-                writer::write_batch(&self.pool, blocks, txs, logs, receipts).await
+                writer::write_batch(&self.pool, blocks, txs, logs, receipts).await?;
             }
+            observe("postgres");
+            Ok::<_, anyhow::Error>(())
         };
 
         match (target, &self.ch) {
             (WriteTarget::All, Some(ch)) => {
                 let seed = batch_deduplication_seed(blocks);
-                tokio::try_join!(
-                    write_postgres(),
+                tokio::try_join!(write_postgres(), async {
                     write_clickhouse_batch(ch, blocks, txs, logs, receipts, seed.as_deref())
-                )?;
+                        .await?;
+                    observe(ch.name());
+                    Ok::<_, anyhow::Error>(())
+                })?;
             }
             (WriteTarget::All | WriteTarget::Postgres, _) => {
                 write_postgres().await?;
@@ -292,6 +346,7 @@ impl SinkSet {
             (WriteTarget::ClickHouse, Some(ch)) => {
                 let seed = batch_deduplication_seed(blocks);
                 write_clickhouse_batch(ch, blocks, txs, logs, receipts, seed.as_deref()).await?;
+                observe(ch.name());
             }
             (WriteTarget::ClickHouse, None) => {
                 anyhow::bail!("ClickHouse archive backfill requested without an active sink");

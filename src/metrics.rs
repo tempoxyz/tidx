@@ -314,6 +314,44 @@ pub fn record_sink_error(sink: &str) {
     counter!("tidx_sink_errors_total", &labels).increment(1);
 }
 
+// Index freshness (realtime path)
+
+/// Buckets for [`record_index_latency`], in seconds: sub-second block times
+/// up to a minute behind.
+pub const INDEX_LATENCY_BUCKETS: &[f64] = &[
+    0.05, 0.1, 0.15, 0.2, 0.25, 0.3, 0.4, 0.5, 0.75, 1.0, 1.5, 2.0, 3.0, 5.0, 10.0, 30.0, 60.0,
+];
+
+/// Buckets for `tidx_clickhouse_query_duration_seconds`, in seconds.
+pub const CLICKHOUSE_QUERY_BUCKETS: &[f64] = &[
+    0.005, 0.01, 0.025, 0.05, 0.075, 0.1, 0.15, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0,
+];
+
+/// Seconds from a block's timestamp to now, floored at zero (clock skew).
+fn seconds_since_block(now_ms: i64, block_timestamp_ms: i64) -> f64 {
+    now_ms.saturating_sub(block_timestamp_ms).max(0) as f64 / 1000.0
+}
+
+/// Record `tidx_index_latency_seconds`: the time from a block's timestamp to
+/// its rows being committed (and so queryable) in `sink`. Called by the
+/// realtime path only, so backfill of old blocks does not skew it.
+pub fn record_index_latency(chain_id: u64, sink: &str, block_timestamp_ms: i64) {
+    let labels = [
+        ("chain_id", chain_id.to_string()),
+        ("sink", sink.to_string()),
+    ];
+    let latency = seconds_since_block(chrono::Utc::now().timestamp_millis(), block_timestamp_ms);
+    histogram!("tidx_index_latency_seconds", &labels).record(latency);
+}
+
+/// Set `tidx_sync_head_timestamp_seconds`: the timestamp (Unix seconds, ms
+/// precision) of the newest block committed to every sink by realtime sync.
+/// `time() - tidx_sync_head_timestamp_seconds` is how stale the index is.
+pub fn set_sync_head_timestamp(chain_id: u64, block_timestamp_ms: i64) {
+    let labels = [("chain_id", chain_id.to_string())];
+    gauge!("tidx_sync_head_timestamp_seconds", &labels).set(block_timestamp_ms as f64 / 1000.0);
+}
+
 // ClickHouse OLAP metrics
 
 pub fn record_clickhouse_query(duration: std::time::Duration, success: bool) {
@@ -513,6 +551,15 @@ fn format_eta(secs: Option<f64>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn seconds_since_block_uses_millisecond_timestamps() {
+        assert!((seconds_since_block(1_700_000_000_250, 1_700_000_000_000) - 0.25).abs() < 1e-9);
+        assert_eq!(
+            seconds_since_block(1_700_000_000_000, 1_700_000_000_500),
+            0.0
+        );
+    }
 
     #[test]
     fn gap_fill_remaining_counts_down_from_total_blocks() {

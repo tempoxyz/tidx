@@ -8,6 +8,7 @@ pub mod metrics;
 pub mod query;
 pub mod service;
 pub mod sync;
+pub mod telemetry;
 pub mod tempo;
 pub mod types;
 pub mod virtual_address;
