@@ -129,7 +129,7 @@ fn validate_query_ast(query: &Query, cte_names: &HashSet<String>, depth: usize) 
     if let Some(with) = &query.with {
         for cte in &with.cte_tables {
             validate_query_ast(&cte.query, &all_cte_names, depth + 1)?;
-            all_cte_names.insert(cte.alias.name.value.to_lowercase());
+            all_cte_names.insert(postgres_relation_key(&cte.alias.name));
         }
     }
 
@@ -389,7 +389,8 @@ fn validate_clickhouse_query_ast(
                 return Err(anyhow!("FROM before SELECT is not allowed after WITH"));
             }
             validate_clickhouse_query_ast(&cte.query, &all_cte_names, depth + 1)?;
-            all_cte_names.insert(cte.alias.name.value.to_lowercase());
+            // ClickHouse resolves identifiers case-sensitively, quoted or not.
+            all_cte_names.insert(cte.alias.name.value.clone());
         }
     }
 
@@ -643,11 +644,19 @@ fn validate_clickhouse_table_name(name: &ObjectName, cte_names: &HashSet<String>
         ));
     }
 
+    // Match relations by the exact name ClickHouse resolves, which is
+    // case-sensitive: a lowercased CTE name must not stand in for a table.
+    let exact_name = name
+        .0
+        .last()
+        .and_then(|part| part.as_ident())
+        .map(|ident| ident.value.clone())
+        .unwrap_or_default();
     let bare_name = parts.last().cloned().unwrap_or_default();
-    if parts.len() == 1 && crate::clickhouse_schema::is_public_query_table(&bare_name) {
+    if parts.len() == 1 && crate::clickhouse_schema::is_public_query_table(&exact_name) {
         return Ok(());
     }
-    if parts.len() == 1 && cte_names.contains(&bare_name) {
+    if parts.len() == 1 && cte_names.contains(&exact_name) {
         return Ok(());
     }
 
@@ -957,7 +966,7 @@ impl Visitor for ClickHouseNodeValidator {
                         "FROM before SELECT is not allowed after WITH"
                     ));
                 }
-                self.cte_names.insert(cte.alias.name.value.to_lowercase());
+                self.cte_names.insert(cte.alias.name.value.clone());
             }
         }
         ControlFlow::Continue(())
@@ -1183,11 +1192,29 @@ fn validate_table_name(name: &ObjectName, cte_names: &HashSet<String>) -> Result
         return Ok(());
     }
 
-    if name_parts.len() == 1 && cte_names.contains(&bare_name) {
-        return Ok(());
+    // CTE names follow PostgreSQL's identifier folding: unquoted names fold to
+    // lowercase, quoted names keep their case. Comparing lowercased names would
+    // let a quoted "FOO" CTE vouch for the real relation foo.
+    if name.0.len() == 1 {
+        if let Some(ident) = name.0[0].as_ident() {
+            if cte_names.contains(&postgres_relation_key(ident)) {
+                return Ok(());
+            }
+        }
     }
 
     Err(anyhow!("Access to table '{bare_name}' is not allowed"))
+}
+
+/// The name PostgreSQL resolves an identifier to: unquoted identifiers fold to
+/// ASCII lowercase, quoted ones keep their exact case.
+fn postgres_relation_key(ident: &sqlparser::ast::Ident) -> String {
+    if ident.quote_style.is_some() {
+        ident.value.clone()
+    } else {
+        // PostgreSQL folds only ASCII A-Z in unquoted identifiers.
+        ident.value.to_ascii_lowercase()
+    }
 }
 
 fn object_name_parts(name: &ObjectName) -> Result<Vec<String>> {
@@ -2748,6 +2775,77 @@ mod tests {
     fn test_clickhouse_allows_missing_limit_for_outer_cap() {
         assert!(
             validate_clickhouse_query("SELECT num, hash FROM blocks ORDER BY num DESC").is_ok()
+        );
+    }
+
+    #[test]
+    fn test_clickhouse_rejects_case_mismatched_cte_shadowing() {
+        // ClickHouse resolves identifiers case-sensitively, so a CTE named
+        // "TIDX_SCHEMA_OBJECTS" does not shadow the real tidx_schema_objects.
+        for sql in [
+            r#"WITH "TIDX_SCHEMA_OBJECTS" AS (SELECT 1 AS x) SELECT name FROM tidx_schema_objects"#,
+            r#"WITH "TOKEN_TRANSFERS_MV" AS (SELECT 1 AS x) SELECT * FROM token_transfers_mv"#,
+            "WITH TOKEN_TRANSFERS_MV AS (SELECT 1 AS x) SELECT * FROM token_transfers_mv",
+            r#"WITH t AS (SELECT 1 AS x) SELECT * FROM "T""#,
+        ] {
+            assert!(validate_clickhouse_query(sql).is_err(), "{sql}");
+        }
+    }
+
+    #[test]
+    fn test_clickhouse_allows_exact_case_cte() {
+        assert!(
+            validate_clickhouse_query(
+                r#"WITH "Recent" AS (SELECT num FROM blocks) SELECT * FROM "Recent""#
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_clickhouse_query(
+                "WITH recent AS (SELECT num FROM blocks) SELECT * FROM recent"
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn test_rejects_case_mismatched_cte_shadowing() {
+        // PostgreSQL keeps the case of quoted identifiers, so a quoted
+        // uppercase CTE does not shadow an unquoted lowercase relation.
+        for sql in [
+            r#"WITH "SYNC_STATE" AS (SELECT 1 AS x) SELECT * FROM sync_state"#,
+            r#"WITH "Sync_State" AS (SELECT 1 AS x) SELECT * FROM sync_state"#,
+            r#"WITH sync_state AS (SELECT 1 AS x) SELECT * FROM "SYNC_STATE""#,
+        ] {
+            assert!(validate_query(sql).is_err(), "{sql}");
+        }
+    }
+
+    #[test]
+    fn test_rejects_non_ascii_folded_cte_shadowing() {
+        // PostgreSQL does not fold U+212A KELVIN SIGN to ASCII k.
+        assert!(
+            validate_query("WITH pg_loc\u{212A}s AS (SELECT 1) SELECT * FROM pg_locks").is_err()
+        );
+        assert!(validate_query("WITH SYNC_\u{212A} AS (SELECT 1) SELECT * FROM sync_k").is_err());
+    }
+
+    #[test]
+    fn test_allows_cte_with_postgres_identifier_folding() {
+        // Unquoted identifiers fold to lowercase on both sides.
+        assert!(
+            validate_query("WITH Recent AS (SELECT num FROM blocks) SELECT * FROM recent").is_ok()
+        );
+        assert!(
+            validate_query("WITH recent AS (SELECT num FROM blocks) SELECT * FROM RECENT").is_ok()
+        );
+        assert!(
+            validate_query(r#"WITH recent AS (SELECT num FROM blocks) SELECT * FROM "recent""#)
+                .is_ok()
+        );
+        assert!(
+            validate_query(r#"WITH "Recent" AS (SELECT num FROM blocks) SELECT * FROM "Recent""#)
+                .is_ok()
         );
     }
 
