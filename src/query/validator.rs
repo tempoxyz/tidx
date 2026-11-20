@@ -98,6 +98,49 @@ pub fn validate_clickhouse_query(sql: &str) -> Result<()> {
     }
 }
 
+/// Rejects the unquoted session keywords PostgreSQL evaluates to a session
+/// value (current_user, user, ...). Queries sent with the postgres engine can
+/// run natively on ClickHouse, where only [validate_clickhouse_query] applies
+/// and these words are plain identifiers, so that path calls this to keep
+/// PostgreSQL semantics. Native ClickHouse queries keep bare names as columns.
+pub fn reject_postgres_session_keywords(sql: &str) -> Result<()> {
+    use sqlparser::ast::Visit;
+    use std::ops::ControlFlow;
+
+    for dialect in [
+        &GenericDialect {} as &dyn sqlparser::dialect::Dialect,
+        &sqlparser::dialect::ClickHouseDialect {},
+    ] {
+        // Unparseable SQL is rejected by the full validators.
+        let Ok(statements) = Parser::parse_sql(dialect, sql) else {
+            continue;
+        };
+        let found = statements.visit(&mut SessionKeywordVisitor);
+        if let ControlFlow::Break(keyword) = found {
+            return Err(anyhow!("Function '{keyword}' is not allowed"));
+        }
+    }
+    Ok(())
+}
+
+struct SessionKeywordVisitor;
+
+impl sqlparser::ast::Visitor for SessionKeywordVisitor {
+    type Break = String;
+
+    fn pre_visit_expr(&mut self, expr: &Expr) -> std::ops::ControlFlow<String> {
+        if let Expr::Identifier(ident) = expr
+            && ident.quote_style.is_none()
+        {
+            let name = ident.value.to_lowercase();
+            if POSTGRES_SESSION_KEYWORDS.contains(&name.as_str()) {
+                return std::ops::ControlFlow::Break(name);
+            }
+        }
+        std::ops::ControlFlow::Continue(())
+    }
+}
+
 fn validate_query_ast(query: &Query, cte_names: &HashSet<String>, depth: usize) -> Result<()> {
     if depth > MAX_SUBQUERY_DEPTH {
         return Err(anyhow!(
@@ -665,18 +708,6 @@ fn validate_clickhouse_table_name(name: &ObjectName, cte_names: &HashSet<String>
 
 fn validate_clickhouse_expr(expr: &Expr, cte_names: &HashSet<String>, depth: usize) -> Result<()> {
     match expr {
-        // Queries on the postgres engine can run natively on ClickHouse, so
-        // reject the same unquoted session keywords the PostgreSQL validator
-        // does. A quoted name is still a column reference.
-        Expr::Identifier(ident)
-            if ident.quote_style.is_none()
-                && POSTGRES_SESSION_KEYWORDS.contains(&ident.value.to_lowercase().as_str()) =>
-        {
-            Err(anyhow!(
-                "Function '{}' is not allowed",
-                ident.value.to_lowercase()
-            ))
-        }
         Expr::Identifier(_)
         | Expr::CompoundIdentifier(_)
         | Expr::Value(_)
@@ -2406,7 +2437,7 @@ mod tests {
     }
 
     #[test]
-    fn test_clickhouse_rejects_session_keywords() {
+    fn test_tiered_native_rejects_session_keywords() {
         for keyword in [
             "current_role",
             "CURRENT_ROLE",
@@ -2419,17 +2450,22 @@ mod tests {
             "user",
         ] {
             let sql = format!("SELECT {keyword} AS x");
-            let error = validate_clickhouse_query(&sql).expect_err(&sql);
+            let error = reject_postgres_session_keywords(&sql).expect_err(&sql);
             assert!(
                 error.to_string().ends_with("is not allowed"),
                 "{sql}: {error}"
             );
             let sql = format!("SELECT block_num FROM logs WHERE {keyword} IS NOT NULL");
-            assert!(validate_clickhouse_query(&sql).is_err(), "{sql}");
+            assert!(reject_postgres_session_keywords(&sql).is_err(), "{sql}");
+            let sql = format!("SELECT x FROM (SELECT {keyword} AS x FROM logs) t");
+            assert!(reject_postgres_session_keywords(&sql).is_err(), "{sql}");
+            // Native ClickHouse queries keep bare names as column references.
+            let sql = format!("SELECT {keyword} FROM logs");
+            assert!(validate_clickhouse_query(&sql).is_ok(), "{sql}");
         }
         // A quoted name is a column reference, not the keyword.
-        assert!(validate_clickhouse_query(r#"SELECT "user" FROM logs"#).is_ok());
-        assert!(validate_clickhouse_query("SELECT `user` FROM logs").is_ok());
+        assert!(reject_postgres_session_keywords(r#"SELECT "user" FROM logs"#).is_ok());
+        assert!(reject_postgres_session_keywords("SELECT block_num FROM logs").is_ok());
     }
 
     #[test]
