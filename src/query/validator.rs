@@ -665,6 +665,18 @@ fn validate_clickhouse_table_name(name: &ObjectName, cte_names: &HashSet<String>
 
 fn validate_clickhouse_expr(expr: &Expr, cte_names: &HashSet<String>, depth: usize) -> Result<()> {
     match expr {
+        // Queries on the postgres engine can run natively on ClickHouse, so
+        // reject the same unquoted session keywords the PostgreSQL validator
+        // does. A quoted name is still a column reference.
+        Expr::Identifier(ident)
+            if ident.quote_style.is_none()
+                && POSTGRES_SESSION_KEYWORDS.contains(&ident.value.to_lowercase().as_str()) =>
+        {
+            Err(anyhow!(
+                "Function '{}' is not allowed",
+                ident.value.to_lowercase()
+            ))
+        }
         Expr::Identifier(_)
         | Expr::CompoundIdentifier(_)
         | Expr::Value(_)
@@ -2391,6 +2403,33 @@ mod tests {
                 "{sql}: {error}"
             );
         }
+    }
+
+    #[test]
+    fn test_clickhouse_rejects_session_keywords() {
+        for keyword in [
+            "current_role",
+            "CURRENT_ROLE",
+            "current_schema",
+            "current_catalog",
+            "current_user",
+            "CURRENT_USER",
+            "session_user",
+            "system_user",
+            "user",
+        ] {
+            let sql = format!("SELECT {keyword} AS x");
+            let error = validate_clickhouse_query(&sql).expect_err(&sql);
+            assert!(
+                error.to_string().ends_with("is not allowed"),
+                "{sql}: {error}"
+            );
+            let sql = format!("SELECT block_num FROM logs WHERE {keyword} IS NOT NULL");
+            assert!(validate_clickhouse_query(&sql).is_err(), "{sql}");
+        }
+        // A quoted name is a column reference, not the keyword.
+        assert!(validate_clickhouse_query(r#"SELECT "user" FROM logs"#).is_ok());
+        assert!(validate_clickhouse_query("SELECT `user` FROM logs").is_ok());
     }
 
     #[test]
