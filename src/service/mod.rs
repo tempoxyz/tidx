@@ -426,6 +426,9 @@ pub async fn execute_query_tiered(
     signatures: &[&str],
     options: &QueryOptions,
 ) -> Result<QueryResult> {
+    // Parts of this query may run natively on ClickHouse, which only applies
+    // the ClickHouse validator: keep PostgreSQL's session-keyword rule.
+    crate::query::reject_postgres_session_keywords(sql)?;
     let crate::db::tiered::PruneBoundary {
         boundary,
         boundary_ts,

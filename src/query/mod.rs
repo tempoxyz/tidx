@@ -16,7 +16,9 @@ pub use tag::QueryTag;
 pub use tiered_split::{
     HotWindow, TieredSplit, hot_window_confined, hot_window_confinement, plan_tiered_split,
 };
-pub use validator::{HARD_LIMIT_MAX, validate_clickhouse_query, validate_query};
+pub use validator::{
+    HARD_LIMIT_MAX, reject_postgres_session_keywords, validate_clickhouse_query, validate_query,
+};
 
 use regex_lite::Regex;
 use sqlparser::ast::{
