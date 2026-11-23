@@ -52,7 +52,7 @@ pub fn validate_query(sql: &str) -> Result<()> {
 /// `Parser::parse_sql` stops without an error at some keywords (a bare `END`
 /// ends a statement list), so text after them would never reach the
 /// validator while the caller still executes the original SQL.
-fn parse_single_statement(dialect: &dyn Dialect, sql: &str) -> Result<Statement> {
+pub(crate) fn parse_single_statement(dialect: &dyn Dialect, sql: &str) -> Result<Statement> {
     let mut parser = Parser::new(dialect)
         .try_with_sql(sql)
         .map_err(|e| anyhow!("SQL parse error: {e}"))?;
@@ -1567,9 +1567,14 @@ fn validate_cast_type(data_type: &DataType) -> Result<()> {
             // resolved with PostgreSQL's identifier rules so that "name" and
             // name match while "NAME" does not.
             let builtin = match name.0.as_slice() {
-                [part] if modifiers.is_empty() => part.as_ident().is_some_and(|ident| {
-                    POSTGRES_BUILTIN_CUSTOM_TYPES.contains(&postgres_relation_key(ident).as_str())
-                }),
+                // Integer modifiers (bpchar(10), timestamptz(3)) are lengths
+                // and precisions; anything else could name another object.
+                [part] if modifiers.iter().all(|m| m.trim().parse::<u32>().is_ok()) => {
+                    part.as_ident().is_some_and(|ident| {
+                        POSTGRES_BUILTIN_CUSTOM_TYPES
+                            .contains(&postgres_relation_key(ident).as_str())
+                    })
+                }
                 _ => false,
             };
             if builtin {
@@ -3202,6 +3207,7 @@ mod tests {
             "SELECT num::regclass FROM blocks",
             "SELECT CAST(num AS my_type) FROM blocks",
             r#"SELECT 'n'::"NAME""#,
+            "SELECT 'ab'::bpchar(x)",
             "SELECT CAST('now' AS regproc)",
             "SELECT ARRAY[10]::regtype[]",
             "SELECT num FROM blocks WHERE num::regnamespace IS NOT NULL",
@@ -3220,6 +3226,7 @@ mod tests {
             "SELECT ARRAY[num]::bigint[] FROM blocks",
             "SELECT 'n'::name, '2024-01-02 03:04:05+05:30'::timestamptz, 7::int2",
             r#"SELECT 'n'::"name", 'n'::NAME"#,
+            "SELECT 'ab'::bpchar(10), now()::timestamptz(3)",
         ] {
             assert!(validate_query(sql).is_ok(), "{sql}");
         }

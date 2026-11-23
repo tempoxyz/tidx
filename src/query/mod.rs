@@ -352,8 +352,8 @@ pub fn hoist_set_operation_order_by_clickhouse(sql: &str) -> anyhow::Result<Stri
     // same tree. The original form cannot be sent instead: ClickHouse would
     // reject it or apply the trailing clauses to the last arm only.
     let hoisted = statements[0].to_string();
-    match Parser::parse_sql(&ClickHouseDialect {}, &hoisted) {
-        Ok(reparsed) if reparsed == statements => Ok(hoisted),
+    match validator::parse_single_statement(&ClickHouseDialect {}, &hoisted) {
+        Ok(reparsed) if reparsed == statements[0] => Ok(hoisted),
         _ => Err(anyhow::anyhow!(
             "This set operation with ORDER BY, LIMIT or OFFSET cannot be run on ClickHouse;              remove backslash escapes from its string literals"
         )),
