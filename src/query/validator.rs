@@ -1123,9 +1123,10 @@ fn validate_set_expr(set_expr: &SetExpr, cte_names: &HashSet<String>, depth: usi
                         // name 'text' as a value of type name, which the parser
                         // here would take as a column with an alias.
                         if alias.quote_style == Some('\'') {
-                            return Err(anyhow!("String literal aliases are not allowed"));
+                            validate_typed_literal_prefix(expr)?;
+                        } else {
+                            validate_expr(expr, cte_names, depth)?;
                         }
-                        validate_expr(expr, cte_names, depth)?;
                     }
                     SelectItem::Wildcard(options) => {
                         validate_postgres_wildcard_options(options)?;
@@ -1551,18 +1552,13 @@ fn validate_expr(expr: &Expr, cte_names: &HashSet<String>, depth: usize) -> Resu
 /// None of them resolves a value through the catalog.
 const POSTGRES_BUILTIN_CUSTOM_TYPES: &[&str] = &[
     // Quoted spellings of types that have dedicated variants when unquoted.
+    // Only real catalog names: SQL aliases such as integer or boolean are not
+    // types when quoted and would resolve through the search path.
     "text",
     "varchar",
     "char",
     "numeric",
-    "decimal",
     "bytea",
-    "bigint",
-    "integer",
-    "int",
-    "smallint",
-    "boolean",
-    "real",
     "date",
     "time",
     "timestamp",
@@ -1581,6 +1577,18 @@ const POSTGRES_BUILTIN_CUSTOM_TYPES: &[&str] = &[
     "float8",
     "bool",
 ];
+
+/// Validates a select item PostgreSQL reads as a typed literal: a type name
+/// followed by a string, which the parser here returns as a column with a
+/// string-literal alias. The name must pass the same check as a cast target.
+fn validate_typed_literal_prefix(expr: &Expr) -> Result<()> {
+    let parts = match expr {
+        Expr::Identifier(ident) => vec![ident.clone()],
+        Expr::CompoundIdentifier(idents) => idents.clone(),
+        _ => return Err(anyhow!("String literal aliases are not allowed")),
+    };
+    validate_cast_type(&DataType::Custom(ObjectName::from(parts), vec![]))
+}
 
 /// Rejects cast targets that resolve through the catalog.
 ///
@@ -3245,6 +3253,10 @@ mod tests {
             "SELECT CAST(7 AS pg_catalog.regclass)",
             "SELECT CAST(7 AS public.int4)",
             "SELECT regrole '10'",
+            r#"SELECT "regrole" '10'"#,
+            r#"SELECT CAST(7 AS "integer")"#,
+            r#"SELECT CAST(true AS "boolean")"#,
+            "SELECT 1 + 1 'x'",
             "SELECT num FROM blocks WHERE regclass 'blocks' IS NOT NULL",
             "SELECT CAST('now' AS regproc)",
             "SELECT ARRAY[10]::regtype[]",
@@ -3267,6 +3279,7 @@ mod tests {
             "SELECT 'ab'::bpchar(10), now()::timestamptz(3)",
             "SELECT CAST(7 AS pg_catalog.int4)",
             r#"SELECT CAST(7 AS "text"), num AS "Num" FROM blocks"#,
+            r#"SELECT "text" 'hello', name 'x'"#,
         ] {
             assert!(validate_query(sql).is_ok(), "{sql}");
         }
