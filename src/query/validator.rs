@@ -1567,6 +1567,10 @@ const POSTGRES_BUILTIN_CUSTOM_TYPES: &[&str] = &[
     "json",
     "jsonb",
     "bpchar",
+    "inet",
+    "cidr",
+    "macaddr",
+    "macaddr8",
     "name",
     "timestamptz",
     "timetz",
@@ -1583,6 +1587,18 @@ const POSTGRES_BUILTIN_CUSTOM_TYPES: &[&str] = &[
 /// string-literal alias. The name must pass the same check as a cast target.
 fn validate_typed_literal_prefix(expr: &Expr) -> Result<()> {
     let parts = match expr {
+        // Two string constants separated by a newline are one constant in
+        // PostgreSQL ('a' then 'b' on the next line is 'ab'); without the
+        // newline PostgreSQL rejects the query. Either way no type applies.
+        Expr::Value(value)
+            if matches!(
+                value.value,
+                sqlparser::ast::Value::SingleQuotedString(_)
+                    | sqlparser::ast::Value::EscapedStringLiteral(_)
+            ) =>
+        {
+            return Ok(());
+        }
         Expr::Identifier(ident) => vec![ident.clone()],
         Expr::CompoundIdentifier(idents) => idents.clone(),
         _ => return Err(anyhow!("String literal aliases are not allowed")),
@@ -3280,6 +3296,9 @@ mod tests {
             "SELECT CAST(7 AS pg_catalog.int4)",
             r#"SELECT CAST(7 AS "text"), num AS "Num" FROM blocks"#,
             r#"SELECT "text" 'hello', name 'x'"#,
+            "SELECT 'hello'\n'world'",
+            "SELECT '10.0.0.1'::inet, '10.0.0.0/8'::cidr, '08:00:2b:01:02:03'::macaddr",
+            "SELECT CAST('08:00:2b:01:02:03:04:05' AS macaddr8), inet '10.0.0.1'",
         ] {
             assert!(validate_query(sql).is_ok(), "{sql}");
         }
