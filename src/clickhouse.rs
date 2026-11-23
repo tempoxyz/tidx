@@ -183,6 +183,8 @@ impl ClickHouseEngine {
         let sql = Self::prepare_query(sql, signatures)?;
         validate_clickhouse_query(&sql)?;
         let sql = hoist_set_operation_order_by_clickhouse(&sql);
+        // Validate the SQL that is actually sent, not only the caller's.
+        validate_clickhouse_query(&sql)?;
         let sql = Self::wrap_user_query_with_limit(&sql, limit.clamp(1, HARD_LIMIT_MAX));
         // The memory cap goes last so no caller setting can override it.
         let max_memory_usage = MAX_USER_QUERY_MEMORY_BYTES.to_string();

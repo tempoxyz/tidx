@@ -3,11 +3,13 @@ use std::ops::ControlFlow;
 
 use anyhow::{Result, anyhow};
 use sqlparser::ast::{
-    Expr, Function, FunctionArg, FunctionArgExpr, FunctionArguments, LimitClause, ObjectName,
-    Query, SetExpr, Statement, TableFactor, TableWithJoins, Visit, Visitor,
+    ArrayElemTypeDef, DataType, Expr, Function, FunctionArg, FunctionArgExpr, FunctionArguments,
+    GroupByExpr, JoinConstraint, JoinOperator, LimitClause, ObjectName, Query, SelectFlavor,
+    SelectItem, SetExpr, Statement, TableFactor, TableWithJoins, Visit, Visitor,
 };
-use sqlparser::dialect::GenericDialect;
+use sqlparser::dialect::{Dialect, GenericDialect};
 use sqlparser::parser::Parser;
+use sqlparser::tokenizer::Token;
 
 const POSTGRES_ALLOWED_TABLES: &[&str] = &["blocks", "txs", "logs", "receipts"];
 
@@ -34,26 +36,43 @@ pub fn validate_query(sql: &str) -> Result<()> {
         return Err(anyhow!("LIMIT ALL is not allowed"));
     }
 
-    let dialect = GenericDialect {};
-    let statements =
-        Parser::parse_sql(&dialect, sql).map_err(|e| anyhow!("SQL parse error: {e}"))?;
-
-    if statements.is_empty() {
-        return Err(anyhow!("Empty query"));
-    }
-
-    if statements.len() > 1 {
-        return Err(anyhow!("Multiple statements not allowed"));
-    }
-
-    let stmt = &statements[0];
-
-    match stmt {
+    match parse_single_statement(&GenericDialect {}, sql)? {
         Statement::Query(query) => {
             let cte_names = HashSet::new();
-            validate_query_ast(query, &cte_names, 0)
+            validate_query_ast(&query, &cte_names, 0)?;
+            validate_postgres_query_nodes(&query)
         }
         _ => Err(anyhow!("Only SELECT queries are allowed")),
+    }
+}
+
+/// Parses `sql` as exactly one statement and requires the parser to consume
+/// all of it.
+///
+/// `Parser::parse_sql` stops without an error at some keywords (a bare `END`
+/// ends a statement list), so text after them would never reach the
+/// validator while the caller still executes the original SQL.
+fn parse_single_statement(dialect: &dyn Dialect, sql: &str) -> Result<Statement> {
+    let mut parser = Parser::new(dialect)
+        .try_with_sql(sql)
+        .map_err(|e| anyhow!("SQL parse error: {e}"))?;
+    while parser.consume_token(&Token::SemiColon) {}
+    if parser.peek_token().token == Token::EOF {
+        return Err(anyhow!("Empty query"));
+    }
+    let statement = parser
+        .parse_statement()
+        .map_err(|e| anyhow!("SQL parse error: {e}"))?;
+    let mut delimited = false;
+    while parser.consume_token(&Token::SemiColon) {
+        delimited = true;
+    }
+    match parser.peek_token().token {
+        Token::EOF => Ok(statement),
+        _ if delimited => Err(anyhow!("Multiple statements not allowed")),
+        token => Err(anyhow!(
+            "SQL parse error: unexpected '{token}' after the query"
+        )),
     }
 }
 
@@ -77,22 +96,11 @@ pub fn validate_clickhouse_query(sql: &str) -> Result<()> {
         return Err(anyhow!("LIMIT ALL is not allowed"));
     }
 
-    let dialect = sqlparser::dialect::ClickHouseDialect {};
-    let statements =
-        Parser::parse_sql(&dialect, sql).map_err(|e| anyhow!("SQL parse error: {e}"))?;
-
-    if statements.is_empty() {
-        return Err(anyhow!("Empty query"));
-    }
-    if statements.len() > 1 {
-        return Err(anyhow!("Multiple statements not allowed"));
-    }
-
-    match &statements[0] {
+    match parse_single_statement(&sqlparser::dialect::ClickHouseDialect {}, sql)? {
         Statement::Query(query) => {
             let cte_names = HashSet::new();
-            validate_clickhouse_query_ast(query, &cte_names, 0)?;
-            validate_clickhouse_query_nodes(query)
+            validate_clickhouse_query_ast(&query, &cte_names, 0)?;
+            validate_clickhouse_query_nodes(&query)
         }
         _ => Err(anyhow!("Only SELECT queries are allowed")),
     }
@@ -168,9 +176,22 @@ fn validate_query_ast(query: &Query, cte_names: &HashSet<String>, depth: usize) 
         return Err(anyhow!("FETCH clause is not allowed, use LIMIT instead"));
     }
 
+    // Other dialects' trailing clauses carry expressions the walk below
+    // would not see.
+    if query.for_clause.is_some()
+        || query.settings.is_some()
+        || query.format_clause.is_some()
+        || !query.pipe_operators.is_empty()
+    {
+        return Err(anyhow!("Unsupported query clause"));
+    }
+
     let mut all_cte_names = cte_names.clone();
     if let Some(with) = &query.with {
         for cte in &with.cte_tables {
+            if cte.from.is_some() {
+                return Err(anyhow!("FROM before SELECT is not allowed after WITH"));
+            }
             validate_query_ast(&cte.query, &all_cte_names, depth + 1)?;
             all_cte_names.insert(postgres_relation_key(&cte.alias.name));
         }
@@ -1067,6 +1088,23 @@ fn validate_set_expr(set_expr: &SetExpr, cte_names: &HashSet<String>, depth: usi
                 return Err(anyhow!("SELECT INTO is not allowed"));
             }
 
+            // Clauses PostgreSQL does not have. Each can hold expressions
+            // that the checks below would otherwise skip.
+            if select.top.is_some()
+                || select.exclude.is_some()
+                || !select.lateral_views.is_empty()
+                || select.prewhere.is_some()
+                || !select.cluster_by.is_empty()
+                || !select.distribute_by.is_empty()
+                || !select.sort_by.is_empty()
+                || select.qualify.is_some()
+                || select.value_table_mode.is_some()
+                || select.connect_by.is_some()
+                || select.flavor != SelectFlavor::Standard
+            {
+                return Err(anyhow!("Unsupported SELECT clause"));
+            }
+
             if let Some(sqlparser::ast::Distinct::On(exprs)) = &select.distinct {
                 for expr in exprs {
                     validate_expr(expr, cte_names, depth)?;
@@ -1078,10 +1116,19 @@ fn validate_set_expr(set_expr: &SetExpr, cte_names: &HashSet<String>, depth: usi
             }
 
             for item in &select.projection {
-                if let sqlparser::ast::SelectItem::UnnamedExpr(expr)
-                | sqlparser::ast::SelectItem::ExprWithAlias { expr, .. } = item
-                {
-                    validate_expr(expr, cte_names, depth)?;
+                match item {
+                    SelectItem::UnnamedExpr(expr) | SelectItem::ExprWithAlias { expr, .. } => {
+                        validate_expr(expr, cte_names, depth)?;
+                    }
+                    SelectItem::Wildcard(options) => {
+                        validate_postgres_wildcard_options(options)?;
+                    }
+                    SelectItem::QualifiedWildcard(kind, options) => {
+                        if let sqlparser::ast::SelectItemQualifiedWildcardKind::Expr(expr) = kind {
+                            validate_expr(expr, cte_names, depth)?;
+                        }
+                        validate_postgres_wildcard_options(options)?;
+                    }
                 }
             }
 
@@ -1089,10 +1136,21 @@ fn validate_set_expr(set_expr: &SetExpr, cte_names: &HashSet<String>, depth: usi
                 validate_expr(selection, cte_names, depth)?;
             }
 
-            // Validate GROUP BY expressions
-            if let sqlparser::ast::GroupByExpr::Expressions(exprs, _) = &select.group_by {
-                for expr in exprs {
-                    validate_expr(expr, cte_names, depth)?;
+            // Validate GROUP BY expressions. Trailing modifiers (WITH ROLLUP,
+            // a Hive-style GROUPING SETS list) are not PostgreSQL syntax.
+            match &select.group_by {
+                GroupByExpr::Expressions(exprs, modifiers) => {
+                    if !modifiers.is_empty() {
+                        return Err(anyhow!("GROUP BY modifiers are not allowed"));
+                    }
+                    for expr in exprs {
+                        validate_expr(expr, cte_names, depth)?;
+                    }
+                }
+                GroupByExpr::All(modifiers) => {
+                    if !modifiers.is_empty() {
+                        return Err(anyhow!("GROUP BY modifiers are not allowed"));
+                    }
                 }
             }
 
@@ -1136,24 +1194,31 @@ fn validate_table_with_joins(
     validate_table_factor(&table.relation, cte_names, depth)?;
     for join in &table.joins {
         validate_table_factor(&join.relation, cte_names, depth)?;
+        // Every join form must be listed here: a form that carries
+        // expressions and falls through unchecked would skip validation.
         let constraint = match &join.join_operator {
-            sqlparser::ast::JoinOperator::Join(c)
-            | sqlparser::ast::JoinOperator::Inner(c)
-            | sqlparser::ast::JoinOperator::Left(c)
-            | sqlparser::ast::JoinOperator::LeftOuter(c)
-            | sqlparser::ast::JoinOperator::Right(c)
-            | sqlparser::ast::JoinOperator::RightOuter(c)
-            | sqlparser::ast::JoinOperator::FullOuter(c)
-            | sqlparser::ast::JoinOperator::CrossJoin(c)
-            | sqlparser::ast::JoinOperator::Semi(c)
-            | sqlparser::ast::JoinOperator::LeftSemi(c)
-            | sqlparser::ast::JoinOperator::RightSemi(c)
-            | sqlparser::ast::JoinOperator::Anti(c)
-            | sqlparser::ast::JoinOperator::LeftAnti(c)
-            | sqlparser::ast::JoinOperator::RightAnti(c) => Some(c),
-            _ => None,
+            JoinOperator::Join(c)
+            | JoinOperator::Inner(c)
+            | JoinOperator::Left(c)
+            | JoinOperator::LeftOuter(c)
+            | JoinOperator::Right(c)
+            | JoinOperator::RightOuter(c)
+            | JoinOperator::FullOuter(c)
+            | JoinOperator::CrossJoin(c)
+            | JoinOperator::Semi(c)
+            | JoinOperator::LeftSemi(c)
+            | JoinOperator::RightSemi(c)
+            | JoinOperator::Anti(c)
+            | JoinOperator::LeftAnti(c)
+            | JoinOperator::RightAnti(c) => c,
+            JoinOperator::CrossApply
+            | JoinOperator::OuterApply
+            | JoinOperator::AsOf { .. }
+            | JoinOperator::StraightJoin(_) => {
+                return Err(anyhow!("Unsupported join type"));
+            }
         };
-        if let Some(sqlparser::ast::JoinConstraint::On(expr)) = constraint {
+        if let JoinConstraint::On(expr) = constraint {
             validate_expr(expr, cte_names, depth)?;
         }
     }
@@ -1289,7 +1354,7 @@ fn validate_expr(expr: &Expr, cte_names: &HashSet<String>, depth: usize) -> Resu
         // Safe leaf nodes
         Expr::Identifier(_) | Expr::CompoundIdentifier(_) => Ok(()),
         Expr::Value(_) => Ok(()),
-        Expr::TypedString(_) => Ok(()),
+        Expr::TypedString(typed) => validate_cast_type(&typed.data_type),
         Expr::Wildcard(_) | Expr::QualifiedWildcard(_, _) => Ok(()),
 
         // Function calls (validated against allowlist)
@@ -1340,7 +1405,12 @@ fn validate_expr(expr: &Expr, cte_names: &HashSet<String>, depth: usize) -> Resu
         }
 
         // Type casting
-        Expr::Cast { expr, .. } => validate_expr(expr, cte_names, depth),
+        Expr::Cast {
+            expr, data_type, ..
+        } => {
+            validate_cast_type(data_type)?;
+            validate_expr(expr, cte_names, depth)
+        }
         Expr::Nested(e) => validate_expr(e, cte_names, depth),
 
         // IN list
@@ -1467,6 +1537,149 @@ fn validate_expr(expr: &Expr, cte_names: &HashSet<String>, depth: usize) -> Resu
 
         // Reject everything else (reject-by-default)
         _ => Err(anyhow!("Unsupported expression type")),
+    }
+}
+
+/// Built-in PostgreSQL scalar types that sqlparser parses as custom types.
+/// None of them resolves a value through the catalog.
+const POSTGRES_BUILTIN_CUSTOM_TYPES: &[&str] = &[
+    "bpchar",
+    "name",
+    "timestamptz",
+    "timetz",
+    "int2",
+    "int4",
+    "int8",
+    "float4",
+    "float8",
+    "bool",
+];
+
+/// Rejects cast targets that resolve through the catalog.
+///
+/// PostgreSQL's OID alias types (regclass, regrole, regproc, ...) turn a
+/// number or string into a catalog object's name, and any other named type
+/// may be user-defined. Built-in scalar types parse to dedicated variants.
+fn validate_cast_type(data_type: &DataType) -> Result<()> {
+    match data_type {
+        DataType::Custom(name, modifiers) => {
+            let type_name = name.to_string().to_lowercase();
+            // Unqualified built-in scalar types the parser has no variant for.
+            if name.0.len() == 1
+                && modifiers.is_empty()
+                && POSTGRES_BUILTIN_CUSTOM_TYPES.contains(&type_name.as_str())
+            {
+                Ok(())
+            } else {
+                Err(anyhow!("Cast to type '{type_name}' is not allowed"))
+            }
+        }
+        DataType::Regclass => Err(anyhow!("Cast to type 'regclass' is not allowed")),
+        DataType::Array(element) => match element {
+            ArrayElemTypeDef::AngleBracket(inner)
+            | ArrayElemTypeDef::SquareBracket(inner, _)
+            | ArrayElemTypeDef::Parenthesis(inner) => validate_cast_type(inner),
+            ArrayElemTypeDef::None => Ok(()),
+        },
+        _ => Ok(()),
+    }
+}
+
+fn validate_postgres_wildcard_options(
+    options: &sqlparser::ast::WildcardAdditionalOptions,
+) -> Result<()> {
+    if options.opt_ilike.is_some()
+        || options.opt_exclude.is_some()
+        || options.opt_except.is_some()
+        || options.opt_replace.is_some()
+        || options.opt_rename.is_some()
+    {
+        return Err(anyhow!("Wildcard options are not allowed"));
+    }
+    Ok(())
+}
+
+/// Second pass over every node of a PostgreSQL query, after the scoped walk.
+///
+/// The walk validates the clauses it knows about; this pass checks each
+/// relation, function and cast target wherever it appears, so a clause the
+/// walk does not descend into cannot carry one past the allowlists.
+fn validate_postgres_query_nodes(query: &Query) -> Result<()> {
+    let mut visitor = PostgresNodeValidator {
+        cte_names: HashSet::new(),
+    };
+    match query.visit(&mut visitor) {
+        ControlFlow::Continue(()) => Ok(()),
+        ControlFlow::Break(error) => Err(error),
+    }
+}
+
+struct PostgresNodeValidator {
+    /// CTE names of the whole statement. The scoped check stays in the walk.
+    cte_names: HashSet<String>,
+}
+
+impl Visitor for PostgresNodeValidator {
+    type Break = anyhow::Error;
+
+    fn pre_visit_query(&mut self, query: &Query) -> ControlFlow<Self::Break> {
+        if let Some(with) = &query.with {
+            for cte in &with.cte_tables {
+                self.cte_names
+                    .insert(postgres_relation_key(&cte.alias.name));
+            }
+        }
+        ControlFlow::Continue(())
+    }
+
+    fn pre_visit_table_factor(&mut self, factor: &TableFactor) -> ControlFlow<Self::Break> {
+        let result = match factor {
+            TableFactor::Table { name, args, .. } => {
+                if args.is_some() {
+                    Err(anyhow!("Table functions are not allowed"))
+                } else {
+                    validate_table_name(name, &self.cte_names)
+                }
+            }
+            TableFactor::Derived { .. } | TableFactor::NestedJoin { .. } => Ok(()),
+            TableFactor::TableFunction { .. } | TableFactor::Function { .. } => {
+                Err(anyhow!("Table functions are not allowed"))
+            }
+            _ => Err(anyhow!("Unsupported FROM clause type")),
+        };
+        match result {
+            Ok(()) => ControlFlow::Continue(()),
+            Err(error) => ControlFlow::Break(error),
+        }
+    }
+
+    fn pre_visit_expr(&mut self, expr: &Expr) -> ControlFlow<Self::Break> {
+        let result = match expr {
+            Expr::Function(func) => {
+                let name = func.name.to_string().to_lowercase();
+                if is_allowed_function(&name) {
+                    Ok(())
+                } else {
+                    Err(anyhow!("Function '{name}' is not allowed"))
+                }
+            }
+            Expr::Cast { data_type, .. } => validate_cast_type(data_type),
+            Expr::TypedString(typed) => validate_cast_type(&typed.data_type),
+            Expr::Identifier(ident)
+                if ident.quote_style.is_none()
+                    && POSTGRES_SESSION_KEYWORDS.contains(&ident.value.to_lowercase().as_str()) =>
+            {
+                Err(anyhow!(
+                    "Function '{}' is not allowed",
+                    ident.value.to_lowercase()
+                ))
+            }
+            _ => Ok(()),
+        };
+        match result {
+            Ok(()) => ControlFlow::Continue(()),
+            Err(error) => ControlFlow::Break(error),
+        }
     }
 }
 
@@ -2958,5 +3171,77 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn test_rejects_input_after_bare_end() {
+        assert!(validate_query("SELECT num END FROM other_table").is_err());
+        assert!(validate_query("SELECT num FROM blocks END").is_err());
+        assert!(validate_clickhouse_query("SELECT num END FROM other_table").is_err());
+    }
+
+    #[test]
+    fn test_accepts_trailing_semicolons() {
+        assert!(validate_query("SELECT num FROM blocks;").is_ok());
+        assert!(validate_query("SELECT num FROM blocks;;").is_ok());
+        assert!(validate_clickhouse_query("SELECT num FROM blocks;").is_ok());
+        assert!(validate_query(";").is_err());
+    }
+
+    #[test]
+    fn test_rejects_catalog_cast_targets() {
+        for sql in [
+            "SELECT CAST(10 AS regrole)",
+            "SELECT num::regclass FROM blocks",
+            "SELECT CAST(num AS my_type) FROM blocks",
+            "SELECT CAST('now' AS regproc)",
+            "SELECT ARRAY[10]::regtype[]",
+            "SELECT num FROM blocks WHERE num::regnamespace IS NOT NULL",
+        ] {
+            assert!(validate_query(sql).is_err(), "{sql}");
+        }
+    }
+
+    #[test]
+    fn test_accepts_builtin_cast_targets() {
+        for sql in [
+            "SELECT num::text FROM blocks",
+            "SELECT CAST(num AS numeric) FROM blocks",
+            "SELECT num::bigint FROM blocks",
+            "SELECT timestamp '2026-01-01 00:00:00'",
+            "SELECT ARRAY[num]::bigint[] FROM blocks",
+            "SELECT 'n'::name, '2024-01-02 03:04:05+05:30'::timestamptz, 7::int2",
+        ] {
+            assert!(validate_query(sql).is_ok(), "{sql}");
+        }
+    }
+
+    #[test]
+    fn test_rejects_join_forms_with_unchecked_conditions() {
+        assert!(
+            validate_query(
+                "SELECT b.num FROM blocks b ASOF JOIN txs t \
+                 MATCH_CONDITION (b.num >= t.block_num) ON (SELECT count(*) FROM other_table) > 0"
+            )
+            .is_err()
+        );
+        assert!(
+            validate_query(
+                "SELECT b.num FROM blocks b STRAIGHT_JOIN txs t ON (SELECT count(*) FROM other_table) > 0"
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn test_rejects_group_by_modifiers_and_foreign_clauses() {
+        for sql in [
+            "SELECT num FROM blocks GROUP BY num WITH ROLLUP",
+            "SELECT num FROM blocks GROUP BY num GROUPING SETS ((num))",
+            "SELECT num FROM blocks SETTINGS max_threads = 1",
+            "SELECT num FROM blocks FORMAT JSON",
+        ] {
+            assert!(validate_query(sql).is_err(), "{sql}");
+        }
     }
 }

@@ -344,7 +344,16 @@ pub fn hoist_set_operation_order_by_clickhouse(sql: &str) -> String {
     };
     std::mem::swap(&mut subquery.body, &mut query.body);
     query.body = wrapper_query.body;
-    statements[0].to_string()
+
+    // The ClickHouse dialect unescapes string literals when it parses, and
+    // the formatter does not restore every escape, so rendering can move a
+    // literal's boundaries. Use the rewrite only if it parses back to the
+    // same tree; otherwise keep the original, already validated SQL.
+    let hoisted = statements[0].to_string();
+    match Parser::parse_sql(&ClickHouseDialect {}, &hoisted) {
+        Ok(reparsed) if reparsed == statements => hoisted,
+        _ => sql.to_string(),
+    }
 }
 
 #[cfg(test)]
@@ -611,5 +620,15 @@ mod tests {
         ] {
             assert_eq!(convert_timestamp_literals_clickhouse(sql), sql);
         }
+    }
+
+    #[test]
+    fn hoist_keeps_original_when_rendering_changes_literals() {
+        let sql = r"SELECT 'a\\' AS x FROM blocks UNION ALL SELECT 'b' AS x FROM blocks ORDER BY x";
+        assert_eq!(hoist_set_operation_order_by_clickhouse(sql), sql);
+
+        // The same query without the escaped backslash is still rewritten.
+        let plain = "SELECT 'a' AS x FROM blocks UNION ALL SELECT 'b' AS x FROM blocks ORDER BY x";
+        assert_ne!(hoist_set_operation_order_by_clickhouse(plain), plain);
     }
 }
