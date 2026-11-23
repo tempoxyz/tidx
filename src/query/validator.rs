@@ -438,7 +438,15 @@ fn validate_clickhouse_query_ast(
         ));
     }
 
-    if query.fetch.is_some() || !query.locks.is_empty() || !query.pipe_operators.is_empty() {
+    // tidx chooses the settings and output format of every request itself;
+    // a SETTINGS or FORMAT clause at any depth would let the query change
+    // them, including how ClickHouse resolves the names this walk checks.
+    if query.fetch.is_some()
+        || !query.locks.is_empty()
+        || !query.pipe_operators.is_empty()
+        || query.settings.is_some()
+        || query.format_clause.is_some()
+    {
         return Err(anyhow!("Unsupported query clause"));
     }
 
@@ -3023,7 +3031,6 @@ mod tests {
              SELECT * FROM counted",
             "SELECT * FROM (WITH inner_cte AS (SELECT block_num FROM logs) SELECT * FROM inner_cte) \
              AS derived",
-            "SELECT block_num FROM logs SETTINGS max_threads = 1",
         ] {
             let result = validate_clickhouse_query(sql);
             assert!(result.is_ok(), "{sql}: {result:?}");
@@ -3063,30 +3070,34 @@ mod tests {
 
     #[test]
     fn test_clickhouse_visitor_pass_covers_positions_outside_the_walk() {
-        for (sql, error) in [
-            (
-                "SELECT block_num FROM logs SETTINGS max_threads = sleep(1)",
-                "Function 'sleep' is not allowed",
-            ),
-            (
-                "SELECT block_num FROM logs SETTINGS max_threads = (SELECT count() FROM system.one)",
-                "Access to ClickHouse system schema 'system' is not allowed",
-            ),
-            (
-                "SELECT block_num FROM logs SETTINGS max_threads = (SELECT count() FROM numbers(1))",
-                "Table functions are not allowed",
-            ),
-            (
-                "SELECT CAST(block_num AS Nested(a UInt8 DEFAULT sleep(1))) FROM logs",
-                "Function 'sleep' is not allowed",
-            ),
-        ] {
+        for (sql, error) in [(
+            "SELECT CAST(block_num AS Nested(a UInt8 DEFAULT sleep(1))) FROM logs",
+            "Function 'sleep' is not allowed",
+        )] {
             // The walk does not look at these positions, only the visitor pass does.
             let query = parse_query(&sqlparser::dialect::ClickHouseDialect {}, sql);
             let walk = validate_clickhouse_query_ast(&query, &HashSet::new(), 0);
             assert!(walk.is_ok(), "{sql}: {walk:?}");
             let result = validate_clickhouse_query(sql);
             assert_eq!(result.expect_err(sql).to_string(), error, "{sql}");
+        }
+    }
+
+    #[test]
+    fn test_clickhouse_rejects_settings_and_format_at_any_depth() {
+        for sql in [
+            "SELECT block_num FROM logs SETTINGS max_threads = 1",
+            "SELECT block_num FROM logs FORMAT JSON",
+            "SELECT * FROM (SELECT block_num FROM logs SETTINGS max_threads = 1) AS s",
+            "SELECT (SELECT max(block_num) FROM logs SETTINGS max_threads = 1) AS m",
+            "WITH recent AS (SELECT block_num FROM logs SETTINGS max_threads = 1) SELECT * FROM recent",
+            "WITH recent AS (SELECT block_num FROM logs) \
+             SELECT * FROM (SELECT * FROM recent SETTINGS max_threads = 1) AS s",
+            "SELECT block_num FROM logs UNION ALL \
+             SELECT * FROM (SELECT block_num FROM txs SETTINGS max_threads = 1) AS s",
+        ] {
+            let error = validate_clickhouse_query(sql).expect_err(sql);
+            assert_eq!(error.to_string(), "Unsupported query clause", "{sql}");
         }
     }
 
