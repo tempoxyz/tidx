@@ -1563,15 +1563,22 @@ const POSTGRES_BUILTIN_CUSTOM_TYPES: &[&str] = &[
 fn validate_cast_type(data_type: &DataType) -> Result<()> {
     match data_type {
         DataType::Custom(name, modifiers) => {
-            let type_name = name.to_string().to_lowercase();
-            // Unqualified built-in scalar types the parser has no variant for.
-            if name.0.len() == 1
-                && modifiers.is_empty()
-                && POSTGRES_BUILTIN_CUSTOM_TYPES.contains(&type_name.as_str())
-            {
+            // Unqualified built-in scalar types the parser has no variant for,
+            // resolved with PostgreSQL's identifier rules so that "name" and
+            // name match while "NAME" does not.
+            let builtin = match name.0.as_slice() {
+                [part] if modifiers.is_empty() => part.as_ident().is_some_and(|ident| {
+                    POSTGRES_BUILTIN_CUSTOM_TYPES.contains(&postgres_relation_key(ident).as_str())
+                }),
+                _ => false,
+            };
+            if builtin {
                 Ok(())
             } else {
-                Err(anyhow!("Cast to type '{type_name}' is not allowed"))
+                Err(anyhow!(
+                    "Cast to type '{}' is not allowed",
+                    name.to_string().to_lowercase()
+                ))
             }
         }
         DataType::Regclass => Err(anyhow!("Cast to type 'regclass' is not allowed")),
@@ -3194,6 +3201,7 @@ mod tests {
             "SELECT CAST(10 AS regrole)",
             "SELECT num::regclass FROM blocks",
             "SELECT CAST(num AS my_type) FROM blocks",
+            r#"SELECT 'n'::"NAME""#,
             "SELECT CAST('now' AS regproc)",
             "SELECT ARRAY[10]::regtype[]",
             "SELECT num FROM blocks WHERE num::regnamespace IS NOT NULL",
@@ -3211,6 +3219,7 @@ mod tests {
             "SELECT timestamp '2026-01-01 00:00:00'",
             "SELECT ARRAY[num]::bigint[] FROM blocks",
             "SELECT 'n'::name, '2024-01-02 03:04:05+05:30'::timestamptz, 7::int2",
+            r#"SELECT 'n'::"name", 'n'::NAME"#,
         ] {
             assert!(validate_query(sql).is_ok(), "{sql}");
         }
