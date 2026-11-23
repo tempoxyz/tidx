@@ -1117,7 +1117,14 @@ fn validate_set_expr(set_expr: &SetExpr, cte_names: &HashSet<String>, depth: usi
 
             for item in &select.projection {
                 match item {
-                    SelectItem::UnnamedExpr(expr) | SelectItem::ExprWithAlias { expr, .. } => {
+                    SelectItem::UnnamedExpr(expr) => validate_expr(expr, cte_names, depth)?,
+                    SelectItem::ExprWithAlias { expr, alias } => {
+                        // PostgreSQL has no string-literal aliases: it reads
+                        // name 'text' as a value of type name, which the parser
+                        // here would take as a column with an alias.
+                        if alias.quote_style == Some('\'') {
+                            return Err(anyhow!("String literal aliases are not allowed"));
+                        }
                         validate_expr(expr, cte_names, depth)?;
                     }
                     SelectItem::Wildcard(options) => {
@@ -1543,6 +1550,26 @@ fn validate_expr(expr: &Expr, cte_names: &HashSet<String>, depth: usize) -> Resu
 /// Built-in PostgreSQL scalar types that sqlparser parses as custom types.
 /// None of them resolves a value through the catalog.
 const POSTGRES_BUILTIN_CUSTOM_TYPES: &[&str] = &[
+    // Quoted spellings of types that have dedicated variants when unquoted.
+    "text",
+    "varchar",
+    "char",
+    "numeric",
+    "decimal",
+    "bytea",
+    "bigint",
+    "integer",
+    "int",
+    "smallint",
+    "boolean",
+    "real",
+    "date",
+    "time",
+    "timestamp",
+    "interval",
+    "uuid",
+    "json",
+    "jsonb",
     "bpchar",
     "name",
     "timestamptz",
@@ -3217,6 +3244,8 @@ mod tests {
             "SELECT 'ab'::bpchar(x)",
             "SELECT CAST(7 AS pg_catalog.regclass)",
             "SELECT CAST(7 AS public.int4)",
+            "SELECT regrole '10'",
+            "SELECT num FROM blocks WHERE regclass 'blocks' IS NOT NULL",
             "SELECT CAST('now' AS regproc)",
             "SELECT ARRAY[10]::regtype[]",
             "SELECT num FROM blocks WHERE num::regnamespace IS NOT NULL",
@@ -3237,6 +3266,7 @@ mod tests {
             r#"SELECT 'n'::"name", 'n'::NAME"#,
             "SELECT 'ab'::bpchar(10), now()::timestamptz(3)",
             "SELECT CAST(7 AS pg_catalog.int4)",
+            r#"SELECT CAST(7 AS "text"), num AS "Num" FROM blocks"#,
         ] {
             assert!(validate_query(sql).is_ok(), "{sql}");
         }
