@@ -283,8 +283,9 @@ fn normalize_set_output_references(expr: &mut Expr, references: &SetOutputRefere
 /// derived-table wrapper: `SELECT * FROM (<set operation>) AS tidx_set_query
 /// ORDER BY ... LIMIT ...`. The trailing form is valid PostgreSQL, but
 /// ClickHouse grammar only accepts another set operator after a parenthesized
-/// arm. Non-matching queries are returned unchanged.
-pub fn hoist_set_operation_order_by_clickhouse(sql: &str) -> String {
+/// arm. Non-matching queries are returned unchanged. Fails when the rewrite
+/// cannot be rendered back to the same query.
+pub fn hoist_set_operation_order_by_clickhouse(sql: &str) -> anyhow::Result<String> {
     // A fully parenthesized set expression parses as nested `SetExpr::Query`
     // layers; unwrap them to find the set operation. Inner clauses (its own
     // ORDER BY/LIMIT) stay inside the derived table.
@@ -297,15 +298,15 @@ pub fn hoist_set_operation_order_by_clickhouse(sql: &str) -> String {
     }
 
     let Ok(mut statements) = Parser::parse_sql(&ClickHouseDialect {}, sql) else {
-        return sql.to_string();
+        return Ok(sql.to_string());
     };
     let [Statement::Query(query)] = statements.as_mut_slice() else {
-        return sql.to_string();
+        return Ok(sql.to_string());
     };
     if !is_set_operation(query.body.as_ref())
         || (query.order_by.is_none() && query.limit_clause.is_none() && query.fetch.is_none())
     {
-        return sql.to_string();
+        return Ok(sql.to_string());
     }
     let output_references = SetOutputReferences::from_set(query.body.as_ref());
 
@@ -344,11 +345,27 @@ pub fn hoist_set_operation_order_by_clickhouse(sql: &str) -> String {
     };
     std::mem::swap(&mut subquery.body, &mut query.body);
     query.body = wrapper_query.body;
-    statements[0].to_string()
+
+    // The ClickHouse dialect unescapes string literals when it parses, and
+    // the formatter does not restore every escape, so rendering can move a
+    // literal's boundaries. Send the rewrite only if it parses back to the
+    // same tree. The original form cannot be sent instead: ClickHouse would
+    // reject it or apply the trailing clauses to the last arm only.
+    let hoisted = statements[0].to_string();
+    match validator::parse_single_statement(&ClickHouseDialect {}, &hoisted) {
+        Ok(reparsed) if reparsed == statements[0] => Ok(hoisted),
+        _ => Err(anyhow::anyhow!(
+            "This set operation with ORDER BY, LIMIT or OFFSET cannot be run on ClickHouse;              remove backslash escapes from its string literals"
+        )),
+    }
 }
 
 #[cfg(test)]
 mod tests {
+    fn hoist(sql: &str) -> String {
+        hoist_set_operation_order_by_clickhouse(sql).expect("hoist")
+    }
+
     use super::*;
 
     #[test]
@@ -390,7 +407,7 @@ mod tests {
     #[test]
     fn hoist_union_trailing_order_by_limit() {
         assert_eq!(
-            hoist_set_operation_order_by_clickhouse(
+            hoist(
                 "(SELECT num FROM blocks ORDER BY num DESC LIMIT 2) \
                  UNION (SELECT num FROM blocks ORDER BY num DESC LIMIT 2) \
                  ORDER BY num DESC LIMIT 2"
@@ -404,7 +421,7 @@ mod tests {
     #[test]
     fn hoist_union_trailing_offset() {
         assert_eq!(
-            hoist_set_operation_order_by_clickhouse(
+            hoist(
                 "SELECT num FROM blocks UNION ALL SELECT num FROM txs ORDER BY num LIMIT 5 OFFSET 1"
             ),
             "SELECT * FROM (SELECT num FROM blocks UNION ALL SELECT num FROM txs) \
@@ -415,7 +432,7 @@ mod tests {
     #[test]
     fn hoist_normalizes_qualified_trailing_references() {
         assert_eq!(
-            hoist_set_operation_order_by_clickhouse(
+            hoist(
                 "SELECT b.num FROM blocks AS b UNION ALL SELECT b.num FROM blocks AS b \
                  ORDER BY b.num DESC, abs(b.num) LIMIT 1 BY b.num"
             ),
@@ -428,7 +445,7 @@ mod tests {
     #[test]
     fn hoist_resolves_qualified_reference_to_first_arm_alias() {
         assert_eq!(
-            hoist_set_operation_order_by_clickhouse(
+            hoist(
                 "SELECT b.num AS height FROM blocks AS b \
                  UNION ALL SELECT b.num AS height FROM blocks AS b \
                  ORDER BY b.num DESC"
@@ -442,7 +459,7 @@ mod tests {
     #[test]
     fn hoist_resolves_unquoted_qualifier_case_insensitively() {
         assert_eq!(
-            hoist_set_operation_order_by_clickhouse(
+            hoist(
                 "SELECT B.num AS height FROM blocks AS B \
                  UNION ALL SELECT B.num AS height FROM blocks AS B \
                  ORDER BY b.num DESC"
@@ -456,7 +473,7 @@ mod tests {
     #[test]
     fn hoist_preserves_quoted_qualifier_case_sensitivity() {
         assert_eq!(
-            hoist_set_operation_order_by_clickhouse(
+            hoist(
                 "SELECT \"B\".num AS height FROM blocks AS \"B\" \
                  UNION ALL SELECT \"B\".num AS height FROM blocks AS \"B\" \
                  ORDER BY \"b\".num DESC"
@@ -470,7 +487,7 @@ mod tests {
     #[test]
     fn hoist_resolves_later_arm_reference_to_first_arm_output() {
         assert_eq!(
-            hoist_set_operation_order_by_clickhouse(
+            hoist(
                 "SELECT b.num FROM blocks AS b \
                  UNION ALL SELECT t.block_num FROM txs AS t \
                  ORDER BY t.block_num DESC"
@@ -484,7 +501,7 @@ mod tests {
     #[test]
     fn hoist_preserves_qualified_references_in_trailing_subqueries() {
         assert_eq!(
-            hoist_set_operation_order_by_clickhouse(
+            hoist(
                 "SELECT b.num FROM blocks AS b UNION ALL SELECT b.num FROM blocks AS b \
                  ORDER BY b.num + (SELECT max(t.idx) FROM txs AS t)"
             ),
@@ -497,7 +514,7 @@ mod tests {
     #[test]
     fn hoist_preserves_unresolved_compound_output_reference() {
         assert_eq!(
-            hoist_set_operation_order_by_clickhouse(
+            hoist(
                 "SELECT payload AS result FROM events \
                  UNION ALL SELECT payload AS result FROM events \
                  ORDER BY result.field"
@@ -511,7 +528,7 @@ mod tests {
     #[test]
     fn hoist_strips_qualified_wildcard_arm_reference() {
         assert_eq!(
-            hoist_set_operation_order_by_clickhouse(
+            hoist(
                 "SELECT b.* FROM blocks AS b \
                  UNION ALL SELECT b.* FROM blocks AS b \
                  ORDER BY b.num DESC"
@@ -525,7 +542,7 @@ mod tests {
     #[test]
     fn hoist_strips_unqualified_wildcard_arm_reference() {
         assert_eq!(
-            hoist_set_operation_order_by_clickhouse(
+            hoist(
                 "SELECT * FROM blocks AS b \
                  UNION ALL SELECT * FROM blocks AS b \
                  ORDER BY b.num DESC"
@@ -539,7 +556,7 @@ mod tests {
     #[test]
     fn hoist_preserves_ambiguous_arm_reference() {
         assert_eq!(
-            hoist_set_operation_order_by_clickhouse(
+            hoist(
                 "SELECT b.num AS height, b.num AS other FROM blocks AS b \
                  UNION ALL SELECT b.num, b.num FROM blocks AS b \
                  ORDER BY b.num DESC"
@@ -553,7 +570,7 @@ mod tests {
     #[test]
     fn hoist_preserves_leading_cte() {
         assert_eq!(
-            hoist_set_operation_order_by_clickhouse(
+            hoist(
                 "WITH b AS (SELECT num FROM blocks) \
                  (SELECT num FROM b) UNION (SELECT num FROM b) ORDER BY num"
             ),
@@ -566,9 +583,7 @@ mod tests {
     #[test]
     fn hoist_parenthesized_set_query() {
         assert_eq!(
-            hoist_set_operation_order_by_clickhouse(
-                "(SELECT num FROM blocks UNION SELECT num FROM txs) ORDER BY num LIMIT 10"
-            ),
+            hoist("(SELECT num FROM blocks UNION SELECT num FROM txs) ORDER BY num LIMIT 10"),
             "SELECT * FROM ((SELECT num FROM blocks UNION SELECT num FROM txs)) \
              AS tidx_set_query ORDER BY num LIMIT 10"
         );
@@ -577,7 +592,7 @@ mod tests {
     #[test]
     fn hoist_parenthesized_set_query_preserves_inner_clauses() {
         assert_eq!(
-            hoist_set_operation_order_by_clickhouse(
+            hoist(
                 "(SELECT num FROM blocks UNION SELECT num FROM txs ORDER BY num LIMIT 5) \
                  ORDER BY num DESC LIMIT 3"
             ),
@@ -596,7 +611,7 @@ mod tests {
             "SELECT * FROM (SELECT num FROM blocks UNION SELECT num FROM txs) AS t ORDER BY num",
             "(SELECT num FROM blocks) ORDER BY num LIMIT 2",
         ] {
-            assert_eq!(hoist_set_operation_order_by_clickhouse(sql), sql);
+            assert_eq!(hoist(sql), sql);
         }
     }
 
@@ -611,5 +626,15 @@ mod tests {
         ] {
             assert_eq!(convert_timestamp_literals_clickhouse(sql), sql);
         }
+    }
+
+    #[test]
+    fn hoist_rejects_rewrite_that_changes_literals() {
+        let sql = r"SELECT 'a\\' AS x FROM blocks UNION ALL SELECT 'b' AS x FROM blocks ORDER BY x";
+        assert!(hoist_set_operation_order_by_clickhouse(sql).is_err());
+
+        // The same query without the escaped backslash is still rewritten.
+        let plain = "SELECT 'a' AS x FROM blocks UNION ALL SELECT 'b' AS x FROM blocks ORDER BY x";
+        assert_ne!(hoist(plain), plain);
     }
 }
