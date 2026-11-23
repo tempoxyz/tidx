@@ -1,11 +1,12 @@
-//! Response delivery: query permits that last until the body is sent, and
-//! connections that are closed when the peer stops accepting writes.
+//! Response delivery: query permits that last until the body is sent (up to
+//! a deadline), and connections that are closed when the peer stops
+//! accepting writes.
 
 use std::future::Future;
 use std::io;
 use std::net::SocketAddr;
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll, ready};
 use std::time::Duration;
 
@@ -18,20 +19,26 @@ use axum::serve::{Listener, ListenerExt, TapIo};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+use tokio::task::AbortHandle;
 use tokio::time::Sleep;
 
 /// How long a connection may go without any write progress before it is
 /// closed. Matches the longest query timeout a request can ask for.
 pub const WRITE_STALL_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// How long a buffered query response may take to be handed to the
+/// connection. Past it, the response's permit and buffer are released and the
+/// body ends with an error. Matches the longest query timeout.
+pub const DELIVERY_DEADLINE: Duration = Duration::from_secs(30);
+
 /// Size of the frames a buffered query response is sent in. hyper queues at
-/// most 16 frames per connection, so this bounds what stays queued after the
-/// last frame is handed over.
-const RESPONSE_CHUNK_BYTES: usize = 64 * 1024;
+/// most 16 frames per HTTP/1 connection, so this bounds what stays queued
+/// once the response itself is released.
+const RESPONSE_CHUNK_BYTES: usize = 16 * 1024;
 
 /// Runs a query request under one of `permits` and keeps that permit until
-/// the response body has been handed to the connection, rather than only
-/// until the handler returns.
+/// the response body has been handed to the connection, or until
+/// `DELIVERY_DEADLINE` passes, rather than only until the handler returns.
 ///
 /// A fully buffered response is resent in copied chunks, so its full
 /// allocation is freed together with the permit. Streaming responses (live
@@ -41,6 +48,15 @@ pub async fn hold_query_permit(
     State(permits): State<Arc<Semaphore>>,
     request: Request,
     next: Next,
+) -> Response {
+    hold_query_permit_for(permits, request, next, DELIVERY_DEADLINE).await
+}
+
+async fn hold_query_permit_for(
+    permits: Arc<Semaphore>,
+    request: Request,
+    next: Next,
+    deadline: Duration,
 ) -> Response {
     let Ok(permit) = permits.acquire_owned().await else {
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
@@ -60,25 +76,91 @@ pub async fn hold_query_permit(
         .headers
         .insert(header::CONTENT_LENGTH, HeaderValue::from(bytes.len()));
 
-    Response::from_parts(parts, Body::from_stream(chunked(bytes, permit)))
+    let body = Delivery::start(bytes, permit, deadline);
+    Response::from_parts(parts, Body::from_stream(body.into_stream()))
 }
 
-/// Yields copies of `bytes` in chunks, dropping `bytes` and `permit` once the
-/// last chunk has been taken.
-fn chunked(
+/// What a buffered response still holds while it is being sent.
+struct Pending {
     bytes: Bytes,
-    permit: OwnedSemaphorePermit,
-) -> impl futures::Stream<Item = Result<Bytes, std::convert::Infallible>> + Send {
-    futures::stream::unfold(Some((bytes, 0usize, permit)), |state| async move {
-        let (bytes, offset, permit) = state?;
-        if offset >= bytes.len() {
+    offset: usize,
+    _permit: OwnedSemaphorePermit,
+}
+
+/// A buffered response being sent. A timer drops what it holds at the
+/// deadline even if the connection never polls the body again, as happens
+/// when the peer stops reading.
+struct Delivery {
+    pending: Arc<Mutex<Option<Pending>>>,
+    timer: AbortHandle,
+}
+
+impl Delivery {
+    fn start(bytes: Bytes, permit: OwnedSemaphorePermit, deadline: Duration) -> Self {
+        let pending = Arc::new(Mutex::new(Some(Pending {
+            bytes,
+            offset: 0,
+            _permit: permit,
+        })));
+        let expired = Arc::downgrade(&pending);
+        let timer = tokio::spawn(async move {
+            tokio::time::sleep(deadline).await;
+            if let Some(pending) = expired.upgrade() {
+                let released = pending.lock().map(|mut p| p.take());
+                drop(released);
+            }
+        })
+        .abort_handle();
+        Self { pending, timer }
+    }
+
+    /// The next chunk, or None once the deadline released the response.
+    fn next_chunk(&self) -> Option<Bytes> {
+        let mut guard = self.pending.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(pending) = guard.as_mut() else {
             return None;
+        };
+        let end = (pending.offset + RESPONSE_CHUNK_BYTES).min(pending.bytes.len());
+        let chunk = Bytes::copy_from_slice(&pending.bytes[pending.offset..end]);
+        pending.offset = end;
+        if end >= pending.bytes.len() {
+            // Release the response and its permit with the last chunk.
+            guard.take();
         }
-        let end = (offset + RESPONSE_CHUNK_BYTES).min(bytes.len());
-        let chunk = Bytes::copy_from_slice(&bytes[offset..end]);
-        let next = (end < bytes.len()).then_some((bytes, end, permit));
-        Some((Ok(chunk), next))
-    })
+        Some(chunk)
+    }
+
+    fn into_stream(self) -> impl futures::Stream<Item = io::Result<Bytes>> + Send {
+        let total = self
+            .pending
+            .lock()
+            .map(|p| p.as_ref().map_or(0, |p| p.bytes.len()))
+            .unwrap_or(0);
+        futures::stream::unfold((self, 0usize), move |(delivery, sent)| async move {
+            if sent >= total {
+                return None;
+            }
+            match delivery.next_chunk() {
+                Some(chunk) => {
+                    let sent = sent + chunk.len();
+                    Some((Ok(chunk), (delivery, sent)))
+                }
+                None => Some((
+                    Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "response not delivered before the deadline",
+                    )),
+                    (delivery, total),
+                )),
+            }
+        })
+    }
+}
+
+impl Drop for Delivery {
+    fn drop(&mut self) {
+        self.timer.abort();
+    }
 }
 
 /// A listener whose connections fail once a write makes no progress for
@@ -206,16 +288,18 @@ mod tests {
         Json(serde_json::json!({ "data": "x".repeat(BODY_BYTES) }))
     }
 
-    async fn start(permits: Arc<Semaphore>, timeout: Duration) -> SocketAddr {
+    async fn start(permits: Arc<Semaphore>, stall: Duration, deadline: Duration) -> SocketAddr {
         let router = Router::new().route(
             "/query",
-            get(large).layer(middleware::from_fn_with_state(permits, hold_query_permit)),
+            get(large).layer(middleware::from_fn(move |request, next| {
+                hold_query_permit_for(permits.clone(), request, next, deadline)
+            })),
         );
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move {
             axum::serve(
-                api_listener(listener, timeout),
+                api_listener(listener, stall),
                 router.into_make_service_with_connect_info::<SocketAddr>(),
             )
             .await
@@ -249,7 +333,12 @@ mod tests {
 
     #[tokio::test]
     async fn sends_whole_body_with_content_length() {
-        let addr = start(Arc::new(Semaphore::new(1)), WRITE_STALL_TIMEOUT).await;
+        let addr = start(
+            Arc::new(Semaphore::new(1)),
+            WRITE_STALL_TIMEOUT,
+            DELIVERY_DEADLINE,
+        )
+        .await;
         let response = full_response(addr).await;
         let split = response.windows(4).position(|w| w == b"\r\n\r\n").unwrap();
         let head = String::from_utf8_lossy(&response[..split]).to_lowercase();
@@ -265,7 +354,7 @@ mod tests {
     #[tokio::test]
     async fn permit_held_until_body_is_sent() {
         let permits = Arc::new(Semaphore::new(1));
-        let addr = start(permits.clone(), Duration::from_secs(2)).await;
+        let addr = start(permits.clone(), Duration::from_secs(2), DELIVERY_DEADLINE).await;
 
         let _stalled = stalled_client(addr).await;
         tokio::time::sleep(Duration::from_millis(500)).await;
@@ -284,5 +373,34 @@ mod tests {
         assert!(started.elapsed() >= Duration::from_secs(1));
         assert!(response.starts_with(b"HTTP/1.1 200"));
         assert_eq!(permits.available_permits(), 1);
+    }
+
+    #[tokio::test]
+    async fn deadline_releases_permit_while_connection_stays_open() {
+        let permits = Arc::new(Semaphore::new(1));
+        // The stall timeout never fires here, so only the deadline can
+        // release the permit of a response the peer never reads.
+        let addr = start(
+            permits.clone(),
+            Duration::from_secs(3600),
+            Duration::from_secs(1),
+        )
+        .await;
+
+        let _stalled = stalled_client(addr).await;
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert_eq!(permits.available_permits(), 0);
+
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        assert_eq!(
+            permits.available_permits(),
+            1,
+            "deadline did not release the permit"
+        );
+
+        let response = tokio::time::timeout(Duration::from_secs(10), full_response(addr))
+            .await
+            .expect("second request never served");
+        assert!(response.starts_with(b"HTTP/1.1 200"));
     }
 }
