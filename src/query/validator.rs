@@ -1030,6 +1030,10 @@ impl Visitor for ClickHouseNodeValidator {
     type Break = anyhow::Error;
 
     fn pre_visit_query(&mut self, query: &Query) -> ControlFlow<Self::Break> {
+        // The walk rejects these too, but only on the queries it reaches.
+        if query.settings.is_some() || query.format_clause.is_some() {
+            return ControlFlow::Break(anyhow!("Unsupported query clause"));
+        }
         if let Some(with) = &query.with {
             for cte in &with.cte_tables {
                 // A table named this way never shows up as a table factor.
@@ -3099,6 +3103,16 @@ mod tests {
             let error = validate_clickhouse_query(sql).expect_err(sql);
             assert_eq!(error.to_string(), "Unsupported query clause", "{sql}");
         }
+
+        // A query where only the visitor pass looks, inside a cast's type.
+        let sql = "SELECT CAST(block_num AS Nested(a UInt8 DEFAULT (SELECT max(block_num) FROM logs \
+                   SETTINGS max_threads = 1))) \
+                   FROM logs";
+        let query = parse_query(&sqlparser::dialect::ClickHouseDialect {}, sql);
+        let walk = validate_clickhouse_query_ast(&query, &HashSet::new(), 0);
+        assert!(walk.is_ok(), "{sql}: {walk:?}");
+        let error = validate_clickhouse_query(sql).expect_err(sql);
+        assert_eq!(error.to_string(), "Unsupported query clause", "{sql}");
     }
 
     #[test]
