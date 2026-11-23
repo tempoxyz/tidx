@@ -1566,17 +1566,24 @@ fn validate_cast_type(data_type: &DataType) -> Result<()> {
             // Unqualified built-in scalar types the parser has no variant for,
             // resolved with PostgreSQL's identifier rules so that "name" and
             // name match while "NAME" does not.
-            let builtin = match name.0.as_slice() {
-                // Integer modifiers (bpchar(10), timestamptz(3)) are lengths
-                // and precisions; anything else could name another object.
-                [part] if modifiers.iter().all(|m| m.trim().parse::<u32>().is_ok()) => {
-                    part.as_ident().is_some_and(|ident| {
-                        POSTGRES_BUILTIN_CUSTOM_TYPES
-                            .contains(&postgres_relation_key(ident).as_str())
-                    })
-                }
-                _ => false,
+            let integer_modifiers = modifiers.iter().all(|m| m.trim().parse::<u32>().is_ok());
+            let is_builtin = |part: &sqlparser::ast::ObjectNamePart| {
+                part.as_ident().is_some_and(|ident| {
+                    POSTGRES_BUILTIN_CUSTOM_TYPES.contains(&postgres_relation_key(ident).as_str())
+                })
             };
+            let is_pg_catalog = |part: &sqlparser::ast::ObjectNamePart| {
+                part.as_ident()
+                    .is_some_and(|ident| postgres_relation_key(ident) == "pg_catalog")
+            };
+            // Integer modifiers (bpchar(10), timestamptz(3)) are lengths and
+            // precisions; anything else could name another object.
+            let builtin = integer_modifiers
+                && match name.0.as_slice() {
+                    [part] => is_builtin(part),
+                    [schema, part] => is_pg_catalog(schema) && is_builtin(part),
+                    _ => false,
+                };
             if builtin {
                 Ok(())
             } else {
@@ -3208,6 +3215,8 @@ mod tests {
             "SELECT CAST(num AS my_type) FROM blocks",
             r#"SELECT 'n'::"NAME""#,
             "SELECT 'ab'::bpchar(x)",
+            "SELECT CAST(7 AS pg_catalog.regclass)",
+            "SELECT CAST(7 AS public.int4)",
             "SELECT CAST('now' AS regproc)",
             "SELECT ARRAY[10]::regtype[]",
             "SELECT num FROM blocks WHERE num::regnamespace IS NOT NULL",
@@ -3227,6 +3236,7 @@ mod tests {
             "SELECT 'n'::name, '2024-01-02 03:04:05+05:30'::timestamptz, 7::int2",
             r#"SELECT 'n'::"name", 'n'::NAME"#,
             "SELECT 'ab'::bpchar(10), now()::timestamptz(3)",
+            "SELECT CAST(7 AS pg_catalog.int4)",
         ] {
             assert!(validate_query(sql).is_ok(), "{sql}");
         }
