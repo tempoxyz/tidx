@@ -3070,17 +3070,17 @@ mod tests {
 
     #[test]
     fn test_clickhouse_visitor_pass_covers_positions_outside_the_walk() {
-        for (sql, error) in [(
-            "SELECT CAST(block_num AS Nested(a UInt8 DEFAULT sleep(1))) FROM logs",
+        // The walk does not look inside a cast's type, only the visitor pass does.
+        let sql = "SELECT CAST(block_num AS Nested(a UInt8 DEFAULT sleep(1))) FROM logs";
+        let query = parse_query(&sqlparser::dialect::ClickHouseDialect {}, sql);
+        let walk = validate_clickhouse_query_ast(&query, &HashSet::new(), 0);
+        assert!(walk.is_ok(), "{sql}: {walk:?}");
+        let result = validate_clickhouse_query(sql);
+        assert_eq!(
+            result.expect_err(sql).to_string(),
             "Function 'sleep' is not allowed",
-        )] {
-            // The walk does not look at these positions, only the visitor pass does.
-            let query = parse_query(&sqlparser::dialect::ClickHouseDialect {}, sql);
-            let walk = validate_clickhouse_query_ast(&query, &HashSet::new(), 0);
-            assert!(walk.is_ok(), "{sql}: {walk:?}");
-            let result = validate_clickhouse_query(sql);
-            assert_eq!(result.expect_err(sql).to_string(), error, "{sql}");
-        }
+            "{sql}"
+        );
     }
 
     #[test]
