@@ -1123,7 +1123,7 @@ fn validate_set_expr(set_expr: &SetExpr, cte_names: &HashSet<String>, depth: usi
                         // name 'text' as a value of type name, which the parser
                         // here would take as a column with an alias.
                         if alias.quote_style == Some('\'') {
-                            validate_typed_literal_prefix(expr)?;
+                            validate_typed_literal_prefix(expr, alias)?;
                         } else {
                             validate_expr(expr, cte_names, depth)?;
                         }
@@ -1585,19 +1585,24 @@ const POSTGRES_BUILTIN_CUSTOM_TYPES: &[&str] = &[
 /// Validates a select item PostgreSQL reads as a typed literal: a type name
 /// followed by a string, which the parser here returns as a column with a
 /// string-literal alias. The name must pass the same check as a cast target.
-fn validate_typed_literal_prefix(expr: &Expr) -> Result<()> {
+fn validate_typed_literal_prefix(expr: &Expr, alias: &sqlparser::ast::Ident) -> Result<()> {
     let parts = match expr {
         // Two string constants separated by a newline are one constant in
         // PostgreSQL ('a' then 'b' on the next line is 'ab'); without the
-        // newline PostgreSQL rejects the query. Either way no type applies.
-        Expr::Value(value)
-            if matches!(
-                value.value,
-                sqlparser::ast::Value::SingleQuotedString(_)
-                    | sqlparser::ast::Value::EscapedStringLiteral(_)
-            ) =>
-        {
-            return Ok(());
+        // newline PostgreSQL rejects the query. Only plain strings with no
+        // backslash or quote in either part are accepted: an E'' prefix makes
+        // PostgreSQL read escapes in the continued part, so the two parsers
+        // would disagree on where it ends.
+        Expr::Value(value) => {
+            let plain = |text: &str| !text.contains('\\') && !text.contains('\'');
+            return match &value.value {
+                sqlparser::ast::Value::SingleQuotedString(prefix)
+                    if plain(prefix) && plain(&alias.value) =>
+                {
+                    Ok(())
+                }
+                _ => Err(anyhow!("String literal aliases are not allowed")),
+            };
         }
         Expr::Identifier(ident) => vec![ident.clone()],
         Expr::CompoundIdentifier(idents) => idents.clone(),
@@ -3269,6 +3274,9 @@ mod tests {
             "SELECT CAST(7 AS pg_catalog.regclass)",
             "SELECT CAST(7 AS public.int4)",
             "SELECT regrole '10'",
+            "SELECT E'a'\n'b'",
+            r"SELECT 'a' '\', ' , other_fn(5) --'",
+            "SELECT 'a'\n'it''s'",
             r#"SELECT "regrole" '10'"#,
             r#"SELECT CAST(7 AS "integer")"#,
             r#"SELECT CAST(true AS "boolean")"#,
