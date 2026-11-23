@@ -117,9 +117,7 @@ impl Delivery {
     /// The next chunk, or None once the deadline released the response.
     fn next_chunk(&self) -> Option<Bytes> {
         let mut guard = self.pending.lock().unwrap_or_else(|e| e.into_inner());
-        let Some(pending) = guard.as_mut() else {
-            return None;
-        };
+        let pending = guard.as_mut()?;
         let end = (pending.offset + RESPONSE_CHUNK_BYTES).min(pending.bytes.len());
         let chunk = Bytes::copy_from_slice(&pending.bytes[pending.offset..end]);
         pending.offset = end;
