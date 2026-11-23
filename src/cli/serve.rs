@@ -131,7 +131,7 @@ pub async fn run(args: Args) -> Result<()> {
     let mut drain_rx = shutdown_tx.subscribe();
     let server = tokio::spawn(
         axum::serve(
-            listener,
+            tidx::api::api_listener(listener, tidx::api::WRITE_STALL_TIMEOUT),
             router.into_make_service_with_connect_info::<SocketAddr>(),
         )
         .with_graceful_shutdown(async move {

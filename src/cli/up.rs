@@ -174,7 +174,7 @@ async fn run_with_role(args: Args, role: Role) -> Result<()> {
 
             tokio::spawn(async move {
                 axum::serve(
-                    listener,
+                    tidx::api::api_listener(listener, tidx::api::WRITE_STALL_TIMEOUT),
                     router.into_make_service_with_connect_info::<SocketAddr>(),
                 )
                 .with_graceful_shutdown(async move {
