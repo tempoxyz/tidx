@@ -1236,12 +1236,18 @@ async fn test_query_postgres_cell_json_formats() {
     let db = TestDb::empty().await;
     let opts = default_options();
 
-    // NUMERIC past rust_decimal's 96-bit mantissa and non-finite floats are NULL.
+    // NUMERIC is exact decimal text at any width (2^96 + 1, uint256 max,
+    // int256 min); non-finite floats and numerics are NULL.
     let result = execute_query_postgres(
         &db.pool,
         r#"SELECT 7::int2 AS i2, -42::int4 AS i4, 9007199254740993::int8 AS i8,
             123.4500::numeric AS num, -0.5::numeric AS neg_num,
+            0::numeric AS zero, 0.0010::numeric AS small, 10000.0001::numeric AS mid,
             1234567890123456789012345678901234567890::numeric AS big_num,
+            (2::numeric ^ 96 + 1)::numeric(1000, 0) AS u96_plus_1,
+            115792089237316195423570985008687907853269984665640564039457584007913129639935::numeric AS u256_max,
+            -57896044618658097711785492504343953926634992332820282019728792003956564819968.25::numeric AS i256_min_frac,
+            'NaN'::numeric AS nan_num,
             1.5::float8 AS f8, 'NaN'::float8 AS nan,
             '\xDEADbeef'::bytea AS bytes, ''::bytea AS empty_bytes,
             'héllo "q"'::text AS txt, 'v'::varchar AS vc, 'n'::name AS nm,
@@ -1257,7 +1263,7 @@ async fn test_query_postgres_cell_json_formats() {
 
     assert_eq!(
         serde_json::to_string(&result.rows).unwrap(),
-        r#"[[7,-42,9007199254740993,"123.4500","-0.5",null,1.5,null,"0xdeadbeef","0x","héllo \"q\"","v","n","2024-01-01T21:34:05.678+00:00",true,null,null,null,null,null,null,null]]"#
+        r#"[[7,-42,9007199254740993,"123.4500","-0.5","0","0.0010","10000.0001","1234567890123456789012345678901234567890","79228162514264337593543950337","115792089237316195423570985008687907853269984665640564039457584007913129639935","-57896044618658097711785492504343953926634992332820282019728792003956564819968.25",null,1.5,null,"0xdeadbeef","0x","héllo \"q\"","v","n","2024-01-01T21:34:05.678+00:00",true,null,null,null,null,null,null,null]]"#
     );
 
     // Oversized cells and results fail the query. Values are stored directly

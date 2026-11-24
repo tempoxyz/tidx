@@ -282,9 +282,9 @@ impl PostgresQuery {
 
 /// ClickHouse settings for public queries (native `engine=clickhouse` and the
 /// tiered cold arm): ISO timestamps for [`normalize_datetime_columns`].
-/// 64-bit+ integers keep ClickHouse's default quoting (exact strings;
-/// unquoted UInt256 would parse lossily as f64) — [`normalize_cold_result`]
-/// then converts per column type for the tiered cold arm.
+/// 64-bit+ integers arrive as exact quoted strings (every ClickHouse request
+/// pins `output_format_json_quote_64bit_integers=1`); 64-bit ones are then
+/// converted to JSON numbers by [`normalize_int64_columns`].
 const CH_QUERY_SETTINGS: &[(&str, &str)] = &[
     ("date_time_output_format", "iso"),
     // No `final = 1`: reads match the native ClickHouse engine's semantics
@@ -309,6 +309,7 @@ pub async fn execute_query_clickhouse(
         )
         .await?;
     normalize_datetime_columns(&mut result);
+    normalize_int64_columns(&mut result);
     Ok(result.into())
 }
 
@@ -346,11 +347,10 @@ fn normalize_datetime_columns(result: &mut crate::clickhouse::QueryResult) {
 /// Rewrite ClickHouse JSON values to the hot (PostgreSQL) arm's
 /// representations, per column type:
 ///
-/// - `Int64`/`UInt64`: quoted string → JSON number (PG int8 is a number);
+/// - `Int64`/`UInt64`: see [`normalize_int64_columns`];
 /// - `DateTime*`: see [`normalize_datetime_columns`];
-/// - `(U)Int128`/`(U)Int256`: PG NUMERIC parity — decimal string when the
-///   value fits [`rust_decimal::Decimal`], else NULL (PG's formatter nulls
-///   values past Decimal's 96-bit mantissa, see [`try_format_column_json`]);
+/// - `(U)Int128`/`(U)Int256`: kept as ClickHouse's exact quoted decimal
+///   string, matching PG NUMERIC's formatting in [`try_format_column_json`];
 /// - `selector_null_cols` (projection indexes): '' → NULL, undoing the
 ///   ClickHouse sink's empty-string encoding of PG NULL selectors.
 fn normalize_cold_result(
@@ -367,16 +367,20 @@ fn normalize_cold_result(
         }
     }
     normalize_datetime_columns(result);
+    normalize_int64_columns(result);
+}
+
+/// Rewrite `Int64`/`UInt64` cells from ClickHouse's quoted strings to JSON
+/// numbers, as PostgreSQL formats int8; wider integers stay exact strings.
+fn normalize_int64_columns(result: &mut crate::clickhouse::QueryResult) {
     for (i, ty) in result.column_types.iter().enumerate() {
         enum Kind {
             Int64,
             UInt64,
-            BigNum,
         }
         let kind = match ch_base_type(ty) {
             "Int64" => Kind::Int64,
             "UInt64" => Kind::UInt64,
-            "Int128" | "UInt128" | "Int256" | "UInt256" => Kind::BigNum,
             _ => continue,
         };
         for row in &mut result.rows {
@@ -394,12 +398,6 @@ fn normalize_cold_result(
                     if let Ok(v) = s.parse::<u64>() {
                         *cell = serde_json::Value::Number(v.into());
                     }
-                }
-                Kind::BigNum => {
-                    *cell = match s.parse::<rust_decimal::Decimal>() {
-                        Ok(v) => serde_json::Value::String(v.to_string()),
-                        Err(_) => serde_json::Value::Null,
-                    };
                 }
             }
         }
@@ -1052,17 +1050,14 @@ fn try_format_column_json(row: &tokio_postgres::Row, idx: usize) -> Result<serde
             .map_or(serde_json::Value::Null, |v| {
                 serde_json::Value::Number(v.into())
             }),
-        Type::NUMERIC => {
-            // rust_decimal::Decimal panics (not errors) for values exceeding its
-            // 96-bit mantissa (~28 digits). Postgres NUMERIC is arbitrary precision
-            // (e.g. abi_uint() on uint256 = 78 digits), so catch the panic.
-            match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                row.try_get::<_, Option<rust_decimal::Decimal>>(idx)
-            })) {
-                Ok(Ok(Some(v))) => serde_json::Value::String(v.to_string()),
-                _ => serde_json::Value::Null,
-            }
-        }
+        // Arbitrary precision (abi_uint() on uint256 is 78 digits), so decoded
+        // straight to its exact decimal text rather than a fixed-width type.
+        Type::NUMERIC => row
+            .try_get::<_, Option<PgNumericText>>(idx)
+            .ok()
+            .flatten()
+            .and_then(|v| v.0)
+            .map_or(serde_json::Value::Null, serde_json::Value::String),
         // Widen via the shortest decimal so 1.1::float4 is 1.1, as PostgreSQL
         // prints it, rather than 1.100000023841858.
         Type::FLOAT4 => row
@@ -1301,6 +1296,74 @@ impl FromSql<'_> for RawCell {
     }
 }
 
+/// A PostgreSQL NUMERIC as PostgreSQL's own decimal text (`numeric_out`),
+/// exact at any precision; `None` for NaN and ±Infinity, which format as
+/// NULL like non-finite floats.
+struct PgNumericText(Option<String>);
+
+impl FromSql<'_> for PgNumericText {
+    /// Binary NUMERIC: `ndigits`, `weight`, `sign`, `dscale` (16 bits each),
+    /// then `ndigits` base-10000 digits; digit `i` is worth
+    /// 10000^(weight - i) and `dscale` is the number of fraction digits shown.
+    fn from_sql(_: &Type, raw: &[u8]) -> Result<Self, Box<dyn std::error::Error + Sync + Send>> {
+        let word = |i: usize| -> Result<u16, Box<dyn std::error::Error + Sync + Send>> {
+            raw.get(2 * i..2 * i + 2)
+                .map(|b| u16::from_be_bytes([b[0], b[1]]))
+                .ok_or_else(|| "truncated NUMERIC".into())
+        };
+        let ndigits = usize::from(word(0)?);
+        let weight = i64::from(word(1)? as i16);
+        let sign = word(2)?;
+        let dscale = usize::from(word(3)?);
+        if raw.len() != 8 + 2 * ndigits {
+            return Err("malformed NUMERIC".into());
+        }
+        let negative = match sign {
+            0x0000 => false,
+            0x4000 => true,
+            // NaN, +Infinity, -Infinity.
+            0xC000 | 0xD000 | 0xF000 => return Ok(Self(None)),
+            _ => return Err("invalid NUMERIC sign".into()),
+        };
+        // The base-10000 digit worth 10000^exp; positions past the stored
+        // digits are zero.
+        let digit = |exp: i64| -> Result<u16, Box<dyn std::error::Error + Sync + Send>> {
+            match usize::try_from(weight - exp) {
+                Ok(i) if i < ndigits => word(4 + i),
+                _ => Ok(0),
+            }
+        };
+
+        let mut out = String::new();
+        if negative {
+            out.push('-');
+        }
+        if weight < 0 {
+            out.push('0');
+        } else {
+            out.push_str(&digit(weight)?.to_string());
+            for exp in (0..weight).rev() {
+                out.push_str(&format!("{:04}", digit(exp)?));
+            }
+        }
+        if dscale > 0 {
+            out.push('.');
+            let mut fraction = String::with_capacity(dscale + 3);
+            let mut exp = -1;
+            while fraction.len() < dscale {
+                fraction.push_str(&format!("{:04}", digit(exp)?));
+                exp -= 1;
+            }
+            out.push_str(&fraction[..dscale]);
+        }
+        Ok(Self(Some(out)))
+    }
+
+    fn accepts(ty: &Type) -> bool {
+        *ty == Type::NUMERIC
+    }
+}
+
 /// Counts the bytes written to it.
 struct ByteCount(usize);
 
@@ -1366,10 +1429,12 @@ mod tests {
         assert_eq!(r.rows[0][2], json!(18_446_744_073_709_551_615_u64));
         // RFC 3339 in UTC, matching PG timestamptz serialization.
         assert_eq!(r.rows[0][3], json!("2025-06-01T12:30:45.123+00:00"));
-        // Fits rust_decimal: decimal string, like PG NUMERIC.
+        // Exact decimal strings at any width, like PG NUMERIC.
         assert_eq!(r.rows[0][4], json!("1000000000000000000"));
-        // Exceeds Decimal's 96-bit mantissa: NULL, matching PG's formatter.
-        assert_eq!(r.rows[0][5], J::Null);
+        assert_eq!(
+            r.rows[0][5],
+            json!("115792089237316195423570985008687907853269984665640564039457584007913129639935")
+        );
     }
 
     #[test]

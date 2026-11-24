@@ -930,6 +930,71 @@ async fn test_execute_query_clickhouse_formats_timestamps_like_postgres() {
     assert_eq!(result.rows, pg.rows);
 }
 
+/// Native ClickHouse responses must keep 64-bit and wider integers exact.
+/// ClickHouse 25.8+ writes them as bare JSON numbers by default, which
+/// serde_json rounds through f64 past u64, so every request pins quoting
+/// (CI's pinned ClickHouse image has the unquoted default).
+#[tokio::test]
+#[serial(clickhouse)]
+async fn test_execute_query_clickhouse_keeps_wide_integers_exact() {
+    let ch =
+        TestClickHouse::new("tidx_test_wide_integers").expect("Failed to create ClickHouse client");
+
+    if ch.wait_for_ready().await.is_err() {
+        common::skip("ClickHouse not available");
+        return;
+    }
+    ch.reset_database().await.expect("Failed to reset database");
+
+    let config = ClickHouseConfig {
+        enabled: true,
+        url: ch.url.clone(),
+        database: Some(ch.database.clone()),
+        ..Default::default()
+    };
+    let engine = ClickHouseEngine::new(&config, 4217).expect("Failed to create engine");
+    // 2^53 + 1, 2^64 - 1, 2^64 + 1, 2^128 + 1, uint256 max, int128 min,
+    // int256 min.
+    let expected = [
+        ("Int64", "9007199254740993"),
+        ("UInt64", "18446744073709551615"),
+        ("UInt128", "18446744073709551617"),
+        ("UInt256", "340282366920938463463374607431768211457"),
+        (
+            "UInt256",
+            "115792089237316195423570985008687907853269984665640564039457584007913129639935",
+        ),
+        ("Int128", "-170141183460469231731687303715884105728"),
+        (
+            "Int256",
+            "-57896044618658097711785492504343953926634992332820282019728792003956564819968",
+        ),
+    ];
+    let select = expected
+        .iter()
+        .enumerate()
+        .map(|(i, (ty, v))| format!("to{ty}('{v}') AS c{i}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+
+    let result = tidx::service::execute_query_clickhouse(
+        &engine,
+        &format!("SELECT {select}"),
+        &[],
+        &tidx::service::QueryOptions::default(),
+    )
+    .await
+    .expect("ClickHouse query failed");
+
+    // 64-bit integers are exact JSON numbers, as PostgreSQL formats int8;
+    // wider ones are exact decimal strings, as PostgreSQL formats NUMERIC.
+    let mut want: Vec<serde_json::Value> =
+        expected.iter().map(|(_, v)| serde_json::json!(v)).collect();
+    want[0] = serde_json::json!(9_007_199_254_740_993_i64);
+    want[1] = serde_json::json!(18_446_744_073_709_551_615_u64);
+    assert_eq!(result.rows, [want]);
+}
+
 /// `query_user` (the public /query path) must execute parenthesized UNION arms
 /// with a trailing ORDER BY/LIMIT, a shape valid in PostgreSQL. ClickHouse
 /// grammar rejects the trailing clauses (Code 62) unless they are hoisted
@@ -1794,10 +1859,19 @@ async fn test_api_recipient_query_executes() {
            ORDER BY block_num DESC, log_idx DESC
            LIMIT 256"#
     );
-    let result = engine
-        .query_user(&sql, &[], 5_000, 256)
-        .await
-        .expect("API recipient query should execute");
+    // The /query path: the engine returns 64-bit integers as exact quoted
+    // strings, which the service formats as JSON numbers like PostgreSQL.
+    let result = tidx::service::execute_query_clickhouse(
+        &engine,
+        &sql,
+        &[],
+        &tidx::service::QueryOptions {
+            limit: 256,
+            ..Default::default()
+        },
+    )
+    .await
+    .expect("API recipient query should execute");
 
     assert_eq!(
         result.columns,

@@ -71,9 +71,8 @@ const CORE_TABLES: [&str; 4] = ["blocks", "txs", "logs", "receipts"];
 enum ColKind {
     /// ≤64-bit integers: JSON numbers on both arms.
     Num,
-    /// Decoded uint/int event params: PG NUMERIC and CH UInt256 as decimal
-    /// strings; cold normalization nulls values past rust_decimal's range,
-    /// matching PG's formatter.
+    /// Decoded uint/int event params: PG NUMERIC and CH UInt256 as exact
+    /// decimal strings.
     NumText,
     /// timestamptz vs DateTime64: RFC 3339 strings after cold normalization.
     Ts,

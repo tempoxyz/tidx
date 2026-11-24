@@ -366,8 +366,11 @@ impl ClickHouseEngine {
     ) -> String {
         // union_default_mode: bare UNION behaves as UNION DISTINCT
         // (PostgreSQL semantics); ClickHouse otherwise rejects it.
+        // output_format_json_quote_64bit_integers: (U)Int64 and wider arrive
+        // as exact strings; unquoted (the server default since 25.8) they
+        // parse through serde_json as f64 past u64 and lose precision.
         let mut url = format!(
-            "{}/?database={}&default_format=JSONCompact&max_result_bytes={}&result_overflow_mode=throw&union_default_mode=DISTINCT",
+            "{}/?database={}&default_format=JSONCompact&output_format_json_quote_64bit_integers=1&max_result_bytes={}&result_overflow_mode=throw&union_default_mode=DISTINCT",
             inst.url.trim_end_matches('/'),
             self.database,
             MAX_QUERY_RESULT_BYTES
@@ -958,7 +961,7 @@ mod tests {
 
         assert_eq!(
             url,
-            "http://clickhouse-1:8123/?database=tidx_4217&default_format=JSONCompact&max_result_bytes=10485760&result_overflow_mode=throw&union_default_mode=DISTINCT"
+            "http://clickhouse-1:8123/?database=tidx_4217&default_format=JSONCompact&output_format_json_quote_64bit_integers=1&max_result_bytes=10485760&result_overflow_mode=throw&union_default_mode=DISTINCT"
         );
         assert!(!url.contains("max_execution_time"));
     }
@@ -978,7 +981,7 @@ mod tests {
 
         assert_eq!(
             url,
-            "http://clickhouse-1:8123/?database=tidx_4217&default_format=JSONCompact&max_result_bytes=10485760&result_overflow_mode=throw&union_default_mode=DISTINCT&max_execution_time=2"
+            "http://clickhouse-1:8123/?database=tidx_4217&default_format=JSONCompact&output_format_json_quote_64bit_integers=1&max_result_bytes=10485760&result_overflow_mode=throw&union_default_mode=DISTINCT&max_execution_time=2"
         );
     }
 
@@ -1021,7 +1024,7 @@ mod tests {
             .unwrap();
         engine.query(sql, &[]).await.unwrap();
 
-        let base = "/?database=tidx_4217&default_format=JSONCompact&max_result_bytes=10485760&result_overflow_mode=throw&union_default_mode=DISTINCT";
+        let base = "/?database=tidx_4217&default_format=JSONCompact&output_format_json_quote_64bit_integers=1&max_result_bytes=10485760&result_overflow_mode=throw&union_default_mode=DISTINCT";
         let cap = format!("max_memory_usage={MAX_USER_QUERY_MEMORY_BYTES}");
         assert_eq!(
             server.await.unwrap(),
