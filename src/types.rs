@@ -131,7 +131,7 @@ impl SyncState {
     /// Blocks below the prune floor were intentionally dropped and don't count.
     pub fn backfill_remaining(&self) -> u64 {
         match self.backfill_num {
-            None => self.tip_num.saturating_sub(self.pruned_below),
+            None => self.tip_num.saturating_sub(self.prune_floor()),
             Some(n) => n.saturating_sub(self.prune_floor()),
         }
     }
@@ -205,6 +205,13 @@ mod tests {
         };
         assert!(!state.backfill_complete());
         assert_eq!(state.backfill_remaining(), 1);
+
+        // Before backfill starts, everything below the tip remains.
+        let state = SyncState {
+            backfill_num: None,
+            ..state
+        };
+        assert_eq!(state.backfill_remaining(), 99, "blocks 1..=99 remain");
     }
 
     #[test]
