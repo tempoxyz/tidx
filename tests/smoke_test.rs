@@ -1260,8 +1260,8 @@ async fn test_query_postgres_cell_json_formats() {
         r#"[[7,-42,9007199254740993,"123.4500","-0.5",null,1.5,null,"0xdeadbeef","0x","héllo \"q\"","v","n","2024-01-01T21:34:05.678+00:00",true,null,null,null,null,null,null,null]]"#
     );
 
-    // Cells over 1 MiB fail the query. They are stored directly so the
-    // query itself does not need functions that build large values.
+    // Oversized cells and results fail the query. Values are stored directly
+    // so the query itself does not need functions that build large values.
     let block_num = 74_000_000_i64;
     let conn = db.pool.get().await.unwrap();
     conn.execute("DELETE FROM logs WHERE block_num = $1", &[&block_num])
@@ -1269,28 +1269,60 @@ async fn test_query_postgres_cell_json_formats() {
         .unwrap();
     conn.execute(
         "INSERT INTO logs (block_num, block_timestamp, log_idx, tx_idx, tx_hash, address, data)
-         VALUES ($1, NOW(), 0, 0, $2, $2, $3), ($1, NOW(), 1, 0, $2, $2, $4)",
+         VALUES ($1, NOW(), 0, 0, $2, $2, $3), ($1, NOW(), 1, 0, $2, $2, $4),
+                ($1, NOW(), 2, 0, $2, $2, $5)",
         &[
             &block_num,
             &vec![0_u8; 20],
             &vec![0xab_u8; 1024 * 1024 + 1],
             &vec![b'a'; 1024 * 1024 + 1],
+            &vec![b'"'; 1_000_000],
         ],
     )
     .await
     .unwrap();
-    for sql in [
-        "SELECT data FROM logs WHERE block_num = 74000000 AND log_idx = 0",
-        "SELECT encode(data, 'escape') FROM logs WHERE block_num = 74000000 AND log_idx = 1",
+    let columns = |count: usize, expr: &str| {
+        (0..count)
+            .map(|i| format!("{expr} AS c{i}"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    // 42 cells of 1,000,000 bytes that format as null: each passes the cell
+    // cap, together they exceed the 40 MiB read budget.
+    let wide_arrays = format!(
+        "SELECT {} FROM logs WHERE block_num = 74000000 AND log_idx = 2",
+        columns(42, "ARRAY[data]")
+    );
+    // Six cells of 1,000,000 quotes: 6 MB on the wire, 12 MB of escaped JSON.
+    let escaped = format!(
+        "SELECT {} FROM logs WHERE block_num = 74000000 AND log_idx = 2",
+        columns(6, "encode(data, 'escape')")
+    );
+    for (sql, expected) in [
+        (
+            "SELECT data FROM logs WHERE block_num = 74000000 AND log_idx = 0",
+            "Query result cell exceeded 1048576 bytes",
+        ),
+        (
+            "SELECT encode(data, 'escape') FROM logs WHERE block_num = 74000000 AND log_idx = 1",
+            "Query result cell exceeded 1048576 bytes",
+        ),
+        // Arrays format as null, so only the wire length bounds them.
+        (
+            "SELECT array_agg(data) FROM logs WHERE block_num = 74000000 AND log_idx = 0",
+            "Query result cell exceeded 1048576 bytes",
+        ),
+        (
+            wide_arrays.as_str(),
+            "Query read more than 41943040 bytes from the database",
+        ),
+        (escaped.as_str(), "Query result exceeded 10485760 bytes"),
     ] {
-        let err = execute_query_postgres(&db.pool, sql, &[], &opts)
-            .await
-            .expect_err("cell over 1 MiB should fail");
-        assert!(
-            err.to_string()
-                .contains("Query result cell exceeded 1048576 bytes"),
-            "got: {err}"
-        );
+        // Not `expect_err`: its message would print the whole result.
+        let Err(err) = execute_query_postgres(&db.pool, sql, &[], &opts).await else {
+            panic!("query should fail: {sql}");
+        };
+        assert!(err.to_string().contains(expected), "{sql}: {err}");
     }
     conn.execute("DELETE FROM logs WHERE block_num = $1", &[&block_num])
         .await
