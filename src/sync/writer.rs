@@ -850,7 +850,8 @@ pub async fn get_block_hash(pool: &Pool, block_num: u64) -> Result<Option<Vec<u8
 }
 
 /// Fast check: are there any gaps in [from, to]?
-/// Uses COUNT + btree index scan — O(range) not O(table).
+/// Uses COUNT + btree index scan — O(range) not O(table). Heights are counted
+/// once: the `(timestamp, num)` key lets a height hold several rows.
 pub async fn has_gaps(pool: &Pool, from: u64, to: u64) -> Result<bool> {
     if to < from {
         return Ok(false);
@@ -858,7 +859,7 @@ pub async fn has_gaps(pool: &Pool, from: u64, to: u64) -> Result<bool> {
     let conn = pool.get().await?;
     let row = conn
         .query_one(
-            "SELECT COUNT(*) FROM blocks WHERE num >= $1 AND num <= $2",
+            "SELECT COUNT(DISTINCT num) FROM blocks WHERE num >= $1 AND num <= $2",
             &[&(from as i64), &(to as i64)],
         )
         .await?;

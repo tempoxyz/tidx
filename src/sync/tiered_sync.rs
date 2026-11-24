@@ -266,7 +266,17 @@ impl TieredSync {
     }
 
     async fn tick_hot_window(&self) -> Result<Duration> {
-        let head = self.rpc.latest_block_number().await?;
+        let mut head = self.rpc.latest_block_number().await?;
+        if !self.sinks.has_clickhouse() {
+            // Without the archive, PostgreSQL heights above realtime's tip are realtime's
+            // to write: it checks parent hashes, a gap fill does not. Without a tip the
+            // head is 0, which ends the tick below.
+            let realtime_tip = load_sync_state(self.sinks.pool(), self.chain_id)
+                .await?
+                .map(|s| s.tip_num)
+                .unwrap_or(0);
+            head = head.min(realtime_tip);
+        }
         if head == 0 {
             return Ok(Duration::from_secs(2));
         }

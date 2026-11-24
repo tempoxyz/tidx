@@ -665,6 +665,37 @@ async fn test_has_gaps_single_missing_block() {
 
 #[tokio::test]
 #[serial(db)]
+async fn test_has_gaps_counts_duplicate_heights_once() {
+    let db = TestDb::empty().await;
+    db.truncate_all().await;
+
+    let conn = db.pool.get().await.unwrap();
+
+    // Height 1 is stored twice with different timestamps, which the (timestamp, num)
+    // key allows, and height 2 is missing: three rows for three heights.
+    for (num, seconds) in [(1i64, 1.0f64), (1, 2.0), (3, 3.0)] {
+        conn.execute(
+            r#"INSERT INTO blocks (num, hash, parent_hash, timestamp, timestamp_ms, gas_limit, gas_used, miner)
+               VALUES ($1, $2, $3, NOW() + make_interval(secs => $4), $5, 1000000, 100000, $6)"#,
+            &[
+                &num,
+                &vec![seconds as u8; 32],
+                &vec![0u8; 32],
+                &seconds,
+                &(num * 1000),
+                &vec![0u8; 20],
+            ],
+        )
+        .await
+        .unwrap();
+    }
+
+    assert_eq!(detect_all_gaps(&db.pool, 1, 3).await.unwrap(), [(2, 2)]);
+    assert!(has_gaps(&db.pool, 1, 3).await.unwrap());
+}
+
+#[tokio::test]
+#[serial(db)]
 async fn test_has_gaps_agrees_with_detect_all_gaps() {
     let db = TestDb::empty().await;
     db.truncate_all().await;

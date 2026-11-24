@@ -13,7 +13,7 @@ use tidx::config::RetentionConfig;
 use tidx::db::partitions::{week_index, week_start};
 use tidx::sync::sink::SinkSet;
 use tidx::sync::tiered_sync::TieredSync;
-use tidx::sync::writer::{has_gaps, load_sync_state};
+use tidx::sync::writer::{has_gaps, load_sync_state, update_tip_num};
 use tidx::tempo::Block;
 
 const CHAIN_ID: u64 = 7_777;
@@ -112,6 +112,10 @@ async fn test_hot_window_hydrates_from_rpc_without_repeating_floor_search() {
         .find(|&num| chain.timestamp(num) >= boundary_ts.timestamp())
         .unwrap();
     let rpc_url = chain.serve().await;
+    // The reconciler only fills up to the tip realtime sync has reached.
+    update_tip_num(&db.pool, CHAIN_ID, HEAD, HEAD)
+        .await
+        .unwrap();
 
     let retention = RetentionConfig {
         pg_keep: "3d".to_string(),
@@ -171,5 +175,72 @@ async fn test_hot_window_hydrates_from_rpc_without_repeating_floor_search() {
         calls <= one_search,
         "{calls} single-block RPC calls for {} hydrated blocks, one floor search takes {one_search}",
         HEAD - floor + 1
+    );
+}
+
+#[tokio::test]
+#[serial(db)]
+async fn test_hot_window_without_clickhouse_stops_at_realtime_tip() {
+    let db = TestDb::empty().await;
+    db.truncate_all().await;
+
+    let now = Utc::now();
+    let chain = Chain::new(now);
+    let boundary_ts = week_start(week_index(now - chrono::Duration::days(3)));
+    let floor = (1..=HEAD)
+        .find(|&num| chain.timestamp(num) >= boundary_ts.timestamp())
+        .unwrap();
+    let rpc_url = chain.serve().await;
+    // Realtime sync stopped 100 blocks below the RPC head.
+    let tip = HEAD - 100;
+    update_tip_num(&db.pool, CHAIN_ID, tip, HEAD).await.unwrap();
+
+    let retention = RetentionConfig {
+        pg_keep: "3d".to_string(),
+        prune_interval: "1h".to_string(),
+        require_clickhouse: false,
+    };
+    let tiered = TieredSync::new(
+        SinkSet::new(db.pool.clone()),
+        &rpc_url,
+        CHAIN_ID,
+        &retention,
+        20,
+        2,
+    )
+    .unwrap();
+    let (shutdown_tx, shutdown_rx) = tokio::sync::broadcast::channel(1);
+    let handle = tokio::spawn(tiered.run(shutdown_rx));
+
+    tokio::time::timeout(Duration::from_secs(60), async {
+        loop {
+            let state = load_sync_state(&db.pool, CHAIN_ID).await.unwrap();
+            if state.is_some_and(|s| s.pruned_below == floor - 1 && s.synced_num == tip) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("hot window was not hydrated up to the realtime tip");
+    let _ = shutdown_tx.send(());
+    let _ = handle.await;
+
+    assert!(!has_gaps(&db.pool, floor, tip).await.unwrap());
+    let above_tip: i64 = db
+        .pool
+        .get()
+        .await
+        .unwrap()
+        .query_one(
+            "SELECT COUNT(*) FROM blocks WHERE num > $1",
+            &[&(tip as i64)],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(
+        above_tip, 0,
+        "blocks above the realtime tip are not fetched"
     );
 }
