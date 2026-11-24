@@ -190,12 +190,18 @@ impl Default for QueryOptions {
 }
 
 const MAX_QUERY_RESULT_BYTES: usize = 10 * 1024 * 1024;
+
+/// Most bytes PostgreSQL may send for one result, counted by wire length. It
+/// bounds the data buffered for cells the response may drop, such as arrays and
+/// `jsonb`, which format as null. It is larger than [`MAX_QUERY_RESULT_BYTES`]
+/// because such cells are not returned.
+const MAX_QUERY_WIRE_BYTES: usize = 4 * MAX_QUERY_RESULT_BYTES;
 const MAX_CELL_BYTES: usize = 1024 * 1024;
 
 /// Most cells (rows times columns) one result may hold: [`HARD_LIMIT_MAX`] rows
 /// of 100 columns, above the widest core table. Even an empty cell keeps a
-/// 32-byte `serde_json::Value` alive for the whole request, so the byte budget
-/// alone would let a result hold millions of them.
+/// `serde_json::Value` (up to 72 bytes) alive for the whole request, so the
+/// byte budget alone would let a result hold millions of them.
 const MAX_QUERY_CELLS: usize = 1_000_000;
 
 #[derive(Debug, thiserror::Error)]
@@ -913,7 +919,7 @@ async fn run_pg_query(
         let mut rows = Vec::new();
         let mut result_bytes = 0usize;
         let mut result_cells = 0usize;
-        let mut raw_lens = Vec::with_capacity(columns.len());
+        let mut wire_bytes = 0usize;
 
         while let Some(row) = stream.try_next().await? {
             if rows.len() >= limit {
@@ -921,20 +927,20 @@ async fn run_pg_query(
             }
             result_cells = add_result_cells(result_cells, columns.len())?;
             // The driver already buffered the row, so its wire size is known
-            // before any cell is formatted. Every cell is charged, including
-            // those of types that format as null.
-            raw_lens.clear();
+            // before any cell is formatted. Every cell counts against the wire
+            // budget, including those of types that format as null.
+            let mut row_wire_bytes = 0usize;
             for i in 0..columns.len() {
-                raw_lens.push(raw_cell_len(&row, i)?);
+                row_wire_bytes = row_wire_bytes.saturating_add(raw_cell_len(&row, i)?);
             }
-            if result_bytes.saturating_add(raw_lens.iter().sum::<usize>()) > MAX_QUERY_RESULT_BYTES
-            {
-                return Err(result_too_large());
+            wire_bytes = add_wire_bytes(wire_bytes, row_wire_bytes)?;
+            // Sized exactly, unlike a `collect` through `Result`, so the row
+            // holds no spare capacity for the rest of the request.
+            let mut row_values = Vec::with_capacity(columns.len());
+            for i in 0..columns.len() {
+                row_values.push(try_format_column_json(&row, i)?);
             }
-            let row_values = (0..columns.len())
-                .map(|i| try_format_column_json(&row, i))
-                .collect::<Result<Vec<_>>>()?;
-            result_bytes = result_bytes.saturating_add(row_result_bytes(&raw_lens, &row_values));
+            result_bytes = result_bytes.saturating_add(row_result_bytes(&row_values));
             if result_bytes > MAX_QUERY_RESULT_BYTES {
                 return Err(result_too_large());
             }
@@ -1200,6 +1206,20 @@ fn add_result_cells(total: usize, columns: usize) -> Result<usize> {
         .ok_or_else(|| anyhow!("Query result exceeded {} cells", MAX_QUERY_CELLS))
 }
 
+/// Adds one row's `row_wire_bytes` to the `total` read from the database so
+/// far, failing once the result would exceed [`MAX_QUERY_WIRE_BYTES`].
+fn add_wire_bytes(total: usize, row_wire_bytes: usize) -> Result<usize> {
+    total
+        .checked_add(row_wire_bytes)
+        .filter(|bytes| *bytes <= MAX_QUERY_WIRE_BYTES)
+        .ok_or_else(|| {
+            anyhow!(
+                "Query read more than {} bytes from the database",
+                MAX_QUERY_WIRE_BYTES
+            )
+        })
+}
+
 /// Wire length of the cell at `idx`, failing if it exceeds [`MAX_CELL_BYTES`].
 /// Unlike [`try_format_column_json`], this bounds every column type.
 fn raw_cell_len(row: &tokio_postgres::Row, idx: usize) -> Result<usize> {
@@ -1217,18 +1237,17 @@ fn check_cell_len(len: usize) -> Result<usize> {
     Ok(len)
 }
 
-/// Bytes charged against [`MAX_QUERY_RESULT_BYTES`] for one row: each cell
-/// costs the larger of its wire length (`raw_lens`) and its exact JSON size,
-/// so neither a cell formatted as null nor an escape-heavy string goes
-/// uncharged. The row's brackets, the commas between its cells and the comma
-/// after the row are counted, so the charges of all rows add up to the size of
-/// the response's `rows` array, give or take the array's own two brackets.
-fn row_result_bytes(raw_lens: &[usize], values: &[serde_json::Value]) -> usize {
+/// Bytes charged against [`MAX_QUERY_RESULT_BYTES`] for one row: the exact
+/// JSON size of each cell, so an escape-heavy string is charged what it
+/// serializes to and a cell formatted as null only its `null`. The row's
+/// brackets, the commas between its cells and the comma after the row are
+/// counted, so the charges of all rows add up to the size of the response's
+/// `rows` array, give or take the array's own two brackets.
+fn row_result_bytes(values: &[serde_json::Value]) -> usize {
     let structure = 2 + values.len().saturating_sub(1) + 1;
     values
         .iter()
-        .zip(raw_lens)
-        .map(|(value, raw)| estimated_json_value_bytes(value).max(*raw))
+        .map(estimated_json_value_bytes)
         .fold(structure, usize::saturating_add)
 }
 
@@ -1626,7 +1645,7 @@ mod tests {
     #[test]
     fn test_row_result_bytes_charges_empty_cells() {
         let values = vec![json!(""); 512];
-        let row = row_result_bytes(&[0; 512], &values);
+        let row = row_result_bytes(&values);
 
         // 512 times `""`, 511 commas, the brackets and the comma after the row.
         assert_eq!(row, 512 * 2 + 511 + 2 + 1);
@@ -1645,20 +1664,40 @@ mod tests {
             json!("0xdeadbeef"),
         ];
         assert_eq!(
-            row_result_bytes(&[0; 5], &values),
+            row_result_bytes(&values),
             serde_json::to_vec(&values).unwrap().len() + 1
         );
-        assert_eq!(row_result_bytes(&[], &[]), 3);
+        assert_eq!(row_result_bytes(&[]), 3);
     }
 
     #[test]
-    fn test_row_result_bytes_charges_wire_length_of_null_cells() {
-        // An array column formats as null (4 bytes) but the driver buffered it.
-        let raw = 500_000;
+    fn test_row_result_bytes_charges_null_cells_only_their_json_size() {
+        // A `jsonb` column formats as null (4 bytes) however large its wire
+        // length, so it costs the response budget only `null`.
         let values = vec![J::Null, json!("a")];
-        assert_eq!(row_result_bytes(&[raw, 1], &values), raw + 3 + 1 + 2 + 1);
-        // The larger of the two is charged, not their sum.
-        assert_eq!(row_result_bytes(&[0, 1], &values), 4 + 3 + 1 + 2 + 1);
+        assert_eq!(row_result_bytes(&values), 4 + 3 + 1 + 2 + 1);
+
+        // Its wire length counts against the larger wire budget instead: 10,000
+        // such rows stay under the response budget but not under the wire one.
+        assert!(row_result_bytes(&values) * 10_000 < MAX_QUERY_RESULT_BYTES);
+        let mut wire = 0;
+        let mut rows = 0;
+        while let Ok(total) = add_wire_bytes(wire, 500_000) {
+            wire = total;
+            rows += 1;
+        }
+        assert!(rows < 10_000);
+        assert!(wire > MAX_QUERY_RESULT_BYTES);
+        assert_eq!(
+            add_wire_bytes(wire, MAX_QUERY_WIRE_BYTES)
+                .unwrap_err()
+                .to_string(),
+            "Query read more than 41943040 bytes from the database"
+        );
+        assert_eq!(
+            add_wire_bytes(0, MAX_QUERY_WIRE_BYTES).unwrap(),
+            MAX_QUERY_WIRE_BYTES
+        );
     }
 
     #[test]
