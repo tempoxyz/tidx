@@ -192,7 +192,7 @@ impl Default for QueryOptions {
 const MAX_QUERY_RESULT_BYTES: usize = 10 * 1024 * 1024;
 
 /// Most bytes PostgreSQL may send for one result, counted by wire length. It
-/// bounds the data buffered for cells the response may drop, such as arrays and
+/// bounds the bytes read for cells the response may drop, such as arrays and
 /// `jsonb`, which format as null. It is larger than [`MAX_QUERY_RESULT_BYTES`]
 /// because such cells are not returned.
 const MAX_QUERY_WIRE_BYTES: usize = 4 * MAX_QUERY_RESULT_BYTES;
