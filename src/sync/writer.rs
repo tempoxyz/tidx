@@ -39,8 +39,13 @@ impl BlockSpan {
         let (min_timestamp, max_timestamp) = span?;
         Some(Self {
             block_nums: block_nums.into_iter().collect(),
-            min_timestamp: min_timestamp - DELETE_TIMESTAMP_MARGIN,
-            max_timestamp: max_timestamp + DELETE_TIMESTAMP_MARGIN,
+            // Saturate so a timestamp near chrono's range does not panic.
+            min_timestamp: min_timestamp
+                .checked_sub_signed(DELETE_TIMESTAMP_MARGIN)
+                .unwrap_or(DateTime::<Utc>::MIN_UTC),
+            max_timestamp: max_timestamp
+                .checked_add_signed(DELETE_TIMESTAMP_MARGIN)
+                .unwrap_or(DateTime::<Utc>::MAX_UTC),
         })
     }
 }
@@ -1223,4 +1228,20 @@ pub async fn find_fork_point(
     }
 
     Ok(None)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn block_span_saturates_at_timestamp_limits() {
+        let span = BlockSpan::new(
+            [(1, DateTime::<Utc>::MIN_UTC), (2, DateTime::<Utc>::MAX_UTC)].into_iter(),
+        )
+        .unwrap();
+        assert_eq!(span.block_nums, vec![1, 2]);
+        assert_eq!(span.min_timestamp, DateTime::<Utc>::MIN_UTC);
+        assert_eq!(span.max_timestamp, DateTime::<Utc>::MAX_UTC);
+    }
 }
