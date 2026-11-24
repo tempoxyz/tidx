@@ -415,7 +415,11 @@ async fn spawn_blocking_bounded<T: Send + 'static>(
         job()
     })
     .await
-    .map_err(|e| anyhow::anyhow!("Query preparation failed: {e}"))
+    .map_err(|e| {
+        // A panic's message can carry query internals: log it, don't return it.
+        tracing::error!(target: "tidx::query", error = %e, "query preparation task failed");
+        anyhow::anyhow!("Query preparation failed")
+    })
 }
 
 #[cfg(test)]
@@ -452,6 +456,16 @@ mod tests {
         // The permit comes back once the job finishes.
         release_tx.send(()).unwrap();
         let _permit = semaphore.acquire().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn blocking_panic_is_not_returned_to_the_caller() {
+        let semaphore = Arc::new(Semaphore::new(1));
+        let error = spawn_blocking_bounded::<()>(&semaphore, || panic!("internal detail"))
+            .await
+            .unwrap_err();
+        assert_eq!(error.to_string(), "Query preparation failed");
+        assert_eq!(semaphore.available_permits(), 1);
     }
 
     #[test]
