@@ -281,6 +281,12 @@ impl TieredSync {
                 .map(|s| s.tip_num)
                 .unwrap_or(0);
             if realtime_tip < head.saturating_sub(TAIL_WINDOW) {
+                debug!(
+                    chain_id = self.chain_id,
+                    realtime_tip,
+                    head,
+                    "Waiting for realtime sync before reconciling the PostgreSQL hot window"
+                );
                 return Ok(Duration::from_secs(2));
             }
             head = head.min(realtime_tip);
