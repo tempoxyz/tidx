@@ -10,8 +10,8 @@ use tokio_postgres::types::{ToSql, Type};
 use crate::db::Pool;
 use crate::metrics;
 use crate::query::{
-    EventSignature, HARD_LIMIT_MAX, apply_event_signature_ctes_postgres,
-    apply_event_signature_ctes_tiered, plan_tiered_split, validate_query,
+    EventSignature, HARD_LIMIT_MAX, TieredSplit, apply_event_signature_ctes_postgres,
+    apply_event_signature_ctes_tiered, plan_tiered_split, prepare_blocking, validate_query,
 };
 
 #[derive(Debug, Clone, Serialize)]
@@ -175,6 +175,7 @@ impl From<crate::clickhouse::QueryResult> for QueryResult {
     }
 }
 
+#[derive(Clone)]
 pub struct QueryOptions {
     pub timeout_ms: u64,
     pub limit: i64,
@@ -211,7 +212,8 @@ pub async fn execute_query_postgres(
     signatures: &[&str],
     options: &QueryOptions,
 ) -> Result<QueryResult> {
-    PostgresQuery::new(sql, signatures, options)?
+    PostgresQuery::prepare(sql, signatures, options)
+        .await?
         .execute(pool, &[], options)
         .await
 }
@@ -239,6 +241,15 @@ impl PostgresQuery {
         let sql = crate::query::convert_hex_literals_postgres(&sql);
 
         Ok(Self { sql })
+    }
+
+    /// [`Self::new`] on the blocking pool, for async callers.
+    pub async fn prepare(sql: &str, signatures: &[&str], options: &QueryOptions) -> Result<Self> {
+        let options = options.clone();
+        prepare_blocking(sql, signatures, move |sql, signatures| {
+            Self::new(sql, signatures, &options)
+        })
+        .await
     }
 
     /// The rewritten SQL that runs on PostgreSQL.
@@ -530,25 +541,13 @@ async fn try_execute_tiered_split(
 ) -> Result<Option<QueryResult>> {
     let start = Instant::now();
 
-    let mut events = Vec::with_capacity(signatures.len());
-    for sig in signatures {
-        // Let the fallback path surface signature parse errors.
-        let Ok(parsed) = EventSignature::parse(sig) else {
-            return Ok(None);
-        };
-        events.push(parsed);
-    }
-    let Some(plan) = plan_tiered_split(sql, &events) else {
+    let Some(plan) = prepare_blocking(sql, signatures, |sql, signatures| {
+        Ok(plan_validated_tiered_split(sql, signatures))
+    })
+    .await?
+    else {
         return Ok(None);
     };
-    // Mirror the fallback's raw-SQL gates (LIMIT ALL, length, …): the arms
-    // re-emit SQL from the AST, which would otherwise erase them.
-    if apply_event_signature_ctes_tiered(sql, signatures)
-        .and_then(|s| validate_query(&s))
-        .is_err()
-    {
-        return Ok(None);
-    }
     // Plain PG errors when an explicit SQL LIMIT streams more rows than the
     // API cap; the split would silently cap. Let the fallback decide.
     if plan.sql_limit.is_some_and(|l| l > options.limit) {
@@ -681,6 +680,29 @@ async fn try_execute_tiered_split(
     )))
 }
 
+/// Plan the tiered split of `sql`, or `None` when it is ineligible or the
+/// fallback path would reject it.
+fn plan_validated_tiered_split(sql: &str, signatures: &[&str]) -> Option<TieredSplit> {
+    let mut events = Vec::with_capacity(signatures.len());
+    for sig in signatures {
+        // Let the fallback path surface signature parse errors.
+        let Ok(parsed) = EventSignature::parse(sig) else {
+            return None;
+        };
+        events.push(parsed);
+    }
+    let plan = plan_tiered_split(sql, &events)?;
+    // Mirror the fallback's raw-SQL gates (LIMIT ALL, length, …): the arms
+    // re-emit SQL from the AST, which would otherwise erase them.
+    if apply_event_signature_ctes_tiered(sql, signatures)
+        .and_then(|s| validate_query(&s))
+        .is_err()
+    {
+        return None;
+    }
+    Some(plan)
+}
+
 /// Degraded split path: the hot PostgreSQL arm failed, so serve the original
 /// query natively on the ClickHouse archive (dual-written, full history).
 async fn degrade_split_to_clickhouse(
@@ -763,9 +785,13 @@ pub async fn execute_query_postgres_via_clickhouse(
     }
 
     // ch.* exposes the same ClickHouse text representation as tiered.*.
-    let sql = apply_event_signature_ctes_tiered(sql, signatures)?;
-    validate_query(&sql)?;
-    let sql = append_limit_if_missing(&sql, options.limit);
+    let limit = options.limit;
+    let sql = prepare_blocking(sql, signatures, move |sql, signatures| {
+        let sql = apply_event_signature_ctes_tiered(sql, signatures)?;
+        validate_query(&sql)?;
+        Ok(append_limit_if_missing(&sql, limit))
+    })
+    .await?;
 
     // ClickHouse aborts its scans strictly before PostgreSQL's
     // statement_timeout: a cancel mid pg_clickhouse scan double-frees and

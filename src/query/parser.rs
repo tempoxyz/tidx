@@ -10,6 +10,8 @@ use sqlparser::tokenizer::{Location, Token, Tokenizer};
 use std::collections::{HashMap, HashSet};
 use std::ops::ControlFlow;
 
+use super::validator::MAX_QUERY_LENGTH;
+
 /// Raw columns on the `logs` table that can be safely pushed down into CTEs.
 const RAW_PUSHDOWN_COLUMNS: &[&str] = &[
     "block_num",
@@ -21,6 +23,9 @@ const RAW_PUSHDOWN_COLUMNS: &[&str] = &[
 ];
 
 const MAX_ABI_TYPE_DEPTH: usize = 10;
+
+/// Maximum number of `signature` params a single query may carry.
+const MAX_EVENT_SIGNATURES: usize = 16;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EventSignature {
@@ -402,10 +407,7 @@ impl EventSignature {
     /// Normalize table references in SQL to match the CTE name (case-insensitive).
     /// E.g., if event name is "Transfer", converts "FROM transfer" or "FROM TRANSFER" to "FROM Transfer"
     pub fn normalize_table_references(&self, sql: &str) -> String {
-        // Build a case-insensitive regex to match the event name as a table reference
-        let pattern = format!(r"(?i)\b{}\b", regex_lite::escape(&self.name));
-        let re = regex_lite::Regex::new(&pattern).unwrap();
-        re.replace_all(sql, self.name.as_str()).into_owned()
+        normalize_event_table_references(std::slice::from_ref(self), sql)
     }
 
     /// Rewrite a SQL query to push down filters on decoded columns to use indexed raw columns.
@@ -500,6 +502,8 @@ fn apply_event_signature_ctes(
         return Ok(sql.to_string());
     }
 
+    check_event_signature_limits(sql, signatures)?;
+
     let sigs: Vec<EventSignature> = signatures
         .iter()
         .map(|s| EventSignature::parse(s))
@@ -515,20 +519,16 @@ fn apply_event_signature_ctes(
         }
     }
 
-    let mut rewritten_sql = sql.to_string();
-    for sig in &sigs {
-        rewritten_sql = sig.normalize_table_references(&rewritten_sql);
-    }
+    let mut rewritten_sql = normalize_event_table_references(&sigs, sql);
     rewritten_sql =
         super::filters::rewrite(&rewritten_sql, &sigs, dialect.parser_dialect().as_ref());
 
-    let pushdown = |sig: &EventSignature| {
-        extract_raw_column_predicates_for_table(
-            &rewritten_sql,
-            matches!(dialect, EventCteDialect::ClickHouse).then_some("logs"),
-            Some(&sig.name),
-        )
-    };
+    let table_names: Vec<&str> = sigs.iter().map(|sig| sig.name.as_str()).collect();
+    let pushdowns = extract_raw_column_predicates_for_tables(
+        &rewritten_sql,
+        matches!(dialect, EventCteDialect::ClickHouse).then_some("logs"),
+        Some(&table_names),
+    );
     let ctes: Vec<String> = match dialect {
         EventCteDialect::Postgres => {
             let used_columns = extract_column_references(&rewritten_sql);
@@ -538,12 +538,14 @@ fn apply_event_signature_ctes(
                 Some(&used_columns)
             };
             sigs.iter()
-                .map(|sig| sig.to_cte_sql_postgres_with_pushdown(filter, &pushdown(sig)))
+                .zip(&pushdowns)
+                .map(|(sig, pushdown)| sig.to_cte_sql_postgres_with_pushdown(filter, pushdown))
                 .collect()
         }
         EventCteDialect::ClickHouse => sigs
             .iter()
-            .map(|sig| sig.to_cte_sql_clickhouse_with_pushdown(None, &pushdown(sig)))
+            .zip(&pushdowns)
+            .map(|(sig, pushdown)| sig.to_cte_sql_clickhouse_with_pushdown(None, pushdown))
             .collect(),
         EventCteDialect::Tiered => {
             let used_columns = extract_column_references(&rewritten_sql);
@@ -553,12 +555,61 @@ fn apply_event_signature_ctes(
                 Some(&used_columns)
             };
             sigs.iter()
-                .map(|sig| sig.to_cte_sql_tiered_with_pushdown(filter, &pushdown(sig)))
+                .zip(&pushdowns)
+                .map(|(sig, pushdown)| sig.to_cte_sql_tiered_with_pushdown(filter, pushdown))
                 .collect()
         }
     };
 
     merge_event_ctes(&rewritten_sql, &ctes, &event_names, dialect)
+}
+
+/// Rejects signature input that is too large to rewrite, before any of it is
+/// parsed.
+///
+/// The rewrite scans the SQL once per request, so bounding the raw input
+/// bounds its cost; the composed query is checked against the same limit when
+/// it is validated.
+fn check_event_signature_limits(sql: &str, signatures: &[&str]) -> Result<()> {
+    if signatures.len() > MAX_EVENT_SIGNATURES {
+        return Err(anyhow!(
+            "Too many event signatures ({} given, max {})",
+            signatures.len(),
+            MAX_EVENT_SIGNATURES
+        ));
+    }
+    let size = sql.len() + signatures.iter().map(|s| s.len()).sum::<usize>();
+    if size > MAX_QUERY_LENGTH {
+        return Err(anyhow!(
+            "Query too large ({} bytes, max {})",
+            size,
+            MAX_QUERY_LENGTH
+        ));
+    }
+    Ok(())
+}
+
+/// Rewrites every case-insensitive reference to an event name in `sql` to the
+/// signature's spelling, in one pass over `sql`.
+///
+/// Event names are distinct ignoring case and consist of ASCII word
+/// characters only, so the word-bounded matches never overlap and each
+/// lowercased match is a key of `names`.
+fn normalize_event_table_references(sigs: &[EventSignature], sql: &str) -> String {
+    let names: HashMap<String, &str> = sigs
+        .iter()
+        .map(|sig| (sig.name.to_lowercase(), sig.name.as_str()))
+        .collect();
+    let alternatives: Vec<String> = sigs
+        .iter()
+        .map(|sig| regex_lite::escape(&sig.name))
+        .collect();
+    let re = regex_lite::Regex::new(&format!(r"(?i)\b(?:{})\b", alternatives.join("|")))
+        .expect("escaped event names form a valid regex");
+    re.replace_all(sql, |caps: &regex_lite::Captures<'_>| {
+        names[&caps[0].to_lowercase()].to_string()
+    })
+    .into_owned()
 }
 
 struct UserWithInfo {
@@ -881,52 +932,74 @@ pub fn extract_raw_column_predicates(sql: &str) -> Vec<String> {
 }
 
 fn extract_raw_column_predicates_with_qualifier(sql: &str, qualifier: Option<&str>) -> Vec<String> {
-    extract_raw_column_predicates_for_table(sql, qualifier, None)
+    extract_raw_column_predicates_for_tables(sql, qualifier, None)
+        .into_iter()
+        .next()
+        .unwrap_or_default()
 }
 
-fn extract_raw_column_predicates_for_table(
+/// Extracts the raw-column predicates of each table in `tables` from one
+/// parse of `sql`, in the order of `tables`. With `None`, a single entry
+/// covers every table name.
+fn extract_raw_column_predicates_for_tables(
     sql: &str,
     qualifier: Option<&str>,
-    table: Option<&str>,
-) -> Vec<String> {
+    tables: Option<&[&str]>,
+) -> Vec<Vec<String>> {
+    let count = tables.map_or(1, <[_]>::len);
     let dialect = GenericDialect {};
     let Ok(statements) = Parser::parse_sql(&dialect, sql) else {
-        return Vec::new();
+        return vec![Vec::new(); count];
     };
     let mut visitor = RawPredicateVisitor {
-        predicates: Vec::new(),
         qualifier,
-        references: 0,
-        table,
+        tables,
+        scans: (0..count).map(|_| TableScan::default()).collect(),
     };
     let _ = statements.visit(&mut visitor);
-    // A shared CTE cannot be restricted by just one of its consumers.
-    if visitor.references == 1 {
-        visitor.predicates
-    } else {
-        Vec::new()
-    }
+    visitor
+        .scans
+        .into_iter()
+        // A shared CTE cannot be restricted by just one of its consumers.
+        .map(|scan| {
+            if scan.references == 1 {
+                scan.predicates
+            } else {
+                Vec::new()
+            }
+        })
+        .collect()
 }
 
 struct RawPredicateVisitor<'a> {
-    predicates: Vec<String>,
     qualifier: Option<&'a str>,
+    tables: Option<&'a [&'a str]>,
+    /// One entry per table in `tables`, or a single entry without it.
+    scans: Vec<TableScan>,
+}
+
+#[derive(Default)]
+struct TableScan {
+    predicates: Vec<String>,
     references: usize,
-    table: Option<&'a str>,
 }
 
 impl RawPredicateVisitor<'_> {
-    fn matches(&self, factor: &TableFactor) -> bool {
+    /// Index into `scans` of the table that `factor` references, if any.
+    fn matches(&self, factor: &TableFactor) -> Option<usize> {
         let TableFactor::Table { name, .. } = factor else {
-            return false;
+            return None;
         };
         let [part] = name.0.as_slice() else {
-            return false;
+            return None;
         };
-        part.as_ident().is_some_and(|name| {
-            self.table
-                .is_none_or(|table| name.value.eq_ignore_ascii_case(table))
-        })
+        let name = part.as_ident()?;
+        match self.tables {
+            None => Some(0),
+            Some(tables) => tables
+                .iter()
+                .position(|table| name.value.eq_ignore_ascii_case(table)),
+        }
     }
 
     fn collect(&mut self, body: &SetExpr) {
@@ -942,9 +1015,11 @@ impl RawPredicateVisitor<'_> {
                 let TableFactor::Table { alias, args, .. } = &source.relation else {
                     return;
                 };
+                let Some(scan) = self.matches(&source.relation) else {
+                    return;
+                };
                 // Joins and output aliases can change which column an unqualified name denotes.
                 if !source.joins.is_empty()
-                    || !self.matches(&source.relation)
                     || args.is_some()
                     || alias
                         .as_ref()
@@ -958,7 +1033,7 @@ impl RawPredicateVisitor<'_> {
                     return;
                 }
                 if let Some(selection) = &select.selection {
-                    self.collect_conjuncts(selection);
+                    self.collect_conjuncts(scan, selection);
                 }
             }
             // Nested queries are visited independently by the AST visitor.
@@ -966,19 +1041,19 @@ impl RawPredicateVisitor<'_> {
         }
     }
 
-    fn collect_conjuncts(&mut self, expr: &Expr) {
+    fn collect_conjuncts(&mut self, scan: usize, expr: &Expr) {
         match expr {
-            Expr::Nested(expr) => self.collect_conjuncts(expr),
+            Expr::Nested(expr) => self.collect_conjuncts(scan, expr),
             Expr::BinaryOp {
                 left,
                 op: BinaryOperator::And,
                 right,
             } => {
-                self.collect_conjuncts(left);
-                self.collect_conjuncts(right);
+                self.collect_conjuncts(scan, left);
+                self.collect_conjuncts(scan, right);
             }
             // Never descend into OR, NOT, functions, or subqueries: their children need not hold.
-            _ => extract_raw_predicate(expr, &mut self.predicates, self.qualifier),
+            _ => extract_raw_predicate(expr, &mut self.scans[scan].predicates, self.qualifier),
         }
     }
 }
@@ -992,8 +1067,8 @@ impl Visitor for RawPredicateVisitor<'_> {
     }
 
     fn pre_visit_table_factor(&mut self, factor: &TableFactor) -> ControlFlow<Self::Break> {
-        if self.matches(factor) {
-            self.references += 1;
+        if let Some(scan) = self.matches(factor) {
+            self.scans[scan].references += 1;
         }
         ControlFlow::Continue(())
     }
@@ -1642,6 +1717,115 @@ mod tests {
         .unwrap_err();
 
         assert!(err.to_string().contains("Recursive CTEs"));
+    }
+
+    #[test]
+    fn test_apply_event_cte_rejects_too_many_signatures() {
+        let signatures: Vec<String> = (0..=MAX_EVENT_SIGNATURES)
+            .map(|i| format!("Evt{i}(uint256 value)"))
+            .collect();
+        let signatures: Vec<&str> = signatures.iter().map(String::as_str).collect();
+
+        let err =
+            apply_event_signature_ctes_postgres("SELECT * FROM Evt0", &signatures).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "Too many event signatures (17 given, max 16)"
+        );
+
+        apply_event_signature_ctes_postgres(
+            "SELECT * FROM Evt0",
+            &signatures[..MAX_EVENT_SIGNATURES],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn test_apply_event_cte_rejects_oversized_input_before_parsing_signatures() {
+        // The signature is invalid: a parse error would mean it was parsed.
+        let sql = format!("SELECT * FROM Evt{}", " ".repeat(MAX_QUERY_LENGTH));
+        let err = apply_event_signature_ctes_postgres(&sql, &["not a signature"]).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            format!(
+                "Query too large ({} bytes, max {MAX_QUERY_LENGTH})",
+                sql.len() + "not a signature".len()
+            )
+        );
+    }
+
+    #[test]
+    fn test_apply_event_cte_counts_signature_bytes_towards_size_limit() {
+        let signature = "Evt(uint256 value)";
+        let prefix = "SELECT * FROM Evt";
+        let limit_sql = format!(
+            "{prefix}{}",
+            " ".repeat(MAX_QUERY_LENGTH - signature.len() - prefix.len())
+        );
+        apply_event_signature_ctes_postgres(&limit_sql, &[signature]).unwrap();
+
+        let err = apply_event_signature_ctes_postgres(&format!("{limit_sql} "), &[signature])
+            .unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            format!(
+                "Query too large ({} bytes, max {MAX_QUERY_LENGTH})",
+                MAX_QUERY_LENGTH + 1
+            )
+        );
+    }
+
+    #[test]
+    fn test_apply_event_cte_normalizes_every_event_name_in_one_pass() {
+        let sql = apply_event_signature_ctes_clickhouse(
+            "SELECT deposited, redeemeds FROM DEPOSITED JOIN redeemed ON true",
+            &["Deposited(uint256 assets)", "Redeemed(uint256 assets)"],
+        )
+        .unwrap();
+        assert!(
+            sql.ends_with("SELECT Deposited, redeemeds FROM Deposited JOIN Redeemed ON true"),
+            "{sql}"
+        );
+    }
+
+    #[test]
+    fn test_apply_event_cte_pushes_down_each_event_table_independently() {
+        let deposited = EventSignature::parse("Deposited(uint256 assets)").unwrap();
+        let redeemed = EventSignature::parse("Redeemed(uint256 assets)").unwrap();
+        let signatures = ["Deposited(uint256 assets)", "Redeemed(uint256 assets)"];
+
+        // Each event table is scanned once, so each keeps its own predicates.
+        let query = "SELECT * FROM Deposited WHERE block_num > 100 \
+                     UNION ALL SELECT * FROM Redeemed WHERE block_num < 50";
+        assert_eq!(
+            apply_event_signature_ctes_clickhouse(
+                &query
+                    .replace("Deposited", "deposited")
+                    .replace("Redeemed", "REDEEMED"),
+                &signatures
+            )
+            .unwrap(),
+            format!(
+                "WITH {}, {} {query}",
+                deposited
+                    .to_cte_sql_clickhouse_with_pushdown(None, &["logs.block_num > 100".into()]),
+                redeemed.to_cte_sql_clickhouse_with_pushdown(None, &["logs.block_num < 50".into()]),
+            )
+        );
+
+        // A table referenced twice is shared by its consumers, so only the
+        // table scanned once is restricted.
+        let query = "SELECT * FROM Deposited WHERE block_num > 100 \
+                     UNION ALL SELECT * FROM Deposited WHERE block_num < 50 \
+                     UNION ALL SELECT * FROM Redeemed WHERE block_num < 7";
+        assert_eq!(
+            apply_event_signature_ctes_clickhouse(query, &signatures).unwrap(),
+            format!(
+                "WITH {}, {} {query}",
+                deposited.to_cte_sql_clickhouse_with_pushdown(None, &[]),
+                redeemed.to_cte_sql_clickhouse_with_pushdown(None, &["logs.block_num < 7".into()]),
+            )
+        );
     }
 
     #[test]

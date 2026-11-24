@@ -465,7 +465,7 @@ GET  /status                                             Sync status for all cha
 GET  /query                                              Execute SQL query
      ?sql                   string    (required)         SQL query (SELECT only)
      ?chainId               number    (required)         Chain ID to query
-     ?signature             string                       Event signature for CTE generation
+     ?signature             string                       Event signature for CTE generation (repeatable, max 16)
      ?engine                string    = postgres         Query engine: postgres or clickhouse
      ?source                string    = postgres-clickhouse  Data source: postgres, clickhouse, or postgres-clickhouse
      ?live                  bool      = false            Enable SSE streaming (postgres only)
@@ -675,7 +675,7 @@ Written by the sync engine to both PostgreSQL and ClickHouse. Schemas are identi
 
 ### Event Tables
 
-Pass `?signature=Event(type1,type2,...)` to `/query` and tidx exposes a virtual table named after the event with one column per parameter. The table is generated as a CTE at query time, so no schema registration is needed and any event signature works on demand. Works against both `engine=postgres` and `engine=clickhouse`:
+Pass `?signature=Event(type1,type2,...)` to `/query` and tidx exposes a virtual table named after the event with one column per parameter. The table is generated as a CTE at query time, so no schema registration is needed and any event signature works on demand. Repeat `signature` to expose several events; a query takes at most 16, and its SQL plus all signatures must stay within 65,536 bytes. Works against both `engine=postgres` and `engine=clickhouse`:
 
 ```bash
 curl -G "https://indexer.tempo.xyz/query" \

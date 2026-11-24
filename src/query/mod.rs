@@ -360,6 +360,26 @@ pub fn hoist_set_operation_order_by_clickhouse(sql: &str) -> anyhow::Result<Stri
     }
 }
 
+/// Runs the CPU-bound preparation of a user query (signature rewrite, parsing
+/// and validation) on the blocking pool, so that a large query cannot stall
+/// an async worker thread.
+///
+/// `f` runs with copies of `sql` and `signatures` owned by the blocking task.
+pub(crate) async fn prepare_blocking<T: Send + 'static>(
+    sql: &str,
+    signatures: &[&str],
+    f: impl FnOnce(&str, &[&str]) -> anyhow::Result<T> + Send + 'static,
+) -> anyhow::Result<T> {
+    let sql = sql.to_owned();
+    let signatures: Vec<String> = signatures.iter().map(|s| (*s).to_owned()).collect();
+    tokio::task::spawn_blocking(move || {
+        let signatures: Vec<&str> = signatures.iter().map(String::as_str).collect();
+        f(&sql, &signatures)
+    })
+    .await
+    .map_err(|e| anyhow::anyhow!("Query preparation failed: {e}"))?
+}
+
 #[cfg(test)]
 mod tests {
     fn hoist(sql: &str) -> String {

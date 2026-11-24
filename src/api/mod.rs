@@ -777,7 +777,7 @@ async fn handle_query_live(
                                     return;
                                 }
                             };
-                            match PostgresQuery::new(&filtered_sql, &sigs, &options) {
+                            match PostgresQuery::prepare(&filtered_sql, &sigs, &options).await {
                                 Ok(query) => block_query = Some(query),
                                 Err(e) => {
                                     yield Ok(SseEvent::default()
