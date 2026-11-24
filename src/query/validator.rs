@@ -13,7 +13,7 @@ use sqlparser::tokenizer::Token;
 
 const POSTGRES_ALLOWED_TABLES: &[&str] = &["blocks", "txs", "logs", "receipts"];
 
-const MAX_QUERY_LENGTH: usize = 65_536;
+pub(super) const MAX_QUERY_LENGTH: usize = 65_536;
 const MAX_SUBQUERY_DEPTH: usize = 4;
 pub const HARD_LIMIT_MAX: i64 = 10_000;
 

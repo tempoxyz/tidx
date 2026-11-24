@@ -15,7 +15,7 @@ use tracing::{error, info, warn};
 use crate::config::ClickHouseConfig;
 use crate::query::{
     HARD_LIMIT_MAX, apply_event_signature_ctes_clickhouse, convert_timestamp_literals_clickhouse,
-    hoist_set_operation_order_by_clickhouse, validate_clickhouse_query,
+    hoist_set_operation_order_by_clickhouse, prepare_blocking, validate_clickhouse_query,
 };
 
 const MAX_QUERY_RESULT_BYTES: usize = 10 * 1024 * 1024;
@@ -180,12 +180,18 @@ impl ClickHouseEngine {
         limit: i64,
         settings: &[(&str, &str)],
     ) -> Result<QueryResult> {
-        let sql = Self::prepare_query(sql, signatures)?;
-        validate_clickhouse_query(&sql)?;
-        // The rewrite only re-renders the validated tree inside a wrapper and
-        // fails unless its output parses back to that tree.
-        let sql = hoist_set_operation_order_by_clickhouse(&sql)?;
-        let sql = Self::wrap_user_query_with_limit(&sql, limit.clamp(1, HARD_LIMIT_MAX));
+        let sql = prepare_blocking(sql, signatures, move |sql, signatures| {
+            let sql = Self::prepare_query(sql, signatures)?;
+            validate_clickhouse_query(&sql)?;
+            // The rewrite only re-renders the validated tree inside a wrapper and
+            // fails unless its output parses back to that tree.
+            let sql = hoist_set_operation_order_by_clickhouse(&sql)?;
+            Ok(Self::wrap_user_query_with_limit(
+                &sql,
+                limit.clamp(1, HARD_LIMIT_MAX),
+            ))
+        })
+        .await?;
         // The memory cap goes last so no caller setting can override it.
         let max_memory_usage = MAX_USER_QUERY_MEMORY_BYTES.to_string();
         let mut settings = settings.to_vec();

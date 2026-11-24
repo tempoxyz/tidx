@@ -20,6 +20,8 @@ pub use validator::{
     HARD_LIMIT_MAX, reject_postgres_session_keywords, validate_clickhouse_query, validate_query,
 };
 
+pub(crate) use parser::check_event_signature_limits;
+
 use regex_lite::Regex;
 use sqlparser::ast::{
     Expr, Ident, LimitClause, OrderByKind, Select, SelectItem, SetExpr, Statement, TableFactor,
@@ -29,7 +31,8 @@ use sqlparser::dialect::ClickHouseDialect;
 use sqlparser::parser::Parser;
 use std::collections::{HashMap, HashSet};
 use std::ops::ControlFlow;
-use std::sync::LazyLock;
+use std::sync::{Arc, LazyLock};
+use tokio::sync::Semaphore;
 
 /// Regex to match hex literals: '0x' followed by 40+ hex characters (addresses, topics, hashes)
 /// This avoids matching short '0x' prefixes used in concat() expressions
@@ -360,6 +363,65 @@ pub fn hoist_set_operation_order_by_clickhouse(sql: &str) -> anyhow::Result<Stri
     }
 }
 
+/// Runs the CPU-bound preparation of a user query (signature rewrite, parsing
+/// and validation) on the blocking pool, so that a large query cannot stall
+/// an async worker thread.
+///
+/// At most [`PREPARE_PERMITS`] preparations run at once, process wide.
+///
+/// `f` runs with copies of `sql` and `signatures` owned by the blocking task.
+pub(crate) async fn prepare_blocking<T: Send + 'static>(
+    sql: &str,
+    signatures: &[&str],
+    f: impl FnOnce(&str, &[&str]) -> anyhow::Result<T> + Send + 'static,
+) -> anyhow::Result<T> {
+    let sql = sql.to_owned();
+    let signatures: Vec<String> = signatures.iter().map(|s| (*s).to_owned()).collect();
+    spawn_blocking_bounded(&PREPARE_PERMITS, move || {
+        let signatures: Vec<&str> = signatures.iter().map(String::as_str).collect();
+        f(&sql, &signatures)
+    })
+    .await?
+}
+
+/// Process-wide bound on concurrent query preparations, sized to the available
+/// parallelism.
+///
+/// A blocking job cannot be cancelled, so it keeps running after its request
+/// is dropped (for example when the client disconnects) and the request's
+/// route permit is released. The permit therefore moves into the blocking
+/// closure and is only released when the job finishes. Otherwise repeated
+/// connect-and-drop requests could stack parses up to the size of tokio's
+/// blocking pool, each holding its own copy of the query.
+static PREPARE_PERMITS: LazyLock<Arc<Semaphore>> = LazyLock::new(|| {
+    let parallelism = std::thread::available_parallelism().map_or(4, usize::from);
+    Arc::new(Semaphore::new(parallelism))
+});
+
+/// Runs `job` on the blocking pool once a permit of `semaphore` is available.
+///
+/// The permit is held until `job` returns, even if the returned future is
+/// dropped first.
+async fn spawn_blocking_bounded<T: Send + 'static>(
+    semaphore: &Arc<Semaphore>,
+    job: impl FnOnce() -> T + Send + 'static,
+) -> anyhow::Result<T> {
+    let permit = Arc::clone(semaphore)
+        .acquire_owned()
+        .await
+        .map_err(|e| anyhow::anyhow!("Query preparation failed: {e}"))?;
+    tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        job()
+    })
+    .await
+    .map_err(|e| {
+        // A panic's message can carry query internals: log it, don't return it.
+        tracing::error!(target: "tidx::query", error = %e, "query preparation task failed");
+        anyhow::anyhow!("Query preparation failed")
+    })
+}
+
 #[cfg(test)]
 mod tests {
     fn hoist(sql: &str) -> String {
@@ -367,6 +429,44 @@ mod tests {
     }
 
     use super::*;
+
+    #[tokio::test]
+    async fn blocking_permit_outlives_dropped_future() {
+        let semaphore = Arc::new(Semaphore::new(1));
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+
+        let task = tokio::spawn({
+            let semaphore = Arc::clone(&semaphore);
+            async move {
+                spawn_blocking_bounded(&semaphore, move || {
+                    started_tx.send(()).unwrap();
+                    release_rx.recv().unwrap();
+                })
+                .await
+            }
+        });
+        started_rx.await.unwrap();
+
+        // Dropping the awaiting future must not release the permit while the job runs.
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        assert_eq!(semaphore.available_permits(), 0);
+
+        // The permit comes back once the job finishes.
+        release_tx.send(()).unwrap();
+        let _permit = semaphore.acquire().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn blocking_panic_is_not_returned_to_the_caller() {
+        let semaphore = Arc::new(Semaphore::new(1));
+        let error = spawn_blocking_bounded::<()>(&semaphore, || panic!("internal detail"))
+            .await
+            .unwrap_err();
+        assert_eq!(error.to_string(), "Query preparation failed");
+        assert_eq!(semaphore.available_permits(), 1);
+    }
 
     #[test]
     fn timestamp_literals_utc_offset() {
