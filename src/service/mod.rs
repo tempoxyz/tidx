@@ -370,37 +370,119 @@ fn normalize_cold_result(
     normalize_int64_columns(result);
 }
 
-/// Rewrite `Int64`/`UInt64` cells from ClickHouse's quoted strings to JSON
-/// numbers, as PostgreSQL formats int8; wider integers stay exact strings.
-fn normalize_int64_columns(result: &mut crate::clickhouse::QueryResult) {
+/// Rewrite `Int64`/`UInt64` values from ClickHouse's quoted strings to JSON
+/// numbers, as PostgreSQL formats int8, including those nested in `Array`,
+/// `Tuple` and `Map` values; wider integers stay exact strings.
+pub fn normalize_int64_columns(result: &mut crate::clickhouse::QueryResult) {
     for (i, ty) in result.column_types.iter().enumerate() {
-        enum Kind {
-            Int64,
-            UInt64,
+        if !ty.contains("Int64") {
+            continue;
         }
-        let kind = match ch_base_type(ty) {
-            "Int64" => Kind::Int64,
-            "UInt64" => Kind::UInt64,
-            _ => continue,
-        };
         for row in &mut result.rows {
-            let Some(cell) = row.get_mut(i) else { continue };
-            let serde_json::Value::String(s) = &*cell else {
-                continue;
+            if let Some(cell) = row.get_mut(i) {
+                int64_to_numbers(ty, cell);
+            }
+        }
+    }
+}
+
+/// [`normalize_int64_columns`] for one value of ClickHouse type `ty`. In
+/// JSON output, arrays and unnamed tuples are JSON arrays, and maps and named
+/// tuples are JSON objects.
+fn int64_to_numbers(ty: &str, value: &mut serde_json::Value) {
+    use serde_json::Value;
+    let ty = ch_base_type(ty);
+    let args = |prefix: &str| {
+        ty.strip_prefix(prefix)
+            .and_then(|t| t.strip_suffix(')'))
+            .map(split_ch_type_args)
+    };
+    match value {
+        Value::String(s) => {
+            let number = match ty {
+                "Int64" => s.parse::<i64>().ok().map(serde_json::Number::from),
+                "UInt64" => s.parse::<u64>().ok().map(serde_json::Number::from),
+                _ => None,
             };
-            match kind {
-                Kind::Int64 => {
-                    if let Ok(v) = s.parse::<i64>() {
-                        *cell = serde_json::Value::Number(v.into());
-                    }
+            if let Some(n) = number {
+                *value = Value::Number(n);
+            }
+        }
+        Value::Array(items) => {
+            if let Some(element) = args("Array(") {
+                let element = element.first().copied().unwrap_or_default();
+                for v in items {
+                    int64_to_numbers(element, v);
                 }
-                Kind::UInt64 => {
-                    if let Ok(v) = s.parse::<u64>() {
-                        *cell = serde_json::Value::Number(v.into());
+            } else if let Some(elements) = args("Tuple(") {
+                for (v, element) in items.iter_mut().zip(elements) {
+                    int64_to_numbers(ch_tuple_element(element).1, v);
+                }
+            }
+        }
+        Value::Object(fields) => {
+            if let Some(kv) = args("Map(") {
+                let v_ty = kv.get(1).copied().unwrap_or_default();
+                for v in fields.values_mut() {
+                    int64_to_numbers(v_ty, v);
+                }
+            } else if let Some(elements) = args("Tuple(") {
+                for element in elements {
+                    if let (Some(name), element_ty) = ch_tuple_element(element)
+                        && let Some(v) = fields.get_mut(name)
+                    {
+                        int64_to_numbers(element_ty, v);
                     }
                 }
             }
         }
+        _ => {}
+    }
+}
+
+/// Split a ClickHouse type's arguments, such as `String, Array(UInt64)`, at
+/// top-level commas, skipping commas in parentheses, quotes and backticks
+/// (`Enum8('a,b' = 1)`).
+fn split_ch_type_args(args: &str) -> Vec<&str> {
+    let mut parts = Vec::new();
+    let (mut depth, mut quote, mut escaped, mut start) = (0usize, None, false, 0);
+    for (i, c) in args.char_indices() {
+        if let Some(q) = quote {
+            if escaped {
+                escaped = false;
+            } else if c == '\\' {
+                escaped = true;
+            } else if c == q {
+                quote = None;
+            }
+            continue;
+        }
+        match c {
+            '\'' | '`' => quote = Some(c),
+            '(' => depth += 1,
+            ')' => depth = depth.saturating_sub(1),
+            ',' if depth == 0 => {
+                parts.push(args[start..i].trim());
+                start = i + 1;
+            }
+            _ => {}
+        }
+    }
+    parts.push(args[start..].trim());
+    parts
+}
+
+/// A tuple element's name, if any, and type: `n UInt64`, `` `a b` UInt64 ``
+/// or `UInt64`. A bare type has no space before its first parenthesis.
+fn ch_tuple_element(element: &str) -> (Option<&str>, &str) {
+    if let Some(rest) = element.strip_prefix('`')
+        && let Some((name, ty)) = rest.split_once('`')
+    {
+        return (Some(name), ty.trim());
+    }
+    match element.find([' ', '(']) {
+        Some(i) if element[i..].starts_with(' ') => (Some(&element[..i]), element[i..].trim()),
+        _ => (None, element),
     }
 }
 
@@ -963,11 +1045,19 @@ async fn run_pg_query(
             wire_bytes = add_wire_bytes(wire_bytes, row_wire_bytes)?;
             // Sized exactly, unlike a `collect` through `Result`, so the row
             // holds no spare capacity for the rest of the request.
+            // Each cell is charged as soon as it is formatted: a compact wire
+            // value can expand far past its wire size, such as a NUMERIC
+            // `1e131068` (a few bytes) into 131,069 digits.
             let mut row_values = Vec::with_capacity(columns.len());
+            result_bytes = result_bytes.saturating_add(row_structure_bytes(columns.len()));
             for i in 0..columns.len() {
-                row_values.push(try_format_column_json(&row, i)?);
+                if result_bytes > MAX_QUERY_RESULT_BYTES {
+                    return Err(result_too_large());
+                }
+                let value = try_format_column_json(&row, i)?;
+                result_bytes = result_bytes.saturating_add(estimated_json_value_bytes(&value));
+                row_values.push(value);
             }
-            result_bytes = result_bytes.saturating_add(row_result_bytes(&row_values));
             if result_bytes > MAX_QUERY_RESULT_BYTES {
                 return Err(result_too_large());
             }
@@ -1261,18 +1351,15 @@ fn check_cell_len(len: usize) -> Result<usize> {
     Ok(len)
 }
 
-/// Bytes charged against [`MAX_QUERY_RESULT_BYTES`] for one row: the exact
-/// JSON size of each cell, so an escape-heavy string is charged what it
-/// serializes to and a cell formatted as null only its `null`. The row's
-/// brackets, the commas between its cells and the comma after the row are
-/// counted, so the charges of all rows add up to the size of the response's
-/// `rows` array, give or take the array's own two brackets.
-fn row_result_bytes(values: &[serde_json::Value]) -> usize {
-    let structure = 2 + values.len().saturating_sub(1) + 1;
-    values
-        .iter()
-        .map(estimated_json_value_bytes)
-        .fold(structure, usize::saturating_add)
+/// Bytes charged against [`MAX_QUERY_RESULT_BYTES`] for a row of `cells`
+/// cells besides the cells themselves, which are each charged their exact
+/// JSON size ([`estimated_json_value_bytes`]), so an escape-heavy string is
+/// charged what it serializes to and a cell formatted as null only its
+/// `null`. The row's brackets, the commas between its cells and the comma
+/// after the row are counted, so the charges of all rows add up to the size
+/// of the response's `rows` array, give or take the array's own two brackets.
+fn row_structure_bytes(cells: usize) -> usize {
+    2 + cells.saturating_sub(1) + 1
 }
 
 fn result_too_large() -> anyhow::Error {
@@ -1306,6 +1393,7 @@ impl FromSql<'_> for PgNumericText {
     /// then `ndigits` base-10000 digits; digit `i` is worth
     /// 10000^(weight - i) and `dscale` is the number of fraction digits shown.
     fn from_sql(_: &Type, raw: &[u8]) -> Result<Self, Box<dyn std::error::Error + Sync + Send>> {
+        use std::fmt::Write;
         let word = |i: usize| -> Result<u16, Box<dyn std::error::Error + Sync + Send>> {
             raw.get(2 * i..2 * i + 2)
                 .map(|b| u16::from_be_bytes([b[0], b[1]]))
@@ -1341,9 +1429,9 @@ impl FromSql<'_> for PgNumericText {
         if weight < 0 {
             out.push('0');
         } else {
-            out.push_str(&digit(weight)?.to_string());
+            write!(out, "{}", digit(weight)?)?;
             for exp in (0..weight).rev() {
-                out.push_str(&format!("{:04}", digit(exp)?));
+                write!(out, "{:04}", digit(exp)?)?;
             }
         }
         if dscale > 0 {
@@ -1351,7 +1439,7 @@ impl FromSql<'_> for PgNumericText {
             let mut fraction = String::with_capacity(dscale + 3);
             let mut exp = -1;
             while fraction.len() < dscale {
-                fraction.push_str(&format!("{:04}", digit(exp)?));
+                write!(fraction, "{:04}", digit(exp)?)?;
                 exp -= 1;
             }
             out.push_str(&fraction[..dscale]);
@@ -1434,6 +1522,58 @@ mod tests {
         assert_eq!(
             r.rows[0][5],
             json!("115792089237316195423570985008687907853269984665640564039457584007913129639935")
+        );
+    }
+
+    #[test]
+    fn normalize_int64_converts_nested_values() {
+        // Types and cells as ClickHouse 26.10 writes them in JSONCompact
+        // with output_format_json_quote_64bit_integers=1.
+        let mut r = ch_result(
+            &[
+                "Array(UInt64)",
+                "Tuple(Int64, String)",
+                "Tuple(n UInt64, s String)",
+                "Map(String, UInt64)",
+                "Array(Map(String, Array(Int64)))",
+                "Enum8('a,(b' = 1)",
+                "Nullable(UInt64)",
+                "Array(UInt256)",
+                "Array(Nullable(Int64))",
+                "Tuple(`a b` Int64, Enum8('x,y' = 1), Array(String))",
+            ],
+            vec![vec![
+                json!(["1", "18446744073709551615"]),
+                json!(["-3", "x"]),
+                json!({"n": "4", "s": "y"}),
+                json!({"k": "5"}),
+                json!([{"a": ["6"]}]),
+                json!("a,(b"),
+                json!("7"),
+                json!([
+                    "115792089237316195423570985008687907853269984665640564039457584007913129639935"
+                ]),
+                json!([null, "9"]),
+                json!({"a b": "10", "2": "x,y", "3": ["11"]}),
+            ]],
+        );
+        normalize_int64_columns(&mut r);
+        assert_eq!(
+            r.rows[0],
+            [
+                json!([1, 18_446_744_073_709_551_615_u64]),
+                json!([-3, "x"]),
+                json!({"n": 4, "s": "y"}),
+                json!({"k": 5}),
+                json!([{"a": [6]}]),
+                json!("a,(b"),
+                json!(7),
+                json!([
+                    "115792089237316195423570985008687907853269984665640564039457584007913129639935"
+                ]),
+                json!([null, 9]),
+                json!({"a b": 10, "2": "x,y", "3": ["11"]}),
+            ]
         );
     }
 
@@ -1734,6 +1874,14 @@ mod tests {
             estimated_json_value_bytes(&json!("\u{1}".repeat(1024))),
             6146
         );
+    }
+
+    /// What `run_pg_query` charges for a row of `values`.
+    fn row_result_bytes(values: &[serde_json::Value]) -> usize {
+        values
+            .iter()
+            .map(estimated_json_value_bytes)
+            .fold(row_structure_bytes(values.len()), usize::saturating_add)
     }
 
     #[test]

@@ -72,9 +72,11 @@ pub async fn run(args: Args) -> Result<()> {
             Some(ch) if ch.enabled => {
                 let engine = ClickHouseEngine::new(ch, chain.chain_id)?;
                 let sql = clickhouse_sql(&args, engine.database());
-                let result = engine.query(&sql, &[]).await.context(
+                let mut result = engine.query(&sql, &[]).await.context(
                     "reading system.query_log (the user needs SELECT on system.query_log)",
                 )?;
+                // Counts and timings are UInt64, quoted by ClickHouse.
+                tidx::service::normalize_int64_columns(&mut result);
                 rows_to_json(&result.columns, result.rows)
             }
             _ => json!({ "skipped": "ClickHouse is not enabled for this chain" }),

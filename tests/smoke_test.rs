@@ -1304,7 +1304,15 @@ async fn test_query_postgres_cell_json_formats() {
         "SELECT {} FROM logs WHERE block_num = 74000000 AND log_idx = 2",
         columns(6, "encode(data, 'escape')")
     );
+    // 1,000 NUMERICs of a few wire bytes each that format as 131,069 digits:
+    // the row is rejected as soon as its formatted cells pass 10 MiB, before
+    // the remaining cells are expanded.
+    let wide_numerics = format!("SELECT {}", columns(1_000, "1e131068::numeric"));
     for (sql, expected) in [
+        (
+            wide_numerics.as_str(),
+            "Query result exceeded 10485760 bytes",
+        ),
         (
             "SELECT data FROM logs WHERE block_num = 74000000 AND log_idx = 0",
             "Query result cell exceeded 1048576 bytes",

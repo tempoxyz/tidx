@@ -1,0 +1,5 @@
+{
+  "servicePorts": {
+    "tidx-e2e": 32200
+  }
+}

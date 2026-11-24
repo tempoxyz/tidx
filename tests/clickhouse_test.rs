@@ -993,6 +993,27 @@ async fn test_execute_query_clickhouse_keeps_wide_integers_exact() {
     want[0] = serde_json::json!(9_007_199_254_740_993_i64);
     want[1] = serde_json::json!(18_446_744_073_709_551_615_u64);
     assert_eq!(result.rows, [want]);
+
+    // Nested 64-bit integers are numbers too; nested wider ones stay strings.
+    let result = tidx::service::execute_query_clickhouse(
+        &engine,
+        "SELECT [toUInt64('18446744073709551615')] AS a, \
+         CAST((toInt64(-3), 'x'), 'Tuple(n Int64, s String)') AS t, \
+         map('k', [toUInt64(5)]) AS m, [toUInt256('18446744073709551617')] AS wide",
+        &[],
+        &tidx::service::QueryOptions::default(),
+    )
+    .await
+    .expect("ClickHouse query failed");
+    assert_eq!(
+        result.rows,
+        [[
+            serde_json::json!([18_446_744_073_709_551_615_u64]),
+            serde_json::json!({"n": -3, "s": "x"}),
+            serde_json::json!({"k": [5]}),
+            serde_json::json!(["18446744073709551617"]),
+        ]]
+    );
 }
 
 /// `query_user` (the public /query path) must execute parenthesized UNION arms
