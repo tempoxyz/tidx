@@ -35,6 +35,9 @@ const RECEIPT_BACKFILL_POLL_INTERVAL: Duration = Duration::from_secs(2);
 const RECEIPT_BACKFILL_MAX_WRITE_ROWS: usize = 50_000;
 const RECEIPT_BACKFILL_INFO_ROWS: usize = 10_000;
 
+/// How many blocks behind head to start realtime sync.
+pub(crate) const TAIL_WINDOW: u64 = 10;
+
 pub struct SyncEngine {
     /// Throttled pool - shared by all, but backfill is rate-limited
     throttled_pool: ThrottledPool,
@@ -333,9 +336,6 @@ impl SyncEngine {
             .await?
             .unwrap_or_default();
         let remote_head = self.realtime_rpc.latest_block_number().await?;
-
-        // TAIL_WINDOW: how many blocks behind head to start realtime sync
-        const TAIL_WINDOW: u64 = 10;
 
         // Jump to near head immediately, don't catch up sequentially
         // Backfill-first mode never jumps: no gap-fill loop would fill the skipped range.
