@@ -17,7 +17,7 @@
 
 ---
 
-**tidx** is [Tempo](https://tempo.xyz)'s chain indexer. It ingests blocks, transactions, and logs from a Tempo node, then makes them queryable through SQL, an HTTP API, and a CLI. Its hybrid PostgreSQL and ClickHouse architecture supports fast point lookups (OLTP) and large analytical queries (OLAP).
+**tidx** is [Tempo](https://tempo.com)'s chain indexer. It ingests blocks, transactions, and logs from a Tempo node, then makes them queryable through SQL, an HTTP API, and a CLI. Its hybrid PostgreSQL and ClickHouse architecture supports fast point lookups (OLTP) and large analytical queries (OLAP).
 
 Use tidx when you need structured Tempo chain data without building an indexing pipeline from scratch. Common use cases include analytics dashboards, block explorers, wallet balance lookups, token analytics, and DEX activity tracking.
 
@@ -125,7 +125,7 @@ curl "https://indexer.tempo.xyz/query \
 
 ## Learn more
 
-- [Tempo developer documentation](https://tempo.xyz/developers/docs): guides for building on Tempo
+- [Tempo developer documentation](https://tempo.com/developers): guides for building on Tempo
 - [tempoxyz/tempo](https://github.com/tempoxyz/tempo): Tempo node and protocol implementation
 - [tempoxyz/tempo-apps](https://github.com/tempoxyz/tempo-apps): Tempo applications, including the block explorer
 
