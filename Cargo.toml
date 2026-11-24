@@ -34,11 +34,10 @@ postgres-types = { version = "0.2", features = ["derive"] }
 
 # Ethereum/Tempo primitives
 alloy = { version = "2", features = ["full"] }
-# Pinned to tempoxyz/tempo main @ b6d1615 ("fix(consensus): reject and block peers on undecodable
-# DKG p2p messages (#8787)"), which includes #8750 (configurable-account signatures, TIP-1107).
-# No Tempo release contains #8750 yet; move back to a release tag once one does.
-tempo-alloy = { git = "https://github.com/tempoxyz/tempo", rev = "b6d1615b7a801d1c669824e2422f03024f0e1a67", default-features = false }
-tempo-primitives = { git = "https://github.com/tempoxyz/tempo", rev = "b6d1615b7a801d1c669824e2422f03024f0e1a67", package = "tempo-primitives", default-features = false, features = ["serde"] }
+# Pinned to the tempo/v1.19.1 release, which includes #8750 (configurable-account signatures,
+# TIP-1107) and matches the node version on testnet.
+tempo-alloy = { git = "https://github.com/tempoxyz/tempo", tag = "tempo/v1.19.1", default-features = false }
+tempo-primitives = { git = "https://github.com/tempoxyz/tempo", tag = "tempo/v1.19.1", package = "tempo-primitives", default-features = false, features = ["serde"] }
 
 # URL parsing
 form_urlencoded = "1"
