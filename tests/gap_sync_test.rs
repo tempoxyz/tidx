@@ -762,6 +762,10 @@ async fn test_has_gaps_beyond_indexed_range() {
 // ============================================================================
 
 /// Answers `eth_chainId` and fails every other request, such as reading the head.
+///
+/// A stub rather than the Tempo node from `tests/common`: the engine must be
+/// built against a node that answers `eth_chainId` and then fails only the head
+/// read, which a real node cannot be made to do.
 async fn chain_id_only_rpc(Json(body): Json<Value>) -> impl IntoResponse {
     match body["method"].as_str() {
         Some("eth_chainId") => {
