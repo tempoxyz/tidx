@@ -825,7 +825,7 @@ async fn test_gapfill_reports_not_synced_while_head_read_fails() {
     let deadline = Instant::now() + Duration::from_secs(30);
     let gauge = loop {
         let rendered = metrics.render();
-        if let Some(line) = rendered.lines().find(|l| l.starts_with("tidx_synced")) {
+        if let Some(line) = rendered.lines().find(|l| l.starts_with("tidx_synced{")) {
             break line.to_string();
         }
         assert!(Instant::now() < deadline, "tidx_synced was never set");
