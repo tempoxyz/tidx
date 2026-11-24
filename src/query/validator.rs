@@ -201,10 +201,13 @@ fn validate_query_ast(query: &Query, cte_names: &HashSet<String>, depth: usize) 
 
     // Validate ORDER BY expressions
     if let Some(order_by) = &query.order_by {
+        if order_by.interpolate.is_some() {
+            return Err(anyhow!("ORDER BY INTERPOLATE is not allowed"));
+        }
         match &order_by.kind {
             sqlparser::ast::OrderByKind::Expressions(exprs) => {
                 for order_expr in exprs {
-                    validate_expr(&order_expr.expr, &all_cte_names, depth)?;
+                    validate_order_by_expr(order_expr, &all_cte_names, depth)?;
                 }
             }
             sqlparser::ast::OrderByKind::All(_) => {}
@@ -1880,6 +1883,11 @@ fn validate_function(func: &Function, cte_names: &HashSet<String>, depth: usize)
         return Err(anyhow!("Function '{}' is not allowed", func_name));
     }
 
+    // PostgreSQL has no parametric call syntax, `f(a)(b)`.
+    if !matches!(func.parameters, FunctionArguments::None) {
+        return Err(anyhow!("Parametric function calls are not allowed"));
+    }
+
     validate_pad_length(&func_name, &func.args)?;
 
     if let FunctionArguments::List(arg_list) = &func.args {
@@ -1905,7 +1913,7 @@ fn validate_function(func: &Function, cte_names: &HashSet<String>, depth: usize)
 
     // Validate WITHIN GROUP (ORDER BY ...) clause
     for order_expr in &func.within_group {
-        validate_expr(&order_expr.expr, cte_names, depth)?;
+        validate_order_by_expr(order_expr, cte_names, depth)?;
     }
 
     // Validate window function OVER clause
@@ -1958,7 +1966,7 @@ fn validate_function_argument_clause(
         sqlparser::ast::FunctionArgumentClause::IgnoreOrRespectNulls(_) => Ok(()),
         sqlparser::ast::FunctionArgumentClause::OrderBy(order_by) => {
             for order_expr in order_by {
-                validate_expr(&order_expr.expr, cte_names, depth)?;
+                validate_order_by_expr(order_expr, cte_names, depth)?;
             }
             Ok(())
         }
@@ -1994,7 +2002,7 @@ fn validate_window_spec(
         validate_expr(expr, cte_names, depth)?;
     }
     for order_expr in &spec.order_by {
-        validate_expr(&order_expr.expr, cte_names, depth)?;
+        validate_order_by_expr(order_expr, cte_names, depth)?;
     }
     if let Some(frame) = &spec.window_frame {
         validate_window_frame_bound(&frame.start_bound, cte_names, depth)?;
@@ -2019,6 +2027,21 @@ fn validate_window_frame_bound(
             validate_expr(expr, cte_names, depth)
         }
     }
+}
+
+/// Validates one PostgreSQL ORDER BY item.
+///
+/// `WITH FILL` is ClickHouse syntax that PostgreSQL cannot run, so it is
+/// rejected instead of having its expressions walked.
+fn validate_order_by_expr(
+    order_expr: &sqlparser::ast::OrderByExpr,
+    cte_names: &HashSet<String>,
+    depth: usize,
+) -> Result<()> {
+    if order_expr.with_fill.is_some() {
+        return Err(anyhow!("ORDER BY WITH FILL is not allowed"));
+    }
+    validate_expr(&order_expr.expr, cte_names, depth)
 }
 
 #[cfg(test)]
@@ -2506,6 +2529,69 @@ mod tests {
     #[test]
     fn test_rejects_dangerous_function_in_aggregate_order_by() {
         assert!(validate_query("SELECT array_agg(num ORDER BY pg_sleep(1)) FROM blocks").is_err());
+    }
+
+    #[test]
+    fn test_rejects_order_by_with_fill_in_every_position() {
+        for sql in [
+            "SELECT num FROM blocks ORDER BY num WITH FILL FROM 1 LIMIT 1",
+            "SELECT num FROM blocks ORDER BY num WITH FILL TO 10 LIMIT 1",
+            "SELECT num FROM blocks ORDER BY num WITH FILL STEP 1 LIMIT 1",
+            "SELECT num FROM blocks ORDER BY num WITH FILL FROM length(rpad('x', 1000000000, 'x')) \
+             LIMIT 1",
+            "SELECT array_agg(num ORDER BY num WITH FILL FROM 1) FROM blocks",
+            "SELECT count(*) WITHIN GROUP (ORDER BY num WITH FILL TO 1) FROM blocks",
+            "SELECT row_number() OVER (ORDER BY num WITH FILL STEP 1) FROM blocks",
+            "SELECT row_number() OVER w FROM blocks WINDOW w AS (ORDER BY num WITH FILL FROM 1)",
+        ] {
+            let error = validate_query(sql).expect_err(sql);
+            assert_eq!(
+                error.to_string(),
+                "ORDER BY WITH FILL is not allowed",
+                "{sql}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_rejects_order_by_interpolate() {
+        for (sql, expected) in [
+            (
+                "SELECT num FROM blocks ORDER BY num WITH FILL INTERPOLATE (num AS num + 1) LIMIT 1",
+                "ORDER BY INTERPOLATE is not allowed",
+            ),
+            (
+                "SELECT num FROM blocks ORDER BY num INTERPOLATE (num AS num + 1) LIMIT 1",
+                "ORDER BY INTERPOLATE is not allowed",
+            ),
+            (
+                "SELECT num FROM blocks ORDER BY num INTERPOLATE LIMIT 1",
+                "ORDER BY INTERPOLATE is not allowed",
+            ),
+        ] {
+            let error = validate_query(sql).expect_err(sql);
+            assert_eq!(error.to_string(), expected, "{sql}");
+        }
+    }
+
+    #[test]
+    fn test_rejects_parametric_function_calls() {
+        for sql in [
+            "SELECT count(num)(num) FROM blocks",
+            "SELECT count(length(rpad('x', 1000000000, 'x')))(num) FROM blocks",
+            "SELECT count(pg_read_file('/etc/passwd'))(num) FROM blocks",
+            "SELECT num FROM blocks WHERE count(num)(num) > 0",
+        ] {
+            let error = validate_query(sql).expect_err(sql);
+            assert_eq!(
+                error.to_string(),
+                "Parametric function calls are not allowed",
+                "{sql}"
+            );
+        }
+        // The allowlist is checked first, so an unlisted name keeps its own error.
+        let error = validate_query("SELECT quantile(0.5)(num) FROM blocks").expect_err("quantile");
+        assert_eq!(error.to_string(), "Function 'quantile' is not allowed");
     }
 
     #[test]
