@@ -39,8 +39,13 @@ impl BlockSpan {
         let (min_timestamp, max_timestamp) = span?;
         Some(Self {
             block_nums: block_nums.into_iter().collect(),
-            min_timestamp: min_timestamp - DELETE_TIMESTAMP_MARGIN,
-            max_timestamp: max_timestamp + DELETE_TIMESTAMP_MARGIN,
+            // Saturate so a timestamp near chrono's range does not panic.
+            min_timestamp: min_timestamp
+                .checked_sub_signed(DELETE_TIMESTAMP_MARGIN)
+                .unwrap_or(DateTime::<Utc>::MIN_UTC),
+            max_timestamp: max_timestamp
+                .checked_add_signed(DELETE_TIMESTAMP_MARGIN)
+                .unwrap_or(DateTime::<Utc>::MAX_UTC),
         })
     }
 }
@@ -389,7 +394,7 @@ pub async fn write_blocks(pool: &Pool, blocks: &[BlockRow]) -> Result<()> {
     if blocks.is_empty() {
         return Ok(());
     }
-    write_batch(pool, blocks, &[], &[], &[]).await
+    write_batch_inner(pool, blocks, &[], &[], &[], None, false).await
 }
 
 pub async fn write_txs(pool: &Pool, txs: &[TxRow]) -> Result<()> {
@@ -417,6 +422,10 @@ pub async fn write_receipts(pool: &Pool, receipts: &[ReceiptRow]) -> Result<()> 
 ///
 /// Uses one connection, one transaction, one COMMIT, one WAL flush — instead of
 /// four independent transactions when calling the individual write functions.
+///
+/// The batch is a complete import of its blocks: the txs, logs and receipts stored
+/// for every block in `blocks` are replaced, even when the batch has no new rows
+/// of that kind for the block.
 pub async fn write_batch(
     pool: &Pool,
     blocks: &[BlockRow],
@@ -424,7 +433,7 @@ pub async fn write_batch(
     logs: &[LogRow],
     receipts: &[ReceiptRow],
 ) -> Result<()> {
-    write_batch_inner(pool, blocks, txs, logs, receipts, None).await
+    write_batch_inner(pool, blocks, txs, logs, receipts, None, true).await
 }
 
 pub async fn write_batch_with_application_name(
@@ -435,7 +444,16 @@ pub async fn write_batch_with_application_name(
     receipts: &[ReceiptRow],
     application_name: &str,
 ) -> Result<()> {
-    write_batch_inner(pool, blocks, txs, logs, receipts, Some(application_name)).await
+    write_batch_inner(
+        pool,
+        blocks,
+        txs,
+        logs,
+        receipts,
+        Some(application_name),
+        true,
+    )
+    .await
 }
 
 /// Rows are passed as one array per column and expanded with `unnest`, so a
@@ -443,6 +461,10 @@ pub async fn write_batch_with_application_name(
 /// `INSERT ... SELECT`. Statements are sent back to back without waiting for
 /// each other's results; PostgreSQL runs them in order, so the whole batch
 /// costs one round trip between `BEGIN` and `COMMIT`.
+///
+/// The txs, logs and receipts stored for a block are replaced when the batch has
+/// rows of that kind for it, or, with `replace_children`, whenever the batch has
+/// the block.
 async fn write_batch_inner(
     pool: &Pool,
     blocks: &[BlockRow],
@@ -450,6 +472,7 @@ async fn write_batch_inner(
     logs: &[LogRow],
     receipts: &[ReceiptRow],
     application_name: Option<&str>,
+    replace_children: bool,
 ) -> Result<()> {
     let start = Instant::now();
 
@@ -457,9 +480,19 @@ async fn write_batch_inner(
     let tx_columns = TxColumns::new(txs);
     let log_columns = LogColumns::new(logs);
     let receipt_columns = ReceiptColumns::new(receipts);
-    let tx_span = BlockSpan::new(txs.iter().map(|r| (r.block_num, r.block_timestamp)));
-    let log_span = BlockSpan::new(logs.iter().map(|r| (r.block_num, r.block_timestamp)));
-    let receipt_span = BlockSpan::new(receipts.iter().map(|r| (r.block_num, r.block_timestamp)));
+    let batch_blocks = || {
+        blocks
+            .iter()
+            .filter(|_| replace_children)
+            .map(|b| (b.num, b.timestamp))
+    };
+    let tx_span =
+        BlockSpan::new(batch_blocks().chain(txs.iter().map(|r| (r.block_num, r.block_timestamp))));
+    let log_span =
+        BlockSpan::new(batch_blocks().chain(logs.iter().map(|r| (r.block_num, r.block_timestamp))));
+    let receipt_span = BlockSpan::new(
+        batch_blocks().chain(receipts.iter().map(|r| (r.block_num, r.block_timestamp))),
+    );
     let (repair_blocks, repair_timestamps) = incomplete_blocks(txs);
 
     let mut conn = pool.get().await?;
@@ -478,7 +511,9 @@ async fn write_batch_inner(
     }
     if let Some(span) = &tx_span {
         statements.push(delete_blocks_exact(&tx, DELETE_TXS, span));
-        statements.push(execute(&tx, INSERT_TXS, tx_columns.params()));
+        if !txs.is_empty() {
+            statements.push(execute(&tx, INSERT_TXS, tx_columns.params()));
+        }
         statements.push(execute(
             &tx,
             DELETE_REPAIR_QUEUE,
@@ -497,11 +532,15 @@ async fn write_batch_inner(
     }
     if let Some(span) = &log_span {
         statements.push(delete_blocks_exact(&tx, DELETE_LOGS, span));
-        statements.push(execute(&tx, INSERT_LOGS, log_columns.params()));
+        if !logs.is_empty() {
+            statements.push(execute(&tx, INSERT_LOGS, log_columns.params()));
+        }
     }
     if let Some(span) = &receipt_span {
         statements.push(delete_blocks_exact(&tx, DELETE_RECEIPTS, span));
-        statements.push(execute(&tx, INSERT_RECEIPTS, receipt_columns.params()));
+        if !receipts.is_empty() {
+            statements.push(execute(&tx, INSERT_RECEIPTS, receipt_columns.params()));
+        }
     }
     pipeline(statements).await?;
     tx.commit().await?;
@@ -1189,4 +1228,20 @@ pub async fn find_fork_point(
     }
 
     Ok(None)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn block_span_saturates_at_timestamp_limits() {
+        let span = BlockSpan::new(
+            [(1, DateTime::<Utc>::MIN_UTC), (2, DateTime::<Utc>::MAX_UTC)].into_iter(),
+        )
+        .unwrap();
+        assert_eq!(span.block_nums, vec![1, 2]);
+        assert_eq!(span.min_timestamp, DateTime::<Utc>::MIN_UTC);
+        assert_eq!(span.max_timestamp, DateTime::<Utc>::MAX_UTC);
+    }
 }

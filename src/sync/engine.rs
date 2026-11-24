@@ -424,12 +424,15 @@ impl SyncEngine {
 
             let write_ms;
             let fetch_ms;
+            // A failed fetch of the next batch is returned only once the written batch is
+            // checkpointed, so a retry does not start below rows that are already stored.
+            let mut next_fetch = None;
             if let Some(fetch_fut) = next_fetch_future {
                 let fetch_start = std::time::Instant::now();
                 let (write_result, fetch_result) = tokio::join!(write_future, fetch_fut);
                 write_ms = write_result?;
                 fetch_ms = fetch_start.elapsed().as_millis();
-                current_fetch = Some(fetch_result?);
+                next_fetch = Some(fetch_result);
             } else {
                 write_ms = write_future.await?;
                 fetch_ms = 0;
@@ -483,6 +486,7 @@ impl SyncEngine {
                 "Realtime: wrote blocks+txs+receipts+logs"
             );
 
+            current_fetch = next_fetch.transpose()?;
             current_from = next_from;
             current_to = next_to;
         }
