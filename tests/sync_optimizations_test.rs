@@ -707,6 +707,84 @@ async fn test_rewrite_replaces_rows_of_block_with_other_timestamp() {
 
 #[tokio::test]
 #[serial(db)]
+async fn test_rewrite_clears_rows_of_blocks_without_new_rows() {
+    let db = TestDb::empty().await;
+    db.truncate_all().await;
+
+    let first_block = 73_000_000;
+    let rows = |block_num, timestamp, txs: usize, logs: usize| {
+        let mut block = generate_blocks(1, block_num);
+        block[0].timestamp = timestamp;
+        let mut tx_rows = generate_txs(txs, block_num);
+        let mut log_rows = generate_logs(logs, block_num);
+        let mut receipt_rows: Vec<_> = (0..txs)
+            .map(|i| ReceiptRow {
+                block_num,
+                tx_idx: i as i32,
+                tx_hash: vec![i as u8; 32],
+                from: vec![1u8; 20],
+                gas_used: 21000,
+                cumulative_gas_used: 21000,
+                ..Default::default()
+            })
+            .collect();
+        for tx in &mut tx_rows {
+            tx.block_timestamp = timestamp;
+        }
+        for log in &mut log_rows {
+            log.block_timestamp = timestamp;
+        }
+        for receipt in &mut receipt_rows {
+            receipt.block_timestamp = timestamp;
+        }
+        (block, tx_rows, log_rows, receipt_rows)
+    };
+
+    // Two blocks as first stored, each with transactions, receipts and logs, then the
+    // version a reorg replaced them with: the first block keeps some logs but no
+    // transactions or receipts and the second has transactions and receipts but no logs.
+    let first = chrono::Utc::now() - chrono::Duration::minutes(5);
+    let second = first + chrono::Duration::seconds(3);
+    for (timestamp, versions) in [(first, [(3, 6), (3, 5)]), (second, [(0, 4), (2, 0)])] {
+        let (mut blocks, mut txs, mut logs, mut receipts) = (vec![], vec![], vec![], vec![]);
+        for (i, (tx_count, log_count)) in versions.into_iter().enumerate() {
+            let (b, t, l, r) = rows(first_block + i as i64, timestamp, tx_count, log_count);
+            blocks.extend(b);
+            txs.extend(t);
+            logs.extend(l);
+            receipts.extend(r);
+        }
+        write_batch(&db.pool, &blocks, &txs, &logs, &receipts)
+            .await
+            .unwrap();
+    }
+
+    let conn = db.pool.get().await.unwrap();
+    for (table, block_num, expected) in [
+        ("txs", first_block, 0),
+        ("receipts", first_block, 0),
+        ("logs", first_block, 4),
+        ("txs", first_block + 1, 2),
+        ("receipts", first_block + 1, 2),
+        ("logs", first_block + 1, 0),
+    ] {
+        let count: i64 = conn
+            .query_one(
+                &format!("SELECT COUNT(*) FROM {table} WHERE block_num = $1"),
+                &[&block_num],
+            )
+            .await
+            .unwrap()
+            .get(0);
+        assert_eq!(
+            count, expected,
+            "{table} of block {block_num} should hold only the new version"
+        );
+    }
+}
+
+#[tokio::test]
+#[serial(db)]
 async fn test_write_batch_roundtrips_every_column() {
     let db = TestDb::empty().await;
     db.truncate_all().await;
