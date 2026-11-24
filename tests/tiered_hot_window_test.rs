@@ -27,6 +27,8 @@ struct Chain {
     spacing_secs: i64,
     /// `eth_getBlockByNumber` calls made outside batch requests.
     single_block_calls: Arc<AtomicUsize>,
+    /// `eth_blockNumber` calls, one per reconciler tick.
+    head_calls: Arc<AtomicUsize>,
 }
 
 impl Chain {
@@ -41,6 +43,7 @@ impl Chain {
             first_timestamp: now.timestamp() - span,
             spacing_secs: span / HEAD as i64,
             single_block_calls: Arc::default(),
+            head_calls: Arc::default(),
         }
     }
 
@@ -60,7 +63,10 @@ impl Chain {
     fn respond(&self, request: &Value) -> Value {
         let result = match request["method"].as_str().unwrap() {
             "eth_chainId" => json!(format!("0x{CHAIN_ID:x}")),
-            "eth_blockNumber" => json!(format!("0x{HEAD:x}")),
+            "eth_blockNumber" => {
+                self.head_calls.fetch_add(1, Ordering::SeqCst);
+                json!(format!("0x{HEAD:x}"))
+            }
             "eth_getBlockByNumber" => {
                 let num = request["params"][0].as_str().unwrap();
                 self.block(u64::from_str_radix(num.trim_start_matches("0x"), 16).unwrap())
@@ -191,8 +197,8 @@ async fn test_hot_window_without_clickhouse_stops_at_realtime_tip() {
         .find(|&num| chain.timestamp(num) >= boundary_ts.timestamp())
         .unwrap();
     let rpc_url = chain.serve().await;
-    // Realtime sync stopped 100 blocks below the RPC head.
-    let tip = HEAD - 100;
+    // Realtime sync is a few blocks below the RPC head.
+    let tip = HEAD - 5;
     update_tip_num(&db.pool, CHAIN_ID, tip, HEAD).await.unwrap();
 
     let retention = RetentionConfig {
@@ -243,4 +249,87 @@ async fn test_hot_window_without_clickhouse_stops_at_realtime_tip() {
         above_tip, 0,
         "blocks above the realtime tip are not fetched"
     );
+}
+
+#[tokio::test]
+#[serial(db)]
+async fn test_hot_window_without_clickhouse_waits_for_stale_realtime_tip() {
+    let db = TestDb::empty().await;
+    db.truncate_all().await;
+
+    let now = Utc::now();
+    let chain = Chain::new(now);
+    let head_calls = chain.head_calls.clone();
+    let boundary_ts = week_start(week_index(now - chrono::Duration::days(3)));
+    let floor = (1..=HEAD)
+        .find(|&num| chain.timestamp(num) >= boundary_ts.timestamp())
+        .unwrap();
+    let rpc_url = chain.serve().await;
+    // After a restart the stored tip is far behind the RPC head until realtime sync jumps
+    // to the head's tail.
+    let stale_tip = HEAD - 100;
+    update_tip_num(&db.pool, CHAIN_ID, stale_tip, stale_tip)
+        .await
+        .unwrap();
+
+    let retention = RetentionConfig {
+        pg_keep: "3d".to_string(),
+        prune_interval: "1h".to_string(),
+        require_clickhouse: false,
+    };
+    let tiered = TieredSync::new(
+        SinkSet::new(db.pool.clone()),
+        &rpc_url,
+        CHAIN_ID,
+        &retention,
+        20,
+        2,
+    )
+    .unwrap();
+    let (shutdown_tx, shutdown_rx) = tokio::sync::broadcast::channel(1);
+    let handle = tokio::spawn(tiered.run(shutdown_rx));
+
+    // A second tick means the first one returned a short wait instead of the one hour
+    // reconcile interval.
+    tokio::time::timeout(Duration::from_secs(30), async {
+        while head_calls.load(Ordering::SeqCst) < 2 {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("reconciler did not tick again while realtime is behind");
+    let state = load_sync_state(&db.pool, CHAIN_ID).await.unwrap().unwrap();
+    assert_eq!(state.pruned_below, 0, "the hot boundary must not move");
+    assert_eq!(state.synced_num, 0);
+    let rows: i64 = db
+        .pool
+        .get()
+        .await
+        .unwrap()
+        .query_one("SELECT COUNT(*) FROM blocks", &[])
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(rows, 0, "nothing is filled below a stale realtime tip");
+
+    // Realtime sync jumped to within its tail window of the head, leaving everything below
+    // it empty.
+    let tip = HEAD - 5;
+    update_tip_num(&db.pool, CHAIN_ID, tip, HEAD).await.unwrap();
+
+    tokio::time::timeout(Duration::from_secs(60), async {
+        loop {
+            let state = load_sync_state(&db.pool, CHAIN_ID).await.unwrap();
+            if state.is_some_and(|s| s.pruned_below == floor - 1 && s.synced_num == tip) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("gap below the realtime tip was not filled");
+    let _ = shutdown_tx.send(());
+    let _ = handle.await;
+
+    assert!(!has_gaps(&db.pool, floor, tip).await.unwrap());
 }

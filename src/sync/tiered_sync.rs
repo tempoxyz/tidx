@@ -15,7 +15,7 @@ use tokio::sync::broadcast;
 use tokio::task::JoinSet;
 use tracing::{debug, error, info, warn};
 
-use super::engine::sync_range_standalone_to;
+use super::engine::{TAIL_WINDOW, sync_range_standalone_to};
 use super::fetcher::RpcClient;
 use super::sink::{SinkSet, WriteTarget};
 use super::writer::{
@@ -269,12 +269,20 @@ impl TieredSync {
         let mut head = self.rpc.latest_block_number().await?;
         if !self.sinks.has_clickhouse() {
             // Without the archive, PostgreSQL heights above realtime's tip are realtime's
-            // to write: it checks parent hashes, a gap fill does not. Without a tip the
-            // head is 0, which ends the tick below.
+            // to write: it checks parent hashes, a gap fill does not. Realtime also jumps
+            // to within TAIL_WINDOW of the head, so a tip further behind is stale (for
+            // example right after a restart): the range above it is not filled yet and
+            // gap-fill is off here, so checking gaps now would miss it for a whole
+            // reconcile interval. A stale tip block can also be older than the hot
+            // window, which would move the boundary onto realtime's parent hash anchor.
+            // Wait for realtime instead. Without a tip realtime has not started either.
             let realtime_tip = load_sync_state(self.sinks.pool(), self.chain_id)
                 .await?
                 .map(|s| s.tip_num)
                 .unwrap_or(0);
+            if realtime_tip < head.saturating_sub(TAIL_WINDOW) {
+                return Ok(Duration::from_secs(2));
+            }
             head = head.min(realtime_tip);
         }
         if head == 0 {
