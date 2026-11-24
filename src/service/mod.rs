@@ -5,7 +5,7 @@ use serde::Serialize;
 use std::task::Poll;
 use std::time::Instant;
 use tokio_postgres::error::SqlState;
-use tokio_postgres::types::{ToSql, Type};
+use tokio_postgres::types::{FromSql, ToSql, Type};
 
 use crate::db::Pool;
 use crate::metrics;
@@ -191,7 +191,19 @@ impl Default for QueryOptions {
 }
 
 const MAX_QUERY_RESULT_BYTES: usize = 10 * 1024 * 1024;
+
+/// Most bytes PostgreSQL may send for one result, counted by wire length. It
+/// bounds the bytes read for cells the response may drop, such as arrays and
+/// `jsonb`, which format as null. It is larger than [`MAX_QUERY_RESULT_BYTES`]
+/// because such cells are not returned.
+const MAX_QUERY_WIRE_BYTES: usize = 4 * MAX_QUERY_RESULT_BYTES;
 const MAX_CELL_BYTES: usize = 1024 * 1024;
+
+/// Most cells (rows times columns) one result may hold: [`HARD_LIMIT_MAX`] rows
+/// of 100 columns, above the widest core table. Even an empty cell keeps a
+/// `serde_json::Value` (up to 72 bytes) alive for the whole request, so the
+/// byte budget alone would let a result hold millions of them.
+const MAX_QUERY_CELLS: usize = 1_000_000;
 
 #[derive(Debug, thiserror::Error)]
 enum PostgresQueryFailure {
@@ -935,25 +947,31 @@ async fn run_pg_query(
         futures::pin_mut!(stream);
         let mut rows = Vec::new();
         let mut result_bytes = 0usize;
+        let mut result_cells = 0usize;
+        let mut wire_bytes = 0usize;
 
         while let Some(row) = stream.try_next().await? {
             if rows.len() >= limit {
                 return Err(anyhow!("Query returned more than {limit} rows"));
             }
-            let row_values = (0..columns.len())
-                .map(|i| try_format_column_json(&row, i))
-                .collect::<Result<Vec<_>>>()?;
-            result_bytes = result_bytes.saturating_add(
-                row_values
-                    .iter()
-                    .map(estimated_json_value_bytes)
-                    .sum::<usize>(),
-            );
+            result_cells = add_result_cells(result_cells, columns.len())?;
+            // The driver already buffered the row, so its wire size is known
+            // before any cell is formatted. Every cell counts against the wire
+            // budget, including those of types that format as null.
+            let mut row_wire_bytes = 0usize;
+            for i in 0..columns.len() {
+                row_wire_bytes = row_wire_bytes.saturating_add(raw_cell_len(&row, i)?);
+            }
+            wire_bytes = add_wire_bytes(wire_bytes, row_wire_bytes)?;
+            // Sized exactly, unlike a `collect` through `Result`, so the row
+            // holds no spare capacity for the rest of the request.
+            let mut row_values = Vec::with_capacity(columns.len());
+            for i in 0..columns.len() {
+                row_values.push(try_format_column_json(&row, i)?);
+            }
+            result_bytes = result_bytes.saturating_add(row_result_bytes(&row_values));
             if result_bytes > MAX_QUERY_RESULT_BYTES {
-                return Err(anyhow!(
-                    "Query result exceeded {} bytes",
-                    MAX_QUERY_RESULT_BYTES
-                ));
+                return Err(result_too_large());
             }
             rows.push(row_values);
         }
@@ -1109,30 +1127,15 @@ fn try_format_column_json(row: &tokio_postgres::Row, idx: usize) -> Result<serde
     Ok(value)
 }
 
+/// Exact size of `value` as `serde_json` serializes it, the encoder of API
+/// responses: quotes, escapes and separators included.
 fn estimated_json_value_bytes(value: &serde_json::Value) -> usize {
-    match value {
-        serde_json::Value::Null => 4,
-        serde_json::Value::Bool(_) => 5,
-        serde_json::Value::Number(n) => {
-            use std::fmt::Write;
-
-            struct ByteCount(usize);
-            impl Write for ByteCount {
-                fn write_str(&mut self, s: &str) -> std::fmt::Result {
-                    self.0 += s.len();
-                    Ok(())
-                }
-            }
-            let mut count = ByteCount(0);
-            let _ = write!(count, "{n}");
-            count.0
-        }
-        serde_json::Value::String(s) => s.len(),
-        serde_json::Value::Array(values) => values.iter().map(estimated_json_value_bytes).sum(),
-        serde_json::Value::Object(values) => values
-            .iter()
-            .map(|(key, value)| key.len() + estimated_json_value_bytes(value))
-            .sum(),
+    let mut count = ByteCount(0);
+    // Serializing a `Value` into a counter cannot fail; if it ever did, charge
+    // everything so the result is rejected.
+    match serde_json::to_writer(&mut count, value) {
+        Ok(()) => count.0,
+        Err(_) => usize::MAX,
     }
 }
 
@@ -1221,6 +1224,95 @@ fn sanitize_db_error(error: &str) -> String {
         .unwrap_or(error);
 
     error
+}
+
+/// Adds one row of `columns` cells to the `total` cells of a result, failing
+/// once the result would hold more than [`MAX_QUERY_CELLS`].
+fn add_result_cells(total: usize, columns: usize) -> Result<usize> {
+    total
+        .checked_add(columns)
+        .filter(|cells| *cells <= MAX_QUERY_CELLS)
+        .ok_or_else(|| anyhow!("Query result exceeded {} cells", MAX_QUERY_CELLS))
+}
+
+/// Adds one row's `row_wire_bytes` to the `total` read from the database so
+/// far, failing once the result would exceed [`MAX_QUERY_WIRE_BYTES`].
+fn add_wire_bytes(total: usize, row_wire_bytes: usize) -> Result<usize> {
+    total
+        .checked_add(row_wire_bytes)
+        .filter(|bytes| *bytes <= MAX_QUERY_WIRE_BYTES)
+        .ok_or_else(|| {
+            anyhow!(
+                "Query read more than {} bytes from the database",
+                MAX_QUERY_WIRE_BYTES
+            )
+        })
+}
+
+/// Wire length of the cell at `idx`, failing if it exceeds [`MAX_CELL_BYTES`].
+/// Unlike [`try_format_column_json`], this bounds every column type.
+fn raw_cell_len(row: &tokio_postgres::Row, idx: usize) -> Result<usize> {
+    let RawCell(len) = row.try_get(idx)?;
+    check_cell_len(len)
+}
+
+fn check_cell_len(len: usize) -> Result<usize> {
+    if len > MAX_CELL_BYTES {
+        return Err(anyhow!(
+            "Query result cell exceeded {} bytes",
+            MAX_CELL_BYTES
+        ));
+    }
+    Ok(len)
+}
+
+/// Bytes charged against [`MAX_QUERY_RESULT_BYTES`] for one row: the exact
+/// JSON size of each cell, so an escape-heavy string is charged what it
+/// serializes to and a cell formatted as null only its `null`. The row's
+/// brackets, the commas between its cells and the comma after the row are
+/// counted, so the charges of all rows add up to the size of the response's
+/// `rows` array, give or take the array's own two brackets.
+fn row_result_bytes(values: &[serde_json::Value]) -> usize {
+    let structure = 2 + values.len().saturating_sub(1) + 1;
+    values
+        .iter()
+        .map(estimated_json_value_bytes)
+        .fold(structure, usize::saturating_add)
+}
+
+fn result_too_large() -> anyhow::Error {
+    anyhow!("Query result exceeded {} bytes", MAX_QUERY_RESULT_BYTES)
+}
+
+/// A cell's wire length, read from any column type and from NULLs.
+struct RawCell(usize);
+
+impl FromSql<'_> for RawCell {
+    fn from_sql(_: &Type, raw: &[u8]) -> Result<Self, Box<dyn std::error::Error + Sync + Send>> {
+        Ok(Self(raw.len()))
+    }
+
+    fn from_sql_null(_: &Type) -> Result<Self, Box<dyn std::error::Error + Sync + Send>> {
+        Ok(Self(0))
+    }
+
+    fn accepts(_: &Type) -> bool {
+        true
+    }
+}
+
+/// Counts the bytes written to it.
+struct ByteCount(usize);
+
+impl std::io::Write for ByteCount {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0 = self.0.saturating_add(buf.len());
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -1549,7 +1641,135 @@ mod tests {
             "ok": true
         });
 
-        assert!(estimated_json_value_bytes(&value) >= 10);
+        assert_eq!(
+            estimated_json_value_bytes(&value),
+            serde_json::to_vec(&value).unwrap().len()
+        );
+    }
+
+    #[test]
+    fn test_estimated_json_value_bytes_counts_escapes_and_quotes() {
+        for s in [
+            String::new(),
+            "\"".repeat(1024),
+            "\u{1}".repeat(1024),
+            "a\\b\n\t\"\u{1f}\u{7f}".repeat(100),
+            "h\u{e9}llo \u{1f600}".repeat(100),
+        ] {
+            let value = J::String(s);
+            assert_eq!(
+                estimated_json_value_bytes(&value),
+                serde_json::to_vec(&value).unwrap().len()
+            );
+        }
+
+        // Quotes double and control characters take six bytes, plus the quotes.
+        assert_eq!(estimated_json_value_bytes(&json!("\"".repeat(1024))), 2050);
+        assert_eq!(
+            estimated_json_value_bytes(&json!("\u{1}".repeat(1024))),
+            6146
+        );
+    }
+
+    #[test]
+    fn test_row_result_bytes_charges_empty_cells() {
+        let values = vec![json!(""); 512];
+        let row = row_result_bytes(&values);
+
+        // 512 times `""`, 511 commas, the brackets and the comma after the row.
+        assert_eq!(row, 512 * 2 + 511 + 2 + 1);
+        assert_eq!(row, serde_json::to_vec(&values).unwrap().len() + 1);
+        // 10,000 such rows far exceed the budget they used to stay under.
+        assert!(row * 10_000 > MAX_QUERY_RESULT_BYTES);
+    }
+
+    #[test]
+    fn test_row_result_bytes_matches_serialized_row() {
+        let values = vec![
+            json!("\"quoted\" \u{1}"),
+            json!(null),
+            json!(-42),
+            json!(true),
+            json!("0xdeadbeef"),
+        ];
+        assert_eq!(
+            row_result_bytes(&values),
+            serde_json::to_vec(&values).unwrap().len() + 1
+        );
+        assert_eq!(row_result_bytes(&[]), 3);
+    }
+
+    #[test]
+    fn test_row_result_bytes_charges_null_cells_only_their_json_size() {
+        // A `jsonb` column formats as null (4 bytes) however large its wire
+        // length, so it costs the response budget only `null`.
+        let values = vec![J::Null, json!("a")];
+        assert_eq!(row_result_bytes(&values), 4 + 3 + 1 + 2 + 1);
+
+        // Its wire length counts against the larger wire budget instead: 10,000
+        // such rows stay under the response budget but not under the wire one.
+        assert!(row_result_bytes(&values) * 10_000 < MAX_QUERY_RESULT_BYTES);
+        let mut wire = 0;
+        let mut rows = 0;
+        while let Ok(total) = add_wire_bytes(wire, 500_000) {
+            wire = total;
+            rows += 1;
+        }
+        assert!(rows < 10_000);
+        assert!(wire > MAX_QUERY_RESULT_BYTES);
+        assert_eq!(
+            add_wire_bytes(wire, MAX_QUERY_WIRE_BYTES)
+                .unwrap_err()
+                .to_string(),
+            "Query read more than 41943040 bytes from the database"
+        );
+        assert_eq!(
+            add_wire_bytes(0, MAX_QUERY_WIRE_BYTES).unwrap(),
+            MAX_QUERY_WIRE_BYTES
+        );
+    }
+
+    #[test]
+    fn test_raw_cell_reads_wire_length_of_any_type() {
+        for ty in [
+            Type::INT4_ARRAY,
+            Type::TEXT_ARRAY,
+            Type::JSONB,
+            Type::UUID,
+            Type::INT8,
+            Type::TEXT,
+        ] {
+            assert!(RawCell::accepts(&ty), "{ty}");
+            let RawCell(len) = RawCell::from_sql_nullable(&ty, Some(&[0; 4096])).unwrap();
+            assert_eq!(len, 4096, "{ty}");
+            let RawCell(len) = RawCell::from_sql_nullable(&ty, None).unwrap();
+            assert_eq!(len, 0, "{ty}");
+        }
+    }
+
+    #[test]
+    fn test_check_cell_len_boundary() {
+        assert_eq!(check_cell_len(MAX_CELL_BYTES).unwrap(), MAX_CELL_BYTES);
+        assert_eq!(
+            check_cell_len(MAX_CELL_BYTES + 1).unwrap_err().to_string(),
+            "Query result cell exceeded 1048576 bytes"
+        );
+    }
+
+    #[test]
+    fn test_add_result_cells_boundary() {
+        assert_eq!(add_result_cells(0, 512).unwrap(), 512);
+        assert_eq!(
+            add_result_cells(MAX_QUERY_CELLS - 512, 512).unwrap(),
+            MAX_QUERY_CELLS
+        );
+        assert_eq!(
+            add_result_cells(MAX_QUERY_CELLS - 511, 512)
+                .unwrap_err()
+                .to_string(),
+            "Query result exceeded 1000000 cells"
+        );
+        assert!(add_result_cells(usize::MAX, 1).is_err());
     }
 
     #[test]
