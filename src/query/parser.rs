@@ -570,7 +570,7 @@ fn apply_event_signature_ctes(
 /// The rewrite scans the SQL once per request, so bounding the raw input
 /// bounds its cost; the composed query is checked against the same limit when
 /// it is validated.
-fn check_event_signature_limits(sql: &str, signatures: &[&str]) -> Result<()> {
+pub(crate) fn check_event_signature_limits(sql: &str, signatures: &[&str]) -> Result<()> {
     if signatures.len() > MAX_EVENT_SIGNATURES {
         return Err(anyhow!(
             "Too many event signatures ({} given, max {})",

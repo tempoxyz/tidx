@@ -437,6 +437,9 @@ pub async fn execute_query_tiered(
     signatures: &[&str],
     options: &QueryOptions,
 ) -> Result<QueryResult> {
+    // The keyword check, the split planner and the hot-window check parse the
+    // raw input, partly on this worker: bound it before any of them runs.
+    crate::query::check_event_signature_limits(sql, signatures)?;
     // Parts of this query may run natively on ClickHouse, which only applies
     // the ClickHouse validator: keep PostgreSQL's session-keyword rule.
     crate::query::reject_postgres_session_keywords(sql)?;

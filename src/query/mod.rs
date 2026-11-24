@@ -20,6 +20,8 @@ pub use validator::{
     HARD_LIMIT_MAX, reject_postgres_session_keywords, validate_clickhouse_query, validate_query,
 };
 
+pub(crate) use parser::check_event_signature_limits;
+
 use regex_lite::Regex;
 use sqlparser::ast::{
     Expr, Ident, LimitClause, OrderByKind, Select, SelectItem, SetExpr, Statement, TableFactor,
