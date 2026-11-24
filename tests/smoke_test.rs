@@ -661,7 +661,7 @@ async fn test_sync_state_methods() {
         state.backfill_started(),
         "Backfill started when backfill_num is Some"
     );
-    assert_eq!(state.backfill_remaining(), 100, "100 blocks remaining");
+    assert_eq!(state.backfill_remaining(), 99, "blocks 1..=99 remain");
 
     // Test indexed range
     let (low, high) = state.indexed_range();

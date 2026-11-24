@@ -963,7 +963,11 @@ async fn tick_gapfill_parallel(
 
     // Adaptive throttling: pause backfill when realtime lag is high
     // This ensures realtime sync always has priority
-    let remote_head = rpc.latest_block_number().await.unwrap_or(state.tip_num);
+    // Without a head the lag is unknown, so the chain is not reported synced and no round runs.
+    let remote_head = rpc
+        .latest_block_number()
+        .await
+        .inspect_err(|_| metrics::set_synced(chain_id, false))?;
     let realtime_lag = remote_head.saturating_sub(state.tip_num);
 
     const LAG_THRESHOLD: u64 = 10; // Pause backfill if lag exceeds this

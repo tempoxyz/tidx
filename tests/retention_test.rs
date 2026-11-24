@@ -203,7 +203,7 @@ fn test_backfill_complete_at_prune_floor() {
         ..Default::default()
     };
     assert!(!state.backfill_complete());
-    assert_eq!(state.backfill_remaining(), 11);
+    assert_eq!(state.backfill_remaining(), 10, "blocks 50..=59 remain");
 }
 
 // ── Pruner integration ─────────────────────────────────────────────────────

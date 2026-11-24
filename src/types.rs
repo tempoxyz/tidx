@@ -91,7 +91,8 @@ pub struct SyncState {
     pub synced_num: u64,
     /// Highest block synced near chain head (may have gaps below)
     pub tip_num: u64,
-    /// Lowest block synced going backwards (None = not started, Some(0) = complete)
+    /// Lowest block synced going backwards (None = not started, at or below
+    /// `prune_floor()` = complete)
     pub backfill_num: Option<u64>,
     /// Current sync rate in blocks/second (rolling window)
     #[serde(default)]
@@ -112,11 +113,11 @@ impl SyncState {
         self.pruned_below + 1
     }
 
-    /// Returns true if backfill is complete (reached genesis, or the prune
-    /// floor when history below it was intentionally pruned).
+    /// Returns true if backfill is complete (reached the first indexed block, or
+    /// the prune floor when history below it was intentionally pruned).
     pub fn backfill_complete(&self) -> bool {
         match self.backfill_num {
-            Some(n) => n <= self.pruned_below,
+            Some(n) => n <= self.prune_floor(),
             None => false,
         }
     }
@@ -127,11 +128,11 @@ impl SyncState {
     }
 
     /// Returns the number of blocks remaining to backfill.
-    /// Blocks at or below the prune floor were intentionally dropped and don't count.
+    /// Blocks below the prune floor were intentionally dropped and don't count.
     pub fn backfill_remaining(&self) -> u64 {
         match self.backfill_num {
-            None => self.tip_num.saturating_sub(self.pruned_below),
-            Some(n) => n.saturating_sub(self.pruned_below),
+            None => self.tip_num.saturating_sub(self.prune_floor()),
+            Some(n) => n.saturating_sub(self.prune_floor()),
         }
     }
 
@@ -180,5 +181,55 @@ impl SyncState {
         } else {
             None
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn backfill_is_complete_at_first_indexed_block_without_pruning() {
+        // Block 0 is never indexed, so gap-fill stops at block 1.
+        let state = SyncState {
+            backfill_num: Some(1),
+            tip_num: 100,
+            ..Default::default()
+        };
+        assert!(state.backfill_complete());
+        assert_eq!(state.backfill_remaining(), 0);
+
+        let state = SyncState {
+            backfill_num: Some(2),
+            ..state
+        };
+        assert!(!state.backfill_complete());
+        assert_eq!(state.backfill_remaining(), 1);
+
+        // Before backfill starts, everything below the tip remains.
+        let state = SyncState {
+            backfill_num: None,
+            ..state
+        };
+        assert_eq!(state.backfill_remaining(), 99, "blocks 1..=99 remain");
+    }
+
+    #[test]
+    fn backfill_is_complete_at_prune_floor() {
+        let state = SyncState {
+            backfill_num: Some(50),
+            pruned_below: 49,
+            tip_num: 100,
+            ..Default::default()
+        };
+        assert!(state.backfill_complete());
+        assert_eq!(state.backfill_remaining(), 0);
+
+        let state = SyncState {
+            backfill_num: Some(51),
+            ..state
+        };
+        assert!(!state.backfill_complete());
+        assert_eq!(state.backfill_remaining(), 1);
     }
 }
