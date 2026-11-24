@@ -25,7 +25,7 @@ const FIXED_EVENT: &str = "Fixed(bytes4 indexed tag, bytes4 value, bytes32 word)
 async fn setup() -> Option<(TestDb, TestClickHouse)> {
     let ch = TestClickHouse::new(CH_DB).expect("Failed to create ClickHouse client");
     if ch.wait_for_ready().await.is_err() {
-        println!("ClickHouse not available, skipping test");
+        common::skip("ClickHouse not available");
         return None;
     }
     ch.reset_database().await.expect("Failed to reset database");
@@ -38,7 +38,7 @@ async fn setup() -> Option<(TestDb, TestClickHouse)> {
         std::env::var("TIDX_TEST_FDW_URL").unwrap_or_else(|_| "http://clickhouse:8123".into());
     let target = FdwTarget::new(&fdw_url, CH_DB.to_string(), None, None).unwrap();
     if let Err(e) = bootstrap(&db.pool, &target, None, CHAIN_ID).await {
-        println!("pg_clickhouse not available ({e:#}), skipping test");
+        common::skip(&format!("pg_clickhouse not available ({e:#})"));
         teardown(&db).await;
         return None;
     }
@@ -50,7 +50,9 @@ async fn setup() -> Option<(TestDb, TestClickHouse)> {
         .map_err(anyhow::Error::from);
     drop(conn);
     if let Err(e) = probe {
-        println!("ClickHouse unreachable from PostgreSQL at {fdw_url} ({e:#}), skipping test");
+        common::skip(&format!(
+            "ClickHouse unreachable from PostgreSQL at {fdw_url} ({e:#})"
+        ));
         teardown(&db).await;
         return None;
     }

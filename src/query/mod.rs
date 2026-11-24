@@ -1,6 +1,7 @@
 mod filters;
 mod parser;
 mod router;
+pub mod tag;
 mod tiered_split;
 mod validator;
 
@@ -11,10 +12,15 @@ pub use parser::{
     extract_order_by_columns, extract_raw_column_predicates,
 };
 pub use router::QueryRoute;
+pub use tag::QueryTag;
 pub use tiered_split::{
     HotWindow, TieredSplit, hot_window_confined, hot_window_confinement, plan_tiered_split,
 };
-pub use validator::{HARD_LIMIT_MAX, validate_clickhouse_query, validate_query};
+pub use validator::{
+    HARD_LIMIT_MAX, reject_postgres_session_keywords, validate_clickhouse_query, validate_query,
+};
+
+pub(crate) use parser::check_event_signature_limits;
 
 use regex_lite::Regex;
 use sqlparser::ast::{
@@ -25,7 +31,8 @@ use sqlparser::dialect::ClickHouseDialect;
 use sqlparser::parser::Parser;
 use std::collections::{HashMap, HashSet};
 use std::ops::ControlFlow;
-use std::sync::LazyLock;
+use std::sync::{Arc, LazyLock};
+use tokio::sync::Semaphore;
 
 /// Regex to match hex literals: '0x' followed by 40+ hex characters (addresses, topics, hashes)
 /// This avoids matching short '0x' prefixes used in concat() expressions
@@ -279,8 +286,9 @@ fn normalize_set_output_references(expr: &mut Expr, references: &SetOutputRefere
 /// derived-table wrapper: `SELECT * FROM (<set operation>) AS tidx_set_query
 /// ORDER BY ... LIMIT ...`. The trailing form is valid PostgreSQL, but
 /// ClickHouse grammar only accepts another set operator after a parenthesized
-/// arm. Non-matching queries are returned unchanged.
-pub fn hoist_set_operation_order_by_clickhouse(sql: &str) -> String {
+/// arm. Non-matching queries are returned unchanged. Fails when the rewrite
+/// cannot be rendered back to the same query.
+pub fn hoist_set_operation_order_by_clickhouse(sql: &str) -> anyhow::Result<String> {
     // A fully parenthesized set expression parses as nested `SetExpr::Query`
     // layers; unwrap them to find the set operation. Inner clauses (its own
     // ORDER BY/LIMIT) stay inside the derived table.
@@ -293,15 +301,15 @@ pub fn hoist_set_operation_order_by_clickhouse(sql: &str) -> String {
     }
 
     let Ok(mut statements) = Parser::parse_sql(&ClickHouseDialect {}, sql) else {
-        return sql.to_string();
+        return Ok(sql.to_string());
     };
     let [Statement::Query(query)] = statements.as_mut_slice() else {
-        return sql.to_string();
+        return Ok(sql.to_string());
     };
     if !is_set_operation(query.body.as_ref())
         || (query.order_by.is_none() && query.limit_clause.is_none() && query.fetch.is_none())
     {
-        return sql.to_string();
+        return Ok(sql.to_string());
     }
     let output_references = SetOutputReferences::from_set(query.body.as_ref());
 
@@ -340,12 +348,125 @@ pub fn hoist_set_operation_order_by_clickhouse(sql: &str) -> String {
     };
     std::mem::swap(&mut subquery.body, &mut query.body);
     query.body = wrapper_query.body;
-    statements[0].to_string()
+
+    // The ClickHouse dialect unescapes string literals when it parses, and
+    // the formatter does not restore every escape, so rendering can move a
+    // literal's boundaries. Send the rewrite only if it parses back to the
+    // same tree. The original form cannot be sent instead: ClickHouse would
+    // reject it or apply the trailing clauses to the last arm only.
+    let hoisted = statements[0].to_string();
+    match validator::parse_single_statement(&ClickHouseDialect {}, &hoisted) {
+        Ok(reparsed) if reparsed == statements[0] => Ok(hoisted),
+        _ => Err(anyhow::anyhow!(
+            "This set operation with ORDER BY, LIMIT or OFFSET cannot be run on ClickHouse;              remove backslash escapes from its string literals"
+        )),
+    }
+}
+
+/// Runs the CPU-bound preparation of a user query (signature rewrite, parsing
+/// and validation) on the blocking pool, so that a large query cannot stall
+/// an async worker thread.
+///
+/// At most [`PREPARE_PERMITS`] preparations run at once, process wide.
+///
+/// `f` runs with copies of `sql` and `signatures` owned by the blocking task.
+pub(crate) async fn prepare_blocking<T: Send + 'static>(
+    sql: &str,
+    signatures: &[&str],
+    f: impl FnOnce(&str, &[&str]) -> anyhow::Result<T> + Send + 'static,
+) -> anyhow::Result<T> {
+    let sql = sql.to_owned();
+    let signatures: Vec<String> = signatures.iter().map(|s| (*s).to_owned()).collect();
+    spawn_blocking_bounded(&PREPARE_PERMITS, move || {
+        let signatures: Vec<&str> = signatures.iter().map(String::as_str).collect();
+        f(&sql, &signatures)
+    })
+    .await?
+}
+
+/// Process-wide bound on concurrent query preparations, sized to the available
+/// parallelism.
+///
+/// A blocking job cannot be cancelled, so it keeps running after its request
+/// is dropped (for example when the client disconnects) and the request's
+/// route permit is released. The permit therefore moves into the blocking
+/// closure and is only released when the job finishes. Otherwise repeated
+/// connect-and-drop requests could stack parses up to the size of tokio's
+/// blocking pool, each holding its own copy of the query.
+static PREPARE_PERMITS: LazyLock<Arc<Semaphore>> = LazyLock::new(|| {
+    let parallelism = std::thread::available_parallelism().map_or(4, usize::from);
+    Arc::new(Semaphore::new(parallelism))
+});
+
+/// Runs `job` on the blocking pool once a permit of `semaphore` is available.
+///
+/// The permit is held until `job` returns, even if the returned future is
+/// dropped first.
+async fn spawn_blocking_bounded<T: Send + 'static>(
+    semaphore: &Arc<Semaphore>,
+    job: impl FnOnce() -> T + Send + 'static,
+) -> anyhow::Result<T> {
+    let permit = Arc::clone(semaphore)
+        .acquire_owned()
+        .await
+        .map_err(|e| anyhow::anyhow!("Query preparation failed: {e}"))?;
+    tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        job()
+    })
+    .await
+    .map_err(|e| {
+        // A panic's message can carry query internals: log it, don't return it.
+        tracing::error!(target: "tidx::query", error = %e, "query preparation task failed");
+        anyhow::anyhow!("Query preparation failed")
+    })
 }
 
 #[cfg(test)]
 mod tests {
+    fn hoist(sql: &str) -> String {
+        hoist_set_operation_order_by_clickhouse(sql).expect("hoist")
+    }
+
     use super::*;
+
+    #[tokio::test]
+    async fn blocking_permit_outlives_dropped_future() {
+        let semaphore = Arc::new(Semaphore::new(1));
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+
+        let task = tokio::spawn({
+            let semaphore = Arc::clone(&semaphore);
+            async move {
+                spawn_blocking_bounded(&semaphore, move || {
+                    started_tx.send(()).unwrap();
+                    release_rx.recv().unwrap();
+                })
+                .await
+            }
+        });
+        started_rx.await.unwrap();
+
+        // Dropping the awaiting future must not release the permit while the job runs.
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        assert_eq!(semaphore.available_permits(), 0);
+
+        // The permit comes back once the job finishes.
+        release_tx.send(()).unwrap();
+        let _permit = semaphore.acquire().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn blocking_panic_is_not_returned_to_the_caller() {
+        let semaphore = Arc::new(Semaphore::new(1));
+        let error = spawn_blocking_bounded::<()>(&semaphore, || panic!("internal detail"))
+            .await
+            .unwrap_err();
+        assert_eq!(error.to_string(), "Query preparation failed");
+        assert_eq!(semaphore.available_permits(), 1);
+    }
 
     #[test]
     fn timestamp_literals_utc_offset() {
@@ -386,7 +507,7 @@ mod tests {
     #[test]
     fn hoist_union_trailing_order_by_limit() {
         assert_eq!(
-            hoist_set_operation_order_by_clickhouse(
+            hoist(
                 "(SELECT num FROM blocks ORDER BY num DESC LIMIT 2) \
                  UNION (SELECT num FROM blocks ORDER BY num DESC LIMIT 2) \
                  ORDER BY num DESC LIMIT 2"
@@ -400,7 +521,7 @@ mod tests {
     #[test]
     fn hoist_union_trailing_offset() {
         assert_eq!(
-            hoist_set_operation_order_by_clickhouse(
+            hoist(
                 "SELECT num FROM blocks UNION ALL SELECT num FROM txs ORDER BY num LIMIT 5 OFFSET 1"
             ),
             "SELECT * FROM (SELECT num FROM blocks UNION ALL SELECT num FROM txs) \
@@ -411,7 +532,7 @@ mod tests {
     #[test]
     fn hoist_normalizes_qualified_trailing_references() {
         assert_eq!(
-            hoist_set_operation_order_by_clickhouse(
+            hoist(
                 "SELECT b.num FROM blocks AS b UNION ALL SELECT b.num FROM blocks AS b \
                  ORDER BY b.num DESC, abs(b.num) LIMIT 1 BY b.num"
             ),
@@ -424,7 +545,7 @@ mod tests {
     #[test]
     fn hoist_resolves_qualified_reference_to_first_arm_alias() {
         assert_eq!(
-            hoist_set_operation_order_by_clickhouse(
+            hoist(
                 "SELECT b.num AS height FROM blocks AS b \
                  UNION ALL SELECT b.num AS height FROM blocks AS b \
                  ORDER BY b.num DESC"
@@ -438,7 +559,7 @@ mod tests {
     #[test]
     fn hoist_resolves_unquoted_qualifier_case_insensitively() {
         assert_eq!(
-            hoist_set_operation_order_by_clickhouse(
+            hoist(
                 "SELECT B.num AS height FROM blocks AS B \
                  UNION ALL SELECT B.num AS height FROM blocks AS B \
                  ORDER BY b.num DESC"
@@ -452,7 +573,7 @@ mod tests {
     #[test]
     fn hoist_preserves_quoted_qualifier_case_sensitivity() {
         assert_eq!(
-            hoist_set_operation_order_by_clickhouse(
+            hoist(
                 "SELECT \"B\".num AS height FROM blocks AS \"B\" \
                  UNION ALL SELECT \"B\".num AS height FROM blocks AS \"B\" \
                  ORDER BY \"b\".num DESC"
@@ -466,7 +587,7 @@ mod tests {
     #[test]
     fn hoist_resolves_later_arm_reference_to_first_arm_output() {
         assert_eq!(
-            hoist_set_operation_order_by_clickhouse(
+            hoist(
                 "SELECT b.num FROM blocks AS b \
                  UNION ALL SELECT t.block_num FROM txs AS t \
                  ORDER BY t.block_num DESC"
@@ -480,7 +601,7 @@ mod tests {
     #[test]
     fn hoist_preserves_qualified_references_in_trailing_subqueries() {
         assert_eq!(
-            hoist_set_operation_order_by_clickhouse(
+            hoist(
                 "SELECT b.num FROM blocks AS b UNION ALL SELECT b.num FROM blocks AS b \
                  ORDER BY b.num + (SELECT max(t.idx) FROM txs AS t)"
             ),
@@ -493,7 +614,7 @@ mod tests {
     #[test]
     fn hoist_preserves_unresolved_compound_output_reference() {
         assert_eq!(
-            hoist_set_operation_order_by_clickhouse(
+            hoist(
                 "SELECT payload AS result FROM events \
                  UNION ALL SELECT payload AS result FROM events \
                  ORDER BY result.field"
@@ -507,7 +628,7 @@ mod tests {
     #[test]
     fn hoist_strips_qualified_wildcard_arm_reference() {
         assert_eq!(
-            hoist_set_operation_order_by_clickhouse(
+            hoist(
                 "SELECT b.* FROM blocks AS b \
                  UNION ALL SELECT b.* FROM blocks AS b \
                  ORDER BY b.num DESC"
@@ -521,7 +642,7 @@ mod tests {
     #[test]
     fn hoist_strips_unqualified_wildcard_arm_reference() {
         assert_eq!(
-            hoist_set_operation_order_by_clickhouse(
+            hoist(
                 "SELECT * FROM blocks AS b \
                  UNION ALL SELECT * FROM blocks AS b \
                  ORDER BY b.num DESC"
@@ -535,7 +656,7 @@ mod tests {
     #[test]
     fn hoist_preserves_ambiguous_arm_reference() {
         assert_eq!(
-            hoist_set_operation_order_by_clickhouse(
+            hoist(
                 "SELECT b.num AS height, b.num AS other FROM blocks AS b \
                  UNION ALL SELECT b.num, b.num FROM blocks AS b \
                  ORDER BY b.num DESC"
@@ -549,7 +670,7 @@ mod tests {
     #[test]
     fn hoist_preserves_leading_cte() {
         assert_eq!(
-            hoist_set_operation_order_by_clickhouse(
+            hoist(
                 "WITH b AS (SELECT num FROM blocks) \
                  (SELECT num FROM b) UNION (SELECT num FROM b) ORDER BY num"
             ),
@@ -562,9 +683,7 @@ mod tests {
     #[test]
     fn hoist_parenthesized_set_query() {
         assert_eq!(
-            hoist_set_operation_order_by_clickhouse(
-                "(SELECT num FROM blocks UNION SELECT num FROM txs) ORDER BY num LIMIT 10"
-            ),
+            hoist("(SELECT num FROM blocks UNION SELECT num FROM txs) ORDER BY num LIMIT 10"),
             "SELECT * FROM ((SELECT num FROM blocks UNION SELECT num FROM txs)) \
              AS tidx_set_query ORDER BY num LIMIT 10"
         );
@@ -573,7 +692,7 @@ mod tests {
     #[test]
     fn hoist_parenthesized_set_query_preserves_inner_clauses() {
         assert_eq!(
-            hoist_set_operation_order_by_clickhouse(
+            hoist(
                 "(SELECT num FROM blocks UNION SELECT num FROM txs ORDER BY num LIMIT 5) \
                  ORDER BY num DESC LIMIT 3"
             ),
@@ -592,7 +711,7 @@ mod tests {
             "SELECT * FROM (SELECT num FROM blocks UNION SELECT num FROM txs) AS t ORDER BY num",
             "(SELECT num FROM blocks) ORDER BY num LIMIT 2",
         ] {
-            assert_eq!(hoist_set_operation_order_by_clickhouse(sql), sql);
+            assert_eq!(hoist(sql), sql);
         }
     }
 
@@ -607,5 +726,15 @@ mod tests {
         ] {
             assert_eq!(convert_timestamp_literals_clickhouse(sql), sql);
         }
+    }
+
+    #[test]
+    fn hoist_rejects_rewrite_that_changes_literals() {
+        let sql = r"SELECT 'a\\' AS x FROM blocks UNION ALL SELECT 'b' AS x FROM blocks ORDER BY x";
+        assert!(hoist_set_operation_order_by_clickhouse(sql).is_err());
+
+        // The same query without the escaped backslash is still rewritten.
+        let plain = "SELECT 'a' AS x FROM blocks UNION ALL SELECT 'b' AS x FROM blocks ORDER BY x";
+        assert_ne!(hoist(plain), plain);
     }
 }

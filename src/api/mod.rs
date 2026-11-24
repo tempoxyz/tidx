@@ -1,3 +1,4 @@
+pub mod head_poller;
 mod views;
 
 use std::collections::HashMap;
@@ -11,7 +12,7 @@ use anyhow::{Result as AnyhowResult, anyhow};
 use axum::{
     Json, Router,
     extract::{Query, State},
-    http::{Method, StatusCode, header},
+    http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode, header},
     response::{
         IntoResponse, Response, Sse,
         sse::{Event as SseEvent, KeepAlive, KeepAliveStream},
@@ -29,6 +30,7 @@ use crate::broadcast::Broadcaster;
 use crate::clickhouse::ClickHouseEngine;
 use crate::config::HttpConfig;
 use crate::db::Pool;
+use crate::query::QueryTag;
 use crate::service::{PostgresQuery, QueryOptions, QueryResult, SyncStatus};
 use tokio_postgres::types::Type;
 
@@ -46,6 +48,34 @@ pub struct ChainClickHouseConfig {
 pub type SharedClickHouseConfigs = Arc<RwLock<HashMap<u64, ChainClickHouseConfig>>>;
 pub type SharedTrustedCidrs = Arc<StdRwLock<Vec<(IpAddr, u8)>>>;
 const MAX_CONCURRENT_API_QUERIES: usize = 32;
+const MAX_LIVE_CONNECTIONS: usize = 20;
+
+/// Per-process API limits, from `[http]`.
+#[derive(Clone, Copy, Debug)]
+pub struct ApiLimits {
+    /// API statements that may run at once.
+    pub max_concurrent_queries: usize,
+    /// Live query streams accepted at once.
+    pub max_live_connections: usize,
+}
+
+impl Default for ApiLimits {
+    fn default() -> Self {
+        Self {
+            max_concurrent_queries: MAX_CONCURRENT_API_QUERIES,
+            max_live_connections: MAX_LIVE_CONNECTIONS,
+        }
+    }
+}
+
+impl From<&HttpConfig> for ApiLimits {
+    fn from(http: &HttpConfig) -> Self {
+        Self {
+            max_concurrent_queries: http.max_concurrent_queries.max(1),
+            max_live_connections: http.max_live_connections.max(1),
+        }
+    }
+}
 
 #[derive(Clone)]
 pub struct AppState {
@@ -63,6 +93,8 @@ pub struct AppState {
     /// Permits for the API statements that may run at once. One-shot queries
     /// and every statement of a live stream draw from the same permits.
     pub query_permits: Arc<Semaphore>,
+    /// Live query streams accepted at once.
+    pub max_live_connections: usize,
 }
 
 impl AppState {
@@ -177,10 +209,25 @@ pub fn router_with_options(
         clickhouse_configs: Arc::new(RwLock::new(clickhouse_configs)),
         clickhouse_engines: Arc::new(RwLock::new(HashMap::new())),
         trusted_cidrs,
-        query_permits: Arc::new(Semaphore::new(MAX_CONCURRENT_API_QUERIES)),
+        query_permits: Arc::new(Semaphore::new(http_config.max_concurrent_queries.max(1))),
+        max_live_connections: http_config.max_live_connections.max(1),
     };
 
-    Ok(build_router(state))
+    Ok(build_router(state, ApiMode::Full))
+}
+
+/// Which routes a process serves.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ApiMode {
+    /// Every route: what `tidx up` serves.
+    Full,
+    /// Read-only routes for `tidx serve`: queries, status and listing
+    /// views. ClickHouse view creation and deletion are left out, so the
+    /// horizontally scaled tier runs no DDL.
+    Serve,
+    /// Routes for `tidx sync`: health, status and view management. Queries
+    /// are served by `tidx serve`.
+    Sync,
 }
 
 pub fn router_shared(
@@ -191,6 +238,29 @@ pub fn router_shared(
     clickhouse_engines: SharedClickHouseEngines,
     trusted_cidrs: SharedTrustedCidrs,
 ) -> Router<()> {
+    router_shared_with_mode(
+        pools,
+        default_chain_id,
+        broadcaster,
+        clickhouse_configs,
+        clickhouse_engines,
+        trusted_cidrs,
+        ApiMode::Full,
+        ApiLimits::default(),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn router_shared_with_mode(
+    pools: SharedPools,
+    default_chain_id: u64,
+    broadcaster: Arc<Broadcaster>,
+    clickhouse_configs: SharedClickHouseConfigs,
+    clickhouse_engines: SharedClickHouseEngines,
+    trusted_cidrs: SharedTrustedCidrs,
+    mode: ApiMode,
+    limits: ApiLimits,
+) -> Router<()> {
     let state = AppState {
         pools,
         default_chain_id,
@@ -198,39 +268,77 @@ pub fn router_shared(
         clickhouse_configs,
         clickhouse_engines,
         trusted_cidrs,
-        query_permits: Arc::new(Semaphore::new(MAX_CONCURRENT_API_QUERIES)),
+        query_permits: Arc::new(Semaphore::new(limits.max_concurrent_queries.max(1))),
+        max_live_connections: limits.max_live_connections.max(1),
     };
 
-    build_router(state)
+    build_router(state, mode)
 }
 
-fn build_router(state: AppState) -> Router<()> {
+fn build_router(state: AppState, mode: ApiMode) -> Router<()> {
     let cors = CorsLayer::new()
         .allow_methods([Method::GET, Method::OPTIONS])
-        .allow_headers([header::CONTENT_TYPE, header::AUTHORIZATION])
+        .allow_headers([
+            header::CONTENT_TYPE,
+            header::AUTHORIZATION,
+            HeaderName::from_static(crate::query::tag::CALLER_HEADER),
+            HeaderName::from_static(crate::query::tag::REQUEST_ID_HEADER),
+        ])
+        .expose_headers([HeaderName::from_static(
+            crate::query::tag::REQUEST_ID_HEADER,
+        )])
         .allow_origin(tower_http::cors::Any);
 
-    Router::new()
+    let mut router = Router::new()
         .route("/health", get(handle_health))
-        .route("/status", get(handle_status))
-        .route(
+        .route("/status", get(handle_status));
+
+    if mode != ApiMode::Sync {
+        router = router.route(
             "/query",
             get(handle_query).layer(GlobalConcurrencyLimitLayer::with_semaphore(
                 state.query_permits.clone(),
             )),
-        )
-        .route("/views", get(views::list_views).post(views::create_view))
-        .route(
-            "/views/{name}",
-            get(views::get_view).delete(views::delete_view),
-        )
+        );
+    }
+
+    router = match mode {
+        ApiMode::Serve => router
+            .route("/views", get(views::list_views))
+            .route("/views/{name}", get(views::get_view)),
+        ApiMode::Full | ApiMode::Sync => router
+            .route("/views", get(views::list_views).post(views::create_view))
+            .route(
+                "/views/{name}",
+                get(views::get_view).delete(views::delete_view),
+            ),
+    };
+
+    router
         .layer(cors)
         .layer(TraceLayer::new_for_http())
         .with_state(state)
 }
 
-async fn handle_health() -> &'static str {
-    "OK"
+/// Fails while a realtime sync tick in this process has been stuck for
+/// [`crate::sync::liveness::STALL_AFTER`], so a stuck indexer gets restarted.
+/// Processes without realtime sync (`tidx serve`) always answer OK.
+async fn handle_health() -> Response {
+    let stalled = crate::sync::liveness::global().stalled();
+    if stalled.is_empty() {
+        return (StatusCode::OK, "OK").into_response();
+    }
+    let detail = stalled
+        .iter()
+        .map(|(chain_id, silent)| format!("chain {chain_id} silent {}s", silent.as_secs()))
+        .collect::<Vec<_>>()
+        .join(", ");
+    tracing::warn!(%detail, "Health check failing: realtime sync stalled");
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        format!("realtime sync stalled: {detail}"),
+    )
+        .into_response()
 }
 
 #[derive(Serialize)]
@@ -400,8 +508,33 @@ struct QueryResponse {
 
 async fn handle_query(
     State(state): State<AppState>,
+    headers: HeaderMap,
     uri: axum::http::Uri,
     Query(params): Query<QueryParams>,
+) -> Response {
+    let header = |name: &str| headers.get(name).and_then(|v| v.to_str().ok());
+    let caller = header(QueryTag::CALLER_HEADER_NAME).map(str::to_owned);
+    // Reuse the gateway's request ID (or make one) for every query this
+    // request runs, and echo it so callers can quote it.
+    let request_id = QueryTag::new("query", None, header(QueryTag::REQUEST_ID_HEADER_NAME))
+        .request_id()
+        .to_owned();
+    let mut response = Box::pin(route_query(state, uri, params, caller, request_id.clone())).await;
+    if let Ok(value) = HeaderValue::from_str(&request_id) {
+        response.headers_mut().insert(
+            HeaderName::from_static(crate::query::tag::REQUEST_ID_HEADER),
+            value,
+        );
+    }
+    response
+}
+
+async fn route_query(
+    state: AppState,
+    uri: axum::http::Uri,
+    params: QueryParams,
+    caller: Option<String>,
+    request_id: String,
 ) -> Response {
     let signatures = extract_signatures(uri.query());
 
@@ -428,13 +561,22 @@ async fn handle_query(
             ))
             .into_response();
         }
-        handle_query_live(state, params, signatures)
+        let tag = QueryTag::new("query.live", caller.as_deref(), Some(&request_id));
+        handle_query_live(state, params, signatures, tag)
             .await
             .into_response()
     } else {
-        handle_query_once(state, params, signatures, route)
+        let route_name = format!("query.{route}");
+        let tag = QueryTag::new(&route_name, caller.as_deref(), Some(&request_id));
+        let start = std::time::Instant::now();
+        let response = tag
+            .scope(Box::pin(handle_query_once(
+                state, params, signatures, route,
+            )))
             .await
-            .into_response()
+            .into_response();
+        crate::metrics::record_api_query(&route_name, response.status().as_u16(), start.elapsed());
+        response
     }
 }
 
@@ -524,15 +666,15 @@ type SseStream = std::pin::Pin<Box<dyn Stream<Item = Result<SseEvent, Infallible
 
 /// Maximum blocks to catch up in a single update (prevents query multiplication attack)
 const MAX_CATCHUP_BLOCKS: u64 = 10;
-const MAX_LIVE_CONNECTIONS: usize = 20;
 
 async fn handle_query_live(
     state: AppState,
     params: QueryParams,
     signatures: Vec<String>,
+    tag: QueryTag,
 ) -> Sse<KeepAliveStream<SseStream>> {
     let mut rx = state.broadcaster.subscribe();
-    if state.broadcaster.receiver_count() > MAX_LIVE_CONNECTIONS {
+    if state.broadcaster.receiver_count() > state.max_live_connections {
         let stream: SseStream = Box::pin(async_stream::stream! {
             yield Ok(SseEvent::default()
                 .event("error")
@@ -568,7 +710,7 @@ async fn handle_query_live(
         let mut block_query: Option<PostgresQuery> = None;
 
         // Execute initial query (live streaming uses Postgres for realtime data)
-        match execute_live_query(&permits, &pool, &sql, &sigs, &options).await {
+        match tag.clone().scope(execute_live_query(&permits, &pool, &sql, &sigs, &options)).await {
             Ok(result) => {
                 yield Ok(SseEvent::default()
                     .event("result")
@@ -635,7 +777,7 @@ async fn handle_query_live(
                                     return;
                                 }
                             };
-                            match PostgresQuery::new(&filtered_sql, &sigs, &options) {
+                            match PostgresQuery::prepare(&filtered_sql, &sigs, &options).await {
                                 Ok(query) => block_query = Some(query),
                                 Err(e) => {
                                     yield Ok(SseEvent::default()
@@ -647,7 +789,8 @@ async fn handle_query_live(
                             }
                         }
                         let Some(query) = &block_query else { continue };
-                        match execute_live_block_query(&permits, &pool, query, block_num as i64, &options).await {
+                        let block_query_run = execute_live_block_query(&permits, &pool, query, block_num as i64, &options);
+                        match tag.clone().scope(block_query_run).await {
                             Ok(result) => {
                                 yield Ok(SseEvent::default()
                                     .event("result")
@@ -898,6 +1041,7 @@ mod tests {
             clickhouse_engines: Arc::new(RwLock::new(HashMap::new())),
             trusted_cidrs: Arc::new(std::sync::RwLock::new(Vec::new())),
             query_permits: Arc::new(Semaphore::new(MAX_CONCURRENT_API_QUERIES)),
+            max_live_connections: MAX_LIVE_CONNECTIONS,
         };
         assert!(!state.is_trusted_ip(&"127.0.0.1".parse().unwrap()));
     }
@@ -972,6 +1116,7 @@ mod tests {
             clickhouse_engines: Arc::new(RwLock::new(HashMap::new())),
             trusted_cidrs: Arc::new(std::sync::RwLock::new(Vec::new())),
             query_permits: Arc::new(Semaphore::new(0)),
+            max_live_connections: MAX_LIVE_CONNECTIONS,
         };
         let permits = state.query_permits.clone();
         let params = QueryParams {
@@ -983,11 +1128,16 @@ mod tests {
             engine: None,
             source: None,
         };
-        let mut events = handle_query_live(state, params, vec![])
-            .await
-            .into_response()
-            .into_body()
-            .into_data_stream();
+        let mut events = handle_query_live(
+            state,
+            params,
+            vec![],
+            QueryTag::new("query.live", None, None),
+        )
+        .await
+        .into_response()
+        .into_body()
+        .into_data_stream();
 
         // Every permit is taken, so the stream must not run its first statement.
         assert!(

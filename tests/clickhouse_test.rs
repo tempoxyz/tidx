@@ -26,7 +26,7 @@ const TEST_DB: &str = "tidx_test";
 async fn test_reward_cursor_keeps_later_deposits_and_transfers() {
     let ch = TestClickHouse::new(TEST_DB).expect("Failed to create ClickHouse client");
     if ch.wait_for_ready().await.is_err() {
-        println!("ClickHouse not available, skipping test");
+        common::skip("ClickHouse not available");
         return;
     }
     ch.reset_database().await.unwrap();
@@ -115,7 +115,7 @@ async fn test_clickhouse_connection() {
     let ch = TestClickHouse::new(TEST_DB).expect("Failed to create ClickHouse client");
 
     if ch.wait_for_ready().await.is_err() {
-        println!("ClickHouse not available, skipping test");
+        common::skip("ClickHouse not available");
         return;
     }
 
@@ -129,7 +129,7 @@ async fn test_clickhouse_database_creation() {
     let ch = TestClickHouse::new(TEST_DB).expect("Failed to create ClickHouse client");
 
     if ch.wait_for_ready().await.is_err() {
-        println!("ClickHouse not available, skipping test");
+        common::skip("ClickHouse not available");
         return;
     }
 
@@ -157,7 +157,7 @@ async fn test_transfer_cte_execution() {
     let ch = TestClickHouse::new(TEST_DB).expect("Failed to create ClickHouse client");
 
     if ch.wait_for_ready().await.is_err() {
-        println!("ClickHouse not available, skipping test");
+        common::skip("ClickHouse not available");
         return;
     }
 
@@ -208,7 +208,7 @@ async fn test_approval_cte_execution() {
     let ch = TestClickHouse::new(TEST_DB).expect("Failed to create ClickHouse client");
 
     if ch.wait_for_ready().await.is_err() {
-        println!("ClickHouse not available, skipping test");
+        common::skip("ClickHouse not available");
         return;
     }
 
@@ -263,7 +263,7 @@ async fn test_hex_literal_filter_execution() {
     let ch = TestClickHouse::new(TEST_DB).expect("Failed to create ClickHouse client");
 
     if ch.wait_for_ready().await.is_err() {
-        println!("ClickHouse not available, skipping test");
+        common::skip("ClickHouse not available");
         return;
     }
 
@@ -326,7 +326,7 @@ async fn test_aggregation_query() {
     let ch = TestClickHouse::new(TEST_DB).expect("Failed to create ClickHouse client");
 
     if ch.wait_for_ready().await.is_err() {
-        println!("ClickHouse not available, skipping test");
+        common::skip("ClickHouse not available");
         return;
     }
 
@@ -380,7 +380,7 @@ async fn test_create_materialized_view_transfer_counts() {
     let ch = TestClickHouse::new(TEST_DB).expect("Failed to create ClickHouse client");
 
     if ch.wait_for_ready().await.is_err() {
-        println!("ClickHouse not available, skipping test");
+        common::skip("ClickHouse not available");
         return;
     }
 
@@ -477,7 +477,7 @@ async fn test_create_materialized_view_token_supply() {
     let ch = TestClickHouse::new(TEST_DB).expect("Failed to create ClickHouse client");
 
     if ch.wait_for_ready().await.is_err() {
-        println!("ClickHouse not available, skipping test");
+        common::skip("ClickHouse not available");
         return;
     }
 
@@ -559,7 +559,7 @@ async fn test_create_materialized_view_daily_stats() {
     let ch = TestClickHouse::new(TEST_DB).expect("Failed to create ClickHouse client");
 
     if ch.wait_for_ready().await.is_err() {
-        println!("ClickHouse not available, skipping test");
+        common::skip("ClickHouse not available");
         return;
     }
 
@@ -626,7 +626,7 @@ async fn test_uniswap_swap_cte() {
     let ch = TestClickHouse::new(TEST_DB).expect("Failed to create ClickHouse client");
 
     if ch.wait_for_ready().await.is_err() {
-        println!("ClickHouse not available, skipping test");
+        common::skip("ClickHouse not available");
         return;
     }
 
@@ -691,7 +691,7 @@ async fn test_role_granted_cte() {
     let ch = TestClickHouse::new(TEST_DB).expect("Failed to create ClickHouse client");
 
     if ch.wait_for_ready().await.is_err() {
-        println!("ClickHouse not available, skipping test");
+        common::skip("ClickHouse not available");
         return;
     }
 
@@ -743,7 +743,7 @@ async fn test_fixed_bytes_cte_returns_declared_width() {
         TestClickHouse::new("tidx_test_fixed_bytes").expect("Failed to create ClickHouse client");
 
     if ch.wait_for_ready().await.is_err() {
-        println!("ClickHouse not available, skipping test");
+        common::skip("ClickHouse not available");
         return;
     }
 
@@ -877,7 +877,7 @@ async fn test_execute_query_clickhouse_formats_timestamps_like_postgres() {
         .expect("Failed to create ClickHouse client");
 
     if ch.wait_for_ready().await.is_err() {
-        println!("ClickHouse not available, skipping test");
+        common::skip("ClickHouse not available");
         return;
     }
 
@@ -941,7 +941,7 @@ async fn test_query_user_union_with_trailing_order_by() {
         TestClickHouse::new("tidx_repro_union_ch").expect("Failed to create ClickHouse client");
 
     if ch.wait_for_ready().await.is_err() {
-        println!("ClickHouse not available, skipping test");
+        common::skip("ClickHouse not available");
         return;
     }
 
@@ -991,7 +991,7 @@ async fn test_query_user_union_with_qualified_trailing_order_by() {
         .expect("Failed to create ClickHouse client");
 
     if ch.wait_for_ready().await.is_err() {
-        println!("ClickHouse not available, skipping test");
+        common::skip("ClickHouse not available");
         return;
     }
 
@@ -1043,7 +1043,7 @@ async fn test_query_user_parenthesized_union_with_trailing_order_by() {
         .expect("Failed to create ClickHouse client");
 
     if ch.wait_for_ready().await.is_err() {
-        println!("ClickHouse not available, skipping test");
+        common::skip("ClickHouse not available");
         return;
     }
 
@@ -1092,7 +1092,7 @@ async fn test_predicate_pushdown_indexed_param() {
     let ch = TestClickHouse::new(TEST_DB).expect("Failed to create ClickHouse client");
 
     if ch.wait_for_ready().await.is_err() {
-        println!("ClickHouse not available, skipping test");
+        common::skip("ClickHouse not available");
         return;
     }
 
@@ -1187,7 +1187,7 @@ async fn test_case_insensitive_table_reference() {
     let ch = TestClickHouse::new(TEST_DB).expect("Failed to create ClickHouse client");
 
     if ch.wait_for_ready().await.is_err() {
-        println!("ClickHouse not available, skipping test");
+        common::skip("ClickHouse not available");
         return;
     }
 
@@ -1327,7 +1327,7 @@ async fn assert_retired_clickhouse_objects_absent(ch: &TestClickHouse) {
 async fn setup_sink() -> Option<(ClickHouseSink, TestClickHouse)> {
     let ch = TestClickHouse::new(SINK_DB).expect("Failed to create CH client");
     if ch.wait_for_ready().await.is_err() {
-        println!("ClickHouse not available, skipping test");
+        common::skip("ClickHouse not available");
         return None;
     }
     // Drop any previous test state
@@ -1531,7 +1531,7 @@ async fn test_sink_ensure_schema_creates_tables() {
 async fn test_sink_ensure_schema_drops_retired_objects() {
     let ch = TestClickHouse::new(SINK_DB).expect("Failed to create CH client");
     if ch.wait_for_ready().await.is_err() {
-        println!("ClickHouse not available, skipping test");
+        common::skip("ClickHouse not available");
         return;
     }
     ch.reset_database().await.expect("Failed to reset database");
@@ -1878,7 +1878,7 @@ async fn test_sink_token_balances_view_tracks_balances_and_reorgs() {
 async fn test_sink_ensure_schema_backfills_token_transfer_views() {
     let ch = TestClickHouse::new(SINK_DB).expect("Failed to create CH client");
     if ch.wait_for_ready().await.is_err() {
-        println!("ClickHouse not available, skipping test");
+        common::skip("ClickHouse not available");
         return;
     }
     ch.reset_database().await.expect("Failed to reset database");
@@ -2042,7 +2042,7 @@ async fn test_sink_token_balances_handles_amount_above_int256_max() {
 async fn test_post_derived_migrations_repair_legacy_signed_holder_deltas() {
     let ch = TestClickHouse::new(SINK_DB).expect("Failed to create CH client");
     if ch.wait_for_ready().await.is_err() {
-        println!("ClickHouse not available, skipping test");
+        common::skip("ClickHouse not available");
         return;
     }
     ch.reset_database().await.expect("Failed to reset database");
@@ -2710,7 +2710,7 @@ async fn setup_backfill() -> Option<(tidx::db::Pool, SinkSet, ClickHouseSink, Te
     // Set up CH
     let ch = TestClickHouse::new(SINK_DB).expect("Failed to create CH client");
     if ch.wait_for_ready().await.is_err() {
-        println!("ClickHouse not available, skipping test");
+        common::skip("ClickHouse not available");
         return None;
     }
     ch.reset_database()
@@ -2728,7 +2728,7 @@ async fn setup_backfill() -> Option<(tidx::db::Pool, SinkSet, ClickHouseSink, Te
     let pg_url = match std::env::var("DATABASE_URL") {
         Ok(url) => url,
         Err(_) => {
-            println!("DATABASE_URL not set, skipping backfill test");
+            common::skip("DATABASE_URL not set");
             return None;
         }
     };

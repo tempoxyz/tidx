@@ -2,8 +2,14 @@ mod common;
 
 use common::testdb::TestDb;
 
+use axum::{Json, Router, http::StatusCode, response::IntoResponse, routing::post};
+use serde_json::{Value, json};
 use serial_test::serial;
-use tidx::sync::writer::{detect_all_gaps, detect_gaps, has_gaps};
+use std::time::{Duration, Instant};
+use tidx::db::ThrottledPool;
+use tidx::sync::engine::SyncEngine;
+use tidx::sync::sink::SinkSet;
+use tidx::sync::writer::{detect_all_gaps, detect_gaps, has_gaps, update_tip_num};
 
 // ============================================================================
 // detect_all_gaps tests - unified gap detection from genesis to tip
@@ -665,6 +671,37 @@ async fn test_has_gaps_single_missing_block() {
 
 #[tokio::test]
 #[serial(db)]
+async fn test_has_gaps_counts_duplicate_heights_once() {
+    let db = TestDb::empty().await;
+    db.truncate_all().await;
+
+    let conn = db.pool.get().await.unwrap();
+
+    // Height 1 is stored twice with different timestamps, which the (timestamp, num)
+    // key allows, and height 2 is missing: three rows for three heights.
+    for (num, seconds) in [(1i64, 1.0f64), (1, 2.0), (3, 3.0)] {
+        conn.execute(
+            r#"INSERT INTO blocks (num, hash, parent_hash, timestamp, timestamp_ms, gas_limit, gas_used, miner)
+               VALUES ($1, $2, $3, NOW() + make_interval(secs => $4), $5, 1000000, 100000, $6)"#,
+            &[
+                &num,
+                &vec![seconds as u8; 32],
+                &vec![0u8; 32],
+                &seconds,
+                &(num * 1000),
+                &vec![0u8; 20],
+            ],
+        )
+        .await
+        .unwrap();
+    }
+
+    assert_eq!(detect_all_gaps(&db.pool, 1, 3).await.unwrap(), [(2, 2)]);
+    assert!(has_gaps(&db.pool, 1, 3).await.unwrap());
+}
+
+#[tokio::test]
+#[serial(db)]
 async fn test_has_gaps_agrees_with_detect_all_gaps() {
     let db = TestDb::empty().await;
     db.truncate_all().await;
@@ -749,4 +786,84 @@ async fn test_has_gaps_beyond_indexed_range() {
 
     // Asking about exactly the indexed range — no gaps
     assert!(!has_gaps(&db.pool, 1, 10).await.unwrap());
+}
+
+// ============================================================================
+// gap-fill status reporting
+// ============================================================================
+
+/// Answers `eth_chainId` and fails every other request, such as reading the head.
+///
+/// A stub rather than the Tempo node from `tests/common`: the engine must be
+/// built against a node that answers `eth_chainId` and then fails only the head
+/// read, which a real node cannot be made to do.
+async fn chain_id_only_rpc(Json(body): Json<Value>) -> impl IntoResponse {
+    match body["method"].as_str() {
+        Some("eth_chainId") => {
+            Json(json!({ "jsonrpc": "2.0", "id": body["id"], "result": "0x7e57" })).into_response()
+        }
+        _ => StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    }
+}
+
+#[tokio::test]
+#[serial(db)]
+async fn test_gapfill_reports_not_synced_while_head_read_fails() {
+    let db = TestDb::empty().await;
+    db.truncate_all().await;
+
+    // Blocks 1-3 are stored and the tip is 3, so gap-fill sees no gap.
+    let conn = db.pool.get().await.unwrap();
+    for num in 1i64..=3 {
+        conn.execute(
+            r#"INSERT INTO blocks (num, hash, parent_hash, timestamp, timestamp_ms, gas_limit, gas_used, miner)
+               VALUES ($1, $2, $3, NOW(), $4, 1000000, 100000, $5)"#,
+            &[
+                &num,
+                &vec![num as u8; 32],
+                &vec![(num - 1) as u8; 32],
+                &(num * 1000),
+                &vec![0u8; 20],
+            ],
+        )
+        .await
+        .unwrap();
+    }
+    update_tip_num(&db.pool, 0x7e57, 3, 3).await.unwrap();
+
+    let metrics = metrics_exporter_prometheus::PrometheusBuilder::new()
+        .install_recorder()
+        .unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let rpc_url = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move {
+        axum::serve(listener, Router::new().route("/", post(chain_id_only_rpc)))
+            .await
+            .unwrap();
+    });
+
+    let mut engine = SyncEngine::new(
+        ThrottledPool::from_pool(db.pool.clone()),
+        SinkSet::new(db.pool.clone()),
+        &rpc_url,
+    )
+    .await
+    .unwrap();
+    let (shutdown_tx, shutdown_rx) = tokio::sync::broadcast::channel(1);
+    let handle = tokio::spawn(async move { engine.run(shutdown_rx).await.unwrap() });
+
+    // The gauge is first set by the first gap-fill tick.
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let gauge = loop {
+        let rendered = metrics.render();
+        if let Some(line) = rendered.lines().find(|l| l.starts_with("tidx_synced{")) {
+            break line.to_string();
+        }
+        assert!(Instant::now() < deadline, "tidx_synced was never set");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    };
+    shutdown_tx.send(()).unwrap();
+    handle.await.unwrap();
+
+    assert_eq!(gauge, "tidx_synced{chain_id=\"32343\"} 0");
 }

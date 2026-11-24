@@ -3,15 +3,17 @@ use std::ops::ControlFlow;
 
 use anyhow::{Result, anyhow};
 use sqlparser::ast::{
-    Expr, Function, FunctionArg, FunctionArgExpr, FunctionArguments, LimitClause, ObjectName,
-    Query, SetExpr, Statement, TableFactor, TableWithJoins, Visit, Visitor,
+    ArrayElemTypeDef, DataType, Expr, Function, FunctionArg, FunctionArgExpr, FunctionArguments,
+    GroupByExpr, JoinConstraint, JoinOperator, LimitClause, ObjectName, Query, SelectFlavor,
+    SelectItem, SetExpr, Statement, TableFactor, TableWithJoins, Visit, Visitor,
 };
-use sqlparser::dialect::GenericDialect;
+use sqlparser::dialect::{Dialect, GenericDialect};
 use sqlparser::parser::Parser;
+use sqlparser::tokenizer::Token;
 
 const POSTGRES_ALLOWED_TABLES: &[&str] = &["blocks", "txs", "logs", "receipts"];
 
-const MAX_QUERY_LENGTH: usize = 65_536;
+pub(super) const MAX_QUERY_LENGTH: usize = 65_536;
 const MAX_SUBQUERY_DEPTH: usize = 4;
 pub const HARD_LIMIT_MAX: i64 = 10_000;
 
@@ -34,26 +36,43 @@ pub fn validate_query(sql: &str) -> Result<()> {
         return Err(anyhow!("LIMIT ALL is not allowed"));
     }
 
-    let dialect = GenericDialect {};
-    let statements =
-        Parser::parse_sql(&dialect, sql).map_err(|e| anyhow!("SQL parse error: {e}"))?;
-
-    if statements.is_empty() {
-        return Err(anyhow!("Empty query"));
-    }
-
-    if statements.len() > 1 {
-        return Err(anyhow!("Multiple statements not allowed"));
-    }
-
-    let stmt = &statements[0];
-
-    match stmt {
+    match parse_single_statement(&GenericDialect {}, sql)? {
         Statement::Query(query) => {
             let cte_names = HashSet::new();
-            validate_query_ast(query, &cte_names, 0)
+            validate_query_ast(&query, &cte_names, 0)?;
+            validate_postgres_query_nodes(&query)
         }
         _ => Err(anyhow!("Only SELECT queries are allowed")),
+    }
+}
+
+/// Parses `sql` as exactly one statement and requires the parser to consume
+/// all of it.
+///
+/// `Parser::parse_sql` stops without an error at some keywords (a bare `END`
+/// ends a statement list), so text after them would never reach the
+/// validator while the caller still executes the original SQL.
+pub(crate) fn parse_single_statement(dialect: &dyn Dialect, sql: &str) -> Result<Statement> {
+    let mut parser = Parser::new(dialect)
+        .try_with_sql(sql)
+        .map_err(|e| anyhow!("SQL parse error: {e}"))?;
+    while parser.consume_token(&Token::SemiColon) {}
+    if parser.peek_token().token == Token::EOF {
+        return Err(anyhow!("Empty query"));
+    }
+    let statement = parser
+        .parse_statement()
+        .map_err(|e| anyhow!("SQL parse error: {e}"))?;
+    let mut delimited = false;
+    while parser.consume_token(&Token::SemiColon) {
+        delimited = true;
+    }
+    match parser.peek_token().token {
+        Token::EOF => Ok(statement),
+        _ if delimited => Err(anyhow!("Multiple statements not allowed")),
+        token => Err(anyhow!(
+            "SQL parse error: unexpected '{token}' after the query"
+        )),
     }
 }
 
@@ -77,24 +96,56 @@ pub fn validate_clickhouse_query(sql: &str) -> Result<()> {
         return Err(anyhow!("LIMIT ALL is not allowed"));
     }
 
-    let dialect = sqlparser::dialect::ClickHouseDialect {};
-    let statements =
-        Parser::parse_sql(&dialect, sql).map_err(|e| anyhow!("SQL parse error: {e}"))?;
-
-    if statements.is_empty() {
-        return Err(anyhow!("Empty query"));
-    }
-    if statements.len() > 1 {
-        return Err(anyhow!("Multiple statements not allowed"));
-    }
-
-    match &statements[0] {
+    match parse_single_statement(&sqlparser::dialect::ClickHouseDialect {}, sql)? {
         Statement::Query(query) => {
             let cte_names = HashSet::new();
-            validate_clickhouse_query_ast(query, &cte_names, 0)?;
-            validate_clickhouse_query_nodes(query)
+            validate_clickhouse_query_ast(&query, &cte_names, 0)?;
+            validate_clickhouse_query_nodes(&query)
         }
         _ => Err(anyhow!("Only SELECT queries are allowed")),
+    }
+}
+
+/// Rejects the unquoted session keywords PostgreSQL evaluates to a session
+/// value (current_user, user, ...). Queries sent with the postgres engine can
+/// run natively on ClickHouse, where only [validate_clickhouse_query] applies
+/// and these words are plain identifiers, so that path calls this to keep
+/// PostgreSQL semantics. Native ClickHouse queries keep bare names as columns.
+pub fn reject_postgres_session_keywords(sql: &str) -> Result<()> {
+    use sqlparser::ast::Visit;
+    use std::ops::ControlFlow;
+
+    for dialect in [
+        &GenericDialect {} as &dyn sqlparser::dialect::Dialect,
+        &sqlparser::dialect::ClickHouseDialect {},
+    ] {
+        // Unparseable SQL is rejected by the full validators.
+        let Ok(statements) = Parser::parse_sql(dialect, sql) else {
+            continue;
+        };
+        let found = statements.visit(&mut SessionKeywordVisitor);
+        if let ControlFlow::Break(keyword) = found {
+            return Err(anyhow!("Function '{keyword}' is not allowed"));
+        }
+    }
+    Ok(())
+}
+
+struct SessionKeywordVisitor;
+
+impl sqlparser::ast::Visitor for SessionKeywordVisitor {
+    type Break = String;
+
+    fn pre_visit_expr(&mut self, expr: &Expr) -> std::ops::ControlFlow<String> {
+        if let Expr::Identifier(ident) = expr
+            && ident.quote_style.is_none()
+        {
+            let name = ident.value.to_lowercase();
+            if POSTGRES_SESSION_KEYWORDS.contains(&name.as_str()) {
+                return std::ops::ControlFlow::Break(name);
+            }
+        }
+        std::ops::ControlFlow::Continue(())
     }
 }
 
@@ -125,11 +176,24 @@ fn validate_query_ast(query: &Query, cte_names: &HashSet<String>, depth: usize) 
         return Err(anyhow!("FETCH clause is not allowed, use LIMIT instead"));
     }
 
+    // Other dialects' trailing clauses carry expressions the walk below
+    // would not see.
+    if query.for_clause.is_some()
+        || query.settings.is_some()
+        || query.format_clause.is_some()
+        || !query.pipe_operators.is_empty()
+    {
+        return Err(anyhow!("Unsupported query clause"));
+    }
+
     let mut all_cte_names = cte_names.clone();
     if let Some(with) = &query.with {
         for cte in &with.cte_tables {
+            if cte.from.is_some() {
+                return Err(anyhow!("FROM before SELECT is not allowed after WITH"));
+            }
             validate_query_ast(&cte.query, &all_cte_names, depth + 1)?;
-            all_cte_names.insert(cte.alias.name.value.to_lowercase());
+            all_cte_names.insert(postgres_relation_key(&cte.alias.name));
         }
     }
 
@@ -137,10 +201,13 @@ fn validate_query_ast(query: &Query, cte_names: &HashSet<String>, depth: usize) 
 
     // Validate ORDER BY expressions
     if let Some(order_by) = &query.order_by {
+        if order_by.interpolate.is_some() {
+            return Err(anyhow!("ORDER BY INTERPOLATE is not allowed"));
+        }
         match &order_by.kind {
             sqlparser::ast::OrderByKind::Expressions(exprs) => {
                 for order_expr in exprs {
-                    validate_expr(&order_expr.expr, &all_cte_names, depth)?;
+                    validate_order_by_expr(order_expr, &all_cte_names, depth)?;
                 }
             }
             sqlparser::ast::OrderByKind::All(_) => {}
@@ -304,6 +371,62 @@ const CLICKHOUSE_DANGEROUS_FUNCTIONS: &[&str] = &[
     "notnullin",
     "globalnullin",
     "globalnotnullin",
+    // Server, session and deployment introspection.
+    "hostname",
+    "fqdn",
+    "fullhostname",
+    "serveruuid",
+    "version",
+    "revision",
+    "buildid",
+    "uptime",
+    "displayname",
+    "getoskernelversion",
+    "tcpport",
+    "getserverport",
+    "getmacro",
+    "getsetting",
+    "getsettingordefault",
+    "getserversetting",
+    "getmergetreesetting",
+    "currentuser",
+    "current_user",
+    "user",
+    "session_user",
+    "authenticateduser",
+    "authenticated_user",
+    "currentdatabase",
+    "current_database",
+    "database",
+    "schema",
+    "currentschemas",
+    "current_schemas",
+    "currentroles",
+    "enabledroles",
+    "defaultroles",
+    "currentprofiles",
+    "enabledprofiles",
+    "defaultprofiles",
+    "queryid",
+    "query_id",
+    "initialqueryid",
+    "initial_query_id",
+    "initialquerystarttime",
+    "initial_query_start_time",
+    "servertimezone",
+    "server_timezone",
+    "connectionid",
+    "connection_id",
+    "getclienthttpheader",
+    "shardnum",
+    "shardcount",
+    "zookeepersessionuptime",
+    "filesystemavailable",
+    "filesystemcapacity",
+    "filesystemunreserved",
+    "transactionid",
+    "transactionlatestsnapshot",
+    "transactionoldestsnapshot",
 ];
 
 fn validate_clickhouse_query_ast(
@@ -318,7 +441,15 @@ fn validate_clickhouse_query_ast(
         ));
     }
 
-    if query.fetch.is_some() || !query.locks.is_empty() || !query.pipe_operators.is_empty() {
+    // tidx chooses the settings and output format of every request itself;
+    // a SETTINGS or FORMAT clause at any depth would let the query change
+    // them, including how ClickHouse resolves the names this walk checks.
+    if query.fetch.is_some()
+        || !query.locks.is_empty()
+        || !query.pipe_operators.is_empty()
+        || query.settings.is_some()
+        || query.format_clause.is_some()
+    {
         return Err(anyhow!("Unsupported query clause"));
     }
 
@@ -333,7 +464,8 @@ fn validate_clickhouse_query_ast(
                 return Err(anyhow!("FROM before SELECT is not allowed after WITH"));
             }
             validate_clickhouse_query_ast(&cte.query, &all_cte_names, depth + 1)?;
-            all_cte_names.insert(cte.alias.name.value.to_lowercase());
+            // ClickHouse resolves identifiers case-sensitively, quoted or not.
+            all_cte_names.insert(cte.alias.name.value.clone());
         }
     }
 
@@ -587,11 +719,19 @@ fn validate_clickhouse_table_name(name: &ObjectName, cte_names: &HashSet<String>
         ));
     }
 
+    // Match relations by the exact name ClickHouse resolves, which is
+    // case-sensitive: a lowercased CTE name must not stand in for a table.
+    let exact_name = name
+        .0
+        .last()
+        .and_then(|part| part.as_ident())
+        .map(|ident| ident.value.clone())
+        .unwrap_or_default();
     let bare_name = parts.last().cloned().unwrap_or_default();
-    if parts.len() == 1 && crate::clickhouse_schema::is_public_query_table(&bare_name) {
+    if parts.len() == 1 && crate::clickhouse_schema::is_public_query_table(&exact_name) {
         return Ok(());
     }
-    if parts.len() == 1 && cte_names.contains(&bare_name) {
+    if parts.len() == 1 && cte_names.contains(&exact_name) {
         return Ok(());
     }
 
@@ -893,6 +1033,10 @@ impl Visitor for ClickHouseNodeValidator {
     type Break = anyhow::Error;
 
     fn pre_visit_query(&mut self, query: &Query) -> ControlFlow<Self::Break> {
+        // The walk rejects these too, but only on the queries it reaches.
+        if query.settings.is_some() || query.format_clause.is_some() {
+            return ControlFlow::Break(anyhow!("Unsupported query clause"));
+        }
         if let Some(with) = &query.with {
             for cte in &with.cte_tables {
                 // A table named this way never shows up as a table factor.
@@ -901,7 +1045,7 @@ impl Visitor for ClickHouseNodeValidator {
                         "FROM before SELECT is not allowed after WITH"
                     ));
                 }
-                self.cte_names.insert(cte.alias.name.value.to_lowercase());
+                self.cte_names.insert(cte.alias.name.value.clone());
             }
         }
         ControlFlow::Continue(())
@@ -959,6 +1103,23 @@ fn validate_set_expr(set_expr: &SetExpr, cte_names: &HashSet<String>, depth: usi
                 return Err(anyhow!("SELECT INTO is not allowed"));
             }
 
+            // Clauses PostgreSQL does not have. Each can hold expressions
+            // that the checks below would otherwise skip.
+            if select.top.is_some()
+                || select.exclude.is_some()
+                || !select.lateral_views.is_empty()
+                || select.prewhere.is_some()
+                || !select.cluster_by.is_empty()
+                || !select.distribute_by.is_empty()
+                || !select.sort_by.is_empty()
+                || select.qualify.is_some()
+                || select.value_table_mode.is_some()
+                || select.connect_by.is_some()
+                || select.flavor != SelectFlavor::Standard
+            {
+                return Err(anyhow!("Unsupported SELECT clause"));
+            }
+
             if let Some(sqlparser::ast::Distinct::On(exprs)) = &select.distinct {
                 for expr in exprs {
                     validate_expr(expr, cte_names, depth)?;
@@ -970,10 +1131,27 @@ fn validate_set_expr(set_expr: &SetExpr, cte_names: &HashSet<String>, depth: usi
             }
 
             for item in &select.projection {
-                if let sqlparser::ast::SelectItem::UnnamedExpr(expr)
-                | sqlparser::ast::SelectItem::ExprWithAlias { expr, .. } = item
-                {
-                    validate_expr(expr, cte_names, depth)?;
+                match item {
+                    SelectItem::UnnamedExpr(expr) => validate_expr(expr, cte_names, depth)?,
+                    SelectItem::ExprWithAlias { expr, alias } => {
+                        // PostgreSQL has no string-literal aliases: it reads
+                        // name 'text' as a value of type name, which the parser
+                        // here would take as a column with an alias.
+                        if alias.quote_style == Some('\'') {
+                            validate_typed_literal_prefix(expr, alias)?;
+                        } else {
+                            validate_expr(expr, cte_names, depth)?;
+                        }
+                    }
+                    SelectItem::Wildcard(options) => {
+                        validate_postgres_wildcard_options(options)?;
+                    }
+                    SelectItem::QualifiedWildcard(kind, options) => {
+                        if let sqlparser::ast::SelectItemQualifiedWildcardKind::Expr(expr) = kind {
+                            validate_expr(expr, cte_names, depth)?;
+                        }
+                        validate_postgres_wildcard_options(options)?;
+                    }
                 }
             }
 
@@ -981,10 +1159,21 @@ fn validate_set_expr(set_expr: &SetExpr, cte_names: &HashSet<String>, depth: usi
                 validate_expr(selection, cte_names, depth)?;
             }
 
-            // Validate GROUP BY expressions
-            if let sqlparser::ast::GroupByExpr::Expressions(exprs, _) = &select.group_by {
-                for expr in exprs {
-                    validate_expr(expr, cte_names, depth)?;
+            // Validate GROUP BY expressions. Trailing modifiers (WITH ROLLUP,
+            // a Hive-style GROUPING SETS list) are not PostgreSQL syntax.
+            match &select.group_by {
+                GroupByExpr::Expressions(exprs, modifiers) => {
+                    if !modifiers.is_empty() {
+                        return Err(anyhow!("GROUP BY modifiers are not allowed"));
+                    }
+                    for expr in exprs {
+                        validate_expr(expr, cte_names, depth)?;
+                    }
+                }
+                GroupByExpr::All(modifiers) => {
+                    if !modifiers.is_empty() {
+                        return Err(anyhow!("GROUP BY modifiers are not allowed"));
+                    }
                 }
             }
 
@@ -1028,24 +1217,31 @@ fn validate_table_with_joins(
     validate_table_factor(&table.relation, cte_names, depth)?;
     for join in &table.joins {
         validate_table_factor(&join.relation, cte_names, depth)?;
+        // Every join form must be listed here: a form that carries
+        // expressions and falls through unchecked would skip validation.
         let constraint = match &join.join_operator {
-            sqlparser::ast::JoinOperator::Join(c)
-            | sqlparser::ast::JoinOperator::Inner(c)
-            | sqlparser::ast::JoinOperator::Left(c)
-            | sqlparser::ast::JoinOperator::LeftOuter(c)
-            | sqlparser::ast::JoinOperator::Right(c)
-            | sqlparser::ast::JoinOperator::RightOuter(c)
-            | sqlparser::ast::JoinOperator::FullOuter(c)
-            | sqlparser::ast::JoinOperator::CrossJoin(c)
-            | sqlparser::ast::JoinOperator::Semi(c)
-            | sqlparser::ast::JoinOperator::LeftSemi(c)
-            | sqlparser::ast::JoinOperator::RightSemi(c)
-            | sqlparser::ast::JoinOperator::Anti(c)
-            | sqlparser::ast::JoinOperator::LeftAnti(c)
-            | sqlparser::ast::JoinOperator::RightAnti(c) => Some(c),
-            _ => None,
+            JoinOperator::Join(c)
+            | JoinOperator::Inner(c)
+            | JoinOperator::Left(c)
+            | JoinOperator::LeftOuter(c)
+            | JoinOperator::Right(c)
+            | JoinOperator::RightOuter(c)
+            | JoinOperator::FullOuter(c)
+            | JoinOperator::CrossJoin(c)
+            | JoinOperator::Semi(c)
+            | JoinOperator::LeftSemi(c)
+            | JoinOperator::RightSemi(c)
+            | JoinOperator::Anti(c)
+            | JoinOperator::LeftAnti(c)
+            | JoinOperator::RightAnti(c) => c,
+            JoinOperator::CrossApply
+            | JoinOperator::OuterApply
+            | JoinOperator::AsOf { .. }
+            | JoinOperator::StraightJoin(_) => {
+                return Err(anyhow!("Unsupported join type"));
+            }
         };
-        if let Some(sqlparser::ast::JoinConstraint::On(expr)) = constraint {
+        if let JoinConstraint::On(expr) = constraint {
             validate_expr(expr, cte_names, depth)?;
         }
     }
@@ -1127,11 +1323,29 @@ fn validate_table_name(name: &ObjectName, cte_names: &HashSet<String>) -> Result
         return Ok(());
     }
 
-    if name_parts.len() == 1 && cte_names.contains(&bare_name) {
-        return Ok(());
+    // CTE names follow PostgreSQL's identifier folding: unquoted names fold to
+    // lowercase, quoted names keep their case. Comparing lowercased names would
+    // let a quoted "FOO" CTE vouch for the real relation foo.
+    if name.0.len() == 1 {
+        if let Some(ident) = name.0[0].as_ident() {
+            if cte_names.contains(&postgres_relation_key(ident)) {
+                return Ok(());
+            }
+        }
     }
 
     Err(anyhow!("Access to table '{bare_name}' is not allowed"))
+}
+
+/// The name PostgreSQL resolves an identifier to: unquoted identifiers fold to
+/// ASCII lowercase, quoted ones keep their exact case.
+fn postgres_relation_key(ident: &sqlparser::ast::Ident) -> String {
+    if ident.quote_style.is_some() {
+        ident.value.clone()
+    } else {
+        // PostgreSQL folds only ASCII A-Z in unquoted identifiers.
+        ident.value.to_ascii_lowercase()
+    }
 }
 
 fn object_name_parts(name: &ObjectName) -> Result<Vec<String>> {
@@ -1149,10 +1363,21 @@ fn object_name_parts(name: &ObjectName) -> Result<Vec<String>> {
 /// Only explicitly allowed expression types are permitted.
 fn validate_expr(expr: &Expr, cte_names: &HashSet<String>, depth: usize) -> Result<()> {
     match expr {
+        // An unquoted keyword such as current_role is a session value in
+        // PostgreSQL, not a column, even though it parses as an identifier.
+        Expr::Identifier(ident)
+            if ident.quote_style.is_none()
+                && POSTGRES_SESSION_KEYWORDS.contains(&ident.value.to_lowercase().as_str()) =>
+        {
+            Err(anyhow!(
+                "Function '{}' is not allowed",
+                ident.value.to_lowercase()
+            ))
+        }
         // Safe leaf nodes
         Expr::Identifier(_) | Expr::CompoundIdentifier(_) => Ok(()),
         Expr::Value(_) => Ok(()),
-        Expr::TypedString(_) => Ok(()),
+        Expr::TypedString(typed) => validate_cast_type(&typed.data_type),
         Expr::Wildcard(_) | Expr::QualifiedWildcard(_, _) => Ok(()),
 
         // Function calls (validated against allowlist)
@@ -1203,7 +1428,12 @@ fn validate_expr(expr: &Expr, cte_names: &HashSet<String>, depth: usize) -> Resu
         }
 
         // Type casting
-        Expr::Cast { expr, .. } => validate_expr(expr, cte_names, depth),
+        Expr::Cast {
+            expr, data_type, ..
+        } => {
+            validate_cast_type(data_type)?;
+            validate_expr(expr, cte_names, depth)
+        }
         Expr::Nested(e) => validate_expr(e, cte_names, depth),
 
         // IN list
@@ -1333,6 +1563,227 @@ fn validate_expr(expr: &Expr, cte_names: &HashSet<String>, depth: usize) -> Resu
     }
 }
 
+/// Built-in PostgreSQL scalar types that sqlparser parses as custom types.
+/// None of them resolves a value through the catalog.
+const POSTGRES_BUILTIN_CUSTOM_TYPES: &[&str] = &[
+    // Quoted spellings of types that have dedicated variants when unquoted.
+    // Only real catalog names: SQL aliases such as integer or boolean are not
+    // types when quoted and would resolve through the search path.
+    "text",
+    "varchar",
+    "char",
+    "numeric",
+    "bytea",
+    "date",
+    "time",
+    "timestamp",
+    "interval",
+    "uuid",
+    "json",
+    "jsonb",
+    "bpchar",
+    "inet",
+    "cidr",
+    "macaddr",
+    "macaddr8",
+    "name",
+    "timestamptz",
+    "timetz",
+    "int2",
+    "int4",
+    "int8",
+    "float4",
+    "float8",
+    "bool",
+];
+
+/// Validates a select item PostgreSQL reads as a typed literal: a type name
+/// followed by a string, which the parser here returns as a column with a
+/// string-literal alias. The name must pass the same check as a cast target.
+fn validate_typed_literal_prefix(expr: &Expr, alias: &sqlparser::ast::Ident) -> Result<()> {
+    let parts = match expr {
+        // Two string constants separated by a newline are one constant in
+        // PostgreSQL ('a' then 'b' on the next line is 'ab'); without the
+        // newline PostgreSQL rejects the query. Only plain strings with no
+        // backslash or quote in either part are accepted: an E'' prefix makes
+        // PostgreSQL read escapes in the continued part, so the two parsers
+        // would disagree on where it ends.
+        Expr::Value(value) => {
+            let plain = |text: &str| !text.contains('\\') && !text.contains('\'');
+            return match &value.value {
+                sqlparser::ast::Value::SingleQuotedString(prefix)
+                    if plain(prefix) && plain(&alias.value) =>
+                {
+                    Ok(())
+                }
+                _ => Err(anyhow!("String literal aliases are not allowed")),
+            };
+        }
+        Expr::Identifier(ident) => vec![ident.clone()],
+        Expr::CompoundIdentifier(idents) => idents.clone(),
+        _ => return Err(anyhow!("String literal aliases are not allowed")),
+    };
+    validate_cast_type(&DataType::Custom(ObjectName::from(parts), vec![]))
+}
+
+/// Rejects cast targets that resolve through the catalog.
+///
+/// PostgreSQL's OID alias types (regclass, regrole, regproc, ...) turn a
+/// number or string into a catalog object's name, and any other named type
+/// may be user-defined. Built-in scalar types parse to dedicated variants.
+fn validate_cast_type(data_type: &DataType) -> Result<()> {
+    match data_type {
+        DataType::Custom(name, modifiers) => {
+            // Unqualified built-in scalar types the parser has no variant for,
+            // resolved with PostgreSQL's identifier rules so that "name" and
+            // name match while "NAME" does not.
+            let integer_modifiers = modifiers.iter().all(|m| m.trim().parse::<u32>().is_ok());
+            let is_builtin = |part: &sqlparser::ast::ObjectNamePart| {
+                part.as_ident().is_some_and(|ident| {
+                    POSTGRES_BUILTIN_CUSTOM_TYPES.contains(&postgres_relation_key(ident).as_str())
+                })
+            };
+            let is_pg_catalog = |part: &sqlparser::ast::ObjectNamePart| {
+                part.as_ident()
+                    .is_some_and(|ident| postgres_relation_key(ident) == "pg_catalog")
+            };
+            // Integer modifiers (bpchar(10), timestamptz(3)) are lengths and
+            // precisions; anything else could name another object.
+            let builtin = integer_modifiers
+                && match name.0.as_slice() {
+                    [part] => is_builtin(part),
+                    [schema, part] => is_pg_catalog(schema) && is_builtin(part),
+                    _ => false,
+                };
+            if builtin {
+                Ok(())
+            } else {
+                Err(anyhow!(
+                    "Cast to type '{}' is not allowed",
+                    name.to_string().to_lowercase()
+                ))
+            }
+        }
+        DataType::Regclass => Err(anyhow!("Cast to type 'regclass' is not allowed")),
+        DataType::Array(element) => match element {
+            ArrayElemTypeDef::AngleBracket(inner)
+            | ArrayElemTypeDef::SquareBracket(inner, _)
+            | ArrayElemTypeDef::Parenthesis(inner) => validate_cast_type(inner),
+            ArrayElemTypeDef::None => Ok(()),
+        },
+        _ => Ok(()),
+    }
+}
+
+fn validate_postgres_wildcard_options(
+    options: &sqlparser::ast::WildcardAdditionalOptions,
+) -> Result<()> {
+    if options.opt_ilike.is_some()
+        || options.opt_exclude.is_some()
+        || options.opt_except.is_some()
+        || options.opt_replace.is_some()
+        || options.opt_rename.is_some()
+    {
+        return Err(anyhow!("Wildcard options are not allowed"));
+    }
+    Ok(())
+}
+
+/// Second pass over every node of a PostgreSQL query, after the scoped walk.
+///
+/// The walk validates the clauses it knows about; this pass checks each
+/// relation, function and cast target wherever it appears, so a clause the
+/// walk does not descend into cannot carry one past the allowlists.
+fn validate_postgres_query_nodes(query: &Query) -> Result<()> {
+    let mut visitor = PostgresNodeValidator {
+        cte_names: HashSet::new(),
+    };
+    match query.visit(&mut visitor) {
+        ControlFlow::Continue(()) => Ok(()),
+        ControlFlow::Break(error) => Err(error),
+    }
+}
+
+struct PostgresNodeValidator {
+    /// CTE names of the whole statement. The scoped check stays in the walk.
+    cte_names: HashSet<String>,
+}
+
+impl Visitor for PostgresNodeValidator {
+    type Break = anyhow::Error;
+
+    fn pre_visit_query(&mut self, query: &Query) -> ControlFlow<Self::Break> {
+        if let Some(with) = &query.with {
+            for cte in &with.cte_tables {
+                self.cte_names
+                    .insert(postgres_relation_key(&cte.alias.name));
+            }
+        }
+        ControlFlow::Continue(())
+    }
+
+    fn pre_visit_table_factor(&mut self, factor: &TableFactor) -> ControlFlow<Self::Break> {
+        let result = match factor {
+            TableFactor::Table { name, args, .. } => {
+                if args.is_some() {
+                    Err(anyhow!("Table functions are not allowed"))
+                } else {
+                    validate_table_name(name, &self.cte_names)
+                }
+            }
+            TableFactor::Derived { .. } | TableFactor::NestedJoin { .. } => Ok(()),
+            TableFactor::TableFunction { .. } | TableFactor::Function { .. } => {
+                Err(anyhow!("Table functions are not allowed"))
+            }
+            _ => Err(anyhow!("Unsupported FROM clause type")),
+        };
+        match result {
+            Ok(()) => ControlFlow::Continue(()),
+            Err(error) => ControlFlow::Break(error),
+        }
+    }
+
+    fn pre_visit_expr(&mut self, expr: &Expr) -> ControlFlow<Self::Break> {
+        let result = match expr {
+            Expr::Function(func) => {
+                let name = func.name.to_string().to_lowercase();
+                if is_allowed_function(&name) {
+                    Ok(())
+                } else {
+                    Err(anyhow!("Function '{name}' is not allowed"))
+                }
+            }
+            Expr::Cast { data_type, .. } => validate_cast_type(data_type),
+            Expr::TypedString(typed) => validate_cast_type(&typed.data_type),
+            Expr::Identifier(ident)
+                if ident.quote_style.is_none()
+                    && POSTGRES_SESSION_KEYWORDS.contains(&ident.value.to_lowercase().as_str()) =>
+            {
+                Err(anyhow!(
+                    "Function '{}' is not allowed",
+                    ident.value.to_lowercase()
+                ))
+            }
+            _ => Ok(()),
+        };
+        match result {
+            Ok(()) => ControlFlow::Continue(()),
+            Err(error) => ControlFlow::Break(error),
+        }
+    }
+}
+
+/// Keywords PostgreSQL evaluates to a session value when written unquoted.
+const POSTGRES_SESSION_KEYWORDS: &[&str] = &[
+    "current_catalog",
+    "current_role",
+    "current_schema",
+    "current_user",
+    "session_user",
+    "system_user",
+    "user",
+];
+
 const ALLOWED_FUNCTIONS: &[&str] = &[
     // ABI decode helpers (custom PostgreSQL functions)
     "abi_uint",
@@ -1432,6 +1883,11 @@ fn validate_function(func: &Function, cte_names: &HashSet<String>, depth: usize)
         return Err(anyhow!("Function '{}' is not allowed", func_name));
     }
 
+    // PostgreSQL has no parametric call syntax, `f(a)(b)`.
+    if !matches!(func.parameters, FunctionArguments::None) {
+        return Err(anyhow!("Parametric function calls are not allowed"));
+    }
+
     validate_pad_length(&func_name, &func.args)?;
 
     if let FunctionArguments::List(arg_list) = &func.args {
@@ -1457,7 +1913,7 @@ fn validate_function(func: &Function, cte_names: &HashSet<String>, depth: usize)
 
     // Validate WITHIN GROUP (ORDER BY ...) clause
     for order_expr in &func.within_group {
-        validate_expr(&order_expr.expr, cte_names, depth)?;
+        validate_order_by_expr(order_expr, cte_names, depth)?;
     }
 
     // Validate window function OVER clause
@@ -1510,7 +1966,7 @@ fn validate_function_argument_clause(
         sqlparser::ast::FunctionArgumentClause::IgnoreOrRespectNulls(_) => Ok(()),
         sqlparser::ast::FunctionArgumentClause::OrderBy(order_by) => {
             for order_expr in order_by {
-                validate_expr(&order_expr.expr, cte_names, depth)?;
+                validate_order_by_expr(order_expr, cte_names, depth)?;
             }
             Ok(())
         }
@@ -1546,7 +2002,7 @@ fn validate_window_spec(
         validate_expr(expr, cte_names, depth)?;
     }
     for order_expr in &spec.order_by {
-        validate_expr(&order_expr.expr, cte_names, depth)?;
+        validate_order_by_expr(order_expr, cte_names, depth)?;
     }
     if let Some(frame) = &spec.window_frame {
         validate_window_frame_bound(&frame.start_bound, cte_names, depth)?;
@@ -1571,6 +2027,21 @@ fn validate_window_frame_bound(
             validate_expr(expr, cte_names, depth)
         }
     }
+}
+
+/// Validates one PostgreSQL ORDER BY item.
+///
+/// `WITH FILL` is ClickHouse syntax that PostgreSQL cannot run, so it is
+/// rejected instead of having its expressions walked.
+fn validate_order_by_expr(
+    order_expr: &sqlparser::ast::OrderByExpr,
+    cte_names: &HashSet<String>,
+    depth: usize,
+) -> Result<()> {
+    if order_expr.with_fill.is_some() {
+        return Err(anyhow!("ORDER BY WITH FILL is not allowed"));
+    }
+    validate_expr(&order_expr.expr, cte_names, depth)
 }
 
 #[cfg(test)]
@@ -2061,6 +2532,69 @@ mod tests {
     }
 
     #[test]
+    fn test_rejects_order_by_with_fill_in_every_position() {
+        for sql in [
+            "SELECT num FROM blocks ORDER BY num WITH FILL FROM 1 LIMIT 1",
+            "SELECT num FROM blocks ORDER BY num WITH FILL TO 10 LIMIT 1",
+            "SELECT num FROM blocks ORDER BY num WITH FILL STEP 1 LIMIT 1",
+            "SELECT num FROM blocks ORDER BY num WITH FILL FROM length(rpad('x', 1000000000, 'x')) \
+             LIMIT 1",
+            "SELECT array_agg(num ORDER BY num WITH FILL FROM 1) FROM blocks",
+            "SELECT count(*) WITHIN GROUP (ORDER BY num WITH FILL TO 1) FROM blocks",
+            "SELECT row_number() OVER (ORDER BY num WITH FILL STEP 1) FROM blocks",
+            "SELECT row_number() OVER w FROM blocks WINDOW w AS (ORDER BY num WITH FILL FROM 1)",
+        ] {
+            let error = validate_query(sql).expect_err(sql);
+            assert_eq!(
+                error.to_string(),
+                "ORDER BY WITH FILL is not allowed",
+                "{sql}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_rejects_order_by_interpolate() {
+        for (sql, expected) in [
+            (
+                "SELECT num FROM blocks ORDER BY num WITH FILL INTERPOLATE (num AS num + 1) LIMIT 1",
+                "ORDER BY INTERPOLATE is not allowed",
+            ),
+            (
+                "SELECT num FROM blocks ORDER BY num INTERPOLATE (num AS num + 1) LIMIT 1",
+                "ORDER BY INTERPOLATE is not allowed",
+            ),
+            (
+                "SELECT num FROM blocks ORDER BY num INTERPOLATE LIMIT 1",
+                "ORDER BY INTERPOLATE is not allowed",
+            ),
+        ] {
+            let error = validate_query(sql).expect_err(sql);
+            assert_eq!(error.to_string(), expected, "{sql}");
+        }
+    }
+
+    #[test]
+    fn test_rejects_parametric_function_calls() {
+        for sql in [
+            "SELECT count(num)(num) FROM blocks",
+            "SELECT count(length(rpad('x', 1000000000, 'x')))(num) FROM blocks",
+            "SELECT count(pg_read_file('/etc/passwd'))(num) FROM blocks",
+            "SELECT num FROM blocks WHERE count(num)(num) > 0",
+        ] {
+            let error = validate_query(sql).expect_err(sql);
+            assert_eq!(
+                error.to_string(),
+                "Parametric function calls are not allowed",
+                "{sql}"
+            );
+        }
+        // The allowlist is checked first, so an unlisted name keeps its own error.
+        let error = validate_query("SELECT quantile(0.5)(num) FROM blocks").expect_err("quantile");
+        assert_eq!(error.to_string(), "Function 'quantile' is not allowed");
+    }
+
+    #[test]
     fn test_rejects_table_sample_modifier() {
         assert!(validate_query("SELECT * FROM blocks TABLESAMPLE SYSTEM (10)").is_err());
     }
@@ -2247,6 +2781,102 @@ mod tests {
             )
             .is_ok()
         );
+    }
+
+    #[test]
+    fn test_clickhouse_rejects_introspection_functions() {
+        for call in [
+            "hostname()",
+            "hostName()",
+            "fqdn()",
+            "FQDN()",
+            "serverUUID()",
+            "version()",
+            "uptime()",
+            "getServerPort('tcp_port')",
+            "getMacro('replica')",
+            "getSetting('max_memory_usage')",
+            "getSettingOrDefault('max_memory_usage', 0)",
+            "currentUser()",
+            "authenticatedUser()",
+            "authenticated_user()",
+            "serverTimeZone()",
+            "initial_query_start_time()",
+            "user()",
+            "currentDatabase()",
+            "current_database()",
+            "database()",
+            "currentRoles()",
+            "currentProfiles()",
+            "queryID()",
+            "initialQueryID()",
+            "shardNum()",
+            "filesystemAvailable()",
+        ] {
+            let sql = format!("SELECT {call} AS x");
+            let error = validate_clickhouse_query(&sql).expect_err(&sql);
+            assert!(
+                error.to_string().ends_with("is not allowed"),
+                "{sql}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_tiered_native_rejects_session_keywords() {
+        for keyword in [
+            "current_role",
+            "CURRENT_ROLE",
+            "current_schema",
+            "current_catalog",
+            "current_user",
+            "CURRENT_USER",
+            "session_user",
+            "system_user",
+            "user",
+        ] {
+            let sql = format!("SELECT {keyword} AS x");
+            let error = reject_postgres_session_keywords(&sql).expect_err(&sql);
+            assert!(
+                error.to_string().ends_with("is not allowed"),
+                "{sql}: {error}"
+            );
+            let sql = format!("SELECT block_num FROM logs WHERE {keyword} IS NOT NULL");
+            assert!(reject_postgres_session_keywords(&sql).is_err(), "{sql}");
+            let sql = format!("SELECT x FROM (SELECT {keyword} AS x FROM logs) t");
+            assert!(reject_postgres_session_keywords(&sql).is_err(), "{sql}");
+            // Native ClickHouse queries keep bare names as column references.
+            let sql = format!("SELECT {keyword} FROM logs");
+            assert!(validate_clickhouse_query(&sql).is_ok(), "{sql}");
+        }
+        // A quoted name is a column reference, not the keyword.
+        assert!(reject_postgres_session_keywords(r#"SELECT "user" FROM logs"#).is_ok());
+        assert!(reject_postgres_session_keywords("SELECT block_num FROM logs").is_ok());
+    }
+
+    #[test]
+    fn test_postgres_rejects_session_keywords() {
+        for keyword in [
+            "current_role",
+            "CURRENT_ROLE",
+            "current_schema",
+            "current_catalog",
+            "current_user",
+            "session_user",
+            "system_user",
+            "user",
+        ] {
+            let sql = format!("SELECT {keyword} AS x");
+            let error = validate_query(&sql).expect_err(&sql);
+            assert!(
+                error.to_string().ends_with("is not allowed"),
+                "{sql}: {error}"
+            );
+            let sql = format!("SELECT block_num FROM logs WHERE {keyword} IS NOT NULL");
+            assert!(validate_query(&sql).is_err(), "{sql}");
+        }
+        // A quoted name is a column reference, not the keyword.
+        assert!(validate_query(r#"SELECT "user" FROM logs"#).is_ok());
     }
 
     #[test]
@@ -2491,7 +3121,6 @@ mod tests {
              SELECT * FROM counted",
             "SELECT * FROM (WITH inner_cte AS (SELECT block_num FROM logs) SELECT * FROM inner_cte) \
              AS derived",
-            "SELECT block_num FROM logs SETTINGS max_threads = 1",
         ] {
             let result = validate_clickhouse_query(sql);
             assert!(result.is_ok(), "{sql}: {result:?}");
@@ -2531,31 +3160,45 @@ mod tests {
 
     #[test]
     fn test_clickhouse_visitor_pass_covers_positions_outside_the_walk() {
-        for (sql, error) in [
-            (
-                "SELECT block_num FROM logs SETTINGS max_threads = sleep(1)",
-                "Function 'sleep' is not allowed",
-            ),
-            (
-                "SELECT block_num FROM logs SETTINGS max_threads = (SELECT count() FROM system.one)",
-                "Access to ClickHouse system schema 'system' is not allowed",
-            ),
-            (
-                "SELECT block_num FROM logs SETTINGS max_threads = (SELECT count() FROM numbers(1))",
-                "Table functions are not allowed",
-            ),
-            (
-                "SELECT CAST(block_num AS Nested(a UInt8 DEFAULT sleep(1))) FROM logs",
-                "Function 'sleep' is not allowed",
-            ),
+        // The walk does not look inside a cast's type, only the visitor pass does.
+        let sql = "SELECT CAST(block_num AS Nested(a UInt8 DEFAULT sleep(1))) FROM logs";
+        let query = parse_query(&sqlparser::dialect::ClickHouseDialect {}, sql);
+        let walk = validate_clickhouse_query_ast(&query, &HashSet::new(), 0);
+        assert!(walk.is_ok(), "{sql}: {walk:?}");
+        let result = validate_clickhouse_query(sql);
+        assert_eq!(
+            result.expect_err(sql).to_string(),
+            "Function 'sleep' is not allowed",
+            "{sql}"
+        );
+    }
+
+    #[test]
+    fn test_clickhouse_rejects_settings_and_format_at_any_depth() {
+        for sql in [
+            "SELECT block_num FROM logs SETTINGS max_threads = 1",
+            "SELECT block_num FROM logs FORMAT JSON",
+            "SELECT * FROM (SELECT block_num FROM logs SETTINGS max_threads = 1) AS s",
+            "SELECT (SELECT max(block_num) FROM logs SETTINGS max_threads = 1) AS m",
+            "WITH recent AS (SELECT block_num FROM logs SETTINGS max_threads = 1) SELECT * FROM recent",
+            "WITH recent AS (SELECT block_num FROM logs) \
+             SELECT * FROM (SELECT * FROM recent SETTINGS max_threads = 1) AS s",
+            "SELECT block_num FROM logs UNION ALL \
+             SELECT * FROM (SELECT block_num FROM txs SETTINGS max_threads = 1) AS s",
         ] {
-            // The walk does not look at these positions, only the visitor pass does.
-            let query = parse_query(&sqlparser::dialect::ClickHouseDialect {}, sql);
-            let walk = validate_clickhouse_query_ast(&query, &HashSet::new(), 0);
-            assert!(walk.is_ok(), "{sql}: {walk:?}");
-            let result = validate_clickhouse_query(sql);
-            assert_eq!(result.expect_err(sql).to_string(), error, "{sql}");
+            let error = validate_clickhouse_query(sql).expect_err(sql);
+            assert_eq!(error.to_string(), "Unsupported query clause", "{sql}");
         }
+
+        // A query where only the visitor pass looks, inside a cast's type.
+        let sql = "SELECT CAST(block_num AS Nested(a UInt8 DEFAULT (SELECT max(block_num) FROM logs \
+                   SETTINGS max_threads = 1))) \
+                   FROM logs";
+        let query = parse_query(&sqlparser::dialect::ClickHouseDialect {}, sql);
+        let walk = validate_clickhouse_query_ast(&query, &HashSet::new(), 0);
+        assert!(walk.is_ok(), "{sql}: {walk:?}");
+        let error = validate_clickhouse_query(sql).expect_err(sql);
+        assert_eq!(error.to_string(), "Unsupported query clause", "{sql}");
     }
 
     #[test]
@@ -2610,6 +3253,77 @@ mod tests {
     }
 
     #[test]
+    fn test_clickhouse_rejects_case_mismatched_cte_shadowing() {
+        // ClickHouse resolves identifiers case-sensitively, so a CTE named
+        // "TIDX_SCHEMA_OBJECTS" does not shadow the real tidx_schema_objects.
+        for sql in [
+            r#"WITH "TIDX_SCHEMA_OBJECTS" AS (SELECT 1 AS x) SELECT name FROM tidx_schema_objects"#,
+            r#"WITH "TOKEN_TRANSFERS_MV" AS (SELECT 1 AS x) SELECT * FROM token_transfers_mv"#,
+            "WITH TOKEN_TRANSFERS_MV AS (SELECT 1 AS x) SELECT * FROM token_transfers_mv",
+            r#"WITH t AS (SELECT 1 AS x) SELECT * FROM "T""#,
+        ] {
+            assert!(validate_clickhouse_query(sql).is_err(), "{sql}");
+        }
+    }
+
+    #[test]
+    fn test_clickhouse_allows_exact_case_cte() {
+        assert!(
+            validate_clickhouse_query(
+                r#"WITH "Recent" AS (SELECT num FROM blocks) SELECT * FROM "Recent""#
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_clickhouse_query(
+                "WITH recent AS (SELECT num FROM blocks) SELECT * FROM recent"
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn test_rejects_case_mismatched_cte_shadowing() {
+        // PostgreSQL keeps the case of quoted identifiers, so a quoted
+        // uppercase CTE does not shadow an unquoted lowercase relation.
+        for sql in [
+            r#"WITH "SYNC_STATE" AS (SELECT 1 AS x) SELECT * FROM sync_state"#,
+            r#"WITH "Sync_State" AS (SELECT 1 AS x) SELECT * FROM sync_state"#,
+            r#"WITH sync_state AS (SELECT 1 AS x) SELECT * FROM "SYNC_STATE""#,
+        ] {
+            assert!(validate_query(sql).is_err(), "{sql}");
+        }
+    }
+
+    #[test]
+    fn test_rejects_non_ascii_folded_cte_shadowing() {
+        // PostgreSQL does not fold U+212A KELVIN SIGN to ASCII k.
+        assert!(
+            validate_query("WITH pg_loc\u{212A}s AS (SELECT 1) SELECT * FROM pg_locks").is_err()
+        );
+        assert!(validate_query("WITH SYNC_\u{212A} AS (SELECT 1) SELECT * FROM sync_k").is_err());
+    }
+
+    #[test]
+    fn test_allows_cte_with_postgres_identifier_folding() {
+        // Unquoted identifiers fold to lowercase on both sides.
+        assert!(
+            validate_query("WITH Recent AS (SELECT num FROM blocks) SELECT * FROM recent").is_ok()
+        );
+        assert!(
+            validate_query("WITH recent AS (SELECT num FROM blocks) SELECT * FROM RECENT").is_ok()
+        );
+        assert!(
+            validate_query(r#"WITH recent AS (SELECT num FROM blocks) SELECT * FROM "recent""#)
+                .is_ok()
+        );
+        assert!(
+            validate_query(r#"WITH "Recent" AS (SELECT num FROM blocks) SELECT * FROM "Recent""#)
+                .is_ok()
+        );
+    }
+
+    #[test]
     fn test_clickhouse_rejects_schema_qualified_cte_shadowing() {
         assert!(
             validate_clickhouse_query(
@@ -2643,5 +3357,98 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn test_rejects_input_after_bare_end() {
+        assert!(validate_query("SELECT num END FROM other_table").is_err());
+        assert!(validate_query("SELECT num FROM blocks END").is_err());
+        assert!(validate_clickhouse_query("SELECT num END FROM other_table").is_err());
+    }
+
+    #[test]
+    fn test_accepts_trailing_semicolons() {
+        assert!(validate_query("SELECT num FROM blocks;").is_ok());
+        assert!(validate_query("SELECT num FROM blocks;;").is_ok());
+        assert!(validate_clickhouse_query("SELECT num FROM blocks;").is_ok());
+        assert!(validate_query(";").is_err());
+    }
+
+    #[test]
+    fn test_rejects_catalog_cast_targets() {
+        for sql in [
+            "SELECT CAST(10 AS regrole)",
+            "SELECT num::regclass FROM blocks",
+            "SELECT CAST(num AS my_type) FROM blocks",
+            r#"SELECT 'n'::"NAME""#,
+            "SELECT 'ab'::bpchar(x)",
+            "SELECT CAST(7 AS pg_catalog.regclass)",
+            "SELECT CAST(7 AS public.int4)",
+            "SELECT regrole '10'",
+            "SELECT E'a'\n'b'",
+            r"SELECT 'a' '\', ' , other_fn(5) --'",
+            "SELECT 'a'\n'it''s'",
+            r#"SELECT "regrole" '10'"#,
+            r#"SELECT CAST(7 AS "integer")"#,
+            r#"SELECT CAST(true AS "boolean")"#,
+            "SELECT 1 + 1 'x'",
+            "SELECT num FROM blocks WHERE regclass 'blocks' IS NOT NULL",
+            "SELECT CAST('now' AS regproc)",
+            "SELECT ARRAY[10]::regtype[]",
+            "SELECT num FROM blocks WHERE num::regnamespace IS NOT NULL",
+        ] {
+            assert!(validate_query(sql).is_err(), "{sql}");
+        }
+    }
+
+    #[test]
+    fn test_accepts_builtin_cast_targets() {
+        for sql in [
+            "SELECT num::text FROM blocks",
+            "SELECT CAST(num AS numeric) FROM blocks",
+            "SELECT num::bigint FROM blocks",
+            "SELECT timestamp '2026-01-01 00:00:00'",
+            "SELECT ARRAY[num]::bigint[] FROM blocks",
+            "SELECT 'n'::name, '2024-01-02 03:04:05+05:30'::timestamptz, 7::int2",
+            r#"SELECT 'n'::"name", 'n'::NAME"#,
+            "SELECT 'ab'::bpchar(10), now()::timestamptz(3)",
+            "SELECT CAST(7 AS pg_catalog.int4)",
+            r#"SELECT CAST(7 AS "text"), num AS "Num" FROM blocks"#,
+            r#"SELECT "text" 'hello', name 'x'"#,
+            "SELECT 'hello'\n'world'",
+            "SELECT '10.0.0.1'::inet, '10.0.0.0/8'::cidr, '08:00:2b:01:02:03'::macaddr",
+            "SELECT CAST('08:00:2b:01:02:03:04:05' AS macaddr8), inet '10.0.0.1'",
+        ] {
+            assert!(validate_query(sql).is_ok(), "{sql}");
+        }
+    }
+
+    #[test]
+    fn test_rejects_join_forms_with_unchecked_conditions() {
+        assert!(
+            validate_query(
+                "SELECT b.num FROM blocks b ASOF JOIN txs t \
+                 MATCH_CONDITION (b.num >= t.block_num) ON (SELECT count(*) FROM other_table) > 0"
+            )
+            .is_err()
+        );
+        assert!(
+            validate_query(
+                "SELECT b.num FROM blocks b STRAIGHT_JOIN txs t ON (SELECT count(*) FROM other_table) > 0"
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn test_rejects_group_by_modifiers_and_foreign_clauses() {
+        for sql in [
+            "SELECT num FROM blocks GROUP BY num WITH ROLLUP",
+            "SELECT num FROM blocks GROUP BY num GROUPING SETS ((num))",
+            "SELECT num FROM blocks SETTINGS max_threads = 1",
+            "SELECT num FROM blocks FORMAT JSON",
+        ] {
+            assert!(validate_query(sql).is_err(), "{sql}");
+        }
     }
 }

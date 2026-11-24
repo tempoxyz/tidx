@@ -17,7 +17,7 @@
 
 ---
 
-**tidx** is [Tempo](https://tempo.xyz)'s chain indexer. It ingests blocks, transactions, and logs from a Tempo node, then makes them queryable through SQL, an HTTP API, and a CLI. Its hybrid PostgreSQL and ClickHouse architecture supports fast point lookups (OLTP) and large analytical queries (OLAP).
+**tidx** is [Tempo](https://tempo.com)'s chain indexer. It ingests blocks, transactions, and logs from a Tempo node, then makes them queryable through SQL, an HTTP API, and a CLI. Its hybrid PostgreSQL and ClickHouse architecture supports fast point lookups (OLTP) and large analytical queries (OLAP).
 
 Use tidx when you need structured Tempo chain data without building an indexing pipeline from scratch. Common use cases include analytics dashboards, block explorers, wallet balance lookups, token analytics, and DEX activity tracking.
 
@@ -125,7 +125,7 @@ curl "https://indexer.tempo.xyz/query \
 
 ## Learn more
 
-- [Tempo developer documentation](https://tempo.xyz/developers/docs): guides for building on Tempo
+- [Tempo developer documentation](https://tempo.com/developers): guides for building on Tempo
 - [tempoxyz/tempo](https://github.com/tempoxyz/tempo): Tempo node and protocol implementation
 - [tempoxyz/tempo-apps](https://github.com/tempoxyz/tempo-apps): Tempo applications, including the block explorer
 
@@ -240,8 +240,12 @@ Usage: tidx <COMMAND>
 Commands:
   init         Initialize a new config.toml
   up           Start syncing blocks from the chain (continuous) and serve HTTP API
+  sync         Start syncing blocks without the query API (pair with `tidx serve`)
+  serve        Serve the HTTP API without syncing (stateless; run any number of copies)
   status       Show sync status
   query        Run a SQL query (use --signature to decode event logs)
+  query-log    Show the most expensive API queries (ClickHouse query_log, pg_stat_statements)
+  replay       Replay captured API traffic against a tidx endpoint and record a latency baseline
   views        Manage ClickHouse materialized views
   upgrade      Update tidx to the latest version
   help         Print this message or the help of the given subcommand(s)
@@ -273,6 +277,39 @@ Usage: tidx up [OPTIONS]
 Options:
   -c, --config <CONFIG>  Path to config file [default: config.toml]
   -h, --help             Print help
+```
+
+### `tidx sync` and `tidx serve`
+
+`tidx up` runs the indexer and the HTTP API in one process. To scale the API on its own, run them separately:
+
+- `tidx sync` runs the indexer: fetching, writing, migrations, pruning and the tiered-storage bootstrap. Run one per database. Its HTTP port serves `/health`, `/status` and view management (`POST`/`DELETE /views`), but not `/query`.
+- `tidx serve` runs the read-only HTTP API. It is stateless, so any number of copies can run behind a load balancer. It never runs migrations, creates databases or issues ClickHouse DDL; it connects with `postgres.api_url` (a read replica with a read-only role) when set, and refuses to start until `sync` has set up the database. Live query streams are driven by polling `sync_state` on the database serve reads from, capped at the highest block in `blocks`, so a replica only announces blocks it already has.
+
+Both read the same `config.toml`, and `tidx up` is unchanged. Each binds `http.port` and `prometheus.port`, so when they share a host give `serve` its own ports with `--port` and `--metrics-port`. `/status` on `serve` reports what `sync_state` holds; the per-store watermarks, row counts and write rates come from the writer's process, so read them from `sync`.
+
+These optional settings tune the API per process. They default to tidx's previous fixed values, so existing configs behave the same:
+
+| Setting | Default | Meaning |
+|---|---|---|
+| `http.max_concurrent_queries` | 32 | API statements that may run at once in one process |
+| `http.max_live_connections` | 20 | Live query streams one process accepts |
+| `chains.postgres.api_pool_size` | 16 | Connections in the API's own pool (`api_url` and `serve`) |
+| `chains.postgres.api_pool_wait_ms` | none | `serve` only: fail a request that waits this long for a connection |
+| `chains.clickhouse.api_user` / `api_password_env` | `user` / `password_env` | `serve` only: ClickHouse user for queries. Use `readonly = 2` or SELECT-only grants: tidx sets query settings on every request, which `readonly = 1` refuses |
+| `chains.clickhouse.api_url` / `api_failover_urls` | `url` / `failover_urls` | `serve` only: ClickHouse URL for queries, such as a replica that serves only API reads, and the URLs to fail over to (such as the writers). Serve returns to `api_url` within 30 seconds of its `/replicas_status` reporting healthy (up and caught up). Tiered-storage queries that PostgreSQL runs through pg_clickhouse use `fdw_url` instead |
+
+With several `serve` copies, the database sees copies x `api_pool_size` connections, so size it under the replica's connection limit.
+
+```
+Usage: tidx serve [OPTIONS]
+
+Options:
+  -c, --config <CONFIG>              Path to config file [default: config.toml]
+      --port <PORT>                  HTTP port, overriding http.port
+      --metrics-port <METRICS_PORT>  Prometheus port, overriding prometheus.port
+      --live-poll-ms <LIVE_POLL_MS>  How often to poll sync_state for new blocks to drive live streams, in milliseconds [default: 250]
+  -h, --help                         Print help
 ```
 
 ### `tidx status`
@@ -310,6 +347,24 @@ Options:
   -t, --timeout <TIMEOUT>      Query timeout in milliseconds [default: 30000]
   -c, --config <CONFIG>        Path to config file [default: config.toml]
   -h, --help                   Print help
+```
+
+### `tidx query-log`
+
+Ranks the API's queries over the last `--since-minutes` by total time, from ClickHouse's `system.query_log` (grouped by query shape, route or caller with `--by`) and, when the extension is installed, PostgreSQL's `pg_stat_statements` for the API role. It connects with the chain's sync credentials, which need `SELECT` on `system.query_log`; pass `--cluster` to read every replica.
+
+Every database query an API request runs is tagged `tidx/<route>/<caller>/<request_id>`: ClickHouse's `log_comment` (directly or through pg_clickhouse) and PostgreSQL's `application_name`. The route is `query.<engine route>` or `query.live`; the caller is the request's `x-tidx-caller` header (`-` without one); the request ID is its `x-request-id` header or a generated one, echoed on the response.
+
+```bash
+tidx query-log --config config.toml --since-minutes 60 --by shape --limit 20
+```
+
+### `tidx replay`
+
+Replays captured requests (JSON lines with a `path` such as `/query?sql=…&chainId=…` and an optional RFC 3339 `t`, or raw Envoy access-log entries) against a tidx API, at the captured pace (`--pace recorded --speed 2` for twice as fast), a fixed rate (`--pace rate --speed 200`) or as fast as `--concurrency` allows (`--pace max`). It reports status codes and latency percentiles per route and the costliest query shapes, and tags every request with `x-tidx-caller: replay` so `tidx query-log --by caller` shows its server-side cost. `--chain-id` rewrites the chain, and live requests are skipped unless `--live-seconds` is given.
+
+```bash
+tidx replay --input capture.jsonl --url http://localhost:8080 --pace rate --speed 200 --report replay.json
 ```
 
 ### `tidx views`
@@ -410,10 +465,12 @@ GET  /status                                             Sync status for all cha
 GET  /query                                              Execute SQL query
      ?sql                   string    (required)         SQL query (SELECT only)
      ?chainId               number    (required)         Chain ID to query
-     ?signature             string                       Event signature for CTE generation
+     ?signature             string                       Event signature for CTE generation (repeatable, max 16)
      ?engine                string    = postgres         Query engine: postgres or clickhouse
      ?source                string    = postgres-clickhouse  Data source: postgres, clickhouse, or postgres-clickhouse
      ?live                  bool      = false            Enable SSE streaming (postgres only)
+     x-tidx-caller          header                       Calling service, recorded in query tags
+     x-request-id           header                       Request ID for query tags (generated if absent; echoed)
 GET  /views?chainId=                                     List materialized views
 GET  /views/{name}?chainId=                              Get view details
 POST /views                                              Create view (trusted IP only)
@@ -618,7 +675,7 @@ Written by the sync engine to both PostgreSQL and ClickHouse. Schemas are identi
 
 ### Event Tables
 
-Pass `?signature=Event(type1,type2,...)` to `/query` and tidx exposes a virtual table named after the event with one column per parameter. The table is generated as a CTE at query time, so no schema registration is needed and any event signature works on demand. Works against both `engine=postgres` and `engine=clickhouse`:
+Pass `?signature=Event(type1,type2,...)` to `/query` and tidx exposes a virtual table named after the event with one column per parameter. The table is generated as a CTE at query time, so no schema registration is needed and any event signature works on demand. Repeat `signature` to expose several events; a query takes at most 16, and its SQL plus all signatures must stay within 65,536 bytes. Works against both `engine=postgres` and `engine=clickhouse`:
 
 ```bash
 curl -G "https://indexer.tempo.xyz/query" \

@@ -35,18 +35,29 @@ struct Node {
     canonical: Vec<Block>,
     /// Becomes the canonical chain once the next block batch has been answered.
     after_next_block_batch: Option<Vec<Block>>,
+    /// Height answered with `null` the first time it is requested.
+    unavailable_once: Option<u64>,
     /// Hashes of the blocks returned by every block batch answered so far.
     block_batches: Vec<Vec<B256>>,
 }
 
 impl Node {
-    fn respond(&self, request: &Value) -> Value {
+    fn respond(&mut self, request: &Value) -> Value {
         let result = match request["method"].as_str() {
             Some("eth_chainId") => json!(format!("0x{CHAIN_ID:x}")),
             Some("eth_blockNumber") => json!(format!("0x{:x}", self.canonical.len() - 1)),
-            Some("eth_getBlockByNumber") => self
-                .block(request)
-                .map_or(Value::Null, |block| serde_json::to_value(block).unwrap()),
+            Some("eth_getBlockByNumber") => {
+                let unavailable = self
+                    .block(request)
+                    .is_some_and(|block| Some(block.header.number()) == self.unavailable_once);
+                if unavailable {
+                    self.unavailable_once = None;
+                    Value::Null
+                } else {
+                    self.block(request)
+                        .map_or(Value::Null, |block| serde_json::to_value(block).unwrap())
+                }
+            }
             // All blocks are empty.
             Some("eth_getBlockReceipts") => json!([]),
             _ => {
@@ -285,6 +296,39 @@ async fn test_fork_switch_between_pipelined_batches() {
     let block_batches = node.lock().unwrap().block_batches.clone();
     assert_eq!(block_batches[0], hashes(&fork_a[10..=19]));
     assert_eq!(block_batches[1], hashes(&fork_b[20..=20]));
+    assert_stored_chain(&db.pool, &fork_b, fork_point).await;
+}
+
+#[tokio::test]
+#[serial(db)]
+async fn test_failed_pipelined_fetch_checkpoints_written_batch() {
+    let db = TestDb::empty().await;
+    db.truncate_all().await;
+
+    // As in the test above, the first tick writes 10..=19 while it fetches block 20,
+    // and the node switches to fork B, which replaces blocks 15 and up, after serving
+    // the first batch. Block 20 is unavailable on the first request, so the tick fails
+    // after fork A's batch committed.
+    let fork_point = 14;
+    let fork_a = extend(Vec::new(), FORK_A, 20);
+    let fork_b = extend(fork_a[..=fork_point].to_vec(), FORK_B, 22);
+
+    let (node, rpc_url) = start_node(fork_a.clone()).await;
+    {
+        let mut node = node.lock().unwrap();
+        node.after_next_block_batch = Some(fork_b.clone());
+        node.unavailable_once = Some(20);
+    }
+    let (shutdown, engine) = start_engine(&db.pool, &rpc_url).await;
+
+    // The retry must start above the committed batch, where the parent check sees the
+    // fork, instead of rewriting fork B over the stored fork A blocks.
+    wait_for_tip(&db.pool, 22).await;
+    stop_engine(shutdown, engine).await;
+
+    let block_batches = node.lock().unwrap().block_batches.clone();
+    assert_eq!(block_batches[0], hashes(&fork_a[10..=19]));
+    assert_eq!(block_batches[2], hashes(&fork_b[20..=22]));
     assert_stored_chain(&db.pool, &fork_b, fork_point).await;
 }
 

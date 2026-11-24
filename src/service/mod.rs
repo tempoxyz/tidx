@@ -5,13 +5,13 @@ use serde::Serialize;
 use std::task::Poll;
 use std::time::Instant;
 use tokio_postgres::error::SqlState;
-use tokio_postgres::types::{ToSql, Type};
+use tokio_postgres::types::{FromSql, ToSql, Type};
 
 use crate::db::Pool;
 use crate::metrics;
 use crate::query::{
-    EventSignature, HARD_LIMIT_MAX, apply_event_signature_ctes_postgres,
-    apply_event_signature_ctes_tiered, plan_tiered_split, validate_query,
+    EventSignature, HARD_LIMIT_MAX, TieredSplit, apply_event_signature_ctes_postgres,
+    apply_event_signature_ctes_tiered, plan_tiered_split, prepare_blocking, validate_query,
 };
 
 #[derive(Debug, Clone, Serialize)]
@@ -91,7 +91,7 @@ pub async fn get_all_status(pool: &Pool) -> Result<Vec<SyncStatus>> {
             // Blocks at or below the prune floor were intentionally dropped.
             let backfill_remaining = match backfill_num {
                 None => synced_num.saturating_sub(1 + pruned_below).max(0),
-                Some(n) => n.saturating_sub(pruned_below).max(0),
+                Some(n) => n.saturating_sub(1 + pruned_below).max(0),
             };
 
             let sync_rate = started_at.and_then(|started| {
@@ -175,6 +175,7 @@ impl From<crate::clickhouse::QueryResult> for QueryResult {
     }
 }
 
+#[derive(Clone)]
 pub struct QueryOptions {
     pub timeout_ms: u64,
     pub limit: i64,
@@ -190,7 +191,19 @@ impl Default for QueryOptions {
 }
 
 const MAX_QUERY_RESULT_BYTES: usize = 10 * 1024 * 1024;
+
+/// Most bytes PostgreSQL may send for one result, counted by wire length. It
+/// bounds the bytes read for cells the response may drop, such as arrays and
+/// `jsonb`, which format as null. It is larger than [`MAX_QUERY_RESULT_BYTES`]
+/// because such cells are not returned.
+const MAX_QUERY_WIRE_BYTES: usize = 4 * MAX_QUERY_RESULT_BYTES;
 const MAX_CELL_BYTES: usize = 1024 * 1024;
+
+/// Most cells (rows times columns) one result may hold: [`HARD_LIMIT_MAX`] rows
+/// of 100 columns, above the widest core table. Even an empty cell keeps a
+/// `serde_json::Value` (up to 72 bytes) alive for the whole request, so the
+/// byte budget alone would let a result hold millions of them.
+const MAX_QUERY_CELLS: usize = 1_000_000;
 
 #[derive(Debug, thiserror::Error)]
 enum PostgresQueryFailure {
@@ -211,7 +224,8 @@ pub async fn execute_query_postgres(
     signatures: &[&str],
     options: &QueryOptions,
 ) -> Result<QueryResult> {
-    PostgresQuery::new(sql, signatures, options)?
+    PostgresQuery::prepare(sql, signatures, options)
+        .await?
         .execute(pool, &[], options)
         .await
 }
@@ -241,6 +255,15 @@ impl PostgresQuery {
         Ok(Self { sql })
     }
 
+    /// [`Self::new`] on the blocking pool, for async callers.
+    pub async fn prepare(sql: &str, signatures: &[&str], options: &QueryOptions) -> Result<Self> {
+        let options = options.clone();
+        prepare_blocking(sql, signatures, move |sql, signatures| {
+            Self::new(sql, signatures, &options)
+        })
+        .await
+    }
+
     /// The rewritten SQL that runs on PostgreSQL.
     pub fn sql(&self) -> &str {
         &self.sql
@@ -253,7 +276,7 @@ impl PostgresQuery {
         params: &[(&(dyn ToSql + Sync), Type)],
         options: &QueryOptions,
     ) -> Result<QueryResult> {
-        run_pg_query(pool, &self.sql, params, options, &[], "postgres").await
+        run_pg_query(pool, &self.sql, params, options, &[], &[], "postgres").await
     }
 }
 
@@ -426,6 +449,12 @@ pub async fn execute_query_tiered(
     signatures: &[&str],
     options: &QueryOptions,
 ) -> Result<QueryResult> {
+    // The keyword check, the split planner and the hot-window check parse the
+    // raw input, partly on this worker: bound it before any of them runs.
+    crate::query::check_event_signature_limits(sql, signatures)?;
+    // Parts of this query may run natively on ClickHouse, which only applies
+    // the ClickHouse validator: keep PostgreSQL's session-keyword rule.
+    crate::query::reject_postgres_session_keywords(sql)?;
     let crate::db::tiered::PruneBoundary {
         boundary,
         boundary_ts,
@@ -527,25 +556,13 @@ async fn try_execute_tiered_split(
 ) -> Result<Option<QueryResult>> {
     let start = Instant::now();
 
-    let mut events = Vec::with_capacity(signatures.len());
-    for sig in signatures {
-        // Let the fallback path surface signature parse errors.
-        let Ok(parsed) = EventSignature::parse(sig) else {
-            return Ok(None);
-        };
-        events.push(parsed);
-    }
-    let Some(plan) = plan_tiered_split(sql, &events) else {
+    let Some(plan) = prepare_blocking(sql, signatures, |sql, signatures| {
+        Ok(plan_validated_tiered_split(sql, signatures))
+    })
+    .await?
+    else {
         return Ok(None);
     };
-    // Mirror the fallback's raw-SQL gates (LIMIT ALL, length, …): the arms
-    // re-emit SQL from the AST, which would otherwise erase them.
-    if apply_event_signature_ctes_tiered(sql, signatures)
-        .and_then(|s| validate_query(&s))
-        .is_err()
-    {
-        return Ok(None);
-    }
     // Plain PG errors when an explicit SQL LIMIT streams more rows than the
     // API cap; the split would silently cap. Let the fallback decide.
     if plan.sql_limit.is_some_and(|l| l > options.limit) {
@@ -678,6 +695,29 @@ async fn try_execute_tiered_split(
     )))
 }
 
+/// Plan the tiered split of `sql`, or `None` when it is ineligible or the
+/// fallback path would reject it.
+fn plan_validated_tiered_split(sql: &str, signatures: &[&str]) -> Option<TieredSplit> {
+    let mut events = Vec::with_capacity(signatures.len());
+    for sig in signatures {
+        // Let the fallback path surface signature parse errors.
+        let Ok(parsed) = EventSignature::parse(sig) else {
+            return None;
+        };
+        events.push(parsed);
+    }
+    let plan = plan_tiered_split(sql, &events)?;
+    // Mirror the fallback's raw-SQL gates (LIMIT ALL, length, …): the arms
+    // re-emit SQL from the AST, which would otherwise erase them.
+    if apply_event_signature_ctes_tiered(sql, signatures)
+        .and_then(|s| validate_query(&s))
+        .is_err()
+    {
+        return None;
+    }
+    Some(plan)
+}
+
 /// Degraded split path: the hot PostgreSQL arm failed, so serve the original
 /// query natively on the ClickHouse archive (dual-written, full history).
 async fn degrade_split_to_clickhouse(
@@ -760,18 +800,29 @@ pub async fn execute_query_postgres_via_clickhouse(
     }
 
     // ch.* exposes the same ClickHouse text representation as tiered.*.
-    let sql = apply_event_signature_ctes_tiered(sql, signatures)?;
-    validate_query(&sql)?;
-    let sql = append_limit_if_missing(&sql, options.limit);
+    let limit = options.limit;
+    let sql = prepare_blocking(sql, signatures, move |sql, signatures| {
+        let sql = apply_event_signature_ctes_tiered(sql, signatures)?;
+        validate_query(&sql)?;
+        Ok(append_limit_if_missing(&sql, limit))
+    })
+    .await?;
 
     // ClickHouse aborts its scans strictly before PostgreSQL's
     // statement_timeout: a cancel mid pg_clickhouse scan double-frees and
     // restarts the server (upstream 0.3.x bug), so the FDW must never be
     // what PostgreSQL cancels.
     let ch_deadline_secs = (options.timeout_ms / 1000).max(1);
+    // The request's tag reaches ClickHouse's query_log through the FDW; its
+    // characters need no quoting in the settings list. Bound as a parameter
+    // (set_config below) so the per-request value never enters statement
+    // text, which would give pg_stat_statements an entry per request.
+    let log_comment = crate::query::QueryTag::current()
+        .map(|tag| format!(", log_comment {}", tag.comment()))
+        .unwrap_or_default();
     let session_settings = format!(
-        "SET LOCAL pg_clickhouse.session_settings = 'join_use_nulls 1, \
-         group_by_use_nulls 1, final 0, max_execution_time {ch_deadline_secs}'"
+        "join_use_nulls 1, group_by_use_nulls 1, final 0, \
+         max_execution_time {ch_deadline_secs}{log_comment}"
     );
     let statement_timeout = format!(
         "SET LOCAL statement_timeout = {}",
@@ -788,15 +839,26 @@ pub async fn execute_query_postgres_via_clickhouse(
             // ch.* carries prune-boundary CHECKs for the tiered views; the
             // archive holds full history, so never let them prune scans here.
             "SET LOCAL constraint_exclusion = off",
-            // `final 0` drops pg_clickhouse's default FINAL merge (costly
-            // reads; native ClickHouse engine semantics instead).
-            &session_settings,
             // Overrides run_pg_query's base statement_timeout (margin above).
             &statement_timeout,
         ],
+        // `final 0` drops pg_clickhouse's default FINAL merge (costly
+        // reads; native ClickHouse engine semantics instead).
+        &[("pg_clickhouse.session_settings", &session_settings)],
         "postgres-via-clickhouse",
     )
     .await
+}
+
+/// `SELECT set_config('<name>', $1, true), …` for transaction-local settings
+/// whose values are bound. Names come from code, never from requests.
+fn set_config_statement(settings: &[(&str, &str)]) -> String {
+    let calls: Vec<String> = settings
+        .iter()
+        .enumerate()
+        .map(|(i, (name, _))| format!("set_config('{name}', ${}, true)", i + 1))
+        .collect();
+    format!("SELECT {}", calls.join(", "))
 }
 
 /// Run prepared SQL on PostgreSQL and stream the result rows into a
@@ -809,6 +871,7 @@ async fn run_pg_query(
     params: &[(&(dyn ToSql + Sync), Type)],
     options: &QueryOptions,
     session_setup: &[&str],
+    bound_settings: &[(&str, &str)],
     engine: &str,
 ) -> Result<QueryResult> {
     let mut conn = pool.get().await.map_err(|e| {
@@ -819,6 +882,21 @@ async fn run_pg_query(
     let tx = conn.transaction().await.map_err(classify_postgres_error)?;
 
     let mut setup = format!("SET LOCAL statement_timeout = {}", options.timeout_ms);
+    // Transaction-local settings whose values vary per request, such as the
+    // request's tag (application_name, shown in pg_stat_activity and logs as
+    // %a). Their values are bound parameters of one set_config statement, so
+    // its text stays the same and pg_stat_statements keeps one entry for it.
+    let application_name = crate::query::QueryTag::current().map(|tag| tag.application_name());
+    let mut bound: Vec<(&str, &str)> = Vec::with_capacity(bound_settings.len() + 1);
+    if let Some(name) = &application_name {
+        bound.push(("application_name", name));
+    }
+    bound.extend_from_slice(bound_settings);
+    let set_config_sql = (!bound.is_empty()).then(|| set_config_statement(&bound));
+    let set_config_params: Vec<(&(dyn ToSql + Sync), Type)> = bound
+        .iter()
+        .map(|(_, value)| (value as &(dyn ToSql + Sync), Type::TEXT))
+        .collect();
     for stmt in session_setup {
         setup.push_str(";\n");
         setup.push_str(stmt);
@@ -834,14 +912,25 @@ async fn run_pg_query(
         // is parsed. Resolve result types before executing: query_typed_raw
         // can deadlock discovering a composite type behind unread data rows.
         let setup = tx.batch_execute(&setup);
+        let set_config = async {
+            match &set_config_sql {
+                Some(sql) => tx.query_typed(sql, &set_config_params).await.map(drop),
+                None => Ok(()),
+            }
+        };
         let param_types: Vec<Type> = params.iter().map(|(_, ty)| ty.clone()).collect();
         let prepare = tx.prepare_typed(sql, &param_types);
-        futures::pin_mut!(setup, prepare);
+        futures::pin_mut!(setup, set_config, prepare);
         let setup_sent = futures::poll!(setup.as_mut());
+        let set_config_sent = futures::poll!(set_config.as_mut());
         let prepare_sent = futures::poll!(prepare.as_mut());
         match setup_sent {
             Poll::Ready(result) => result?,
             Poll::Pending => setup.await?,
+        }
+        match set_config_sent {
+            Poll::Ready(result) => result?,
+            Poll::Pending => set_config.await?,
         }
         let statement = match prepare_sent {
             Poll::Ready(result) => result?,
@@ -858,25 +947,31 @@ async fn run_pg_query(
         futures::pin_mut!(stream);
         let mut rows = Vec::new();
         let mut result_bytes = 0usize;
+        let mut result_cells = 0usize;
+        let mut wire_bytes = 0usize;
 
         while let Some(row) = stream.try_next().await? {
             if rows.len() >= limit {
                 return Err(anyhow!("Query returned more than {limit} rows"));
             }
-            let row_values = (0..columns.len())
-                .map(|i| try_format_column_json(&row, i))
-                .collect::<Result<Vec<_>>>()?;
-            result_bytes = result_bytes.saturating_add(
-                row_values
-                    .iter()
-                    .map(estimated_json_value_bytes)
-                    .sum::<usize>(),
-            );
+            result_cells = add_result_cells(result_cells, columns.len())?;
+            // The driver already buffered the row, so its wire size is known
+            // before any cell is formatted. Every cell counts against the wire
+            // budget, including those of types that format as null.
+            let mut row_wire_bytes = 0usize;
+            for i in 0..columns.len() {
+                row_wire_bytes = row_wire_bytes.saturating_add(raw_cell_len(&row, i)?);
+            }
+            wire_bytes = add_wire_bytes(wire_bytes, row_wire_bytes)?;
+            // Sized exactly, unlike a `collect` through `Result`, so the row
+            // holds no spare capacity for the rest of the request.
+            let mut row_values = Vec::with_capacity(columns.len());
+            for i in 0..columns.len() {
+                row_values.push(try_format_column_json(&row, i)?);
+            }
+            result_bytes = result_bytes.saturating_add(row_result_bytes(&row_values));
             if result_bytes > MAX_QUERY_RESULT_BYTES {
-                return Err(anyhow!(
-                    "Query result exceeded {} bytes",
-                    MAX_QUERY_RESULT_BYTES
-                ));
+                return Err(result_too_large());
             }
             rows.push(row_values);
         }
@@ -1032,30 +1127,15 @@ fn try_format_column_json(row: &tokio_postgres::Row, idx: usize) -> Result<serde
     Ok(value)
 }
 
+/// Exact size of `value` as `serde_json` serializes it, the encoder of API
+/// responses: quotes, escapes and separators included.
 fn estimated_json_value_bytes(value: &serde_json::Value) -> usize {
-    match value {
-        serde_json::Value::Null => 4,
-        serde_json::Value::Bool(_) => 5,
-        serde_json::Value::Number(n) => {
-            use std::fmt::Write;
-
-            struct ByteCount(usize);
-            impl Write for ByteCount {
-                fn write_str(&mut self, s: &str) -> std::fmt::Result {
-                    self.0 += s.len();
-                    Ok(())
-                }
-            }
-            let mut count = ByteCount(0);
-            let _ = write!(count, "{n}");
-            count.0
-        }
-        serde_json::Value::String(s) => s.len(),
-        serde_json::Value::Array(values) => values.iter().map(estimated_json_value_bytes).sum(),
-        serde_json::Value::Object(values) => values
-            .iter()
-            .map(|(key, value)| key.len() + estimated_json_value_bytes(value))
-            .sum(),
+    let mut count = ByteCount(0);
+    // Serializing a `Value` into a counter cannot fail; if it ever did, charge
+    // everything so the result is rejected.
+    match serde_json::to_writer(&mut count, value) {
+        Ok(()) => count.0,
+        Err(_) => usize::MAX,
     }
 }
 
@@ -1144,6 +1224,95 @@ fn sanitize_db_error(error: &str) -> String {
         .unwrap_or(error);
 
     error
+}
+
+/// Adds one row of `columns` cells to the `total` cells of a result, failing
+/// once the result would hold more than [`MAX_QUERY_CELLS`].
+fn add_result_cells(total: usize, columns: usize) -> Result<usize> {
+    total
+        .checked_add(columns)
+        .filter(|cells| *cells <= MAX_QUERY_CELLS)
+        .ok_or_else(|| anyhow!("Query result exceeded {} cells", MAX_QUERY_CELLS))
+}
+
+/// Adds one row's `row_wire_bytes` to the `total` read from the database so
+/// far, failing once the result would exceed [`MAX_QUERY_WIRE_BYTES`].
+fn add_wire_bytes(total: usize, row_wire_bytes: usize) -> Result<usize> {
+    total
+        .checked_add(row_wire_bytes)
+        .filter(|bytes| *bytes <= MAX_QUERY_WIRE_BYTES)
+        .ok_or_else(|| {
+            anyhow!(
+                "Query read more than {} bytes from the database",
+                MAX_QUERY_WIRE_BYTES
+            )
+        })
+}
+
+/// Wire length of the cell at `idx`, failing if it exceeds [`MAX_CELL_BYTES`].
+/// Unlike [`try_format_column_json`], this bounds every column type.
+fn raw_cell_len(row: &tokio_postgres::Row, idx: usize) -> Result<usize> {
+    let RawCell(len) = row.try_get(idx)?;
+    check_cell_len(len)
+}
+
+fn check_cell_len(len: usize) -> Result<usize> {
+    if len > MAX_CELL_BYTES {
+        return Err(anyhow!(
+            "Query result cell exceeded {} bytes",
+            MAX_CELL_BYTES
+        ));
+    }
+    Ok(len)
+}
+
+/// Bytes charged against [`MAX_QUERY_RESULT_BYTES`] for one row: the exact
+/// JSON size of each cell, so an escape-heavy string is charged what it
+/// serializes to and a cell formatted as null only its `null`. The row's
+/// brackets, the commas between its cells and the comma after the row are
+/// counted, so the charges of all rows add up to the size of the response's
+/// `rows` array, give or take the array's own two brackets.
+fn row_result_bytes(values: &[serde_json::Value]) -> usize {
+    let structure = 2 + values.len().saturating_sub(1) + 1;
+    values
+        .iter()
+        .map(estimated_json_value_bytes)
+        .fold(structure, usize::saturating_add)
+}
+
+fn result_too_large() -> anyhow::Error {
+    anyhow!("Query result exceeded {} bytes", MAX_QUERY_RESULT_BYTES)
+}
+
+/// A cell's wire length, read from any column type and from NULLs.
+struct RawCell(usize);
+
+impl FromSql<'_> for RawCell {
+    fn from_sql(_: &Type, raw: &[u8]) -> Result<Self, Box<dyn std::error::Error + Sync + Send>> {
+        Ok(Self(raw.len()))
+    }
+
+    fn from_sql_null(_: &Type) -> Result<Self, Box<dyn std::error::Error + Sync + Send>> {
+        Ok(Self(0))
+    }
+
+    fn accepts(_: &Type) -> bool {
+        true
+    }
+}
+
+/// Counts the bytes written to it.
+struct ByteCount(usize);
+
+impl std::io::Write for ByteCount {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0 = self.0.saturating_add(buf.len());
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -1472,7 +1641,135 @@ mod tests {
             "ok": true
         });
 
-        assert!(estimated_json_value_bytes(&value) >= 10);
+        assert_eq!(
+            estimated_json_value_bytes(&value),
+            serde_json::to_vec(&value).unwrap().len()
+        );
+    }
+
+    #[test]
+    fn test_estimated_json_value_bytes_counts_escapes_and_quotes() {
+        for s in [
+            String::new(),
+            "\"".repeat(1024),
+            "\u{1}".repeat(1024),
+            "a\\b\n\t\"\u{1f}\u{7f}".repeat(100),
+            "h\u{e9}llo \u{1f600}".repeat(100),
+        ] {
+            let value = J::String(s);
+            assert_eq!(
+                estimated_json_value_bytes(&value),
+                serde_json::to_vec(&value).unwrap().len()
+            );
+        }
+
+        // Quotes double and control characters take six bytes, plus the quotes.
+        assert_eq!(estimated_json_value_bytes(&json!("\"".repeat(1024))), 2050);
+        assert_eq!(
+            estimated_json_value_bytes(&json!("\u{1}".repeat(1024))),
+            6146
+        );
+    }
+
+    #[test]
+    fn test_row_result_bytes_charges_empty_cells() {
+        let values = vec![json!(""); 512];
+        let row = row_result_bytes(&values);
+
+        // 512 times `""`, 511 commas, the brackets and the comma after the row.
+        assert_eq!(row, 512 * 2 + 511 + 2 + 1);
+        assert_eq!(row, serde_json::to_vec(&values).unwrap().len() + 1);
+        // 10,000 such rows far exceed the budget they used to stay under.
+        assert!(row * 10_000 > MAX_QUERY_RESULT_BYTES);
+    }
+
+    #[test]
+    fn test_row_result_bytes_matches_serialized_row() {
+        let values = vec![
+            json!("\"quoted\" \u{1}"),
+            json!(null),
+            json!(-42),
+            json!(true),
+            json!("0xdeadbeef"),
+        ];
+        assert_eq!(
+            row_result_bytes(&values),
+            serde_json::to_vec(&values).unwrap().len() + 1
+        );
+        assert_eq!(row_result_bytes(&[]), 3);
+    }
+
+    #[test]
+    fn test_row_result_bytes_charges_null_cells_only_their_json_size() {
+        // A `jsonb` column formats as null (4 bytes) however large its wire
+        // length, so it costs the response budget only `null`.
+        let values = vec![J::Null, json!("a")];
+        assert_eq!(row_result_bytes(&values), 4 + 3 + 1 + 2 + 1);
+
+        // Its wire length counts against the larger wire budget instead: 10,000
+        // such rows stay under the response budget but not under the wire one.
+        assert!(row_result_bytes(&values) * 10_000 < MAX_QUERY_RESULT_BYTES);
+        let mut wire = 0;
+        let mut rows = 0;
+        while let Ok(total) = add_wire_bytes(wire, 500_000) {
+            wire = total;
+            rows += 1;
+        }
+        assert!(rows < 10_000);
+        assert!(wire > MAX_QUERY_RESULT_BYTES);
+        assert_eq!(
+            add_wire_bytes(wire, MAX_QUERY_WIRE_BYTES)
+                .unwrap_err()
+                .to_string(),
+            "Query read more than 41943040 bytes from the database"
+        );
+        assert_eq!(
+            add_wire_bytes(0, MAX_QUERY_WIRE_BYTES).unwrap(),
+            MAX_QUERY_WIRE_BYTES
+        );
+    }
+
+    #[test]
+    fn test_raw_cell_reads_wire_length_of_any_type() {
+        for ty in [
+            Type::INT4_ARRAY,
+            Type::TEXT_ARRAY,
+            Type::JSONB,
+            Type::UUID,
+            Type::INT8,
+            Type::TEXT,
+        ] {
+            assert!(RawCell::accepts(&ty), "{ty}");
+            let RawCell(len) = RawCell::from_sql_nullable(&ty, Some(&[0; 4096])).unwrap();
+            assert_eq!(len, 4096, "{ty}");
+            let RawCell(len) = RawCell::from_sql_nullable(&ty, None).unwrap();
+            assert_eq!(len, 0, "{ty}");
+        }
+    }
+
+    #[test]
+    fn test_check_cell_len_boundary() {
+        assert_eq!(check_cell_len(MAX_CELL_BYTES).unwrap(), MAX_CELL_BYTES);
+        assert_eq!(
+            check_cell_len(MAX_CELL_BYTES + 1).unwrap_err().to_string(),
+            "Query result cell exceeded 1048576 bytes"
+        );
+    }
+
+    #[test]
+    fn test_add_result_cells_boundary() {
+        assert_eq!(add_result_cells(0, 512).unwrap(), 512);
+        assert_eq!(
+            add_result_cells(MAX_QUERY_CELLS - 512, 512).unwrap(),
+            MAX_QUERY_CELLS
+        );
+        assert_eq!(
+            add_result_cells(MAX_QUERY_CELLS - 511, 512)
+                .unwrap_err()
+                .to_string(),
+            "Query result exceeded 1000000 cells"
+        );
+        assert!(add_result_cells(usize::MAX, 1).is_err());
     }
 
     #[test]

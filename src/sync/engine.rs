@@ -35,6 +35,9 @@ const RECEIPT_BACKFILL_POLL_INTERVAL: Duration = Duration::from_secs(2);
 const RECEIPT_BACKFILL_MAX_WRITE_ROWS: usize = 50_000;
 const RECEIPT_BACKFILL_INFO_ROWS: usize = 10_000;
 
+/// How many blocks behind head to start realtime sync.
+pub(crate) const TAIL_WINDOW: u64 = 10;
+
 pub struct SyncEngine {
     /// Throttled pool - shared by all, but backfill is rate-limited
     throttled_pool: ThrottledPool,
@@ -213,6 +216,8 @@ impl SyncEngine {
         // Phase 2: Run realtime sync (no gap-fill needed)
         let mut realtime_progress = SyncProgress::new(self.chain_id, state.tip_num);
         info!(chain_id = self.chain_id, "Starting realtime sync");
+        // Measure silence from loop start, so a first tick that hangs is caught.
+        super::liveness::record_progress(self.chain_id);
 
         loop {
             tokio::select! {
@@ -221,6 +226,9 @@ impl SyncEngine {
                     break;
                 }
                 result = self.tick_realtime(&mut realtime_progress) => {
+                    // A tick that returns, even with an error, means the loop
+                    // is turning; /health only fails for a tick stuck in place.
+                    super::liveness::record_progress(self.chain_id);
                     if let Err(e) = result {
                         error!(error = %e, "Realtime sync tick failed");
                         tokio::time::sleep(Duration::from_secs(1)).await;
@@ -288,6 +296,9 @@ impl SyncEngine {
             .await
         });
 
+        // Measure silence from loop start, so a first tick that hangs is caught.
+        super::liveness::record_progress(self.chain_id);
+
         // Run realtime loop in foreground
         loop {
             tokio::select! {
@@ -296,6 +307,9 @@ impl SyncEngine {
                     break;
                 }
                 result = self.tick_realtime(&mut realtime_progress) => {
+                    // A tick that returns, even with an error, means the loop
+                    // is turning; /health only fails for a tick stuck in place.
+                    super::liveness::record_progress(self.chain_id);
                     if let Err(e) = result {
                         error!(error = %e, "Realtime sync tick failed");
                         tokio::time::sleep(Duration::from_secs(1)).await;
@@ -322,9 +336,6 @@ impl SyncEngine {
             .await?
             .unwrap_or_default();
         let remote_head = self.realtime_rpc.latest_block_number().await?;
-
-        // TAIL_WINDOW: how many blocks behind head to start realtime sync
-        const TAIL_WINDOW: u64 = 10;
 
         // Jump to near head immediately, don't catch up sequentially
         // Backfill-first mode never jumps: no gap-fill loop would fill the skipped range.
@@ -413,12 +424,15 @@ impl SyncEngine {
 
             let write_ms;
             let fetch_ms;
+            // A failed fetch of the next batch is returned only once the written batch is
+            // checkpointed, so a retry does not start below rows that are already stored.
+            let mut next_fetch = None;
             if let Some(fetch_fut) = next_fetch_future {
                 let fetch_start = std::time::Instant::now();
                 let (write_result, fetch_result) = tokio::join!(write_future, fetch_fut);
                 write_ms = write_result?;
                 fetch_ms = fetch_start.elapsed().as_millis();
-                current_fetch = Some(fetch_result?);
+                next_fetch = Some(fetch_result);
             } else {
                 write_ms = write_future.await?;
                 fetch_ms = 0;
@@ -472,6 +486,7 @@ impl SyncEngine {
                 "Realtime: wrote blocks+txs+receipts+logs"
             );
 
+            current_fetch = next_fetch.transpose()?;
             current_from = next_from;
             current_to = next_to;
         }
@@ -948,7 +963,11 @@ async fn tick_gapfill_parallel(
 
     // Adaptive throttling: pause backfill when realtime lag is high
     // This ensures realtime sync always has priority
-    let remote_head = rpc.latest_block_number().await.unwrap_or(state.tip_num);
+    // Without a head the lag is unknown, so the chain is not reported synced and no round runs.
+    let remote_head = rpc
+        .latest_block_number()
+        .await
+        .inspect_err(|_| metrics::set_synced(chain_id, false))?;
     let realtime_lag = remote_head.saturating_sub(state.tip_num);
 
     const LAG_THRESHOLD: u64 = 10; // Pause backfill if lag exceeds this

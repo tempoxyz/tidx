@@ -37,6 +37,16 @@ pub struct HttpConfig {
     /// Trusted CIDRs for admin operations (e.g., `100.64.0.0/10` for Tailscale)
     #[serde(default = "default_trusted_cidrs")]
     pub trusted_cidrs: Vec<String>,
+
+    /// API statements that may run at once in this process, one-shot queries
+    /// and live-stream statements together (default: 32). With several
+    /// `tidx serve` copies, the database sees copies x this many.
+    #[serde(default = "default_max_concurrent_queries")]
+    pub max_concurrent_queries: usize,
+
+    /// Live query streams this process accepts at once (default: 20).
+    #[serde(default = "default_max_live_connections")]
+    pub max_live_connections: usize,
 }
 
 impl Default for HttpConfig {
@@ -46,6 +56,8 @@ impl Default for HttpConfig {
             port: 8080,
             bind: "0.0.0.0".to_string(),
             trusted_cidrs: default_trusted_cidrs(),
+            max_concurrent_queries: default_max_concurrent_queries(),
+            max_live_connections: default_max_live_connections(),
         }
     }
 }
@@ -80,6 +92,14 @@ fn default_http_port() -> u16 {
 
 fn default_bind() -> String {
     "0.0.0.0".to_string()
+}
+
+fn default_max_concurrent_queries() -> usize {
+    32
+}
+
+fn default_max_live_connections() -> usize {
+    20
 }
 
 fn default_trusted_cidrs() -> Vec<String> {
@@ -229,6 +249,17 @@ pub struct PostgresConfig {
     /// When set, replaces the password in `api_url`. Has no effect without `api_url`.
     #[serde(default)]
     pub api_password_env: Option<String>,
+
+    /// Connections in the HTTP API's own pool: the `api_url` pool, and every
+    /// pool of `tidx serve` (default: 16).
+    #[serde(default)]
+    pub api_pool_size: Option<usize>,
+
+    /// How long an API request waits for a pooled connection before failing,
+    /// in milliseconds, for `tidx serve` (default: no limit beyond the query
+    /// timeout).
+    #[serde(default)]
+    pub api_pool_wait_ms: Option<u64>,
 }
 
 /// Configuration for ClickHouse OLAP engine
@@ -261,6 +292,33 @@ pub struct ClickHouseConfig {
     #[serde(default)]
     pub password_env: Option<String>,
 
+    /// ClickHouse user for `tidx serve`'s API queries, such as a read-only
+    /// user. It must be allowed to set query settings (tidx sends
+    /// `max_execution_time`, `max_result_bytes` and others on every
+    /// request), so use `readonly = 2` or SELECT-only grants, not
+    /// `readonly = 1`. Falls back to `user` and `password_env` when unset. `tidx up`
+    /// and `tidx sync` keep using `user`, which view management needs.
+    #[serde(default)]
+    pub api_user: Option<String>,
+
+    /// Environment variable holding `api_user`'s password.
+    #[serde(default)]
+    pub api_password_env: Option<String>,
+
+    /// ClickHouse URL for `tidx serve`'s native ClickHouse queries, such as a
+    /// replica that serves only reads, so that load stays off the replicas
+    /// `tidx sync` writes to. Falls back to `url` and `failover_urls` when
+    /// unset. Queries that PostgreSQL runs through pg_clickhouse (tiered
+    /// storage) use `fdw_url` instead; point that at the replica too to move
+    /// them.
+    #[serde(default)]
+    pub api_url: Option<String>,
+
+    /// Failover URLs for `api_url`, tried in order when it is unreachable,
+    /// such as the writer replicas. Needs `api_url`.
+    #[serde(default)]
+    pub api_failover_urls: Vec<String>,
+
     /// Scan and repair historical derived-table gaps on startup (default: true).
     #[serde(default = "default_true")]
     pub repair_derived_on_startup: bool,
@@ -292,6 +350,46 @@ impl ClickHouseConfig {
         urls
     }
 
+    /// URLs for API-only queries (`tidx serve`): `api_url` then
+    /// `api_failover_urls` when `api_url` is set, else [`Self::all_urls`].
+    pub fn api_urls(&self) -> Result<Vec<&str>> {
+        let Some(api_url) = &self.api_url else {
+            if !self.api_failover_urls.is_empty() {
+                anyhow::bail!(
+                    "clickhouse api_failover_urls is set without api_url; set api_url too"
+                );
+            }
+            return Ok(self.all_urls());
+        };
+        let mut urls = vec![api_url.as_str()];
+        urls.extend(self.api_failover_urls.iter().map(String::as_str));
+        Ok(urls)
+    }
+
+    /// The user and password for API-only queries: `api_user` and
+    /// `api_password_env` when `api_user` is set, else `user` and
+    /// `password_env`.
+    pub fn api_credentials(&self) -> Result<(Option<String>, Option<String>)> {
+        let Some(user) = &self.api_user else {
+            if self.api_password_env.is_some() {
+                anyhow::bail!(
+                    "clickhouse api_password_env is set without api_user; set api_user too, \
+                     or serve would silently query as the writer user"
+                );
+            }
+            return Ok((self.user.clone(), self.resolved_password()?));
+        };
+        let password = match &self.api_password_env {
+            Some(env_var) => Some(std::env::var(env_var).with_context(|| {
+                format!(
+                    "clickhouse api_password_env '{env_var}' is set but environment variable not found"
+                )
+            })?),
+            None => None,
+        };
+        Ok((Some(user.clone()), password))
+    }
+
     /// Resolve the ClickHouse password from the environment variable specified by `password_env`.
     pub fn resolved_password(&self) -> Result<Option<String>> {
         match &self.password_env {
@@ -317,6 +415,10 @@ impl Default for ClickHouseConfig {
             database: None,
             user: None,
             password_env: None,
+            api_user: None,
+            api_password_env: None,
+            api_url: None,
+            api_failover_urls: Vec::new(),
             repair_derived_on_startup: true,
             fdw_url: None,
             replicated_database: false,
@@ -400,6 +502,19 @@ impl ChainConfig {
             )?)),
             None => Ok(Some(api_url)),
         }
+    }
+
+    /// Size of the HTTP API's own Postgres pool (default 16).
+    pub fn api_pool_size(&self) -> Result<usize> {
+        Ok(self.postgres()?.api_pool_size.unwrap_or(16).max(1))
+    }
+
+    /// How long an API request may wait for a pooled connection.
+    pub fn api_pool_wait(&self) -> Result<Option<std::time::Duration>> {
+        Ok(self
+            .postgres()?
+            .api_pool_wait_ms
+            .map(std::time::Duration::from_millis))
     }
 
     /// PostgreSQL role the API pool connects as, when `postgres.api_url` is set
@@ -673,6 +788,8 @@ mod tests {
             password_env: None,
             api_url: None,
             api_password_env: None,
+            api_pool_size: None,
+            api_pool_wait_ms: None,
         }
     }
 
@@ -793,5 +910,53 @@ mod tests {
             redact_url_credentials("https://rpc.example.com/path"),
             "https://rpc.example.com/path"
         );
+    }
+
+    #[test]
+    fn clickhouse_api_urls_fall_back_to_writer_urls() {
+        let mut ch = ClickHouseConfig {
+            url: "http://w0:8123".to_string(),
+            failover_urls: vec!["http://w1:8123".to_string()],
+            ..Default::default()
+        };
+        assert_eq!(ch.api_urls().unwrap(), ["http://w0:8123", "http://w1:8123"]);
+
+        ch.api_url = Some("http://reader:8123".to_string());
+        ch.api_failover_urls = vec!["http://w0:8123".to_string()];
+        assert_eq!(
+            ch.api_urls().unwrap(),
+            ["http://reader:8123", "http://w0:8123"]
+        );
+        assert_eq!(ch.all_urls(), ["http://w0:8123", "http://w1:8123"]);
+
+        ch.api_url = None;
+        assert!(ch.api_urls().is_err());
+    }
+
+    #[test]
+    fn api_limits_default_to_previous_constants() {
+        // Configs written before these settings existed must behave as before.
+        let http: HttpConfig = toml::from_str("port = 8080").unwrap();
+        assert_eq!(http.max_concurrent_queries, 32);
+        assert_eq!(http.max_live_connections, 20);
+        let pg: PostgresConfig = toml::from_str("url = \"postgres://u@h/db\"").unwrap();
+        assert_eq!(pg.api_pool_size, None);
+        assert_eq!(pg.api_pool_wait_ms, None);
+    }
+
+    #[test]
+    fn clickhouse_api_credentials_fall_back_to_writer_user() {
+        let ch: ClickHouseConfig = toml::from_str("user = \"writer\"").unwrap();
+        assert_eq!(ch.api_credentials().unwrap(), (Some("writer".into()), None));
+
+        let ch: ClickHouseConfig =
+            toml::from_str("user = \"writer\"\napi_user = \"reader\"").unwrap();
+        assert_eq!(ch.api_credentials().unwrap(), (Some("reader".into()), None));
+
+        // A password without its user is a config error, not a silent
+        // fallback to the writer.
+        let ch: ClickHouseConfig =
+            toml::from_str("user = \"writer\"\napi_password_env = \"X\"").unwrap();
+        assert!(ch.api_credentials().is_err());
     }
 }

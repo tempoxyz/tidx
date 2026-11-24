@@ -541,6 +541,7 @@ mod tests {
             clickhouse_engines: Arc::new(RwLock::new(HashMap::new())),
             trusted_cidrs: Arc::new(StdRwLock::new(trusted_cidrs)),
             query_permits: Arc::new(Semaphore::new(1)),
+            max_live_connections: 20,
         }
     }
 

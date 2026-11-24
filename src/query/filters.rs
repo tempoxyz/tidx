@@ -175,13 +175,13 @@ impl Filter<'_> {
         }
     }
 
-    fn column<'a>(&self, expr: &'a Expr) -> Option<(&'a Ident, bool)> {
+    fn column<'a>(&self, expr: &'a Expr) -> Option<&'a Ident> {
         match unnested(expr) {
-            Expr::Identifier(ident) => Some((ident, false)),
+            Expr::Identifier(ident) => Some(ident),
             Expr::CompoundIdentifier(parts)
                 if parts.len() == 2 && self.key(&parts[0]) == self.key(self.qualifier) =>
             {
-                Some((&parts[1], true))
+                Some(&parts[1])
             }
             _ => None,
         }
@@ -190,7 +190,7 @@ impl Filter<'_> {
     fn comparison(&mut self, column: &Expr, literal: &Expr) {
         let column = unnested(column);
         let literal = unnested(literal);
-        let Some((ident, qualified)) = self.column(column) else {
+        let Some(ident) = self.column(column) else {
             return;
         };
         let Expr::Value(value) = literal else { return };
@@ -219,18 +219,14 @@ impl Filter<'_> {
                     (alias == name || alias == topic)
                         && self
                             .column(expr)
-                            .is_none_or(|(column, _)| self.key(column) != alias)
+                            .is_none_or(|column| self.key(column) != alias)
                 })
             {
                 return;
             }
             if let Some(encoded) = EventSignature::encode_value_for_pushdown(&param.ty, value) {
-                let topic = if qualified {
-                    format!("{}.{topic}", self.qualifier)
-                } else {
-                    topic
-                };
-                self.edits.push((column.span(), topic));
+                // Replace only the column name: the caller's qualifier text stays verbatim.
+                self.edits.push((ident.span, topic));
                 self.edits.push((literal.span(), format!("'0x{encoded}'")));
             }
             return;
@@ -248,6 +244,10 @@ fn unnested(mut expr: &Expr) -> &Expr {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::query::parser::{
+        apply_event_signature_ctes_clickhouse, apply_event_signature_ctes_postgres,
+        apply_event_signature_ctes_tiered,
+    };
 
     #[test]
     fn rewrites_each_predicate_without_touching_other_tokens() {
@@ -259,6 +259,35 @@ mod tests {
             "0".repeat(56)
         );
         assert_eq!(sig.rewrite_filters_for_pushdown(sql), expected);
+    }
+
+    #[test]
+    fn keeps_the_callers_qualifier_text() {
+        let signature = "Paid(uint256 indexed amount)";
+        let word = format!("0x{:064x}", 1);
+        // Two adjacent quotes and a backslash before a quote are printed back differently by
+        // sqlparser, so a reprinted qualifier would name another relation.
+        for alias in [r#""q""""r""#, r#""q\""r""#, r#""q""r""#, "q"] {
+            let sql = format!("SELECT 1 FROM Paid AS {alias} WHERE {alias}.amount = 1");
+            let expected = format!("SELECT 1 FROM Paid AS {alias} WHERE {alias}.topic1 = '{word}'");
+            for apply in [
+                apply_event_signature_ctes_postgres,
+                apply_event_signature_ctes_clickhouse,
+                apply_event_signature_ctes_tiered,
+            ] {
+                let rewritten = apply(&sql, &[signature]).unwrap();
+                assert!(rewritten.ends_with(&expected), "{rewritten}");
+            }
+        }
+
+        // Only the column name is replaced, whatever surrounds it.
+        let sig = EventSignature::parse(signature).unwrap();
+        assert_eq!(
+            sig.rewrite_filters_for_pushdown(
+                r#"SELECT 1 FROM Paid AS "q""""r" WHERE ("q""""r" . "amount") = 1"#
+            ),
+            format!(r#"SELECT 1 FROM Paid AS "q""""r" WHERE ("q""""r" . topic1) = '{word}'"#)
+        );
     }
 
     #[test]

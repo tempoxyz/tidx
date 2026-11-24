@@ -94,7 +94,7 @@ cargo bench
 ## Architecture
 
 - `src/api/` - HTTP API server (axum router, handlers)
-- `src/cli/` - CLI commands (up, status, query, sync, compress)
+- `src/cli/` - CLI commands (up, sync, serve, status, query, views)
 - `src/service/` - Shared business logic (status, query execution)
 - `src/sync/` - Sync engine, RPC fetcher, decoder, writer
 - `src/db/` - Database pool and schema management
