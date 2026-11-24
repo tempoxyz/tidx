@@ -91,7 +91,7 @@ pub async fn get_all_status(pool: &Pool) -> Result<Vec<SyncStatus>> {
             // Blocks at or below the prune floor were intentionally dropped.
             let backfill_remaining = match backfill_num {
                 None => synced_num.saturating_sub(1 + pruned_below).max(0),
-                Some(n) => n.saturating_sub(pruned_below).max(0),
+                Some(n) => n.saturating_sub(1 + pruned_below).max(0),
             };
 
             let sync_rate = started_at.and_then(|started| {

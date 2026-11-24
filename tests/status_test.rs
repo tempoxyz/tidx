@@ -250,6 +250,7 @@ async fn test_get_all_status_uses_single_pool_connection() {
 
     assert_eq!(statuses.len(), 1);
     assert_eq!(statuses[0].chain_id, 1);
+    assert_eq!(statuses[0].backfill_remaining, 0);
     assert_eq!(statuses[0].archive_backfill_num, Some(5));
     assert_eq!(statuses[0].archive_tip_num, Some(20));
     assert_eq!(statuses[0].archive_backfill_remaining, Some(4));
