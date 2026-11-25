@@ -432,7 +432,7 @@ impl Int64Shape {
                 .enumerate()
                 .filter_map(|(i, element)| {
                     let (name, ty) = ch_tuple_element(element);
-                    Some((i, name.map(str::to_string), Self::parse(ty, depth + 1)?))
+                    Some((i, name, Self::parse(ty, depth + 1)?))
                 })
                 .collect();
             (!fields.is_empty()).then_some(Self::Tuple(fields))
@@ -517,14 +517,32 @@ fn split_ch_type_args(args: &str) -> Vec<&str> {
 
 /// A tuple element's name, if any, and type: `n UInt64`, `` `a b` UInt64 ``
 /// or `UInt64`. A bare type has no space before its first parenthesis.
-fn ch_tuple_element(element: &str) -> (Option<&str>, &str) {
-    if let Some(rest) = element.strip_prefix('`')
-        && let Some((name, ty)) = rest.split_once('`')
-    {
-        return (Some(name), ty.trim());
+/// Backquoted names are decoded: ClickHouse escapes `` ` `` and `\` in them
+/// with a backslash, and JSON output keys tuples by the decoded name.
+fn ch_tuple_element(element: &str) -> (Option<String>, &str) {
+    if let Some(rest) = element.strip_prefix('`') {
+        let mut name = String::new();
+        let mut chars = rest.char_indices();
+        while let Some((i, c)) = chars.next() {
+            match c {
+                '`' => return (Some(name), rest[i + 1..].trim()),
+                '\\' => match chars.next() {
+                    Some((_, 'n')) => name.push('\n'),
+                    Some((_, 't')) => name.push('\t'),
+                    Some((_, 'r')) => name.push('\r'),
+                    Some((_, '0')) => name.push('\0'),
+                    Some((_, escaped)) => name.push(escaped),
+                    None => break,
+                },
+                _ => name.push(c),
+            }
+        }
+        return (None, element);
     }
     match element.find([' ', '(']) {
-        Some(i) if element[i..].starts_with(' ') => (Some(&element[..i]), element[i..].trim()),
+        Some(i) if element[i..].starts_with(' ') => {
+            (Some(element[..i].to_string()), element[i..].trim())
+        }
         _ => (None, element),
     }
 }
@@ -1584,6 +1602,7 @@ mod tests {
                 "Array(UInt256)",
                 "Array(Nullable(Int64))",
                 "Tuple(`a b` Int64, e Enum8('x,y' = 1), arr Array(String))",
+                "Tuple(`a\\`b` UInt64, `c\\\\d` UInt64, `e\\`f` UInt64)",
             ],
             vec![vec![
                 json!(["1", "18446744073709551615"]),
@@ -1598,6 +1617,7 @@ mod tests {
                 ]),
                 json!([null, "9"]),
                 json!({"a b": "10", "e": "x,y", "arr": ["11"]}),
+                json!({"a`b": "5", "c\\d": "6", "e`f": "7"}),
             ]],
         );
         normalize_int64_columns(&mut r);
@@ -1616,6 +1636,7 @@ mod tests {
                 ]),
                 json!([null, 9]),
                 json!({"a b": 10, "e": "x,y", "arr": ["11"]}),
+                json!({"a`b": 5, "c\\d": 6, "e`f": 7}),
             ]
         );
     }
