@@ -1427,6 +1427,7 @@ mod tests {
                 "Tuple(`a b` Int64, e Enum8('x,y' = 1), arr Array(String))",
                 "Tuple(`a\\`b` UInt64, `c\\\\d` UInt64, `e\\`f` UInt64)",
                 "Array(Tuple(DateTime64(3, 'U,T(C'), UInt64))",
+                "Tuple(`a\\bb\\fc` UInt64, abc String)",
             ],
             vec![vec![
                 json!(["1", "18446744073709551615"]),
@@ -1443,6 +1444,7 @@ mod tests {
                 json!({"a b": "10", "e": "x,y", "arr": ["11"]}),
                 json!({"a`b": "5", "c\\d": "6", "e`f": "7"}),
                 json!([["2026-01-01T00:00:00.000Z", "12"]]),
+                json!({"a\u{8}b\u{c}c": "5", "abc": "9"}),
             ]],
         );
         crate::clickhouse::normalize_int64_columns(&mut r);
@@ -1463,6 +1465,7 @@ mod tests {
                 json!({"a b": 10, "e": "x,y", "arr": ["11"]}),
                 json!({"a`b": 5, "c\\d": 6, "e`f": 7}),
                 json!([["2026-01-01T00:00:00.000Z", 12]]),
+                json!({"a\u{8}b\u{c}c": 5, "abc": "9"}),
             ]
         );
     }

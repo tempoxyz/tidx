@@ -23,9 +23,10 @@ const MAX_QUERY_RESULT_BYTES: usize = 10 * 1024 * 1024;
 /// Bytes read from a ClickHouse response body. The response must still be
 /// within [`MAX_QUERY_RESULT_BYTES`] once the quotes ClickHouse puts around
 /// 64-bit integers are discounted, so pinning their quoting does not reject
-/// results that fit unquoted; `max_result_bytes` (at least 8 bytes per such
-/// value) bounds how many there are, and this bounds what is read meanwhile.
-const MAX_RESPONSE_BYTES: usize = 2 * MAX_QUERY_RESULT_BYTES;
+/// results that fit unquoted. `max_result_bytes` holds each such value in
+/// at least 8 bytes, so quoting adds at most 2 bytes per 8: a quarter more.
+/// Larger bodies are rejected while reading, before any parsing.
+const MAX_RESPONSE_BYTES: usize = MAX_QUERY_RESULT_BYTES + MAX_QUERY_RESULT_BYTES / 4;
 
 /// Working memory ClickHouse may use for one public API query; internal
 /// queries keep the server profile's limit.
@@ -839,6 +840,8 @@ impl<'a> TypeCursor<'a> {
                     let escaped = self.peek()?;
                     self.pos += 1;
                     out.push(match escaped {
+                        b'b' => 0x08,
+                        b'f' => 0x0c,
                         b'n' => b'\n',
                         b't' => b'\t',
                         b'r' => b'\r',
