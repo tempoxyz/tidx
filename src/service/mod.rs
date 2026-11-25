@@ -284,7 +284,7 @@ impl PostgresQuery {
 /// tiered cold arm): ISO timestamps for [`normalize_datetime_columns`].
 /// 64-bit+ integers arrive as exact quoted strings (every ClickHouse request
 /// pins `output_format_json_quote_64bit_integers=1`); 64-bit ones are then
-/// converted to JSON numbers by [`normalize_int64_columns`].
+/// converted to JSON numbers by [`crate::clickhouse::normalize_int64_columns`].
 const CH_QUERY_SETTINGS: &[(&str, &str)] = &[
     ("date_time_output_format", "iso"),
     // No `final = 1`: reads match the native ClickHouse engine's semantics
@@ -309,7 +309,7 @@ pub async fn execute_query_clickhouse(
         )
         .await?;
     normalize_datetime_columns(&mut result);
-    normalize_int64_columns(&mut result);
+    crate::clickhouse::normalize_int64_columns(&mut result);
     Ok(result.into())
 }
 
@@ -347,7 +347,7 @@ fn normalize_datetime_columns(result: &mut crate::clickhouse::QueryResult) {
 /// Rewrite ClickHouse JSON values to the hot (PostgreSQL) arm's
 /// representations, per column type:
 ///
-/// - `Int64`/`UInt64`: see [`normalize_int64_columns`];
+/// - `Int64`/`UInt64`: see [`crate::clickhouse::normalize_int64_columns`];
 /// - `DateTime*`: see [`normalize_datetime_columns`];
 /// - `(U)Int128`/`(U)Int256`: kept as ClickHouse's exact quoted decimal
 ///   string, matching PG NUMERIC's formatting in [`try_format_column_json`];
@@ -367,285 +367,7 @@ fn normalize_cold_result(
         }
     }
     normalize_datetime_columns(result);
-    normalize_int64_columns(result);
-}
-
-/// Rewrite `Int64`/`UInt64` values from ClickHouse's quoted strings to JSON
-/// numbers, as PostgreSQL formats int8, including those nested in `Array`,
-/// `Tuple` and `Map` values; wider integers stay exact strings.
-pub fn normalize_int64_columns(result: &mut crate::clickhouse::QueryResult) {
-    for (i, ty) in result.column_types.iter().enumerate() {
-        // Parsed once per column, so the walk costs O(values), not
-        // O(values × type length).
-        let Some(shape) = Int64Shape::parse(ty) else {
-            continue;
-        };
-        for row in &mut result.rows {
-            if let Some(cell) = row.get_mut(i) {
-                shape.apply(cell);
-            }
-        }
-    }
-}
-
-/// Where a ClickHouse type holds `Int64`/`UInt64` values. Types without any
-/// parse to `None`, so their values are never walked. In JSON output, arrays
-/// and unnamed tuples are JSON arrays; maps and named tuples are objects.
-enum Int64Shape {
-    Int64,
-    UInt64,
-    Array(Box<Int64Shape>),
-    Map(Box<Int64Shape>),
-    /// Element position, name (for named tuples) and shape.
-    Tuple(Vec<(usize, Option<String>, Int64Shape)>),
-}
-
-impl Int64Shape {
-    /// Deeper types are left as they are: serde_json already refuses JSON
-    /// nested past 128 levels.
-    const MAX_DEPTH: usize = 128;
-
-    /// Parse a column type in one pass, so the cost is linear in its length.
-    /// Malformed or unknown types parse to `None` and are left as they are.
-    fn parse(ty: &str) -> Option<Self> {
-        if !ty.contains("Int64") {
-            return None;
-        }
-        let mut c = TypeCursor {
-            s: ty.as_bytes(),
-            pos: 0,
-        };
-        let shape = Self::parse_type(&mut c, 0).ok()??;
-        c.skip_ws();
-        (c.pos == c.s.len()).then_some(shape)
-    }
-
-    /// One type at the cursor, if it holds 64-bit integers.
-    fn parse_type(c: &mut TypeCursor, depth: usize) -> Result<Option<Self>, Malformed> {
-        c.skip_ws();
-        let name = c.ident();
-        if name.is_empty() {
-            return Err(Malformed);
-        }
-        Self::parse_after_name(c, name, depth)
-    }
-
-    fn parse_after_name(
-        c: &mut TypeCursor,
-        name: &str,
-        depth: usize,
-    ) -> Result<Option<Self>, Malformed> {
-        if c.peek() != Some(b'(') {
-            return Ok(match name {
-                "Int64" => Some(Self::Int64),
-                "UInt64" => Some(Self::UInt64),
-                _ => None,
-            });
-        }
-        c.pos += 1;
-        if depth >= Self::MAX_DEPTH {
-            c.skip_args().ok_or(Malformed)?;
-            return Ok(None);
-        }
-        let shape = match name {
-            "Nullable" | "LowCardinality" => Self::parse_type(c, depth + 1)?,
-            "Array" => Self::parse_type(c, depth + 1)?.map(|s| Self::Array(Box::new(s))),
-            "Map" => {
-                Self::parse_type(c, depth + 1)?;
-                if !c.eat(b',') {
-                    return Err(Malformed);
-                }
-                Self::parse_type(c, depth + 1)?.map(|s| Self::Map(Box::new(s)))
-            }
-            "Tuple" => {
-                let mut fields = Vec::new();
-                for i in 0.. {
-                    let (field, shape) = Self::parse_tuple_element(c, depth + 1)?;
-                    if let Some(shape) = shape {
-                        fields.push((i, field, shape));
-                    }
-                    if !c.eat(b',') {
-                        break;
-                    }
-                }
-                (!fields.is_empty()).then_some(Self::Tuple(fields))
-            }
-            // Arguments of other types, such as `DateTime64(3, 'UTC')`.
-            _ => {
-                c.skip_args().ok_or(Malformed)?;
-                return Ok(None);
-            }
-        };
-        if c.eat(b')') {
-            Ok(shape)
-        } else {
-            Err(Malformed)
-        }
-    }
-
-    /// A tuple element: `n UInt64`, `` `a b` UInt64 `` or `UInt64`. ClickHouse
-    /// escapes `` ` `` and `\` in backquoted names with a backslash, and JSON
-    /// output keys named tuples by the decoded name.
-    fn parse_tuple_element(
-        c: &mut TypeCursor,
-        depth: usize,
-    ) -> Result<(Option<String>, Option<Self>), Malformed> {
-        c.skip_ws();
-        if c.peek() == Some(b'`') {
-            let name = c.quoted().and_then(|n| String::from_utf8(n).ok());
-            let name = name.ok_or(Malformed)?;
-            return Ok((Some(name), Self::parse_type(c, depth)?));
-        }
-        let first = c.ident();
-        if first.is_empty() {
-            return Err(Malformed);
-        }
-        let after = c.pos;
-        c.skip_ws();
-        if c.pos > after
-            && c.peek()
-                .is_some_and(|b| b.is_ascii_alphabetic() || b == b'_')
-        {
-            return Ok((Some(first.to_string()), Self::parse_type(c, depth)?));
-        }
-        c.pos = after;
-        Ok((None, Self::parse_after_name(c, first, depth)?))
-    }
-
-    fn apply(&self, value: &mut serde_json::Value) {
-        use serde_json::Value;
-        match (self, value) {
-            (Self::Int64, value @ Value::String(_)) => {
-                if let Some(v) = value.as_str().and_then(|s| s.parse::<i64>().ok()) {
-                    *value = Value::Number(v.into());
-                }
-            }
-            (Self::UInt64, value @ Value::String(_)) => {
-                if let Some(v) = value.as_str().and_then(|s| s.parse::<u64>().ok()) {
-                    *value = Value::Number(v.into());
-                }
-            }
-            (Self::Array(element), Value::Array(items)) => {
-                for v in items {
-                    element.apply(v);
-                }
-            }
-            (Self::Map(v_shape), Value::Object(entries)) => {
-                for v in entries.values_mut() {
-                    v_shape.apply(v);
-                }
-            }
-            (Self::Tuple(fields), Value::Array(items)) => {
-                for (i, _, shape) in fields {
-                    if let Some(v) = items.get_mut(*i) {
-                        shape.apply(v);
-                    }
-                }
-            }
-            (Self::Tuple(fields), Value::Object(entries)) => {
-                for (_, name, shape) in fields {
-                    if let Some(v) = name.as_deref().and_then(|n| entries.get_mut(n)) {
-                        shape.apply(v);
-                    }
-                }
-            }
-            _ => {}
-        }
-    }
-}
-
-/// A ClickHouse type string [`Int64Shape::parse`] cannot read.
-struct Malformed;
-
-/// A position in a ClickHouse type string, for [`Int64Shape::parse`].
-struct TypeCursor<'a> {
-    s: &'a [u8],
-    pos: usize,
-}
-
-impl<'a> TypeCursor<'a> {
-    fn peek(&self) -> Option<u8> {
-        self.s.get(self.pos).copied()
-    }
-
-    fn skip_ws(&mut self) {
-        while self.peek().is_some_and(|b| b.is_ascii_whitespace()) {
-            self.pos += 1;
-        }
-    }
-
-    /// Consume `b` after any whitespace.
-    fn eat(&mut self, b: u8) -> bool {
-        self.skip_ws();
-        let found = self.peek() == Some(b);
-        if found {
-            self.pos += 1;
-        }
-        found
-    }
-
-    fn ident(&mut self) -> &'a str {
-        let start = self.pos;
-        while self
-            .peek()
-            .is_some_and(|b| b.is_ascii_alphanumeric() || b == b'_')
-        {
-            self.pos += 1;
-        }
-        // ASCII only, so always valid UTF-8.
-        std::str::from_utf8(&self.s[start..self.pos]).unwrap_or_default()
-    }
-
-    /// The decoded contents of the quoted string at the cursor (`'…'`,
-    /// `` `…` `` or `"…"`), with backslash escapes resolved.
-    fn quoted(&mut self) -> Option<Vec<u8>> {
-        let quote = self.peek()?;
-        self.pos += 1;
-        let mut out = Vec::new();
-        loop {
-            let b = self.peek()?;
-            self.pos += 1;
-            match b {
-                b'\\' => {
-                    let escaped = self.peek()?;
-                    self.pos += 1;
-                    out.push(match escaped {
-                        b'n' => b'\n',
-                        b't' => b'\t',
-                        b'r' => b'\r',
-                        b'0' => 0,
-                        other => other,
-                    });
-                }
-                b if b == quote => return Some(out),
-                b => out.push(b),
-            }
-        }
-    }
-
-    /// Skip to just past the `)` closing the argument list the cursor is in,
-    /// ignoring parentheses inside quotes.
-    fn skip_args(&mut self) -> Option<()> {
-        let mut depth = 1usize;
-        loop {
-            match self.peek()? {
-                b'\'' | b'`' | b'"' => {
-                    self.quoted()?;
-                    continue;
-                }
-                b'(' => depth += 1,
-                b')' => {
-                    depth -= 1;
-                    if depth == 0 {
-                        self.pos += 1;
-                        return Some(());
-                    }
-                }
-                _ => {}
-            }
-            self.pos += 1;
-        }
-    }
+    crate::clickhouse::normalize_int64_columns(result);
 }
 
 /// Floor for the cold arm's remaining timeout budget.
@@ -1723,7 +1445,7 @@ mod tests {
                 json!([["2026-01-01T00:00:00.000Z", "12"]]),
             ]],
         );
-        normalize_int64_columns(&mut r);
+        crate::clickhouse::normalize_int64_columns(&mut r);
         assert_eq!(
             r.rows[0],
             [

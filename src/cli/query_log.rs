@@ -76,7 +76,7 @@ pub async fn run(args: Args) -> Result<()> {
                     "reading system.query_log (the user needs SELECT on system.query_log)",
                 )?;
                 // Counts and timings are UInt64, quoted by ClickHouse.
-                tidx::service::normalize_int64_columns(&mut result);
+                tidx::clickhouse::normalize_int64_columns(&mut result);
                 rows_to_json(&result.columns, result.rows)
             }
             _ => json!({ "skipped": "ClickHouse is not enabled for this chain" }),

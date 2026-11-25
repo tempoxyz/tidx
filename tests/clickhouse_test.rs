@@ -1014,6 +1014,31 @@ async fn test_execute_query_clickhouse_keeps_wide_integers_exact() {
             serde_json::json!(["18446744073709551617"]),
         ]]
     );
+
+    // The 10 MiB response limit discounts the quotes around 64-bit integers:
+    // 480,000 × u64::MAX is about 10.08 MB unquoted (under 10 MiB) but
+    // 11.04 MB quoted, while 520,000 is over the limit either way.
+    let big_array =
+        |n: usize| format!("SELECT arrayWithConstant({n}, toUInt64('18446744073709551615')) AS a");
+    let result = tidx::service::execute_query_clickhouse(
+        &engine,
+        &big_array(480_000),
+        &[],
+        &tidx::service::QueryOptions::default(),
+    )
+    .await
+    .expect("a result under 10 MiB unquoted must be returned");
+    assert_eq!(result.rows[0][0].as_array().map(Vec::len), Some(480_000));
+    assert_eq!(result.rows[0][0][0], serde_json::json!(u64::MAX));
+    let err = tidx::service::execute_query_clickhouse(
+        &engine,
+        &big_array(520_000),
+        &[],
+        &tidx::service::QueryOptions::default(),
+    )
+    .await
+    .expect_err("a result over 10 MiB unquoted must be rejected");
+    assert!(err.to_string().contains("exceeded 10485760 bytes"), "{err}");
 }
 
 /// `query_user` (the public /query path) must execute parenthesized UNION arms
