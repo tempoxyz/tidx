@@ -9,7 +9,7 @@ use sqlparser::ast::{
 };
 use sqlparser::dialect::{Dialect, GenericDialect};
 use sqlparser::parser::Parser;
-use sqlparser::tokenizer::Token;
+use sqlparser::tokenizer::{Token, Tokenizer, Whitespace};
 
 const POSTGRES_ALLOWED_TABLES: &[&str] = &["blocks", "txs", "logs", "receipts"];
 
@@ -35,6 +35,7 @@ pub fn validate_query(sql: &str) -> Result<()> {
     {
         return Err(anyhow!("LIMIT ALL is not allowed"));
     }
+    reject_carriage_return_in_line_comments(sql)?;
 
     match parse_single_statement(&GenericDialect {}, sql)? {
         Statement::Query(query) => {
@@ -74,6 +75,31 @@ pub(crate) fn parse_single_statement(dialect: &dyn Dialect, sql: &str) -> Result
             "SQL parse error: unexpected '{token}' after the query"
         )),
     }
+}
+
+/// Rejects `--` comments that PostgreSQL ends before the validator does.
+///
+/// PostgreSQL ends a `--` comment at `\r` as well as `\n`, but [GenericDialect]
+/// only at `\n`, so text after a lone `\r` would run on PostgreSQL without
+/// ever being validated. A `\r\n` line ending is accepted: both end the comment
+/// there.
+fn reject_carriage_return_in_line_comments(sql: &str) -> Result<()> {
+    let tokens = Tokenizer::new(&GenericDialect {}, sql)
+        .tokenize()
+        .map_err(|e| anyhow!("SQL parse error: {e}"))?;
+    for token in tokens {
+        if let Token::Whitespace(Whitespace::SingleLineComment { comment, .. }) = token
+            && comment
+                .strip_suffix("\r\n")
+                .unwrap_or(&comment)
+                .contains('\r')
+        {
+            return Err(anyhow!(
+                "Carriage return inside a '--' comment is not allowed"
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// Validates that a ClickHouse user query is safe to execute.
@@ -2093,6 +2119,30 @@ mod tests {
             "WITH x AS (UPDA/**/TE blocks SET miner = 'pwn' RETURNING 1) SELECT * FROM x",
         );
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_rejects_carriage_return_comment_bypass() {
+        for sql in [
+            // PostgreSQL runs everything after the `\r`.
+            "SELECT 1 AS a --\r, current_setting('data_directory') AS leak, \
+             (SELECT count(*) FROM pg_stat_activity) AS sessions",
+            "SELECT num FROM blocks -- x\rWHERE pg_sleep(5) IS NULL",
+            "SELECT num FROM blocks -- x\r",
+        ] {
+            assert_eq!(
+                validate_query(sql).unwrap_err().to_string(),
+                "Carriage return inside a '--' comment is not allowed",
+                "{sql:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_allows_crlf_line_comments() {
+        assert!(validate_query("SELECT num -- block number\r\nFROM blocks").is_ok());
+        assert!(validate_query("SELECT num FROM blocks /* \r */").is_ok());
+        assert!(validate_query("SELECT '--\r' AS s FROM blocks").is_ok());
     }
 
     #[test]
