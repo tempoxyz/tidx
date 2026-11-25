@@ -1306,6 +1306,10 @@ impl FromSql<'_> for PgNumericText {
             }
         };
 
+        // Exponent of the last stored digit; positions below it are zero
+        // and are appended in bulk, since a value such as 1e131068 is one
+        // stored digit followed by 32,767 zero groups.
+        let lowest = weight - ndigits as i64 + 1;
         let mut out = String::new();
         if negative {
             out.push('-');
@@ -1314,19 +1318,26 @@ impl FromSql<'_> for PgNumericText {
             out.push('0');
         } else {
             write!(out, "{}", digit(weight)?)?;
-            for exp in (0..weight).rev() {
+            for exp in (lowest.max(0)..weight).rev() {
                 write!(out, "{:04}", digit(exp)?)?;
             }
+            let zero_groups = usize::try_from(lowest.clamp(0, weight)).unwrap_or(0);
+            out.push_str(&"0000".repeat(zero_groups));
         }
         if dscale > 0 {
             out.push('.');
-            let mut fraction = String::with_capacity(dscale + 3);
-            let mut exp = -1;
-            while fraction.len() < dscale {
+            // Zero groups between the point and the first stored digit,
+            // then the stored fraction digits, then zeros up to `dscale`.
+            let leading = usize::try_from(-1 - weight).unwrap_or(0);
+            let mut fraction = "0000".repeat(leading.min(dscale.div_ceil(4)));
+            let mut exp = weight.min(-1);
+            while fraction.len() < dscale && exp >= lowest {
                 write!(fraction, "{:04}", digit(exp)?)?;
                 exp -= 1;
             }
-            out.push_str(&fraction[..dscale]);
+            fraction.truncate(dscale);
+            out.push_str(&fraction);
+            out.push_str(&"0".repeat(dscale - fraction.len()));
         }
         Ok(Self(Some(out)))
     }

@@ -1266,6 +1266,28 @@ async fn test_query_postgres_cell_json_formats() {
         r#"[[7,-42,9007199254740993,"123.4500","-0.5","0","0.0010","10000.0001","1234567890123456789012345678901234567890","79228162514264337593543950337","115792089237316195423570985008687907853269984665640564039457584007913129639935","-57896044618658097711785492504343953926634992332820282019728792003956564819968.25",null,1.5,null,"0xdeadbeef","0x","héllo \"q\"","v","n","2024-01-01T21:34:05.678+00:00",true,null,null,null,null,null,null,null]]"#
     );
 
+    // NUMERIC matches PostgreSQL's own text output, across digit-group
+    // boundaries, leading and trailing zero groups, scales and signs.
+    let result = execute_query_postgres(
+        &db.pool,
+        r#"SELECT n, n::text FROM (VALUES
+            (0::numeric), (0.000::numeric), (1::numeric), (-1::numeric), (9999::numeric),
+            (10000::numeric), (100000000::numeric), (123456789012::numeric),
+            (0.0001::numeric), (0.00001::numeric), (-0.000000012300::numeric),
+            (1.5e-30::numeric), (12345.6789::numeric), (10000.00010000::numeric),
+            (1e40::numeric), (1e40::numeric(60, 5)), (-98765432109876543210.012345::numeric),
+            (1e131068::numeric), (1e-16000::numeric), (12e-16380::numeric)
+        ) AS t(n)"#,
+        &[],
+        &opts,
+    )
+    .await
+    .expect("Query failed");
+    assert_eq!(result.rows.len(), 20);
+    for row in &result.rows {
+        assert_eq!(row[0], row[1]);
+    }
+
     // Oversized cells and results fail the query. Values are stored directly
     // so the query itself does not need functions that build large values.
     let block_num = 74_000_000_i64;
