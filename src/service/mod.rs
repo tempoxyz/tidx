@@ -375,68 +375,111 @@ fn normalize_cold_result(
 /// `Tuple` and `Map` values; wider integers stay exact strings.
 pub fn normalize_int64_columns(result: &mut crate::clickhouse::QueryResult) {
     for (i, ty) in result.column_types.iter().enumerate() {
-        if !ty.contains("Int64") {
+        // Parsed once per column, so the walk costs O(values), not
+        // O(values × type length).
+        let Some(shape) = Int64Shape::parse(ty, 0) else {
             continue;
-        }
+        };
         for row in &mut result.rows {
             if let Some(cell) = row.get_mut(i) {
-                int64_to_numbers(ty, cell);
+                shape.apply(cell);
             }
         }
     }
 }
 
-/// [`normalize_int64_columns`] for one value of ClickHouse type `ty`. In
-/// JSON output, arrays and unnamed tuples are JSON arrays, and maps and named
-/// tuples are JSON objects.
-fn int64_to_numbers(ty: &str, value: &mut serde_json::Value) {
-    use serde_json::Value;
-    let ty = ch_base_type(ty);
-    let args = |prefix: &str| {
-        ty.strip_prefix(prefix)
-            .and_then(|t| t.strip_suffix(')'))
-            .map(split_ch_type_args)
-    };
-    match value {
-        Value::String(s) => {
-            let number = match ty {
-                "Int64" => s.parse::<i64>().ok().map(serde_json::Number::from),
-                "UInt64" => s.parse::<u64>().ok().map(serde_json::Number::from),
-                _ => None,
-            };
-            if let Some(n) = number {
-                *value = Value::Number(n);
-            }
+/// Where a ClickHouse type holds `Int64`/`UInt64` values. Types without any
+/// parse to `None`, so their values are never walked. In JSON output, arrays
+/// and unnamed tuples are JSON arrays; maps and named tuples are objects.
+enum Int64Shape {
+    Int64,
+    UInt64,
+    Array(Box<Int64Shape>),
+    Map(Box<Int64Shape>),
+    /// Element position, name (for named tuples) and shape.
+    Tuple(Vec<(usize, Option<String>, Int64Shape)>),
+}
+
+impl Int64Shape {
+    /// Deeper types are left as they are: serde_json already refuses JSON
+    /// nested past 128 levels.
+    const MAX_DEPTH: usize = 128;
+
+    fn parse(ty: &str, depth: usize) -> Option<Self> {
+        if depth > Self::MAX_DEPTH || !ty.contains("Int64") {
+            return None;
         }
-        Value::Array(items) => {
-            if let Some(element) = args("Array(") {
-                let element = element.first().copied().unwrap_or_default();
+        let ty = ch_base_type(ty);
+        let args = |prefix: &str| {
+            ty.strip_prefix(prefix)
+                .and_then(|t| t.strip_suffix(')'))
+                .map(split_ch_type_args)
+        };
+        match ty {
+            "Int64" => return Some(Self::Int64),
+            "UInt64" => return Some(Self::UInt64),
+            _ => {}
+        }
+        if let Some(element) = args("Array(") {
+            let element = Self::parse(element.first()?, depth + 1)?;
+            Some(Self::Array(Box::new(element)))
+        } else if let Some(kv) = args("Map(") {
+            let value = Self::parse(kv.get(1)?, depth + 1)?;
+            Some(Self::Map(Box::new(value)))
+        } else if let Some(elements) = args("Tuple(") {
+            let fields: Vec<_> = elements
+                .into_iter()
+                .enumerate()
+                .filter_map(|(i, element)| {
+                    let (name, ty) = ch_tuple_element(element);
+                    Some((i, name.map(str::to_string), Self::parse(ty, depth + 1)?))
+                })
+                .collect();
+            (!fields.is_empty()).then_some(Self::Tuple(fields))
+        } else {
+            None
+        }
+    }
+
+    fn apply(&self, value: &mut serde_json::Value) {
+        use serde_json::Value;
+        match (self, value) {
+            (Self::Int64, value @ Value::String(_)) => {
+                if let Some(v) = value.as_str().and_then(|s| s.parse::<i64>().ok()) {
+                    *value = Value::Number(v.into());
+                }
+            }
+            (Self::UInt64, value @ Value::String(_)) => {
+                if let Some(v) = value.as_str().and_then(|s| s.parse::<u64>().ok()) {
+                    *value = Value::Number(v.into());
+                }
+            }
+            (Self::Array(element), Value::Array(items)) => {
                 for v in items {
-                    int64_to_numbers(element, v);
-                }
-            } else if let Some(elements) = args("Tuple(") {
-                for (v, element) in items.iter_mut().zip(elements) {
-                    int64_to_numbers(ch_tuple_element(element).1, v);
+                    element.apply(v);
                 }
             }
-        }
-        Value::Object(fields) => {
-            if let Some(kv) = args("Map(") {
-                let v_ty = kv.get(1).copied().unwrap_or_default();
-                for v in fields.values_mut() {
-                    int64_to_numbers(v_ty, v);
+            (Self::Map(v_shape), Value::Object(entries)) => {
+                for v in entries.values_mut() {
+                    v_shape.apply(v);
                 }
-            } else if let Some(elements) = args("Tuple(") {
-                for element in elements {
-                    if let (Some(name), element_ty) = ch_tuple_element(element)
-                        && let Some(v) = fields.get_mut(name)
-                    {
-                        int64_to_numbers(element_ty, v);
+            }
+            (Self::Tuple(fields), Value::Array(items)) => {
+                for (i, _, shape) in fields {
+                    if let Some(v) = items.get_mut(*i) {
+                        shape.apply(v);
                     }
                 }
             }
+            (Self::Tuple(fields), Value::Object(entries)) => {
+                for (_, name, shape) in fields {
+                    if let Some(v) = name.as_deref().and_then(|n| entries.get_mut(n)) {
+                        shape.apply(v);
+                    }
+                }
+            }
+            _ => {}
         }
-        _ => {}
     }
 }
 
