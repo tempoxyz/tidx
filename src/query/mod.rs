@@ -20,7 +20,7 @@ pub use validator::{
     HARD_LIMIT_MAX, reject_postgres_session_keywords, validate_clickhouse_query, validate_query,
 };
 
-pub(crate) use parser::check_event_signature_limits;
+pub(crate) use parser::{byte_index_for_location, check_event_signature_limits};
 
 use regex_lite::Regex;
 use sqlparser::ast::{
