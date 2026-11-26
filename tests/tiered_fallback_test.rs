@@ -14,6 +14,7 @@ use serial_test::serial;
 use tidx::clickhouse::ClickHouseEngine;
 use tidx::config::ClickHouseConfig;
 use tidx::db::run_migrations;
+use tidx::db::tiered::{FdwTarget, bootstrap};
 use tidx::query::EventSignature;
 use tidx::service::{QueryOptions, execute_query_tiered};
 use tidx::sync::ch_sink::ClickHouseSink;
@@ -333,6 +334,58 @@ async fn test_desc_split_serves_backslash_alias_from_hot_arm() {
     .expect("the hot arm fills the page without ClickHouse");
 
     assert_eq!(result.columns, vec![r"a\b".to_string()]);
+    let nums: Vec<i64> = result
+        .rows
+        .iter()
+        .map(|r| r[0].as_i64().expect("num is an integer"))
+        .collect();
+    assert_eq!(nums, vec![20, 19, 18, 17, 16]);
+    assert_eq!(result.engine.as_deref(), Some("tiered"));
+}
+
+/// A hot-arm failure on a split query ClickHouse would reject natively (a
+/// backslash in a quoted identifier) must take the ordinary fallback, which
+/// serves it through the pg_clickhouse foreign tables.
+#[tokio::test]
+#[serial(db)]
+async fn test_desc_split_backslash_alias_falls_back_to_fdw_when_hot_arm_fails() {
+    let Some((_ch, db, engine)) = setup_tiered_store().await else {
+        return;
+    };
+    let fdw_url =
+        std::env::var("TIDX_TEST_FDW_URL").unwrap_or_else(|_| "http://clickhouse:8123".into());
+    let target = FdwTarget::new(&fdw_url, CH_DB.to_string(), None, None).unwrap();
+    if let Err(e) = bootstrap(&db.pool, &target, None, CHAIN_ID).await {
+        common::skip(&format!("pg_clickhouse not available ({e:#})"));
+        return;
+    }
+    // Break only the hot PostgreSQL arm, after the foreign tables exist.
+    let conn = db.pool.get().await.expect("conn");
+    conn.execute("DROP TABLE blocks CASCADE", &[])
+        .await
+        .expect("drop hot table");
+    drop(conn);
+
+    let result = execute_query_tiered(
+        &db.pool,
+        Some(&engine),
+        CHAIN_ID,
+        r#"SELECT num AS "a\b" FROM blocks ORDER BY num DESC LIMIT 5"#,
+        &[],
+        &QueryOptions {
+            timeout_ms: 10_000,
+            limit: 100,
+        },
+    )
+    .await;
+
+    let conn = db.pool.get().await.expect("conn");
+    conn.batch_execute("DROP SERVER IF EXISTS tidx_clickhouse CASCADE")
+        .await
+        .expect("drop FDW server");
+    drop(conn);
+
+    let result = result.expect("the FDW fallback serves the query");
     let nums: Vec<i64> = result
         .rows
         .iter()

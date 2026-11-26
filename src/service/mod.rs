@@ -647,6 +647,10 @@ async fn try_execute_tiered_split(
                 let Some(ch) = clickhouse else {
                     return Err(e);
                 };
+                if !cold_runs {
+                    // Native ClickHouse would reject this query too.
+                    return Ok(None);
+                }
                 return degrade_split_to_clickhouse(
                     ch,
                     sql,
