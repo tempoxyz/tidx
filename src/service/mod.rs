@@ -565,8 +565,12 @@ async fn try_execute_tiered_split(
 ) -> Result<Option<QueryResult>> {
     let start = Instant::now();
 
-    let Some(plan) = prepare_blocking(sql, signatures, |sql, signatures| {
-        Ok(plan_validated_tiered_split(sql, signatures))
+    let Some((plan, cold_runs)) = prepare_blocking(sql, signatures, |sql, signatures| {
+        // ClickHouse rejects backslashes in quoted identifiers, so such a
+        // query has no cold arm: serve it from the hot arm alone when that
+        // fills the page, else leave it to the fallback.
+        let cold_runs = crate::query::reject_clickhouse_backslash_identifiers(sql).is_ok();
+        Ok(plan_validated_tiered_split(sql, signatures).map(|plan| (plan, cold_runs)))
     })
     .await?
     else {
@@ -594,7 +598,7 @@ async fn try_execute_tiered_split(
     let (hot, cold) = if plan.cold_leads {
         // Ascending order: cold (ClickHouse) rows sort first. Run both arms
         // concurrently; cold may fill the page, hot back-fills the rest.
-        let Some(ch) = clickhouse else {
+        let Some(ch) = clickhouse.filter(|_| cold_runs) else {
             return Ok(None);
         };
         let cold_sql = plan.arm_sql(false, boundary, Some(eff_limit));
@@ -661,7 +665,7 @@ async fn try_execute_tiered_split(
             return Ok(Some(finish_tiered(hot, None, false, eff_limit, start)));
         }
         // Hot under-filled: fill the remainder from the ClickHouse archive.
-        let Some(ch) = clickhouse else {
+        let Some(ch) = clickhouse.filter(|_| cold_runs) else {
             return Ok(None);
         };
         let remaining = eff_limit - hot.row_count as i64;
@@ -716,11 +720,6 @@ fn plan_validated_tiered_split(sql: &str, signatures: &[&str]) -> Option<TieredS
         events.push(parsed);
     }
     let plan = plan_tiered_split(sql, &events)?;
-    // The cold arm runs on ClickHouse, which rejects backslashes in quoted
-    // identifiers: leave those queries to the native or FDW fallback.
-    if crate::query::reject_clickhouse_backslash_identifiers(sql).is_err() {
-        return None;
-    }
     // Mirror the fallback's raw-SQL gates (LIMIT ALL, length, …): the arms
     // re-emit SQL from the AST, which would otherwise erase them.
     if apply_event_signature_ctes_tiered(sql, signatures)
@@ -1714,15 +1713,6 @@ mod tests {
     // ========================================================================
     // Query Options Tests
     // ========================================================================
-
-    #[test]
-    fn test_tiered_split_skips_backslash_in_quoted_identifier() {
-        let sql = r#"SELECT num AS "a\b" FROM blocks ORDER BY num DESC LIMIT 10"#;
-        assert!(plan_tiered_split(sql, &[]).is_some());
-        assert!(plan_validated_tiered_split(sql, &[]).is_none());
-        let sql = r#"SELECT num AS "ab" FROM blocks ORDER BY num DESC LIMIT 10"#;
-        assert!(plan_validated_tiered_split(sql, &[]).is_some());
-    }
 
     #[test]
     fn test_query_options_default() {

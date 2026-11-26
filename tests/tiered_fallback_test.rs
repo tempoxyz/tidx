@@ -17,7 +17,7 @@ use tidx::db::run_migrations;
 use tidx::query::EventSignature;
 use tidx::service::{QueryOptions, execute_query_tiered};
 use tidx::sync::ch_sink::ClickHouseSink;
-use tidx::sync::writer::{set_hot_boundary, write_logs};
+use tidx::sync::writer::{set_hot_boundary, write_blocks, write_logs};
 use tidx::types::{BlockRow, LogRow};
 
 const CHAIN_ID: u64 = 999;
@@ -300,4 +300,44 @@ async fn test_degraded_split_preserves_null_selector() {
     );
     assert_eq!(rows[1].0, 19);
     assert_eq!(rows[1].1.as_str(), Some("0xdddddddd"));
+}
+
+/// ClickHouse rejects backslashes in quoted identifiers, so a split query
+/// with one has no cold arm. A descending page the hot arm fills must still
+/// be served from PostgreSQL.
+#[tokio::test]
+#[serial(db)]
+async fn test_desc_split_serves_backslash_alias_from_hot_arm() {
+    let Some((_ch, db, engine)) = setup_tiered_store().await else {
+        return;
+    };
+
+    let base_ts = Utc::now() - Duration::seconds(30);
+    let hot: Vec<_> = (11..=20)
+        .map(|n| make_block(n, base_ts + Duration::seconds(n)))
+        .collect();
+    write_blocks(&db.pool, &hot).await.expect("PG blocks");
+
+    let result = execute_query_tiered(
+        &db.pool,
+        Some(&engine),
+        CHAIN_ID,
+        r#"SELECT num AS "a\b" FROM blocks ORDER BY num DESC LIMIT 5"#,
+        &[],
+        &QueryOptions {
+            timeout_ms: 10_000,
+            limit: 100,
+        },
+    )
+    .await
+    .expect("the hot arm fills the page without ClickHouse");
+
+    assert_eq!(result.columns, vec![r"a\b".to_string()]);
+    let nums: Vec<i64> = result
+        .rows
+        .iter()
+        .map(|r| r[0].as_i64().expect("num is an integer"))
+        .collect();
+    assert_eq!(nums, vec![20, 19, 18, 17, 16]);
+    assert_eq!(result.engine.as_deref(), Some("tiered"));
 }
