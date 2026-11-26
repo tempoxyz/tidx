@@ -1678,7 +1678,7 @@ async fn test_query_rejects_forbidden_keywords() {
 
 #[tokio::test]
 #[serial(db)]
-async fn test_query_rejects_carriage_return_comment_bypass() {
+async fn test_query_rejects_postgres_lexer_mismatches() {
     let db = TestDb::empty().await;
     let opts = default_options();
 
@@ -1695,6 +1695,19 @@ async fn test_query_rejects_carriage_return_comment_bypass() {
         err.to_string(),
         "Carriage return inside a '--' comment is not allowed"
     );
+
+    // PostgreSQL has no raw strings: it reads `r` as a column and the quotes
+    // as identifiers, so the call runs.
+    let err = execute_query_postgres(
+        &db.pool,
+        "WITH t AS (SELECT num AS r FROM blocks) \
+         SELECT r\"\"\" \", current_setting('data_directory') AS leak, 1 AS \" \"\"\" FROM t",
+        &[],
+        &opts,
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(err.to_string(), "Raw string literals are not allowed");
 
     // A `\r\n` line ending ends the comment in both lexers.
     let result = execute_query_postgres(

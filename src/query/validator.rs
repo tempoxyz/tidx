@@ -36,7 +36,7 @@ pub fn validate_query(sql: &str) -> Result<()> {
         return Err(anyhow!("LIMIT ALL is not allowed"));
     }
     let tokens = tokenize(&GenericDialect {}, sql)?;
-    reject_carriage_return_in_line_comments(&tokens)?;
+    reject_postgres_lexer_mismatch_tokens(&tokens)?;
 
     match parse_single_statement_from_tokens(&GenericDialect {}, tokens)? {
         Statement::Query(query) => {
@@ -92,23 +92,55 @@ fn parse_single_statement_from_tokens(
     }
 }
 
-/// Rejects `--` comments that PostgreSQL ends before the validator does.
+/// Rejects input that PostgreSQL lexes differently from the validator, for
+/// callers that run a PostgreSQL query without [validate_query], e.g. on
+/// ClickHouse. See [reject_postgres_lexer_mismatch_tokens].
+pub(crate) fn reject_postgres_lexer_mismatches(sql: &str) -> Result<()> {
+    let may_mismatch = sql.contains('\r')
+        || sql
+            .as_bytes()
+            .windows(2)
+            .any(|pair| matches!(pair, [b'r' | b'R', b'\'' | b'"'] | [b'b' | b'B', b'"']));
+    if !may_mismatch {
+        return Ok(());
+    }
+    reject_postgres_lexer_mismatch_tokens(&tokenize(&GenericDialect {}, sql)?)
+}
+
+/// Rejects tokens that [GenericDialect] reads differently from PostgreSQL.
 ///
-/// PostgreSQL ends a `--` comment at `\r` as well as `\n`, but [GenericDialect]
-/// only at `\n`, so text after a lone `\r` would run on PostgreSQL without
-/// ever being validated. A `\r\n` line ending is accepted: both end the comment
-/// there.
-fn reject_carriage_return_in_line_comments(tokens: &[TokenWithSpan]) -> Result<()> {
+/// The validator checks the tokens it reads, while PostgreSQL runs the raw
+/// text, so text that one side reads as a comment or literal and the other as
+/// code would run unvalidated:
+///
+/// - PostgreSQL ends a `--` comment at `\r` as well as `\n`, the validator only
+///   at `\n`. A `\r\n` line ending is accepted: both end the comment there.
+/// - PostgreSQL has no raw strings (`r'...'`, `r"""..."""`) or double-quoted
+///   byte strings (`b"..."`). It reads the prefix as a name and the quotes as
+///   identifiers or strings, which can end inside the validator's literal.
+fn reject_postgres_lexer_mismatch_tokens(tokens: &[TokenWithSpan]) -> Result<()> {
     for token in tokens {
-        if let Token::Whitespace(Whitespace::SingleLineComment { comment, .. }) = &token.token
-            && comment
-                .strip_suffix("\r\n")
-                .unwrap_or(comment)
-                .contains('\r')
-        {
-            return Err(anyhow!(
-                "Carriage return inside a '--' comment is not allowed"
-            ));
+        match &token.token {
+            Token::Whitespace(Whitespace::SingleLineComment { comment, .. })
+                if comment
+                    .strip_suffix("\r\n")
+                    .unwrap_or(comment)
+                    .contains('\r') =>
+            {
+                return Err(anyhow!(
+                    "Carriage return inside a '--' comment is not allowed"
+                ));
+            }
+            Token::SingleQuotedRawStringLiteral(_)
+            | Token::DoubleQuotedRawStringLiteral(_)
+            | Token::TripleSingleQuotedRawStringLiteral(_)
+            | Token::TripleDoubleQuotedRawStringLiteral(_) => {
+                return Err(anyhow!("Raw string literals are not allowed"));
+            }
+            Token::DoubleQuotedByteStringLiteral(_) => {
+                return Err(anyhow!("Double-quoted byte strings are not allowed"));
+            }
+            _ => {}
         }
     }
     Ok(())
@@ -2177,6 +2209,63 @@ mod tests {
                 "Carriage return inside a '--' comment is not allowed",
                 "{sql:?}"
             );
+        }
+    }
+
+    #[test]
+    fn test_rejects_raw_string_bypass() {
+        for sql in [
+            // PostgreSQL reads `r` as a name and the quotes as identifiers,
+            // so the call runs.
+            "WITH t AS (SELECT num AS r FROM blocks) \
+             SELECT r\"\"\" \", current_setting('data_directory') AS leak, 1 AS \" \"\"\" FROM t",
+            "SELECT r''' ', pg_sleep(5), ' ''' FROM blocks",
+            "SELECT R'x' FROM blocks",
+            "SELECT r\"x\" FROM blocks",
+        ] {
+            assert_eq!(
+                validate_query(sql).unwrap_err().to_string(),
+                "Raw string literals are not allowed",
+                "{sql}"
+            );
+            assert_eq!(
+                reject_postgres_lexer_mismatches(sql)
+                    .unwrap_err()
+                    .to_string(),
+                "Raw string literals are not allowed",
+                "{sql}"
+            );
+        }
+        assert_eq!(
+            validate_query("SELECT b\"x\" FROM blocks")
+                .unwrap_err()
+                .to_string(),
+            "Double-quoted byte strings are not allowed"
+        );
+        // Names that start with r or b stay names.
+        assert!(
+            validate_query("SELECT r.num, b.hash FROM blocks r JOIN blocks b ON r.num = b.num")
+                .is_ok()
+        );
+        assert!(validate_query("SELECT B'1' AS bits, 'r' AS s FROM blocks").is_ok());
+    }
+
+    #[test]
+    fn test_reject_postgres_lexer_mismatches() {
+        assert_eq!(
+            reject_postgres_lexer_mismatches(
+                "SELECT 1 AS a --\r, current_setting('data_directory')"
+            )
+            .unwrap_err()
+            .to_string(),
+            "Carriage return inside a '--' comment is not allowed"
+        );
+        for sql in [
+            "SELECT num FROM blocks",
+            "SELECT num -- block number\r\nFROM blocks",
+            "SELECT 'r' || \"num\" FROM blocks",
+        ] {
+            assert!(reject_postgres_lexer_mismatches(sql).is_ok(), "{sql}");
         }
     }
 
