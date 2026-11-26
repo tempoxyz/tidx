@@ -96,6 +96,8 @@ pub fn validate_clickhouse_query(sql: &str) -> Result<()> {
         return Err(anyhow!("LIMIT ALL is not allowed"));
     }
 
+    reject_clickhouse_backslash_identifiers(sql)?;
+
     match parse_single_statement(&sqlparser::dialect::ClickHouseDialect {}, sql)? {
         Statement::Query(query) => {
             let cte_names = HashSet::new();
@@ -104,6 +106,29 @@ pub fn validate_clickhouse_query(sql: &str) -> Result<()> {
         }
         _ => Err(anyhow!("Only SELECT queries are allowed")),
     }
+}
+
+/// Rejects quoted identifiers that contain a backslash.
+///
+/// ClickHouse reads a backslash inside a quoted identifier as an escape, while
+/// the parser keeps it as a plain character. The two would then disagree on
+/// where the identifier ends and what it names, so the validator would check
+/// a different query from the one ClickHouse runs. Table, column and function
+/// names never need a backslash.
+fn reject_clickhouse_backslash_identifiers(sql: &str) -> Result<()> {
+    let dialect = sqlparser::dialect::ClickHouseDialect {};
+    let tokens = sqlparser::tokenizer::Tokenizer::new(&dialect, sql)
+        .tokenize()
+        .map_err(|e| anyhow!("SQL parse error: {e}"))?;
+    for token in tokens {
+        if let Token::Word(word) = token
+            && word.quote_style.is_some()
+            && word.value.contains('\\')
+        {
+            return Err(anyhow!("Backslashes are not allowed in quoted identifiers"));
+        }
+    }
+    Ok(())
 }
 
 /// Rejects the unquoted session keywords PostgreSQL evaluates to a session
@@ -2661,6 +2686,22 @@ mod tests {
     fn test_clickhouse_rejects_system_tables() {
         assert!(validate_clickhouse_query("SELECT * FROM system.tables").is_err());
         assert!(validate_clickhouse_query(r#"SELECT * FROM "system".tables"#).is_err());
+    }
+
+    #[test]
+    fn test_clickhouse_rejects_backslash_in_quoted_identifiers() {
+        for sql in [
+            "SELECT 1 AS `\\` FROM blocks WHERE 1 = `, num FROM blocks`",
+            "SELECT 1 AS `\\` FROM blocks WHERE 1 = '`, num FROM blocks -- '\n",
+            r#"SELECT 1 AS "\" FROM blocks WHERE 1 = ", num FROM blocks""#,
+            r#"SELECT "sl\x65ep"(1) FROM blocks"#,
+        ] {
+            let err = validate_clickhouse_query(sql).unwrap_err().to_string();
+            assert!(err.contains("Backslashes are not allowed"), "{sql}: {err}");
+        }
+        // Backslashes in string literals and quoted names without one still work.
+        assert!(validate_clickhouse_query(r"SELECT 'a\'b' AS x FROM blocks").is_ok());
+        assert!(validate_clickhouse_query(r#"SELECT `num`, "hash" FROM blocks"#).is_ok());
     }
 
     #[test]
