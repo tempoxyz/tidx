@@ -1,5 +1,23 @@
 # Changelog
 
+## `tidx@1.1.0`
+
+### Minor Changes
+
+- Indexed blocks that contain Tempo configurable-account transactions (TIP-1107). Such blocks previously failed to decode (`data did not match any variant of untagged enum BlockTransactions`) and stopped sync. Pinned the Tempo crates to the `tempo/v1.19.1` release, which includes configurable-account signatures (tempoxyz/tempo#8750). `txs.signature_type` records configurable-account signatures, sent directly or as an access key, as `3`. (by @jxom, [#395](https://github.com/tempoxyz/tidx/pull/395))
+
+### Patch Changes
+
+- Status now reports backfill as complete once block 1 is indexed on chains without a retention window, with no blocks remaining and no backfill ETA, and `tidx_synced` is reported as 0 for a gap-fill tick that cannot read the chain head instead of 1. (by Matthias Seitz, [#428](https://github.com/tempoxyz/tidx/pull/428))
+- `/query` now rejects more than 16 `signature` params, and a query whose SQL and signatures together exceed 65,536 bytes, before rewriting it. Event signatures are applied to the SQL in a single pass, and the rewrite runs off the async worker threads, so a request with many signatures can no longer stall the API. Concurrent preparations are bounded by the available parallelism, and a dropped request keeps its slot until its job finishes. (by Matthias Seitz, [#422](https://github.com/tempoxyz/tidx/pull/422))
+- Realtime sync now saves its tip for a batch that was already written before returning an error from fetching the next batch, so a retry no longer starts below rows that are stored. Writing a batch also replaces the transactions, logs and receipts stored for every block in it, including blocks the new version has no rows for. (by Matthias Seitz, [#426](https://github.com/tempoxyz/tidx/pull/426))
+- Without a ClickHouse sink, the PostgreSQL hot-window reconciler fills missing blocks only up to the tip realtime sync has reached, so a block it fetched above the tip can no longer be replaced by a different block at that height without a parent hash check. After a restart it waits until realtime sync is within its tail window of the head before checking gaps or moving the hot boundary, so the range realtime skips is filled on the next tick and the pruner cannot drop realtime's parent hash anchor. Gap detection also counts each block height once, so a duplicate row for a height no longer hides a missing one. (by Matthias Seitz, [#427](https://github.com/tempoxyz/tidx/pull/427))
+- PostgreSQL queries now reject text that PostgreSQL lexes differently from the query validator: a `--` comment containing a carriage return not followed by a newline, raw string literals (`r'...'`, `r"""..."""`) and double-quoted byte strings (`b"..."`). PostgreSQL ends the comment at the carriage return and has no such literals, so part of the query ran without being validated. Comments ending in `\r\n` are still accepted, and tiered queries apply the same checks before any part runs on ClickHouse. (by Matthias Seitz, [#432](https://github.com/tempoxyz/tidx/pull/432))
+- Fixed PostgreSQL `/query` result-size limits. Responses are now charged their exact JSON size (quotes, escapes and separators), so escape-heavy strings can no longer exceed the 10 MiB result limit. The data PostgreSQL sends is bounded separately at 40 MiB by wire length: cells returned as `null`, such as arrays or `txs.calls`, count only `null` towards the 10 MiB response limit but their full size towards the 40 MiB read limit. Cells of any type over 1 MiB are rejected, and a result may hold at most 1,000,000 cells. (by Matthias Seitz, [#423](https://github.com/tempoxyz/tidx/pull/423))
+- PostgreSQL `/query` now refuses to send a row larger than 10 MiB as text, so a single huge value such as `string_agg` over a large table can no longer make the API buffer it before the result limits apply; such a query fails with `Query result row exceeded 10485760 bytes`. (by Matthias Seitz, [#430](https://github.com/tempoxyz/tidx/pull/430))
+- PostgreSQL queries now reject ClickHouse-only syntax that PostgreSQL cannot run: `ORDER BY ... WITH FILL`, `INTERPOLATE`, and parametric calls such as `f(a)(b)`. The query validator returns a clear error for them instead of passing the statement through to the database. (by Matthias Seitz, [#424](https://github.com/tempoxyz/tidx/pull/424))
+- Event filters no longer change a quoted table alias that contains adjacent quotes or a backslash before a quote when rewriting a qualified column such as `"q""""r".amount`. The rewritten query now names the same relation as the `FROM` clause instead of failing or binding to another one. (by Matthias Seitz, [#425](https://github.com/tempoxyz/tidx/pull/425))
+
 ## `tidx@1.0.1`
 
 ### Patch Changes
