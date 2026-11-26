@@ -539,3 +539,58 @@ async fn test_backslash_alias_short_deadline_reads_archive_through_fdw() {
         .collect();
     assert_eq!(nums, vec![1, 2, 3, 4, 5]);
 }
+
+/// A split shape native ClickHouse can't run, which the split declines
+/// (ascending here), reads the archive through pg_clickhouse with NULL
+/// selectors restored.
+#[tokio::test]
+#[serial(db)]
+async fn test_declined_backslash_split_restores_null_selector_through_fdw() {
+    let Some((ch, db, engine)) = setup_tiered_store().await else {
+        return;
+    };
+    let sink = ClickHouseSink::new(&ch.url, CH_DB, None, None).expect("CH sink");
+    let base_ts = Utc::now() - Duration::seconds(30);
+    let logs: Vec<_> = (1..=20)
+        .map(|n| {
+            make_log(
+                n,
+                base_ts + Duration::seconds(n),
+                (n != 1).then(|| vec![0xdd; 4]),
+            )
+        })
+        .collect();
+    sink.write_logs(&logs).await.expect("CH logs");
+    let fdw_url =
+        std::env::var("TIDX_TEST_FDW_URL").unwrap_or_else(|_| "http://clickhouse:8123".into());
+    let target = FdwTarget::new(&fdw_url, CH_DB.to_string(), None, None).unwrap();
+    if let Err(e) = bootstrap(&db.pool, &target, None, CHAIN_ID).await {
+        common::skip(&format!("pg_clickhouse not available ({e:#})"));
+        return;
+    }
+
+    let result = execute_query_tiered(
+        &db.pool,
+        Some(&engine),
+        CHAIN_ID,
+        r#"SELECT block_num, selector AS "s\x" FROM logs ORDER BY block_num ASC LIMIT 2"#,
+        &[],
+        &QueryOptions {
+            timeout_ms: 10_000,
+            limit: 100,
+        },
+    )
+    .await;
+
+    let conn = db.pool.get().await.expect("conn");
+    conn.batch_execute("DROP SERVER IF EXISTS tidx_clickhouse CASCADE")
+        .await
+        .expect("drop FDW server");
+    drop(conn);
+
+    let result = result.unwrap_or_else(|e| panic!("the FDW path serves the query: {e:#}"));
+    assert_eq!(result.rows[0][0].as_i64(), Some(1));
+    assert_eq!(result.rows[0][1], serde_json::Value::Null);
+    assert_eq!(result.rows[1][0].as_i64(), Some(2));
+    assert!(result.rows[1][1].is_string());
+}
