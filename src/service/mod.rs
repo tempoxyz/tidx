@@ -716,6 +716,11 @@ fn plan_validated_tiered_split(sql: &str, signatures: &[&str]) -> Option<TieredS
         events.push(parsed);
     }
     let plan = plan_tiered_split(sql, &events)?;
+    // The cold arm runs on ClickHouse, which rejects backslashes in quoted
+    // identifiers: leave those queries to the native or FDW fallback.
+    if crate::query::reject_clickhouse_backslash_identifiers(sql).is_err() {
+        return None;
+    }
     // Mirror the fallback's raw-SQL gates (LIMIT ALL, length, …): the arms
     // re-emit SQL from the AST, which would otherwise erase them.
     if apply_event_signature_ctes_tiered(sql, signatures)
@@ -1709,6 +1714,15 @@ mod tests {
     // ========================================================================
     // Query Options Tests
     // ========================================================================
+
+    #[test]
+    fn test_tiered_split_skips_backslash_in_quoted_identifier() {
+        let sql = r#"SELECT num AS "a\b" FROM blocks ORDER BY num DESC LIMIT 10"#;
+        assert!(plan_tiered_split(sql, &[]).is_some());
+        assert!(plan_validated_tiered_split(sql, &[]).is_none());
+        let sql = r#"SELECT num AS "ab" FROM blocks ORDER BY num DESC LIMIT 10"#;
+        assert!(plan_validated_tiered_split(sql, &[]).is_some());
+    }
 
     #[test]
     fn test_query_options_default() {

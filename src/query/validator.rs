@@ -115,7 +115,7 @@ pub fn validate_clickhouse_query(sql: &str) -> Result<()> {
 /// where the identifier ends and what it names, so the validator would check
 /// a different query from the one ClickHouse runs. Table, column and function
 /// names never need a backslash.
-fn reject_clickhouse_backslash_identifiers(sql: &str) -> Result<()> {
+pub(crate) fn reject_clickhouse_backslash_identifiers(sql: &str) -> Result<()> {
     let dialect = sqlparser::dialect::ClickHouseDialect {};
     let tokens = sqlparser::tokenizer::Tokenizer::new(&dialect, sql)
         .tokenize()
