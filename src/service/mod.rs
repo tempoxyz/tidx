@@ -650,9 +650,17 @@ async fn try_execute_tiered_split(
                 if !cold_runs {
                     // Native ClickHouse would reject this query too: serve
                     // it from the archive through the pg_clickhouse tables.
-                    return degrade_split_to_fdw(pool, sql, signatures, e, options, start)
-                        .await
-                        .map(Some);
+                    return degrade_split_to_fdw(
+                        pool,
+                        sql,
+                        signatures,
+                        &plan.selector_null_cols,
+                        e,
+                        options,
+                        start,
+                    )
+                    .await
+                    .map(Some);
                 }
                 return degrade_split_to_clickhouse(
                     ch,
@@ -780,6 +788,7 @@ async fn degrade_split_to_fdw(
     pool: &Pool,
     sql: &str,
     signatures: &[&str],
+    selector_null_cols: &[usize],
     hot_err: anyhow::Error,
     options: &QueryOptions,
     start: Instant,
@@ -792,11 +801,20 @@ async fn degrade_split_to_fdw(
             .max(TIERED_COLD_MIN_TIMEOUT_MS),
         limit: options.limit,
     };
-    let mut result = execute_query_postgres_via_clickhouse(pool, sql, signatures, &opts)
-        .await
-        .map_err(|fdw_err| {
-            anyhow!("tiered split failed on both arms: hot (postgres): {hot_err}; cold (pg_clickhouse): {fdw_err}")
-        })?;
+    // The archive's own error (a timeout keeps its type); the hot one is
+    // logged above.
+    let mut result = execute_query_postgres_via_clickhouse(pool, sql, signatures, &opts).await?;
+    // The archive stores missing selectors as '': restore NULL, as the
+    // native degrade path does.
+    for &i in selector_null_cols {
+        for row in &mut result.rows {
+            if let Some(cell) = row.get_mut(i)
+                && matches!(&*cell, serde_json::Value::String(s) if s.is_empty())
+            {
+                *cell = serde_json::Value::Null;
+            }
+        }
+    }
     result.engine = Some("tiered".to_string());
     result.query_time_ms = Some(start.elapsed().as_secs_f64() * 1000.0);
     Ok(result)

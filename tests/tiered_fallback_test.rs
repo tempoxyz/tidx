@@ -405,3 +405,62 @@ async fn backslash_alias_falls_back_to_fdw_when_hot_arm_fails(sql: &str) {
     assert_eq!(nums, vec![20, 19, 18, 17, 16]);
     assert_eq!(result.engine.as_deref(), Some("tiered"));
 }
+
+/// The pg_clickhouse degrade path for a query native ClickHouse rejects
+/// restores NULL for missing selectors too.
+#[tokio::test]
+#[serial(db)]
+async fn test_fdw_degraded_split_preserves_null_selector() {
+    let Some((ch, db, engine)) = setup_tiered_store().await else {
+        return;
+    };
+    let sink = ClickHouseSink::new(&ch.url, CH_DB, None, None).expect("CH sink");
+    let base_ts = Utc::now() - Duration::seconds(30);
+    let logs: Vec<_> = (1..=20)
+        .map(|n| {
+            make_log(
+                n,
+                base_ts + Duration::seconds(n),
+                (n != 20).then(|| vec![0xdd; 4]),
+            )
+        })
+        .collect();
+    sink.write_logs(&logs).await.expect("CH logs");
+
+    let fdw_url =
+        std::env::var("TIDX_TEST_FDW_URL").unwrap_or_else(|_| "http://clickhouse:8123".into());
+    let target = FdwTarget::new(&fdw_url, CH_DB.to_string(), None, None).unwrap();
+    if let Err(e) = bootstrap(&db.pool, &target, None, CHAIN_ID).await {
+        common::skip(&format!("pg_clickhouse not available ({e:#})"));
+        return;
+    }
+    let conn = db.pool.get().await.expect("conn");
+    conn.execute("DROP TABLE logs CASCADE", &[])
+        .await
+        .expect("drop hot logs table");
+    drop(conn);
+
+    let result = execute_query_tiered(
+        &db.pool,
+        Some(&engine),
+        CHAIN_ID,
+        r#"SELECT block_num, selector AS "s\x" FROM logs ORDER BY block_num DESC LIMIT 2"#,
+        &[],
+        &QueryOptions {
+            timeout_ms: 10_000,
+            limit: 100,
+        },
+    )
+    .await;
+
+    let conn = db.pool.get().await.expect("conn");
+    conn.batch_execute("DROP SERVER IF EXISTS tidx_clickhouse CASCADE")
+        .await
+        .expect("drop FDW server");
+    drop(conn);
+
+    let result = result.unwrap_or_else(|e| panic!("the FDW fallback serves the query: {e:#}"));
+    assert_eq!(result.rows[0][0].as_i64(), Some(20));
+    assert_eq!(result.rows[0][1], serde_json::Value::Null);
+    assert!(result.rows[1][1].is_string());
+}
