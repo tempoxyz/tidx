@@ -2,6 +2,8 @@ use anyhow::{Result, anyhow};
 use chrono::{DateTime, Utc};
 use futures::TryStreamExt;
 use serde::Serialize;
+use sqlparser::dialect::GenericDialect;
+use sqlparser::tokenizer::{Token, Tokenizer};
 use std::task::Poll;
 use std::time::Instant;
 use tokio_postgres::error::SqlState;
@@ -198,6 +200,13 @@ const MAX_QUERY_RESULT_BYTES: usize = 10 * 1024 * 1024;
 /// because such cells are not returned.
 const MAX_QUERY_WIRE_BYTES: usize = 4 * MAX_QUERY_RESULT_BYTES;
 const MAX_CELL_BYTES: usize = 1024 * 1024;
+
+/// Text PostgreSQL puts in the error that [`bound_row_size`] raises for a row
+/// over [`MAX_QUERY_RESULT_BYTES`]. [`is_row_too_large`] looks for it.
+const ROW_TOO_LARGE_MARKER: &str = "tidx_row_too_large";
+
+/// Alias of the subquery [`bound_row_size`] wraps around a public query.
+const BOUNDED_ROW_ALIAS: &str = "tidx_bounded_row";
 
 /// Most cells (rows times columns) one result may hold: [`HARD_LIMIT_MAX`] rows
 /// of 100 columns, above the widest core table. Even an empty cell keeps a
@@ -455,6 +464,13 @@ pub async fn execute_query_tiered(
     // Parts of this query may run natively on ClickHouse, which only applies
     // the ClickHouse validator: keep PostgreSQL's session-keyword rule.
     crate::query::reject_postgres_session_keywords(sql)?;
+    // ClickHouse rejects backslashes in quoted identifiers, so such a query
+    // can't run natively there: read the archive through pg_clickhouse.
+    let native_ok = !sql.contains('\\')
+        || prepare_blocking(sql, signatures, |sql, _| {
+            Ok(crate::query::reject_clickhouse_backslash_identifiers(sql).is_ok())
+        })
+        .await?;
     let crate::db::tiered::PruneBoundary {
         boundary,
         boundary_ts,
@@ -466,7 +482,11 @@ pub async fn execute_query_tiered(
         result.engine = Some("tiered".to_string());
         return Ok(result);
     }
-    match try_execute_tiered_split(pool, clickhouse, boundary, sql, signatures, options).await? {
+    match try_execute_tiered_split(
+        pool, clickhouse, native_ok, boundary, sql, signatures, options,
+    )
+    .await?
+    {
         Some(result) => Ok(result),
         None => {
             let hot = crate::query::hot_window_confinement(sql, boundary, boundary_ts);
@@ -477,7 +497,35 @@ pub async fn execute_query_tiered(
             if hot_on_pg {
                 // Every scan is provably above the prune boundary and
                 // index-friendly: plain PostgreSQL serves it whole.
-                let mut result = execute_query_postgres(pool, sql, signatures, options).await?;
+                let start = Instant::now();
+                let mut result = match execute_query_postgres(pool, sql, signatures, options).await
+                {
+                    Ok(result) => result,
+                    // A split query would have degraded to the archive; only
+                    // the split's shapes read the same through pg_clickhouse.
+                    Err(e)
+                        if clickhouse.is_some()
+                            && !native_ok
+                            && is_retryable_hot_postgres_failure(&e) =>
+                    {
+                        let Some(selector_null_cols) =
+                            split_selector_null_cols(sql, signatures).await?
+                        else {
+                            return Err(e);
+                        };
+                        degrade_split_to_fdw(
+                            pool,
+                            sql,
+                            signatures,
+                            &selector_null_cols,
+                            e,
+                            options,
+                            start,
+                        )
+                        .await?
+                    }
+                    Err(e) => return Err(e),
+                };
                 result.engine = Some("tiered".to_string());
                 return Ok(result);
             }
@@ -486,7 +534,7 @@ pub async fn execute_query_tiered(
             // sorts/aggregates, no FDW row transfer), with fallback when
             // ClickHouse fails (e.g. bare UNION, timestamp literals).
             let start = Instant::now();
-            let native = match clickhouse {
+            let native = match clickhouse.filter(|_| native_ok) {
                 Some(ch) => Some(
                     ch.query_user_with_settings(
                         sql,
@@ -534,9 +582,23 @@ pub async fn execute_query_tiered(
                     Ok(result)
                 }
                 None => {
-                    let mut result =
-                        execute_query_postgres_via_clickhouse(pool, sql, signatures, options)
-                            .await?;
+                    // Native ClickHouse can't run it: a hot-window aggregate
+                    // goes to plain PostgreSQL, as after a native failure.
+                    let mut result = if hot.is_some() {
+                        execute_query_postgres(pool, sql, signatures, options).await?
+                    } else {
+                        let mut result =
+                            execute_query_postgres_via_clickhouse(pool, sql, signatures, options)
+                                .await?;
+                        // A split shape native ClickHouse can't run: restore
+                        // NULL selectors as its cold arm would have.
+                        if clickhouse.is_some()
+                            && let Some(cols) = split_selector_null_cols(sql, signatures).await?
+                        {
+                            restore_null_selectors(&mut result, &cols);
+                        }
+                        result
+                    };
                     result.engine = Some("tiered".to_string());
                     Ok(result)
                 }
@@ -549,6 +611,7 @@ pub async fn execute_query_tiered(
 async fn try_execute_tiered_split(
     pool: &Pool,
     clickhouse: Option<&crate::clickhouse::ClickHouseEngine>,
+    cold_runs: bool,
     boundary: i64,
     sql: &str,
     signatures: &[&str],
@@ -556,6 +619,8 @@ async fn try_execute_tiered_split(
 ) -> Result<Option<QueryResult>> {
     let start = Instant::now();
 
+    // Without a native cold arm (cold_runs false), the hot arm alone serves
+    // a page it fills; anything else goes to the fallback.
     let Some(plan) = prepare_blocking(sql, signatures, |sql, signatures| {
         Ok(plan_validated_tiered_split(sql, signatures))
     })
@@ -585,7 +650,7 @@ async fn try_execute_tiered_split(
     let (hot, cold) = if plan.cold_leads {
         // Ascending order: cold (ClickHouse) rows sort first. Run both arms
         // concurrently; cold may fill the page, hot back-fills the rest.
-        let Some(ch) = clickhouse else {
+        let Some(ch) = clickhouse.filter(|_| cold_runs) else {
             return Ok(None);
         };
         let cold_sql = plan.arm_sql(false, boundary, Some(eff_limit));
@@ -634,6 +699,21 @@ async fn try_execute_tiered_split(
                 let Some(ch) = clickhouse else {
                     return Err(e);
                 };
+                if !cold_runs {
+                    // Native ClickHouse would reject this query too: serve
+                    // it from the archive through the pg_clickhouse tables.
+                    return degrade_split_to_fdw(
+                        pool,
+                        sql,
+                        signatures,
+                        &plan.selector_null_cols,
+                        e,
+                        options,
+                        start,
+                    )
+                    .await
+                    .map(Some);
+                }
                 return degrade_split_to_clickhouse(
                     ch,
                     sql,
@@ -652,7 +732,7 @@ async fn try_execute_tiered_split(
             return Ok(Some(finish_tiered(hot, None, false, eff_limit, start)));
         }
         // Hot under-filled: fill the remainder from the ClickHouse archive.
-        let Some(ch) = clickhouse else {
+        let Some(ch) = clickhouse.filter(|_| cold_runs) else {
             return Ok(None);
         };
         let remaining = eff_limit - hot.row_count as i64;
@@ -748,6 +828,58 @@ async fn degrade_split_to_clickhouse(
         })?;
     normalize_cold_result(&mut raw, selector_null_cols);
     let mut result: QueryResult = raw.into();
+    result.engine = Some("tiered".to_string());
+    result.query_time_ms = Some(start.elapsed().as_secs_f64() * 1000.0);
+    Ok(result)
+}
+
+/// The selector columns of the split plan for the query, or `None` when the
+/// split planner rejects it. Plans on the blocking pool, as the split does.
+async fn split_selector_null_cols(sql: &str, signatures: &[&str]) -> Result<Option<Vec<usize>>> {
+    prepare_blocking(sql, signatures, |sql, signatures| {
+        Ok(plan_validated_tiered_split(sql, signatures).map(|plan| plan.selector_null_cols))
+    })
+    .await
+}
+
+/// The archive stores missing selectors as '': restore NULL, as the native
+/// cold arm does.
+fn restore_null_selectors(result: &mut QueryResult, selector_null_cols: &[usize]) {
+    for &i in selector_null_cols {
+        for row in &mut result.rows {
+            if let Some(cell) = row.get_mut(i)
+                && matches!(&*cell, serde_json::Value::String(s) if s.is_empty())
+            {
+                *cell = serde_json::Value::Null;
+            }
+        }
+    }
+}
+
+/// Degraded split path for a query native ClickHouse rejects: the hot
+/// PostgreSQL arm failed, so serve the original query from the archive
+/// through the pg_clickhouse foreign tables.
+async fn degrade_split_to_fdw(
+    pool: &Pool,
+    sql: &str,
+    signatures: &[&str],
+    selector_null_cols: &[usize],
+    hot_err: anyhow::Error,
+    options: &QueryOptions,
+    start: Instant,
+) -> Result<QueryResult> {
+    tracing::warn!(target: "tidx::query", error = %hot_err, "tiered: hot arm failed; degrading split query to pg_clickhouse");
+    let opts = QueryOptions {
+        timeout_ms: options
+            .timeout_ms
+            .saturating_sub(start.elapsed().as_millis() as u64)
+            .max(TIERED_COLD_MIN_TIMEOUT_MS),
+        limit: options.limit,
+    };
+    // The archive's own error (a timeout keeps its type); the hot one is
+    // logged above.
+    let mut result = execute_query_postgres_via_clickhouse(pool, sql, signatures, &opts).await?;
+    restore_null_selectors(&mut result, selector_null_cols);
     result.engine = Some("tiered".to_string());
     result.query_time_ms = Some(start.elapsed().as_secs_f64() * 1000.0);
     Ok(result)
@@ -874,6 +1006,7 @@ async fn run_pg_query(
     bound_settings: &[(&str, &str)],
     engine: &str,
 ) -> Result<QueryResult> {
+    let sql = bound_row_size(sql)?;
     let mut conn = pool.get().await.map_err(|e| {
         anyhow::Error::new(PostgresQueryFailure::Unavailable {
             message: e.to_string(),
@@ -919,7 +1052,7 @@ async fn run_pg_query(
             }
         };
         let param_types: Vec<Type> = params.iter().map(|(_, ty)| ty.clone()).collect();
-        let prepare = tx.prepare_typed(sql, &param_types);
+        let prepare = tx.prepare_typed(&sql, &param_types);
         futures::pin_mut!(setup, set_config, prepare);
         let setup_sent = futures::poll!(setup.as_mut());
         let set_config_sent = futures::poll!(set_config.as_mut());
@@ -1004,6 +1137,75 @@ async fn run_pg_query(
         engine: Some(engine.to_string()),
         query_time_ms: Some(elapsed_ms),
     })
+}
+
+/// Wraps `sql` so that PostgreSQL itself refuses to send a row larger than
+/// [`MAX_QUERY_RESULT_BYTES`]. The driver buffers a whole row before any of the
+/// result limits can look at it, and the validator allows aggregates and
+/// concatenation whose single value may reach PostgreSQL's 1 GB limit.
+///
+/// The row is measured as the text of its whole-row reference, which is close to
+/// what the response charges for it (`bytea` is hex in both). Notes on the
+/// shape:
+///
+/// - `alias.*` is a whole-row reference. A bare `alias::text` would resolve to a
+///   column of the public query that has the alias as its name.
+/// - It is not `pg_column_size`, which reports the compressed size of stored
+///   TOAST values: `SELECT input, input, ... FROM txs` over compressible calldata
+///   would be badly undercounted.
+/// - PostgreSQL has no builtin that raises an error with a chosen message, so
+///   the failing branch casts a text to `boolean`, which fails with SQLSTATE
+///   22P02 and the text in its message (see [`is_row_too_large`]). The text must
+///   not be constant: PostgreSQL folds immutable expressions in a `CASE` arm at
+///   plan time, which would fail every query.
+///
+/// The subquery keeps `ORDER BY`, `LIMIT`, CTEs and set operations of `sql`
+/// intact and unflattened. The limit is formatted into the text, which stays
+/// the same for every request, so `pg_stat_statements` keeps one entry per query.
+///
+/// A trailing `;` would end the subquery early, and the validator accepts
+/// semicolons around the statement, so they are cut off first.
+fn bound_row_size(sql: &str) -> Result<String> {
+    let tokens = Tokenizer::new(&GenericDialect {}, sql)
+        .tokenize_with_location()
+        .map_err(|e| anyhow!("SQL parse error: {e}"))?;
+    let code: Vec<_> = tokens
+        .iter()
+        .filter(|token| !matches!(token.token, Token::Whitespace(_)))
+        .collect();
+    let (Some(first), Some(last)) = (
+        code.iter()
+            .position(|token| token.token != Token::SemiColon),
+        code.iter()
+            .rposition(|token| token.token != Token::SemiColon),
+    ) else {
+        return Err(anyhow!("Empty query"));
+    };
+    // Whitespace and comments around the statement stay: they cannot break the
+    // subquery, as the closing parenthesis follows a newline.
+    let locate = |location| {
+        crate::query::byte_index_for_location(sql, location)
+            .ok_or_else(|| anyhow!("Failed to locate the statement"))
+    };
+    let start = if first == 0 {
+        0
+    } else {
+        locate(code[first].span.start)?
+    };
+    let end = if last + 1 == code.len() {
+        sql.len()
+    } else {
+        locate(code[last].span.end)?
+    };
+    let sql = &sql[start..end];
+    let alias = BOUNDED_ROW_ALIAS;
+    let marker = ROW_TOO_LARGE_MARKER;
+
+    Ok(format!(
+        "SELECT * FROM (\n{sql}\n) AS {alias}\n\
+         WHERE CASE WHEN octet_length(({alias}.*)::text) <= {MAX_QUERY_RESULT_BYTES} THEN true\n\
+         ELSE ('{marker} ' || octet_length(({alias}.*)::text))::boolean END"
+    ))
 }
 
 fn append_limit_if_missing(sql: &str, limit: i64) -> String {
@@ -1150,13 +1352,29 @@ pub fn format_column_string(row: &tokio_postgres::Row, idx: usize) -> String {
 }
 
 fn classify_query_execution_error(error: anyhow::Error) -> anyhow::Error {
-    match error.downcast::<tokio_postgres::Error>() {
-        Ok(error) => classify_postgres_error(error),
-        Err(error) => PostgresQueryFailure::Processing {
-            message: format!("Query error: {}", sanitize_db_error(&format!("{error:#}"))),
+    let error = match error.downcast::<tokio_postgres::Error>() {
+        Ok(error) => {
+            let oversized = error
+                .as_db_error()
+                .is_some_and(|db| is_row_too_large(db.code(), db.message()));
+            if !oversized {
+                return classify_postgres_error(error);
+            }
+            row_too_large()
         }
-        .into(),
+        Err(error) => error,
+    };
+    PostgresQueryFailure::Processing {
+        message: format!("Query error: {}", sanitize_db_error(&format!("{error:#}"))),
     }
+    .into()
+}
+
+/// Whether a database error is the one [`bound_row_size`] raises for an
+/// oversized row. A public query that casts text containing the marker to
+/// `boolean` itself is reported the same way, which does no harm.
+fn is_row_too_large(code: &SqlState, message: &str) -> bool {
+    code == &SqlState::INVALID_TEXT_REPRESENTATION && message.contains(ROW_TOO_LARGE_MARKER)
 }
 
 fn classify_postgres_error(error: tokio_postgres::Error) -> anyhow::Error {
@@ -1282,6 +1500,10 @@ fn row_result_bytes(values: &[serde_json::Value]) -> usize {
 
 fn result_too_large() -> anyhow::Error {
     anyhow!("Query result exceeded {} bytes", MAX_QUERY_RESULT_BYTES)
+}
+
+fn row_too_large() -> anyhow::Error {
+    anyhow!("Query result row exceeded {} bytes", MAX_QUERY_RESULT_BYTES)
 }
 
 /// A cell's wire length, read from any column type and from NULLs.
@@ -1770,6 +1992,76 @@ mod tests {
             "Query result exceeded 1000000 cells"
         );
         assert!(add_result_cells(usize::MAX, 1).is_err());
+    }
+
+    #[test]
+    fn test_bound_row_size_wraps_the_query() {
+        assert_eq!(
+            bound_row_size("SELECT num FROM blocks ORDER BY num LIMIT 5").unwrap(),
+            "SELECT * FROM (\n\
+             SELECT num FROM blocks ORDER BY num LIMIT 5\n\
+             ) AS tidx_bounded_row\n\
+             WHERE CASE WHEN octet_length((tidx_bounded_row.*)::text) <= 10485760 THEN true\n\
+             ELSE ('tidx_row_too_large ' || octet_length((tidx_bounded_row.*)::text))::boolean END"
+        );
+    }
+
+    #[test]
+    fn test_bound_row_size_cuts_statement_delimiters() {
+        let inner = |sql: &str| {
+            let wrapped = bound_row_size(sql).unwrap();
+            let body = wrapped.strip_prefix("SELECT * FROM (\n").unwrap();
+            body.split_once("\n) AS tidx_bounded_row")
+                .unwrap()
+                .0
+                .to_string()
+        };
+
+        assert_eq!(inner("SELECT 1 LIMIT 5;"), "SELECT 1 LIMIT 5");
+        assert_eq!(inner(" ; SELECT 1 LIMIT 5 ;; "), "SELECT 1 LIMIT 5");
+        // Comments after the last token go with the delimiter; inner ones stay.
+        assert_eq!(inner("SELECT 1 -- a\n; -- b"), "SELECT 1");
+        assert_eq!(inner("SELECT 1 -- a\n, 2;"), "SELECT 1 -- a\n, 2");
+        assert_eq!(inner("SELECT ';' ; "), "SELECT ';'");
+        // Offsets count characters of a line, not bytes, and lines from the top.
+        assert_eq!(
+            inner("; SELECT '\u{e9}\u{e9}'\n, 2\n;"),
+            "SELECT '\u{e9}\u{e9}'\n, 2"
+        );
+        // Without delimiters the text, comments included, is kept as it is.
+        assert_eq!(inner("-- top\nSELECT 1 -- end"), "-- top\nSELECT 1 -- end");
+
+        assert_eq!(
+            bound_row_size(" ; ;").unwrap_err().to_string(),
+            "Empty query"
+        );
+    }
+
+    #[test]
+    fn test_row_too_large_is_the_bounded_row_error_only() {
+        let message =
+            format!("invalid input syntax for type boolean: \"{ROW_TOO_LARGE_MARKER} 6400002\"");
+        assert!(is_row_too_large(
+            &SqlState::INVALID_TEXT_REPRESENTATION,
+            &message
+        ));
+        // Other casts to boolean, and other errors that show the marker, are not it.
+        assert!(!is_row_too_large(
+            &SqlState::INVALID_TEXT_REPRESENTATION,
+            "invalid input syntax for type boolean: \"maybe\""
+        ));
+        assert!(!is_row_too_large(&SqlState::SYNTAX_ERROR, &message));
+
+        assert_eq!(
+            row_too_large().to_string(),
+            "Query result row exceeded 10485760 bytes"
+        );
+        let classified = classify_query_execution_error(row_too_large());
+        assert_eq!(
+            classified.to_string(),
+            "Query error: Query result row exceeded 10485760 bytes"
+        );
+        assert!(!is_retryable_hot_postgres_failure(&classified));
     }
 
     #[test]

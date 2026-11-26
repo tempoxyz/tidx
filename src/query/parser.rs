@@ -706,7 +706,7 @@ fn top_level_with_end(sql: &str, dialect: &dyn Dialect) -> Result<usize> {
     Err(anyhow!("Failed to locate WITH clause"))
 }
 
-pub(super) fn byte_index_for_location(sql: &str, location: Location) -> Option<usize> {
+pub(crate) fn byte_index_for_location(sql: &str, location: Location) -> Option<usize> {
     if location.line == 0 || location.column == 0 {
         return None;
     }

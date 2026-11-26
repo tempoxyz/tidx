@@ -1115,7 +1115,8 @@ async fn test_seeded_receipt_stats() {
 // Query service integration tests - routes through service layer
 // ============================================================================
 
-use tidx::service::{QueryOptions, execute_query_postgres};
+use tidx::service::{PostgresQuery, QueryOptions, execute_query_postgres};
+use tokio_postgres::types::Type;
 
 fn default_options() -> QueryOptions {
     QueryOptions {
@@ -1267,6 +1268,9 @@ async fn test_query_postgres_cell_json_formats() {
     conn.execute("DELETE FROM logs WHERE block_num = $1", &[&block_num])
         .await
         .unwrap();
+    conn.execute("DELETE FROM receipts WHERE block_num = $1", &[&block_num])
+        .await
+        .unwrap();
     conn.execute(
         "INSERT INTO logs (block_num, block_timestamp, log_idx, tx_idx, tx_hash, address, data)
          VALUES ($1, NOW(), 0, 0, $2, $2, $3), ($1, NOW(), 1, 0, $2, $2, $4),
@@ -1281,22 +1285,42 @@ async fn test_query_postgres_cell_json_formats() {
     )
     .await
     .unwrap();
+    // Nine more rows of the same cell, for a result whose rows each pass the
+    // row cap while together they exceed the read budget.
+    conn.execute(
+        "INSERT INTO logs (block_num, block_timestamp, log_idx, tx_idx, tx_hash, address, data)
+         SELECT $1, NOW(), idx, 0, $2, $2, $3 FROM generate_series(3, 11) AS idx",
+        &[&block_num, &vec![0_u8; 20], &vec![b'"'; 1_000_000]],
+    )
+    .await
+    .unwrap();
+    // Text of 1,000,000 newlines: one byte in the row's text form, `\n` in JSON.
+    conn.execute(
+        "INSERT INTO receipts (block_num, block_timestamp, tx_idx, tx_hash, \"from\",
+                               gas_used, cumulative_gas_used, effective_gas_price)
+         VALUES ($1, NOW(), 0, $2, $2, 0, 0, repeat(E'\\n', 1000000))",
+        &[&block_num, &vec![0_u8; 32]],
+    )
+    .await
+    .unwrap();
     let columns = |count: usize, expr: &str| {
         (0..count)
             .map(|i| format!("{expr} AS c{i}"))
             .collect::<Vec<_>>()
             .join(", ")
     };
-    // 42 cells of 1,000,000 bytes that format as null: each passes the cell
-    // cap, together they exceed the 40 MiB read budget.
+    // Ten rows of five cells of 1,000,000 bytes that format as null: each cell
+    // passes the cell cap and each row the row cap, together they exceed the
+    // 40 MiB read budget.
     let wide_arrays = format!(
-        "SELECT {} FROM logs WHERE block_num = 74000000 AND log_idx = 2",
-        columns(42, "ARRAY[data]")
+        "SELECT {} FROM logs WHERE block_num = 74000000 AND log_idx >= 2",
+        columns(5, "ARRAY[data]")
     );
-    // Six cells of 1,000,000 quotes: 6 MB on the wire, 12 MB of escaped JSON.
+    // Six cells of 1,000,000 newlines: 6 MB on the wire and in the row's text
+    // form, 12 MB of escaped JSON.
     let escaped = format!(
-        "SELECT {} FROM logs WHERE block_num = 74000000 AND log_idx = 2",
-        columns(6, "encode(data, 'escape')")
+        "SELECT {} FROM receipts WHERE block_num = 74000000",
+        columns(6, "effective_gas_price")
     );
     for (sql, expected) in [
         (
@@ -1324,6 +1348,137 @@ async fn test_query_postgres_cell_json_formats() {
         };
         assert!(err.to_string().contains(expected), "{sql}: {err}");
     }
+    conn.execute("DELETE FROM logs WHERE block_num = $1", &[&block_num])
+        .await
+        .unwrap();
+    conn.execute("DELETE FROM receipts WHERE block_num = $1", &[&block_num])
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+#[serial(db)]
+async fn test_query_rejects_oversized_row_server_side() {
+    let db = TestDb::empty().await;
+    let opts = default_options();
+
+    // Six logs of 1,000,000 bytes: each cell passes the 1 MiB cell cap, but
+    // aggregating them builds one value PostgreSQL could grow to 1 GB.
+    let block_num = 74_000_001_i64;
+    let conn = db.pool.get().await.unwrap();
+    conn.execute("DELETE FROM logs WHERE block_num = $1", &[&block_num])
+        .await
+        .unwrap();
+    conn.execute(
+        "INSERT INTO logs (block_num, block_timestamp, log_idx, tx_idx, tx_hash, address, data)
+         SELECT $1, NOW(), idx, 0, $2, $2, $3 FROM generate_series(0, 5) AS idx",
+        &[&block_num, &vec![0_u8; 20], &vec![0xab_u8; 1_000_000]],
+    )
+    .await
+    .unwrap();
+    let columns = |count: usize| {
+        (0..count)
+            .map(|i| format!("left(encode(data, 'hex'), 1000000) AS c{i}"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+
+    // One value of 12,000,000 characters, and eleven cells of 1,000,000
+    // characters. Both rows exceed 10 MiB, and PostgreSQL refuses to send them:
+    // without that the driver buffers the row, then fails on the 1 MiB cell cap
+    // or the 10 MiB response cap.
+    let aggregated =
+        "SELECT string_agg(encode(data, 'hex'), '') FROM logs WHERE block_num = 74000001";
+    let wide = format!(
+        "SELECT {} FROM logs WHERE block_num = 74000001 AND log_idx = 0",
+        columns(11)
+    );
+    for sql in [aggregated, wide.as_str()] {
+        // Not `expect_err`: its message would print the whole result.
+        let Err(err) = execute_query_postgres(&db.pool, sql, &[], &opts).await else {
+            panic!("query should fail: {sql}");
+        };
+        assert_eq!(
+            err.to_string(),
+            "Query error: Query result row exceeded 10485760 bytes",
+            "{sql}"
+        );
+    }
+
+    // Ten such cells make a row of 10,000,000 characters, under the cap.
+    let result = execute_query_postgres(
+        &db.pool,
+        &format!(
+            "SELECT {} FROM logs WHERE block_num = 74000001 AND log_idx = 0",
+            columns(10)
+        ),
+        &[],
+        &opts,
+    )
+    .await
+    .expect("a row under the cap must be returned");
+    assert_eq!(result.row_count, 1);
+    assert!(
+        result.rows[0]
+            .iter()
+            .all(|cell| cell.as_str().unwrap().len() == 1_000_000)
+    );
+
+    // The wrapper leaves other results as they are: order, limit, set
+    // operations, CTEs, duplicate and unnamed columns, a trailing semicolon.
+    for (sql, expected) in [
+        (
+            "SELECT log_idx FROM logs WHERE block_num = 74000001 ORDER BY log_idx DESC LIMIT 3",
+            r#"[[5],[4],[3]]"#,
+        ),
+        (
+            "SELECT log_idx FROM logs WHERE block_num = 74000001 ORDER BY log_idx DESC LIMIT 3;",
+            r#"[[5],[4],[3]]"#,
+        ),
+        (
+            "WITH l AS (SELECT log_idx FROM logs WHERE block_num = 74000001) \
+             SELECT log_idx FROM l ORDER BY log_idx DESC LIMIT 2",
+            r#"[[5],[4]]"#,
+        ),
+        (
+            "SELECT 2 AS n UNION ALL SELECT 1 ORDER BY n",
+            r#"[[1],[2]]"#,
+        ),
+        (
+            "SELECT a.log_idx, b.log_idx FROM logs a JOIN logs b ON a.log_idx = b.log_idx + 1 \
+             WHERE a.block_num = 74000001 AND b.block_num = 74000001 ORDER BY a.log_idx LIMIT 2",
+            r#"[[1,0],[2,1]]"#,
+        ),
+        ("SELECT 1 + 1, 'x', NULL", r#"[[2,"x",null]]"#),
+    ] {
+        let result = execute_query_postgres(&db.pool, sql, &[], &opts)
+            .await
+            .unwrap_or_else(|e| panic!("{sql}: {e}"));
+        assert_eq!(
+            serde_json::to_string(&result.rows).unwrap(),
+            expected,
+            "{sql}"
+        );
+    }
+    let result = execute_query_postgres(&db.pool, "SELECT 2 AS a, 3 AS a", &[], &opts)
+        .await
+        .unwrap();
+    assert_eq!(result.columns, vec!["a", "a"]);
+
+    // Bound parameters reach the wrapped query.
+    let query = PostgresQuery::prepare(
+        "SELECT log_idx FROM logs WHERE block_num = $1 ORDER BY log_idx DESC LIMIT 2",
+        &[],
+        &opts,
+    )
+    .await
+    .unwrap();
+    let result = query
+        .execute(&db.pool, &[(&block_num, Type::INT8)], &opts)
+        .await
+        .unwrap();
+    assert_eq!(serde_json::to_string(&result.rows).unwrap(), "[[5],[4]]");
+
     conn.execute("DELETE FROM logs WHERE block_num = $1", &[&block_num])
         .await
         .unwrap();
