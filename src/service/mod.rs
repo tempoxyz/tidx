@@ -648,8 +648,11 @@ async fn try_execute_tiered_split(
                     return Err(e);
                 };
                 if !cold_runs {
-                    // Native ClickHouse would reject this query too.
-                    return Ok(None);
+                    // Native ClickHouse would reject this query too: serve
+                    // it from the archive through the pg_clickhouse tables.
+                    return degrade_split_to_fdw(pool, sql, signatures, e, options, start)
+                        .await
+                        .map(Some);
                 }
                 return degrade_split_to_clickhouse(
                     ch,
@@ -765,6 +768,35 @@ async fn degrade_split_to_clickhouse(
         })?;
     normalize_cold_result(&mut raw, selector_null_cols);
     let mut result: QueryResult = raw.into();
+    result.engine = Some("tiered".to_string());
+    result.query_time_ms = Some(start.elapsed().as_secs_f64() * 1000.0);
+    Ok(result)
+}
+
+/// Degraded split path for a query native ClickHouse rejects: the hot
+/// PostgreSQL arm failed, so serve the original query from the archive
+/// through the pg_clickhouse foreign tables.
+async fn degrade_split_to_fdw(
+    pool: &Pool,
+    sql: &str,
+    signatures: &[&str],
+    hot_err: anyhow::Error,
+    options: &QueryOptions,
+    start: Instant,
+) -> Result<QueryResult> {
+    tracing::warn!(target: "tidx::query", error = %hot_err, "tiered: hot arm failed; degrading split query to pg_clickhouse");
+    let opts = QueryOptions {
+        timeout_ms: options
+            .timeout_ms
+            .saturating_sub(start.elapsed().as_millis() as u64)
+            .max(TIERED_COLD_MIN_TIMEOUT_MS),
+        limit: options.limit,
+    };
+    let mut result = execute_query_postgres_via_clickhouse(pool, sql, signatures, &opts)
+        .await
+        .map_err(|fdw_err| {
+            anyhow!("tiered split failed on both arms: hot (postgres): {hot_err}; cold (pg_clickhouse): {fdw_err}")
+        })?;
     result.engine = Some("tiered".to_string());
     result.query_time_ms = Some(start.elapsed().as_secs_f64() * 1000.0);
     Ok(result)

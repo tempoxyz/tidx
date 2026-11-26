@@ -344,11 +344,22 @@ async fn test_desc_split_serves_backslash_alias_from_hot_arm() {
 }
 
 /// A hot-arm failure on a split query ClickHouse would reject natively (a
-/// backslash in a quoted identifier) must take the ordinary fallback, which
-/// serves it through the pg_clickhouse foreign tables.
+/// backslash in a quoted identifier) must degrade to the archive, which it
+/// reads through the pg_clickhouse foreign tables.
 #[tokio::test]
 #[serial(db)]
 async fn test_desc_split_backslash_alias_falls_back_to_fdw_when_hot_arm_fails() {
+    // Unbounded, and bounded to the hot window (which plain PostgreSQL
+    // would otherwise serve, with the same missing table).
+    for sql in [
+        r#"SELECT num AS "a\b" FROM blocks ORDER BY num DESC LIMIT 5"#,
+        r#"SELECT num AS "a\b" FROM blocks WHERE num > 10 ORDER BY num DESC LIMIT 5"#,
+    ] {
+        backslash_alias_falls_back_to_fdw_when_hot_arm_fails(sql).await;
+    }
+}
+
+async fn backslash_alias_falls_back_to_fdw_when_hot_arm_fails(sql: &str) {
     let Some((_ch, db, engine)) = setup_tiered_store().await else {
         return;
     };
@@ -370,7 +381,7 @@ async fn test_desc_split_backslash_alias_falls_back_to_fdw_when_hot_arm_fails() 
         &db.pool,
         Some(&engine),
         CHAIN_ID,
-        r#"SELECT num AS "a\b" FROM blocks ORDER BY num DESC LIMIT 5"#,
+        sql,
         &[],
         &QueryOptions {
             timeout_ms: 10_000,
@@ -385,7 +396,7 @@ async fn test_desc_split_backslash_alias_falls_back_to_fdw_when_hot_arm_fails() 
         .expect("drop FDW server");
     drop(conn);
 
-    let result = result.expect("the FDW fallback serves the query");
+    let result = result.unwrap_or_else(|e| panic!("the FDW fallback serves {sql}: {e:#}"));
     let nums: Vec<i64> = result
         .rows
         .iter()
