@@ -464,6 +464,9 @@ pub async fn execute_query_tiered(
     // Parts of this query may run natively on ClickHouse, which only applies
     // the ClickHouse validator: keep PostgreSQL's session-keyword rule.
     crate::query::reject_postgres_session_keywords(sql)?;
+    // Keep its lexer checks too, so a query the PostgreSQL path rejects can't
+    // run there instead.
+    crate::query::reject_postgres_lexer_mismatches(sql)?;
     // ClickHouse rejects backslashes in quoted identifiers, so such a query
     // can't run natively there: read the archive through pg_clickhouse.
     let native_ok = !sql.contains('\\')
