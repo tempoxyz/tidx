@@ -1,5 +1,8 @@
+mod delivery;
 pub mod head_poller;
 mod views;
+
+pub use delivery::{WRITE_STALL_TIMEOUT, api_listener};
 
 use std::collections::HashMap;
 use std::convert::Infallible;
@@ -22,7 +25,6 @@ use axum::{
 use chrono::Utc;
 use futures::Stream;
 use serde::{Deserialize, Serialize};
-use tower::limit::GlobalConcurrencyLimitLayer;
 use tower_http::cors::CorsLayer;
 use tower_http::trace::TraceLayer;
 
@@ -296,8 +298,9 @@ fn build_router(state: AppState, mode: ApiMode) -> Router<()> {
     if mode != ApiMode::Sync {
         router = router.route(
             "/query",
-            get(handle_query).layer(GlobalConcurrencyLimitLayer::with_semaphore(
+            get(handle_query).layer(axum::middleware::from_fn_with_state(
                 state.query_permits.clone(),
+                delivery::hold_query_permit,
             )),
         );
     }
