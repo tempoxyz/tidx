@@ -501,20 +501,21 @@ pub async fn execute_query_tiered(
                 let mut result = match execute_query_postgres(pool, sql, signatures, options).await
                 {
                     Ok(result) => result,
-                    // The split would have degraded this to the archive.
+                    // A split query would have degraded to the archive; only
+                    // the split's shapes read the same through pg_clickhouse.
                     Err(e)
                         if clickhouse.is_some()
                             && !native_ok
                             && is_retryable_hot_postgres_failure(&e) =>
                     {
-                        let selector_null_cols = plan_validated_tiered_split(sql, signatures)
-                            .map(|plan| plan.selector_null_cols)
-                            .unwrap_or_default();
+                        let Some(plan) = plan_validated_tiered_split(sql, signatures) else {
+                            return Err(e);
+                        };
                         degrade_split_to_fdw(
                             pool,
                             sql,
                             signatures,
-                            &selector_null_cols,
+                            &plan.selector_null_cols,
                             e,
                             options,
                             start,
