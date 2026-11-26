@@ -14,10 +14,11 @@ use serial_test::serial;
 use tidx::clickhouse::ClickHouseEngine;
 use tidx::config::ClickHouseConfig;
 use tidx::db::run_migrations;
+use tidx::db::tiered::{FdwTarget, bootstrap};
 use tidx::query::EventSignature;
 use tidx::service::{QueryOptions, execute_query_tiered};
 use tidx::sync::ch_sink::ClickHouseSink;
-use tidx::sync::writer::{set_hot_boundary, write_logs};
+use tidx::sync::writer::{set_hot_boundary, write_blocks, write_logs};
 use tidx::types::{BlockRow, LogRow};
 
 const CHAIN_ID: u64 = 999;
@@ -300,4 +301,296 @@ async fn test_degraded_split_preserves_null_selector() {
     );
     assert_eq!(rows[1].0, 19);
     assert_eq!(rows[1].1.as_str(), Some("0xdddddddd"));
+}
+
+/// ClickHouse rejects backslashes in quoted identifiers, so a split query
+/// with one has no cold arm. A descending page the hot arm fills must still
+/// be served from PostgreSQL.
+#[tokio::test]
+#[serial(db)]
+async fn test_desc_split_serves_backslash_alias_from_hot_arm() {
+    let Some((_ch, db, engine)) = setup_tiered_store().await else {
+        return;
+    };
+
+    let base_ts = Utc::now() - Duration::seconds(30);
+    let hot: Vec<_> = (11..=20)
+        .map(|n| make_block(n, base_ts + Duration::seconds(n)))
+        .collect();
+    write_blocks(&db.pool, &hot).await.expect("PG blocks");
+
+    let result = execute_query_tiered(
+        &db.pool,
+        Some(&engine),
+        CHAIN_ID,
+        r#"SELECT num AS "a\b" FROM blocks ORDER BY num DESC LIMIT 5"#,
+        &[],
+        &QueryOptions {
+            timeout_ms: 10_000,
+            limit: 100,
+        },
+    )
+    .await
+    .expect("the hot arm fills the page without ClickHouse");
+
+    assert_eq!(result.columns, vec![r"a\b".to_string()]);
+    let nums: Vec<i64> = result
+        .rows
+        .iter()
+        .map(|r| r[0].as_i64().expect("num is an integer"))
+        .collect();
+    assert_eq!(nums, vec![20, 19, 18, 17, 16]);
+    assert_eq!(result.engine.as_deref(), Some("tiered"));
+}
+
+/// A hot-arm failure on a split query ClickHouse would reject natively (a
+/// backslash in a quoted identifier) must degrade to the archive, which it
+/// reads through the pg_clickhouse foreign tables.
+#[tokio::test]
+#[serial(db)]
+async fn test_desc_split_backslash_alias_falls_back_to_fdw_when_hot_arm_fails() {
+    // Unbounded, and bounded to the hot window (which plain PostgreSQL
+    // would otherwise serve, with the same missing table).
+    // Ascending and bounded: the split hands it to plain PostgreSQL.
+    for (sql, expected) in [
+        (
+            r#"SELECT num AS "a\b" FROM blocks ORDER BY num DESC LIMIT 5"#,
+            vec![20, 19, 18, 17, 16],
+        ),
+        (
+            r#"SELECT num AS "a\b" FROM blocks WHERE num > 10 ORDER BY num DESC LIMIT 5"#,
+            vec![20, 19, 18, 17, 16],
+        ),
+        (
+            r#"SELECT num AS "a\b" FROM blocks WHERE num > 10 ORDER BY num ASC LIMIT 5"#,
+            vec![11, 12, 13, 14, 15],
+        ),
+    ] {
+        backslash_alias_falls_back_to_fdw_when_hot_arm_fails(sql, expected).await;
+    }
+}
+
+async fn backslash_alias_falls_back_to_fdw_when_hot_arm_fails(sql: &str, expected: Vec<i64>) {
+    let Some((_ch, db, engine)) = setup_tiered_store().await else {
+        return;
+    };
+    let fdw_url =
+        std::env::var("TIDX_TEST_FDW_URL").unwrap_or_else(|_| "http://clickhouse:8123".into());
+    let target = FdwTarget::new(&fdw_url, CH_DB.to_string(), None, None).unwrap();
+    if let Err(e) = bootstrap(&db.pool, &target, None, CHAIN_ID).await {
+        common::skip(&format!("pg_clickhouse not available ({e:#})"));
+        return;
+    }
+    // Break only the hot PostgreSQL arm, after the foreign tables exist.
+    let conn = db.pool.get().await.expect("conn");
+    conn.execute("DROP TABLE blocks CASCADE", &[])
+        .await
+        .expect("drop hot table");
+    drop(conn);
+
+    let result = execute_query_tiered(
+        &db.pool,
+        Some(&engine),
+        CHAIN_ID,
+        sql,
+        &[],
+        &QueryOptions {
+            timeout_ms: 10_000,
+            limit: 100,
+        },
+    )
+    .await;
+
+    let conn = db.pool.get().await.expect("conn");
+    conn.batch_execute("DROP SERVER IF EXISTS tidx_clickhouse CASCADE")
+        .await
+        .expect("drop FDW server");
+    drop(conn);
+
+    let result = result.unwrap_or_else(|e| panic!("the FDW fallback serves {sql}: {e:#}"));
+    let nums: Vec<i64> = result
+        .rows
+        .iter()
+        .map(|r| r[0].as_i64().expect("num is an integer"))
+        .collect();
+    assert_eq!(nums, expected, "{sql}");
+    assert_eq!(result.engine.as_deref(), Some("tiered"));
+}
+
+/// The pg_clickhouse degrade path for a query native ClickHouse rejects
+/// restores NULL for missing selectors too.
+#[tokio::test]
+#[serial(db)]
+async fn test_fdw_degraded_split_preserves_null_selector() {
+    // Descending through the split, and ascending within the hot window
+    // through plain PostgreSQL. Blocks 11 and 20 have no selector.
+    for (sql, null_block, next_block) in [
+        (
+            r#"SELECT block_num, selector AS "s\x" FROM logs ORDER BY block_num DESC LIMIT 2"#,
+            20,
+            19,
+        ),
+        (
+            r#"SELECT block_num, selector AS "s\x" FROM logs WHERE block_num > 10 ORDER BY block_num ASC LIMIT 2"#,
+            11,
+            12,
+        ),
+    ] {
+        fdw_degraded_split_preserves_null_selector(sql, null_block, next_block).await;
+    }
+}
+
+async fn fdw_degraded_split_preserves_null_selector(sql: &str, null_block: i64, next_block: i64) {
+    let Some((ch, db, engine)) = setup_tiered_store().await else {
+        return;
+    };
+    let sink = ClickHouseSink::new(&ch.url, CH_DB, None, None).expect("CH sink");
+    let base_ts = Utc::now() - Duration::seconds(30);
+    let logs: Vec<_> = (1..=20)
+        .map(|n| {
+            make_log(
+                n,
+                base_ts + Duration::seconds(n),
+                (n != 11 && n != 20).then(|| vec![0xdd; 4]),
+            )
+        })
+        .collect();
+    sink.write_logs(&logs).await.expect("CH logs");
+
+    let fdw_url =
+        std::env::var("TIDX_TEST_FDW_URL").unwrap_or_else(|_| "http://clickhouse:8123".into());
+    let target = FdwTarget::new(&fdw_url, CH_DB.to_string(), None, None).unwrap();
+    if let Err(e) = bootstrap(&db.pool, &target, None, CHAIN_ID).await {
+        common::skip(&format!("pg_clickhouse not available ({e:#})"));
+        return;
+    }
+    let conn = db.pool.get().await.expect("conn");
+    conn.execute("DROP TABLE logs CASCADE", &[])
+        .await
+        .expect("drop hot logs table");
+    drop(conn);
+
+    let result = execute_query_tiered(
+        &db.pool,
+        Some(&engine),
+        CHAIN_ID,
+        sql,
+        &[],
+        &QueryOptions {
+            timeout_ms: 10_000,
+            limit: 100,
+        },
+    )
+    .await;
+
+    let conn = db.pool.get().await.expect("conn");
+    conn.batch_execute("DROP SERVER IF EXISTS tidx_clickhouse CASCADE")
+        .await
+        .expect("drop FDW server");
+    drop(conn);
+
+    let result = result.unwrap_or_else(|e| panic!("the FDW fallback serves {sql}: {e:#}"));
+    assert_eq!(result.rows[0][0].as_i64(), Some(null_block), "{sql}");
+    assert_eq!(result.rows[0][1], serde_json::Value::Null, "{sql}");
+    assert_eq!(result.rows[1][0].as_i64(), Some(next_block), "{sql}");
+    assert!(result.rows[1][1].is_string(), "{sql}");
+}
+
+/// A query native ClickHouse rejects goes straight to pg_clickhouse, so a
+/// short deadline is spent there rather than on a native retry gate.
+#[tokio::test]
+#[serial(db)]
+async fn test_backslash_alias_short_deadline_reads_archive_through_fdw() {
+    let Some((_ch, db, engine)) = setup_tiered_store().await else {
+        return;
+    };
+    let fdw_url =
+        std::env::var("TIDX_TEST_FDW_URL").unwrap_or_else(|_| "http://clickhouse:8123".into());
+    let target = FdwTarget::new(&fdw_url, CH_DB.to_string(), None, None).unwrap();
+    if let Err(e) = bootstrap(&db.pool, &target, None, CHAIN_ID).await {
+        common::skip(&format!("pg_clickhouse not available ({e:#})"));
+        return;
+    }
+
+    let result = execute_query_tiered(
+        &db.pool,
+        Some(&engine),
+        CHAIN_ID,
+        r#"SELECT num AS "a\b" FROM blocks ORDER BY num ASC LIMIT 5"#,
+        &[],
+        &QueryOptions {
+            timeout_ms: 200,
+            limit: 100,
+        },
+    )
+    .await;
+
+    let conn = db.pool.get().await.expect("conn");
+    conn.batch_execute("DROP SERVER IF EXISTS tidx_clickhouse CASCADE")
+        .await
+        .expect("drop FDW server");
+    drop(conn);
+
+    let result = result.unwrap_or_else(|e| panic!("the FDW path serves the query: {e:#}"));
+    let nums: Vec<i64> = result
+        .rows
+        .iter()
+        .map(|r| r[0].as_i64().expect("num is an integer"))
+        .collect();
+    assert_eq!(nums, vec![1, 2, 3, 4, 5]);
+}
+
+/// A split shape native ClickHouse can't run, which the split declines
+/// (ascending here), reads the archive through pg_clickhouse with NULL
+/// selectors restored.
+#[tokio::test]
+#[serial(db)]
+async fn test_declined_backslash_split_restores_null_selector_through_fdw() {
+    let Some((ch, db, engine)) = setup_tiered_store().await else {
+        return;
+    };
+    let sink = ClickHouseSink::new(&ch.url, CH_DB, None, None).expect("CH sink");
+    let base_ts = Utc::now() - Duration::seconds(30);
+    let logs: Vec<_> = (1..=20)
+        .map(|n| {
+            make_log(
+                n,
+                base_ts + Duration::seconds(n),
+                (n != 1).then(|| vec![0xdd; 4]),
+            )
+        })
+        .collect();
+    sink.write_logs(&logs).await.expect("CH logs");
+    let fdw_url =
+        std::env::var("TIDX_TEST_FDW_URL").unwrap_or_else(|_| "http://clickhouse:8123".into());
+    let target = FdwTarget::new(&fdw_url, CH_DB.to_string(), None, None).unwrap();
+    if let Err(e) = bootstrap(&db.pool, &target, None, CHAIN_ID).await {
+        common::skip(&format!("pg_clickhouse not available ({e:#})"));
+        return;
+    }
+
+    let result = execute_query_tiered(
+        &db.pool,
+        Some(&engine),
+        CHAIN_ID,
+        r#"SELECT block_num, selector AS "s\x" FROM logs ORDER BY block_num ASC LIMIT 2"#,
+        &[],
+        &QueryOptions {
+            timeout_ms: 10_000,
+            limit: 100,
+        },
+    )
+    .await;
+
+    let conn = db.pool.get().await.expect("conn");
+    conn.batch_execute("DROP SERVER IF EXISTS tidx_clickhouse CASCADE")
+        .await
+        .expect("drop FDW server");
+    drop(conn);
+
+    let result = result.unwrap_or_else(|e| panic!("the FDW path serves the query: {e:#}"));
+    assert_eq!(result.rows[0][0].as_i64(), Some(1));
+    assert_eq!(result.rows[0][1], serde_json::Value::Null);
+    assert_eq!(result.rows[1][0].as_i64(), Some(2));
+    assert!(result.rows[1][1].is_string());
 }

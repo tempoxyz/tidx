@@ -21,6 +21,7 @@ pub use validator::{
 };
 
 pub(crate) use parser::{byte_index_for_location, check_event_signature_limits};
+pub(crate) use validator::reject_clickhouse_backslash_identifiers;
 
 use regex_lite::Regex;
 use sqlparser::ast::{
