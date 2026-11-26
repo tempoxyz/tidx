@@ -422,6 +422,25 @@ async fn backslash_alias_falls_back_to_fdw_when_hot_arm_fails(sql: &str, expecte
 #[tokio::test]
 #[serial(db)]
 async fn test_fdw_degraded_split_preserves_null_selector() {
+    // Descending through the split, and ascending within the hot window
+    // through plain PostgreSQL. Blocks 11 and 20 have no selector.
+    for (sql, null_block, next_block) in [
+        (
+            r#"SELECT block_num, selector AS "s\x" FROM logs ORDER BY block_num DESC LIMIT 2"#,
+            20,
+            19,
+        ),
+        (
+            r#"SELECT block_num, selector AS "s\x" FROM logs WHERE block_num > 10 ORDER BY block_num ASC LIMIT 2"#,
+            11,
+            12,
+        ),
+    ] {
+        fdw_degraded_split_preserves_null_selector(sql, null_block, next_block).await;
+    }
+}
+
+async fn fdw_degraded_split_preserves_null_selector(sql: &str, null_block: i64, next_block: i64) {
     let Some((ch, db, engine)) = setup_tiered_store().await else {
         return;
     };
@@ -432,7 +451,7 @@ async fn test_fdw_degraded_split_preserves_null_selector() {
             make_log(
                 n,
                 base_ts + Duration::seconds(n),
-                (n != 20).then(|| vec![0xdd; 4]),
+                (n != 11 && n != 20).then(|| vec![0xdd; 4]),
             )
         })
         .collect();
@@ -455,7 +474,7 @@ async fn test_fdw_degraded_split_preserves_null_selector() {
         &db.pool,
         Some(&engine),
         CHAIN_ID,
-        r#"SELECT block_num, selector AS "s\x" FROM logs ORDER BY block_num DESC LIMIT 2"#,
+        sql,
         &[],
         &QueryOptions {
             timeout_ms: 10_000,
@@ -470,10 +489,11 @@ async fn test_fdw_degraded_split_preserves_null_selector() {
         .expect("drop FDW server");
     drop(conn);
 
-    let result = result.unwrap_or_else(|e| panic!("the FDW fallback serves the query: {e:#}"));
-    assert_eq!(result.rows[0][0].as_i64(), Some(20));
-    assert_eq!(result.rows[0][1], serde_json::Value::Null);
-    assert!(result.rows[1][1].is_string());
+    let result = result.unwrap_or_else(|e| panic!("the FDW fallback serves {sql}: {e:#}"));
+    assert_eq!(result.rows[0][0].as_i64(), Some(null_block), "{sql}");
+    assert_eq!(result.rows[0][1], serde_json::Value::Null, "{sql}");
+    assert_eq!(result.rows[1][0].as_i64(), Some(next_block), "{sql}");
+    assert!(result.rows[1][1].is_string(), "{sql}");
 }
 
 /// A query native ClickHouse rejects goes straight to pg_clickhouse, so a

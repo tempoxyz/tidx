@@ -466,7 +466,11 @@ pub async fn execute_query_tiered(
     crate::query::reject_postgres_session_keywords(sql)?;
     // ClickHouse rejects backslashes in quoted identifiers, so such a query
     // can't run natively there: read the archive through pg_clickhouse.
-    let native_ok = crate::query::reject_clickhouse_backslash_identifiers(sql).is_ok();
+    let native_ok = !sql.contains('\\')
+        || prepare_blocking(sql, signatures, |sql, _| {
+            Ok(crate::query::reject_clickhouse_backslash_identifiers(sql).is_ok())
+        })
+        .await?;
     let crate::db::tiered::PruneBoundary {
         boundary,
         boundary_ts,
@@ -503,7 +507,19 @@ pub async fn execute_query_tiered(
                             && !native_ok
                             && is_retryable_hot_postgres_failure(&e) =>
                     {
-                        degrade_split_to_fdw(pool, sql, signatures, &[], e, options, start).await?
+                        let selector_null_cols = plan_validated_tiered_split(sql, signatures)
+                            .map(|plan| plan.selector_null_cols)
+                            .unwrap_or_default();
+                        degrade_split_to_fdw(
+                            pool,
+                            sql,
+                            signatures,
+                            &selector_null_cols,
+                            e,
+                            options,
+                            start,
+                        )
+                        .await?
                     }
                     Err(e) => return Err(e),
                 };
@@ -563,9 +579,14 @@ pub async fn execute_query_tiered(
                     Ok(result)
                 }
                 None => {
-                    let mut result =
+                    // Native ClickHouse can't run it: a hot-window aggregate
+                    // goes to plain PostgreSQL, as after a native failure.
+                    let mut result = if hot.is_some() {
+                        execute_query_postgres(pool, sql, signatures, options).await?
+                    } else {
                         execute_query_postgres_via_clickhouse(pool, sql, signatures, options)
-                            .await?;
+                            .await?
+                    };
                     result.engine = Some("tiered".to_string());
                     Ok(result)
                 }

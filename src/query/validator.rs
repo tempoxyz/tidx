@@ -8,8 +8,8 @@ use sqlparser::ast::{
     SelectItem, SetExpr, Statement, TableFactor, TableWithJoins, Visit, Visitor,
 };
 use sqlparser::dialect::{Dialect, GenericDialect};
-use sqlparser::parser::Parser;
-use sqlparser::tokenizer::Token;
+use sqlparser::parser::{Parser, ParserError};
+use sqlparser::tokenizer::{Token, TokenWithSpan, Tokenizer};
 
 const POSTGRES_ALLOWED_TABLES: &[&str] = &["blocks", "txs", "logs", "receipts"];
 
@@ -53,9 +53,23 @@ pub fn validate_query(sql: &str) -> Result<()> {
 /// ends a statement list), so text after them would never reach the
 /// validator while the caller still executes the original SQL.
 pub(crate) fn parse_single_statement(dialect: &dyn Dialect, sql: &str) -> Result<Statement> {
-    let mut parser = Parser::new(dialect)
-        .try_with_sql(sql)
-        .map_err(|e| anyhow!("SQL parse error: {e}"))?;
+    parse_single_statement_from_tokens(dialect, tokenize(dialect, sql)?)
+}
+
+/// Tokenizes the input as the parser does, so the tokens can be checked and
+/// then parsed without tokenizing twice.
+fn tokenize(dialect: &dyn Dialect, sql: &str) -> Result<Vec<TokenWithSpan>> {
+    Tokenizer::new(dialect, sql)
+        .tokenize_with_location()
+        .map_err(|e| anyhow!("SQL parse error: {}", ParserError::from(e)))
+}
+
+/// [parse_single_statement] over tokens from [tokenize].
+fn parse_single_statement_from_tokens(
+    dialect: &dyn Dialect,
+    tokens: Vec<TokenWithSpan>,
+) -> Result<Statement> {
+    let mut parser = Parser::new(dialect).with_tokens_with_locations(tokens);
     while parser.consume_token(&Token::SemiColon) {}
     if parser.peek_token().token == Token::EOF {
         return Err(anyhow!("Empty query"));
@@ -96,9 +110,11 @@ pub fn validate_clickhouse_query(sql: &str) -> Result<()> {
         return Err(anyhow!("LIMIT ALL is not allowed"));
     }
 
-    reject_clickhouse_backslash_identifiers(sql)?;
+    let dialect = sqlparser::dialect::ClickHouseDialect {};
+    let tokens = tokenize(&dialect, sql)?;
+    reject_backslash_identifier_tokens(&tokens)?;
 
-    match parse_single_statement(&sqlparser::dialect::ClickHouseDialect {}, sql)? {
+    match parse_single_statement_from_tokens(&dialect, tokens)? {
         Statement::Query(query) => {
             let cte_names = HashSet::new();
             validate_clickhouse_query_ast(&query, &cte_names, 0)?;
@@ -116,12 +132,15 @@ pub fn validate_clickhouse_query(sql: &str) -> Result<()> {
 /// a different query from the one ClickHouse runs. Table, column and function
 /// names never need a backslash.
 pub(crate) fn reject_clickhouse_backslash_identifiers(sql: &str) -> Result<()> {
-    let dialect = sqlparser::dialect::ClickHouseDialect {};
-    let tokens = sqlparser::tokenizer::Tokenizer::new(&dialect, sql)
-        .tokenize()
-        .map_err(|e| anyhow!("SQL parse error: {e}"))?;
+    if !sql.contains('\\') {
+        return Ok(());
+    }
+    reject_backslash_identifier_tokens(&tokenize(&sqlparser::dialect::ClickHouseDialect {}, sql)?)
+}
+
+fn reject_backslash_identifier_tokens(tokens: &[TokenWithSpan]) -> Result<()> {
     for token in tokens {
-        if let Token::Word(word) = token
+        if let Token::Word(word) = &token.token
             && word.quote_style.is_some()
             && word.value.contains('\\')
         {
