@@ -464,6 +464,9 @@ pub async fn execute_query_tiered(
     // Parts of this query may run natively on ClickHouse, which only applies
     // the ClickHouse validator: keep PostgreSQL's session-keyword rule.
     crate::query::reject_postgres_session_keywords(sql)?;
+    // ClickHouse rejects backslashes in quoted identifiers, so such a query
+    // can't run natively there: read the archive through pg_clickhouse.
+    let native_ok = crate::query::reject_clickhouse_backslash_identifiers(sql).is_ok();
     let crate::db::tiered::PruneBoundary {
         boundary,
         boundary_ts,
@@ -475,7 +478,11 @@ pub async fn execute_query_tiered(
         result.engine = Some("tiered".to_string());
         return Ok(result);
     }
-    match try_execute_tiered_split(pool, clickhouse, boundary, sql, signatures, options).await? {
+    match try_execute_tiered_split(
+        pool, clickhouse, native_ok, boundary, sql, signatures, options,
+    )
+    .await?
+    {
         Some(result) => Ok(result),
         None => {
             let hot = crate::query::hot_window_confinement(sql, boundary, boundary_ts);
@@ -486,7 +493,20 @@ pub async fn execute_query_tiered(
             if hot_on_pg {
                 // Every scan is provably above the prune boundary and
                 // index-friendly: plain PostgreSQL serves it whole.
-                let mut result = execute_query_postgres(pool, sql, signatures, options).await?;
+                let start = Instant::now();
+                let mut result = match execute_query_postgres(pool, sql, signatures, options).await
+                {
+                    Ok(result) => result,
+                    // The split would have degraded this to the archive.
+                    Err(e)
+                        if clickhouse.is_some()
+                            && !native_ok
+                            && is_retryable_hot_postgres_failure(&e) =>
+                    {
+                        degrade_split_to_fdw(pool, sql, signatures, &[], e, options, start).await?
+                    }
+                    Err(e) => return Err(e),
+                };
                 result.engine = Some("tiered".to_string());
                 return Ok(result);
             }
@@ -495,7 +515,7 @@ pub async fn execute_query_tiered(
             // sorts/aggregates, no FDW row transfer), with fallback when
             // ClickHouse fails (e.g. bare UNION, timestamp literals).
             let start = Instant::now();
-            let native = match clickhouse {
+            let native = match clickhouse.filter(|_| native_ok) {
                 Some(ch) => Some(
                     ch.query_user_with_settings(
                         sql,
@@ -558,6 +578,7 @@ pub async fn execute_query_tiered(
 async fn try_execute_tiered_split(
     pool: &Pool,
     clickhouse: Option<&crate::clickhouse::ClickHouseEngine>,
+    cold_runs: bool,
     boundary: i64,
     sql: &str,
     signatures: &[&str],
@@ -565,12 +586,10 @@ async fn try_execute_tiered_split(
 ) -> Result<Option<QueryResult>> {
     let start = Instant::now();
 
-    let Some((plan, cold_runs)) = prepare_blocking(sql, signatures, |sql, signatures| {
-        // ClickHouse rejects backslashes in quoted identifiers, so such a
-        // query has no cold arm: serve it from the hot arm alone when that
-        // fills the page, else leave it to the fallback.
-        let cold_runs = crate::query::reject_clickhouse_backslash_identifiers(sql).is_ok();
-        Ok(plan_validated_tiered_split(sql, signatures).map(|plan| (plan, cold_runs)))
+    // Without a native cold arm (cold_runs false), the hot arm alone serves
+    // a page it fills; anything else goes to the fallback.
+    let Some(plan) = prepare_blocking(sql, signatures, |sql, signatures| {
+        Ok(plan_validated_tiered_split(sql, signatures))
     })
     .await?
     else {

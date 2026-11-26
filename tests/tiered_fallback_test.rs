@@ -351,15 +351,26 @@ async fn test_desc_split_serves_backslash_alias_from_hot_arm() {
 async fn test_desc_split_backslash_alias_falls_back_to_fdw_when_hot_arm_fails() {
     // Unbounded, and bounded to the hot window (which plain PostgreSQL
     // would otherwise serve, with the same missing table).
-    for sql in [
-        r#"SELECT num AS "a\b" FROM blocks ORDER BY num DESC LIMIT 5"#,
-        r#"SELECT num AS "a\b" FROM blocks WHERE num > 10 ORDER BY num DESC LIMIT 5"#,
+    // Ascending and bounded: the split hands it to plain PostgreSQL.
+    for (sql, expected) in [
+        (
+            r#"SELECT num AS "a\b" FROM blocks ORDER BY num DESC LIMIT 5"#,
+            vec![20, 19, 18, 17, 16],
+        ),
+        (
+            r#"SELECT num AS "a\b" FROM blocks WHERE num > 10 ORDER BY num DESC LIMIT 5"#,
+            vec![20, 19, 18, 17, 16],
+        ),
+        (
+            r#"SELECT num AS "a\b" FROM blocks WHERE num > 10 ORDER BY num ASC LIMIT 5"#,
+            vec![11, 12, 13, 14, 15],
+        ),
     ] {
-        backslash_alias_falls_back_to_fdw_when_hot_arm_fails(sql).await;
+        backslash_alias_falls_back_to_fdw_when_hot_arm_fails(sql, expected).await;
     }
 }
 
-async fn backslash_alias_falls_back_to_fdw_when_hot_arm_fails(sql: &str) {
+async fn backslash_alias_falls_back_to_fdw_when_hot_arm_fails(sql: &str, expected: Vec<i64>) {
     let Some((_ch, db, engine)) = setup_tiered_store().await else {
         return;
     };
@@ -402,7 +413,7 @@ async fn backslash_alias_falls_back_to_fdw_when_hot_arm_fails(sql: &str) {
         .iter()
         .map(|r| r[0].as_i64().expect("num is an integer"))
         .collect();
-    assert_eq!(nums, vec![20, 19, 18, 17, 16]);
+    assert_eq!(nums, expected, "{sql}");
     assert_eq!(result.engine.as_deref(), Some("tiered"));
 }
 
@@ -463,4 +474,48 @@ async fn test_fdw_degraded_split_preserves_null_selector() {
     assert_eq!(result.rows[0][0].as_i64(), Some(20));
     assert_eq!(result.rows[0][1], serde_json::Value::Null);
     assert!(result.rows[1][1].is_string());
+}
+
+/// A query native ClickHouse rejects goes straight to pg_clickhouse, so a
+/// short deadline is spent there rather than on a native retry gate.
+#[tokio::test]
+#[serial(db)]
+async fn test_backslash_alias_short_deadline_reads_archive_through_fdw() {
+    let Some((_ch, db, engine)) = setup_tiered_store().await else {
+        return;
+    };
+    let fdw_url =
+        std::env::var("TIDX_TEST_FDW_URL").unwrap_or_else(|_| "http://clickhouse:8123".into());
+    let target = FdwTarget::new(&fdw_url, CH_DB.to_string(), None, None).unwrap();
+    if let Err(e) = bootstrap(&db.pool, &target, None, CHAIN_ID).await {
+        common::skip(&format!("pg_clickhouse not available ({e:#})"));
+        return;
+    }
+
+    let result = execute_query_tiered(
+        &db.pool,
+        Some(&engine),
+        CHAIN_ID,
+        r#"SELECT num AS "a\b" FROM blocks ORDER BY num ASC LIMIT 5"#,
+        &[],
+        &QueryOptions {
+            timeout_ms: 200,
+            limit: 100,
+        },
+    )
+    .await;
+
+    let conn = db.pool.get().await.expect("conn");
+    conn.batch_execute("DROP SERVER IF EXISTS tidx_clickhouse CASCADE")
+        .await
+        .expect("drop FDW server");
+    drop(conn);
+
+    let result = result.unwrap_or_else(|e| panic!("the FDW path serves the query: {e:#}"));
+    let nums: Vec<i64> = result
+        .rows
+        .iter()
+        .map(|r| r[0].as_i64().expect("num is an integer"))
+        .collect();
+    assert_eq!(nums, vec![1, 2, 3, 4, 5]);
 }
